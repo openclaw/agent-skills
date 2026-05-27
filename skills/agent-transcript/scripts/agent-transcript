@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { spawn } from "node:child_process";
 
 const MARKER_START = "<!-- agent-transcript:start -->";
 const MARKER_END = "<!-- agent-transcript:end -->";
@@ -12,9 +13,10 @@ const DEFAULT_ENTRY_MAX_CHARS = 6000;
 function usage() {
   console.log(`Usage:
   agent-transcript find --query TEXT [--cwd PATH] [--since-days N] [--max-files N] [--root PATH...]
-  agent-transcript render --session FILE [--out FILE] [--max-chars N] [--entry-max-chars N] [--title TEXT] [--url URL]
-  agent-transcript preview --session FILE [--out FILE] [--max-chars N] [--entry-max-chars N] [--title TEXT] [--url URL]
-  agent-transcript append-body --body FILE --session FILE [--out FILE] [--max-chars N] [--entry-max-chars N]
+  agent-transcript render --session FILE [--app-server] [--thread-id ID] [--out FILE] [--max-chars N] [--entry-max-chars N] [--title TEXT] [--url URL]
+  agent-transcript render-thread --thread-id ID [--out FILE] [--max-chars N] [--entry-max-chars N] [--title TEXT] [--url URL]
+  agent-transcript preview --session FILE [--app-server] [--thread-id ID] [--out FILE] [--max-chars N] [--entry-max-chars N] [--title TEXT] [--url URL]
+  agent-transcript append-body --body FILE --session FILE [--app-server] [--thread-id ID] [--out FILE] [--max-chars N] [--entry-max-chars N]
   agent-transcript html --prs FILE [--out FILE] [--since-days N] [--min-score N] [--root PATH...] [--exclude-session FILE...]
 
 Local-only. No network calls.`);
@@ -47,6 +49,11 @@ function asArray(value) {
   return Array.isArray(value) ? value : [value];
 }
 
+function optionNumber(options, camelName, kebabName, fallback) {
+  const value = options[camelName] ?? options[kebabName] ?? fallback;
+  return Number(value);
+}
+
 function homePath(...parts) {
   return path.join(os.homedir(), ...parts);
 }
@@ -56,10 +63,19 @@ function openClawSessionRoots() {
   const agentsDir = path.join(stateDir, "agents");
   if (!fs.existsSync(agentsDir)) return [];
   try {
-    return fs
+    const roots = fs
       .readdirSync(agentsDir, { withFileTypes: true })
       .filter((entry) => entry.isDirectory())
-      .map((entry) => path.join(agentsDir, entry.name, "sessions"));
+      .flatMap((entry) => {
+        const agentDir = path.join(agentsDir, entry.name);
+        return [
+          path.join(agentDir, "sessions"),
+          path.join(agentDir, "agent", "sessions"),
+          path.join(agentDir, "agent", "codex-home", "sessions"),
+        ];
+      })
+      .filter((root) => fs.existsSync(root));
+    return [...new Set(roots)];
   } catch {
     return [];
   }
@@ -107,6 +123,12 @@ function readJsonl(file, maxLines = 12000) {
   return rows;
 }
 
+function sessionThreadId(file) {
+  const name = path.basename(String(file || ""));
+  const match = name.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\.jsonl)?$/i);
+  return match ? match[1] : null;
+}
+
 function stringContent(value) {
   if (value == null) return "";
   if (typeof value === "string") return value;
@@ -137,6 +159,9 @@ function detectAgent(file, rows) {
 }
 
 function eventText(row) {
+  if (row?.type === "compacted_replacement_item") {
+    return stringContent(row.payload?.content || row.payload?.summary || row.payload?.arguments || row.payload?.output);
+  }
   if (row?.type === "event_msg") {
     const payload = row.payload || {};
     return stringContent(payload.message || payload.text_elements || payload.content);
@@ -152,6 +177,16 @@ function eventText(row) {
 }
 
 function eventRole(row) {
+  if (row?.type === "compacted_replacement_item") {
+    const payload = row.payload || {};
+    if (payload.type === "function_call") return "tool";
+    if (payload.type === "function_call_output") return "tool_output";
+    if (payload.type === "reasoning" || payload.type === "compaction") return null;
+    if (payload.type === "web_search_call") return "web";
+    if (payload.role === "user") return "user";
+    if (payload.role === "assistant") return "assistant";
+    return null;
+  }
   if (row?.type === "event_msg") {
     const type = row.payload?.type;
     if (type === "user_message") return "user";
@@ -227,7 +262,7 @@ function normalizeEntry(role, text, stats, options = {}) {
   if (!t) return null;
   if (hasSetupBlob(t)) t = "[instructions recap omitted; policy/config text, not task dialogue]";
   if (unsafe(t).length) t = "[omitted: browser/session/auth internals; not useful for public PR transcript]";
-  const entryMaxChars = Number(options.entryMaxChars || options["entry-max-chars"] || DEFAULT_ENTRY_MAX_CHARS);
+  const entryMaxChars = optionNumber(options, "entryMaxChars", "entry-max-chars", DEFAULT_ENTRY_MAX_CHARS);
   if (t.length > entryMaxChars) {
     t = `${t.slice(0, entryMaxChars).trimEnd()}\n...[truncated ${t.length - entryMaxChars} chars]`;
   }
@@ -249,17 +284,10 @@ function coalesceEntries(entries) {
     const role = entryRole(entry);
     const body = entryBody(entry);
     const last = coalesced[coalesced.length - 1];
-    if (!last || !role || entryRole(last) !== role || role === "tool summary") {
-      coalesced.push(entry);
+    if (last && role && entryRole(last) === role && role !== "tool summary" && entryBody(last) === body) {
       continue;
     }
-    const lastBody = entryBody(last);
-    if (lastBody === body || lastBody.includes(body)) continue;
-    if (body.includes(lastBody)) {
-      coalesced[coalesced.length - 1] = `[${role}]\n${body}`;
-      continue;
-    }
-    coalesced[coalesced.length - 1] = `[${role}]\n${lastBody}\n\n${body}`;
+    coalesced.push(entry);
   }
   return coalesced;
 }
@@ -340,6 +368,19 @@ function recountEntries(stats, entries) {
   stats.assistant = entries.filter((entry) => entry.startsWith("[assistant]\n")).length;
 }
 
+function expandCompactedReplacementItems(row) {
+  if (row?.type !== "compacted") return [];
+  const replacementHistory = row.payload?.replacement_history;
+  if (!Array.isArray(replacementHistory)) return [];
+  return replacementHistory.map((item, index) => ({
+    type: "compacted_replacement_item",
+    payload: item,
+    timestamp: row.timestamp,
+    sourceLineType: row.type,
+    replacementIndex: index,
+  }));
+}
+
 function renderSession(file, options = {}) {
   const rows = readJsonl(file);
   const agent = detectAgent(file, rows);
@@ -361,7 +402,8 @@ function renderSession(file, options = {}) {
     const type = row?.type === "event_msg" ? row.payload?.type : null;
     return type === "user_message" || type === "agent_message";
   });
-  for (const row of rows) {
+  const renderRows = rows.flatMap((row) => [row, ...expandCompactedReplacementItems(row)]);
+  for (const row of renderRows) {
     const role = eventRole(row);
     if (!role) continue;
     if (hasEventDialogue && row.type === "response_item" && (role === "user" || role === "assistant")) {
@@ -399,7 +441,7 @@ function renderSession(file, options = {}) {
   }
   const renderedItems = coalesceEntries(items);
   recountEntries(stats, renderedItems);
-  const maxChars = Number(options.maxChars || DEFAULT_MAX_CHARS);
+  const maxChars = optionNumber(options, "maxChars", "max-chars", DEFAULT_MAX_CHARS);
   let joined = renderedItems.join("\n\n");
   if (joined.length > maxChars) joined = `${joined.slice(0, maxChars).trimEnd()}\n\n...[transcript truncated to ${maxChars} chars]`;
   const headerBits = [options.title, options.url].filter(Boolean).join(" | ");
@@ -424,6 +466,170 @@ ${joined}
 ${MARKER_END}
 `;
   return { file, agent, safe, unsafeAfter, stats, markdown };
+}
+
+function appServerThreadRead(threadId) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("codex", ["app-server", "--listen", "stdio://"], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGTERM");
+      reject(new Error("thread/read timed out"));
+    }, 30000);
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.kill("SIGTERM");
+      fn(value);
+    };
+    const send = (item) => child.stdin.write(`${JSON.stringify(item)}\n`);
+    let buffer = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      buffer += chunk.toString();
+      let newline;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (!line.trim()) continue;
+        let message;
+        try {
+          message = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (message.id === 1) {
+          send({ method: "initialized", params: {} });
+          send({
+            method: "thread/read",
+            id: 2,
+            params: {
+              threadId,
+              includeTurns: true,
+            },
+          });
+        }
+        if (message.id === 2) {
+          if (message.error) finish(reject, new Error(`thread/read failed: ${JSON.stringify(message.error)}`));
+          else if (message.result?.thread) finish(resolve, message.result.thread);
+          else finish(reject, new Error("thread/read did not return a thread"));
+        }
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    child.on("error", (error) => finish(reject, error));
+    child.on("exit", () => {
+      if (settled) return;
+      const detail = stderr.trim() || stdout.trim();
+      finish(reject, new Error(`app-server exited before thread/read response${detail ? `: ${detail}` : ""}`));
+    });
+    send({
+      method: "initialize",
+      id: 1,
+      params: {
+        clientInfo: {
+          name: "agent_transcript",
+          title: "Agent Transcript",
+          version: "0.0.0",
+        },
+        capabilities: {
+          experimentalApi: true,
+          optOutNotificationMethods: [],
+        },
+      },
+    });
+  });
+}
+
+function threadItemText(item) {
+  if (item?.type === "userMessage") return stringContent(item.content);
+  if (item?.type === "agentMessage") return stringContent(item.text);
+  return "";
+}
+
+function threadItemRole(item) {
+  if (item?.type === "userMessage") return "user";
+  if (item?.type === "agentMessage") return "assistant";
+  return null;
+}
+
+async function renderThread(threadId, options = {}) {
+  const thread = await appServerThreadRead(threadId);
+  const stats = {
+    agent: "codex",
+    entries: 0,
+    user: 0,
+    assistant: 0,
+    toolCalls: 0,
+    toolOutputsDropped: 0,
+    web: 0,
+    redactions: 0,
+    omittedUnsafe: 0,
+  };
+  const items = [];
+  const seenEntries = new Set();
+  for (const turn of thread.turns || []) {
+    for (const item of turn.items || []) {
+      const role = threadItemRole(item);
+      if (!role) continue;
+      const entry = normalizeEntry(role, threadItemText(item), stats, options);
+      if (!entry) continue;
+      const dedupeKey = entry.replace(/\s+/g, " ").trim();
+      if (seenEntries.has(dedupeKey)) continue;
+      seenEntries.add(dedupeKey);
+      if (entry.includes("[omitted: browser/session/auth internals")) stats.omittedUnsafe++;
+      items.push(entry);
+      stats.entries++;
+      if (role === "user") stats.user++;
+      if (role === "assistant") stats.assistant++;
+    }
+  }
+  const renderedItems = coalesceEntries(items);
+  recountEntries(stats, renderedItems);
+  const maxChars = optionNumber(options, "maxChars", "max-chars", DEFAULT_MAX_CHARS);
+  let joined = renderedItems.join("\n\n");
+  if (joined.length > maxChars) joined = `${joined.slice(0, maxChars).trimEnd()}\n\n...[transcript truncated to ${maxChars} chars]`;
+  const headerBits = [options.title, options.url].filter(Boolean).join(" | ");
+  const unsafeAfter = unsafe(joined);
+  const safe = unsafeAfter.length === 0;
+  const markdown = `${MARKER_START}
+## Agent Transcript
+
+<details>
+<summary>Redacted codex app-server transcript${headerBits ? `: ${redact(headerBits, stats)}` : ""}</summary>
+
+\`\`\`\`text
+source: codex app-server thread/read includeTurns
+thread: ${redact(threadId, stats)}
+redaction: local paths, emails, phone-shaped strings, token-shaped strings, auth headers, auth query params
+omitted: raw tool outputs, system/developer prompts, local paths, secrets, browser/session/auth details
+stats: ${JSON.stringify(stats)}
+
+${joined}
+\`\`\`\`
+
+</details>
+${MARKER_END}
+`;
+  return { file: null, agent: "codex", safe, unsafeAfter, stats, markdown };
+}
+
+async function renderTranscript(options) {
+  if (options["app-server"] || options.appServer || options.threadId || options["thread-id"]) {
+    const threadId = options.threadId || options["thread-id"] || sessionThreadId(options.session);
+    if (!threadId) throw new Error("--thread-id is required when --app-server cannot infer it from --session");
+    return renderThread(threadId, options);
+  }
+  return renderSession(options.session, options);
 }
 
 function readBoundedText(file, maxBytes = 220000) {
@@ -579,7 +785,7 @@ function readPrs(file) {
   return Array.isArray(parsed) ? parsed : parsed.items || parsed.prs || [];
 }
 
-function main() {
+async function main() {
   const [command, ...rest] = process.argv.slice(2);
   const args = parseArgs(rest);
   if (!command || command === "--help" || command === "-h" || args.help) {
@@ -592,7 +798,15 @@ function main() {
   }
   if (command === "render") {
     if (!args.session) throw new Error("--session is required");
-    const rendered = renderSession(args.session, args);
+    const rendered = await renderTranscript(args);
+    if (!rendered.safe) throw new Error(`unsafe transcript after redaction: ${rendered.unsafeAfter.join(", ")}`);
+    if (args.out) fs.writeFileSync(args.out, rendered.markdown);
+    else process.stdout.write(rendered.markdown);
+    return;
+  }
+  if (command === "render-thread") {
+    if (!args["thread-id"] && !args.threadId) throw new Error("--thread-id is required");
+    const rendered = await renderThread(args.threadId || args["thread-id"], args);
     if (!rendered.safe) throw new Error(`unsafe transcript after redaction: ${rendered.unsafeAfter.join(", ")}`);
     if (args.out) fs.writeFileSync(args.out, rendered.markdown);
     else process.stdout.write(rendered.markdown);
@@ -600,7 +814,7 @@ function main() {
   }
   if (command === "preview") {
     if (!args.session) throw new Error("--session is required");
-    const rendered = renderSession(args.session, args);
+    const rendered = await renderTranscript(args);
     if (!rendered.safe) throw new Error(`unsafe transcript after redaction: ${rendered.unsafeAfter.join(", ")}`);
     const output = singlePreviewDocument({
       title: args.title || "Agent Transcript Preview",
@@ -615,7 +829,7 @@ function main() {
   }
   if (command === "append-body") {
     if (!args.body || !args.session) throw new Error("--body and --session are required");
-    const rendered = renderSession(args.session, args);
+    const rendered = await renderTranscript(args);
     if (!rendered.safe) throw new Error(`unsafe transcript after redaction: ${rendered.unsafeAfter.join(", ")}`);
     const body = fs.readFileSync(args.body, "utf8");
     const next = replaceSection(body, rendered.markdown);
@@ -645,7 +859,7 @@ function main() {
         continue;
       }
       try {
-        const rendered = renderSession(candidate.file, { ...args, title: pr.title, url: pr.url });
+        const rendered = await renderTranscript({ ...args, session: candidate.file, title: pr.title, url: pr.url });
         records.push({
           ...pr,
           session: candidate.file,
@@ -667,7 +881,7 @@ function main() {
 }
 
 try {
-  main();
+  await main();
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   process.exit(1);
