@@ -576,16 +576,12 @@ async function renderThread(threadId, options = {}) {
     omittedUnsafe: 0,
   };
   const items = [];
-  const seenEntries = new Set();
   for (const turn of thread.turns || []) {
     for (const item of turn.items || []) {
       const role = threadItemRole(item);
       if (!role) continue;
       const entry = normalizeEntry(role, threadItemText(item), stats, options);
       if (!entry) continue;
-      const dedupeKey = entry.replace(/\s+/g, " ").trim();
-      if (seenEntries.has(dedupeKey)) continue;
-      seenEntries.add(dedupeKey);
       if (entry.includes("[omitted: browser/session/auth internals")) stats.omittedUnsafe++;
       items.push(entry);
       stats.entries++;
