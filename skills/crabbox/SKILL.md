@@ -46,21 +46,29 @@ pnpm crabbox:run -- --help | sed -n '1,120p'
   before reporting Crabbox as unavailable:
 
 ```sh
-mkdir -p ../crabbox
-if [ ! -d ../crabbox/src/.git ]; then
-  git clone https://github.com/openclaw/crabbox.git ../crabbox/src
+crabbox_root="../crabbox"
+crabbox_src="$crabbox_root"
+if [ -d "$crabbox_root/.git" ]; then
+  :
+elif [ -d "$crabbox_root/src/.git" ]; then
+  crabbox_src="$crabbox_root/src"
+elif [ ! -e "$crabbox_root" ]; then
+  git clone https://github.com/openclaw/crabbox.git "$crabbox_root"
 else
-  if [ -n "$(git -C ../crabbox/src status --short)" ]; then
-    git -C ../crabbox/src status --short
-    echo "Dirty ../crabbox/src checkout; resolve before updating Crabbox." >&2
-    exit 1
-  fi
-  git -C ../crabbox/src pull --ff-only
+  echo "Existing $crabbox_root is not a Crabbox checkout; move it aside first." >&2
+  exit 1
 fi
-mkdir -p ../crabbox/bin
+if [ -n "$(git -C "$crabbox_src" status --short)" ]; then
+  git -C "$crabbox_src" status --short
+  echo "Dirty $crabbox_src checkout; resolve before updating Crabbox." >&2
+  exit 1
+fi
+git -C "$crabbox_src" pull --ff-only
+mkdir -p "$crabbox_root/bin"
+crabbox_bin="$(cd "$crabbox_root" && pwd)/bin/crabbox"
 go version
-(cd ../crabbox/src && go build -o ../bin/crabbox ./cmd/crabbox)
-../crabbox/bin/crabbox --version
+(cd "$crabbox_src" && go build -o "$crabbox_bin" ./cmd/crabbox)
+"$crabbox_bin" --version
 node scripts/crabbox-wrapper.mjs run --help | sed -n '1,80p'
 ```
 
