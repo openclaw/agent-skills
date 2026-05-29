@@ -1,6 +1,6 @@
 ---
 name: autoreview
-description: "**WORKFLOW SKILL** — Run a structured code review (Codex default, Claude optional) as a closeout check on a local or PR branch before commit or ship. WHEN: \"autoreview\", \"codex review\", \"claude review\", \"second-model review\", \"review before ship\". INVOKES: bundled review helper script."
+description: "Run a structured code review (Codex default, Claude optional) as a closeout check on a local or PR branch before commit or ship."
 ---
 
 # Auto Review
