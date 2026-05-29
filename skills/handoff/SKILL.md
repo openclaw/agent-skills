@@ -1,6 +1,6 @@
 ---
 name: handoff
-description: "Write a path-free handoff prompt for another agent and copy it to clipboard."
+description: "**UTILITY SKILL** — Write a path-free, clipboard-ready handoff prompt that lets another agent investigate, discuss, or pick up a specific task. WHEN: \"handoff <task>\", \"write a handoff\", \"delegate this\", \"prompt for another agent\", \"prepare handoff\"."
 ---
 
 # Handoff

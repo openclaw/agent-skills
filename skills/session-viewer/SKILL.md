@@ -1,6 +1,6 @@
 ---
 name: session-viewer
-description: "Render Codex, Claude, and OpenClaw/Pi session JSONL as searchable single-file HTML."
+description: "**UTILITY SKILL** — Render Codex, Claude Code, OpenClaw, or Pi session JSONL transcripts as a searchable, shareable single-file HTML viewer. WHEN: \"view session\", \"open transcript\", \"export Codex session\", \"share Claude transcript\", \"inspect JSONL session\". INVOKES: agent-transcript skill to locate JSONL when path is unknown."
 ---
 
 # Session Viewer
