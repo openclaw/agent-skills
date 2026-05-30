@@ -22,7 +22,7 @@ jobs:
       - name: Validate skill frontmatter
         run: scripts/validate-skills
       - name: Check Ruby scripts
-        run: ruby -c scripts/install-skills && ruby -c scripts/validate-skills
+        run: ruby -c scripts/install-skills && ruby -c scripts/validate-skills && ruby scripts/install-skills.test.rb
       - name: Check shell scripts
         run: bash -n skills/autoreview/scripts/test-review-harness
       - name: Check Python scripts

@@ -4,6 +4,12 @@
 require "fileutils"
 require "optparse"
 
+def same_real_path?(left, right)
+  File.realpath(left) == File.realpath(right)
+rescue Errno::ENOENT
+  false
+end
+
 root = File.expand_path("..", __dir__)
 skills_root = File.join(root, "skills")
 
@@ -62,6 +68,11 @@ selected.each do |name|
   if File.exist?(target) || File.symlink?(target)
     unless options[:force]
       warn "exists, skipping: #{target}"
+      next
+    end
+
+    if same_real_path?(source, target)
+      warn "target is source, skipping: #{target}"
       next
     end
 
