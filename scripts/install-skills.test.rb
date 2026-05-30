@@ -29,4 +29,32 @@ class InstallSkillsTest < Minitest::Test
       assert_path_exists File.join(dir, "skills", "sample", "SKILL.md")
     end
   end
+
+  def test_force_copy_replaces_existing_symlink
+    Dir.mktmpdir do |dir|
+      FileUtils.mkdir_p(File.join(dir, "repo", "scripts"))
+      FileUtils.mkdir_p(File.join(dir, "repo", "skills", "sample"))
+      FileUtils.mkdir_p(File.join(dir, "target"))
+      FileUtils.cp(File.join(__dir__, "install-skills"), File.join(dir, "repo", "scripts", "install-skills"))
+      File.write(File.join(dir, "repo", "skills", "sample", "SKILL.md"), "---\nname: sample\ndescription: sample\n---\n")
+      FileUtils.ln_s(File.join(dir, "repo", "skills", "sample"), File.join(dir, "target", "sample"))
+
+      stdout, stderr, status = Open3.capture3(
+        RbConfig.ruby,
+        File.join(dir, "repo", "scripts", "install-skills"),
+        "--target",
+        File.join(dir, "target"),
+        "--force",
+        "--mode",
+        "copy",
+        "sample"
+      )
+
+      assert status.success?, stderr
+      assert_includes stdout, "copy sample"
+      refute File.symlink?(File.join(dir, "target", "sample"))
+      assert_path_exists File.join(dir, "target", "sample", "SKILL.md")
+      assert_path_exists File.join(dir, "repo", "skills", "sample", "SKILL.md")
+    end
+  end
 end

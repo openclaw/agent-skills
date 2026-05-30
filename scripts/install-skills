@@ -71,7 +71,7 @@ selected.each do |name|
       next
     end
 
-    if same_real_path?(source, target)
+    if !File.symlink?(target) && same_real_path?(source, target)
       warn "target is source, skipping: #{target}"
       next
     end
