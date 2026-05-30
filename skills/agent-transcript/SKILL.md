@@ -81,6 +81,12 @@ skills/agent-transcript/scripts/agent-transcript append-body \
 7. If the user approves, use the enriched trimmed body file for creation/update.
 8. If no safe session is found, say nothing and continue without transcript. If the user declines, continue without transcript and do not add any transcript placeholder section.
 
+## Validate
+
+```bash
+node --test skills/agent-transcript/scripts/agent-transcript.test.mjs
+```
+
 ## Review Artifacts
 
 For manual audits across many PR/session candidates, create a local HTML preview from a local JSON file. This is for maintainers only and is not part of the PR/issue workflow:

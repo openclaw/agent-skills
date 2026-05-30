@@ -11,11 +11,13 @@ repo.
 
 ## Included Skills
 
+- `agent-transcript`: local-only, redacted PR/issue transcript provenance.
 - `autoreview`: structured closeout/code-review workflow plus helper script.
 - `crabbox`: Crabbox/Testbox remote validation workflow for broad or CI-parity
   proof.
 - `handoff`: path-free prompt handoff workflow for delegating a task to another
   agent.
+- `session-viewer`: local searchable HTML viewer for agent session JSONL.
 
 Repo-specific product skills should stay in the repo they describe. For example,
 an `acpx` usage skill belongs in `openclaw/acpx`; a general review helper belongs
@@ -28,6 +30,18 @@ Clone the repo:
 ```sh
 git clone https://github.com/openclaw/agent-skills.git
 cd agent-skills
+```
+
+List available skills:
+
+```sh
+scripts/install-skills --list
+```
+
+Preview an install without changing files:
+
+```sh
+scripts/install-skills --dry-run
 ```
 
 Install all skills into the default agent skill directory:
@@ -52,6 +66,12 @@ Use copies instead of symlinks:
 
 ```sh
 scripts/install-skills --mode copy --target ~/.agents/skills
+```
+
+Replace an existing installed skill:
+
+```sh
+scripts/install-skills --force autoreview
 ```
 
 Symlinks are best for local development because changes in this checkout are
@@ -109,6 +129,9 @@ without setup.
 
 ```text
 skills/
+  agent-transcript/
+    SKILL.md
+    scripts/
   autoreview/
     SKILL.md
     scripts/
@@ -116,6 +139,9 @@ skills/
     SKILL.md
   handoff/
     SKILL.md
+  session-viewer/
+    SKILL.md
+    scripts/
 scripts/
   install-skills
   validate-skills
@@ -130,10 +156,18 @@ Run this after edits:
 
 ```sh
 scripts/validate-skills
+ruby -c scripts/install-skills && ruby -c scripts/validate-skills
+bash -n skills/autoreview/scripts/test-review-harness
+python3 -m py_compile skills/autoreview/scripts/autoreview skills/autoreview/scripts/test-review-harness.py
+node --check skills/agent-transcript/scripts/agent-transcript
+node --test skills/agent-transcript/scripts/agent-transcript.test.mjs skills/session-viewer/scripts/session-viewer.test.ts
 ```
 
 The validator checks every `skills/*/SKILL.md` for YAML frontmatter plus required
 `name` and `description`.
+
+Session exports can contain sensitive conversation data. Treat `session-viewer`
+HTML as local/private output unless it has been separately redacted and reviewed.
 
 ## Editing Rules
 

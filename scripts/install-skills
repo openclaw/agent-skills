@@ -10,6 +10,9 @@ skills_root = File.join(root, "skills")
 options = {
   target: File.expand_path("~/.agents/skills"),
   mode: "symlink",
+  dry_run: false,
+  force: false,
+  list: false,
   skills: []
 }
 
@@ -17,6 +20,9 @@ parser = OptionParser.new do |opts|
   opts.banner = "Usage: scripts/install-skills [options] [skill ...]"
   opts.on("--target DIR", "Install target. Default: ~/.agents/skills") { |v| options[:target] = File.expand_path(v) }
   opts.on("--mode MODE", "symlink or copy. Default: symlink") { |v| options[:mode] = v }
+  opts.on("--dry-run", "Print actions without changing files") { options[:dry_run] = true }
+  opts.on("--force", "Replace an existing skill at the target path") { options[:force] = true }
+  opts.on("--list", "List available skills and exit") { options[:list] = true }
   opts.on("-h", "--help", "Show help") do
     puts opts
     exit
@@ -32,6 +38,12 @@ unless %w[symlink copy].include?(options[:mode])
 end
 
 available = Dir.children(skills_root).select { |name| File.file?(File.join(skills_root, name, "SKILL.md")) }.sort
+
+if options[:list]
+  puts available.join("\n")
+  exit
+end
+
 selected = options[:skills].empty? ? available : options[:skills]
 
 missing = selected - available
@@ -41,22 +53,28 @@ if missing.any?
   exit 1
 end
 
-FileUtils.mkdir_p(options[:target])
+FileUtils.mkdir_p(options[:target]) unless options[:dry_run]
 
 selected.each do |name|
   source = File.join(skills_root, name)
   target = File.join(options[:target], name)
 
   if File.exist?(target) || File.symlink?(target)
-    warn "exists, skipping: #{target}"
-    next
+    unless options[:force]
+      warn "exists, skipping: #{target}"
+      next
+    end
+
+    puts "remove #{target}" if options[:dry_run]
+    FileUtils.rm_rf(target) unless options[:dry_run]
   end
 
   if options[:mode] == "symlink"
-    FileUtils.ln_s(source, target)
+    FileUtils.ln_s(source, target) unless options[:dry_run]
   else
-    FileUtils.cp_r(source, target)
+    FileUtils.cp_r(source, target) unless options[:dry_run]
   end
 
-  puts "#{options[:mode]} #{name} -> #{target}"
+  prefix = options[:dry_run] ? "would #{options[:mode]}" : options[:mode]
+  puts "#{prefix} #{name} -> #{target}"
 end
