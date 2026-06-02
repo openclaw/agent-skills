@@ -856,22 +856,25 @@ def extract_json(text: str) -> dict[str, Any]:
         if isinstance(result_json, dict) and "findings" in result_json:
             return result_json
         raise SystemExit(f"review engine result was not structured JSON:\n{parsed['result'][:2000]}")
+    if isinstance(parsed, list):
+        events_report = _report_from_events(parsed)
+        if events_report:
+            return events_report
     jsonl_report = extract_json_from_jsonl(stripped)
     if jsonl_report:
         return jsonl_report
     raise SystemExit(f"review engine returned unexpected JSON shape:\n{json.dumps(parsed)[:2000]}")
 
 
-def extract_json_from_jsonl(text: str) -> dict[str, Any] | None:
+def _report_from_events(events: list[Any]) -> dict[str, Any] | None:
+    """Pull the structured report out of a list of engine stream events.
+
+    Shared by the JSONL path (one event per line) and the JSON-array path
+    (e.g. some `claude --output-format json` versions/configurations return
+    [{type:system,init}, ..., {type:result,...}] rather than a bare object).
+    """
     candidates: list[str | dict[str, Any]] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for event in events:
         if not isinstance(event, dict):
             continue
         part = event.get("part")
@@ -893,6 +896,19 @@ def extract_json_from_jsonl(text: str) -> dict[str, Any] | None:
         if isinstance(parsed, dict) and "findings" in parsed:
             return parsed
     return None
+
+
+def extract_json_from_jsonl(text: str) -> dict[str, Any] | None:
+    events: list[Any] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return _report_from_events(events)
 
 
 def write_executable(path: Path, text: str) -> None:
@@ -1096,6 +1112,36 @@ def self_test_engine_isolation() -> int:
     return 0
 
 
+def self_test_json_array_parser() -> int:
+    report = {
+        "findings": [],
+        "overall_correctness": "patch is correct",
+        "overall_explanation": "parser self-test",
+        "overall_confidence": 0.99,
+    }
+    result_events = [
+        {"type": "system", "subtype": "init"},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "working"}]}},
+        {"type": "result", "result": json.dumps(report)},
+    ]
+    if extract_json(json.dumps(result_events)) != report:
+        raise SystemExit("json array parser self-test failed for result event")
+    jsonl = "\n".join(json.dumps(event) for event in result_events)
+    if extract_json(jsonl) != report:
+        raise SystemExit("json array parser self-test failed for jsonl result event")
+
+    structured_report = {**report, "overall_explanation": "structured output"}
+    if extract_json(json.dumps([{"type": "result", "structured_output": structured_report}])) != structured_report:
+        raise SystemExit("json array parser self-test failed for structured output event")
+
+    text_report = {**report, "overall_explanation": "text event"}
+    if extract_json(json.dumps([{"part": {"text": json.dumps(text_report)}}])) != text_report:
+        raise SystemExit("json array parser self-test failed for text event")
+
+    print("autoreview json array parser self-test: ok")
+    return 0
+
+
 def parse_json_candidate(text: str) -> Any | None:
     stripped = text.strip()
     if stripped.startswith("```"):
@@ -1284,6 +1330,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expect-findings", action="store_true", help="Treat findings as success; for harness acceptance tests.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test-engine-isolation", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--self-test-json-array-parser", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.engine not in ENGINES:
         raise SystemExit(f"invalid --engine/AUTOREVIEW_ENGINE: {args.engine}")
@@ -1453,6 +1500,8 @@ def main() -> int:
     args = parse_args()
     if args.self_test_engine_isolation:
         return self_test_engine_isolation()
+    if args.self_test_json_array_parser:
+        return self_test_json_array_parser()
     reviewers = reviewer_args(args)
     repo = repo_root()
     target, target_ref = choose_target(repo, args.mode, args.base)
