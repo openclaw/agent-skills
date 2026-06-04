@@ -1,0 +1,1426 @@
+# Nexus agentskills.io catalog index
+# Source of truth: backend/routes/*.py
+# Regenerate with: python scripts/generate_agentskills.py
+
+name: nexus-skills
+version: "1.0.0"
+spec: https://agentskills.io/specification
+auth:
+  type: bearer_token
+  env: NEXUS_API_TOKEN
+  scope: nexus.api
+base_url_env: NEXUS_BASE_URL
+skill_count: 230
+endpoint_count: 2120
+skipped_count: 22
+skills:
+  - name: nexus-a2a-marketplace
+    version: "1.0.0"
+    surface: a2a.marketplace
+    path: skills/agentskills/nexus-a2a-marketplace/SKILL.md
+    source_file: backend/routes/routes_a2a_marketplace.py
+    endpoints: 33
+  - name: nexus-a2a-pipelines
+    version: "1.0.0"
+    surface: a2a.pipelines
+    path: skills/agentskills/nexus-a2a-pipelines/SKILL.md
+    source_file: backend/routes/routes_a2a_pipelines.py
+    endpoints: 15
+  - name: nexus-advanced-features
+    version: "1.0.0"
+    surface: advanced.features
+    path: skills/agentskills/nexus-advanced-features/SKILL.md
+    source_file: backend/routes/routes_advanced_features.py
+    endpoints: 7
+  - name: nexus-agent-analytics
+    version: "1.0.0"
+    surface: agent.analytics
+    path: skills/agentskills/nexus-agent-analytics/SKILL.md
+    source_file: backend/routes/routes_agent_analytics.py
+    endpoints: 3
+  - name: nexus-agent-catalog
+    version: "1.0.0"
+    surface: agent.catalog
+    path: skills/agentskills/nexus-agent-catalog/SKILL.md
+    source_file: backend/routes/routes_agent_catalog.py
+    endpoints: 4
+  - name: nexus-agent-contracts
+    version: "1.0.0"
+    surface: agent.contracts
+    path: skills/agentskills/nexus-agent-contracts/SKILL.md
+    source_file: backend/routes/routes_agent_contracts.py
+    endpoints: 3
+  - name: nexus-agent-leaderboard
+    version: "1.0.0"
+    surface: agent.leaderboard
+    path: skills/agentskills/nexus-agent-leaderboard/SKILL.md
+    source_file: backend/routes/routes_agent_leaderboard.py
+    endpoints: 7
+  - name: nexus-agent-marketplace
+    version: "1.0.0"
+    surface: agent.marketplace
+    path: skills/agentskills/nexus-agent-marketplace/SKILL.md
+    source_file: backend/routes/routes_agent_marketplace.py
+    endpoints: 10
+  - name: nexus-agent-memory
+    version: "1.0.0"
+    surface: agent.memory
+    path: skills/agentskills/nexus-agent-memory/SKILL.md
+    source_file: backend/routes/routes_agent_memory.py
+    endpoints: 11
+  - name: nexus-agent-playground
+    version: "1.0.0"
+    surface: agent.playground
+    path: skills/agentskills/nexus-agent-playground/SKILL.md
+    source_file: backend/routes/routes_agent_playground.py
+    endpoints: 5
+  - name: nexus-agent-protocol
+    version: "1.0.0"
+    surface: agent.protocol
+    path: skills/agentskills/nexus-agent-protocol/SKILL.md
+    source_file: backend/routes/routes_agent_protocol.py
+    endpoints: 4
+  - name: nexus-agent-runs
+    version: "1.0.0"
+    surface: agent.runs
+    path: skills/agentskills/nexus-agent-runs/SKILL.md
+    source_file: backend/routes/routes_agent_runs.py
+    endpoints: 7
+  - name: nexus-agent-runs-stream
+    version: "1.0.0"
+    surface: agent.runs.stream
+    path: skills/agentskills/nexus-agent-runs-stream/SKILL.md
+    source_file: backend/routes/routes_agent_runs_stream.py
+    endpoints: 1
+    flags: [streaming]
+  - name: nexus-agent-schedules
+    version: "1.0.0"
+    surface: agent.schedules
+    path: skills/agentskills/nexus-agent-schedules/SKILL.md
+    source_file: backend/routes/routes_agent_schedules.py
+    endpoints: 7
+  - name: nexus-agent-skills
+    version: "1.0.0"
+    surface: agent.skills
+    path: skills/agentskills/nexus-agent-skills/SKILL.md
+    source_file: backend/routes/routes_agent_skills.py
+    endpoints: 7
+  - name: nexus-agent-studio
+    version: "1.0.0"
+    surface: agent.studio
+    path: skills/agentskills/nexus-agent-studio/SKILL.md
+    source_file: backend/routes/routes_agent_studio.py
+    endpoints: 7
+  - name: nexus-agent-teams
+    version: "1.0.0"
+    surface: agent.teams
+    path: skills/agentskills/nexus-agent-teams/SKILL.md
+    source_file: backend/routes/routes_agent_teams.py
+    endpoints: 8
+  - name: nexus-agent-training
+    version: "1.0.0"
+    surface: agent.training
+    path: skills/agentskills/nexus-agent-training/SKILL.md
+    source_file: backend/routes/routes_agent_training.py
+    endpoints: 16
+  - name: nexus-agent-versioning
+    version: "1.0.0"
+    surface: agent.versioning
+    path: skills/agentskills/nexus-agent-versioning/SKILL.md
+    source_file: backend/routes/routes_agent_versioning.py
+    endpoints: 5
+  - name: nexus-ai-billing
+    version: "1.0.0"
+    surface: ai.billing
+    path: skills/agentskills/nexus-ai-billing/SKILL.md
+    source_file: backend/routes/routes_ai_billing.py
+    endpoints: 3
+  - name: nexus-ai-keys
+    version: "1.0.0"
+    surface: ai.keys
+    path: skills/agentskills/nexus-ai-keys/SKILL.md
+    source_file: backend/routes/routes_ai_keys.py
+    endpoints: 8
+  - name: nexus-ai-skills
+    version: "1.0.0"
+    surface: ai.skills
+    path: skills/agentskills/nexus-ai-skills/SKILL.md
+    source_file: backend/routes/routes_ai_skills.py
+    endpoints: 5
+  - name: nexus-ai-tools
+    version: "1.0.0"
+    surface: ai.tools
+    path: skills/agentskills/nexus-ai-tools/SKILL.md
+    source_file: backend/routes/routes_ai_tools.py
+    endpoints: 3
+  - name: nexus-analytics
+    version: "1.0.0"
+    surface: analytics
+    path: skills/agentskills/nexus-analytics/SKILL.md
+    source_file: backend/routes/routes_analytics.py
+    endpoints: 2
+  - name: nexus-api-tokens
+    version: "1.0.0"
+    surface: api.tokens
+    path: skills/agentskills/nexus-api-tokens/SKILL.md
+    source_file: backend/routes/routes_api_tokens.py
+    endpoints: 10
+  - name: nexus-app-templates
+    version: "1.0.0"
+    surface: app.templates
+    path: skills/agentskills/nexus-app-templates/SKILL.md
+    source_file: backend/routes/routes_app_templates.py
+    endpoints: 3
+  - name: nexus-approvals
+    version: "1.0.0"
+    surface: approvals
+    path: skills/agentskills/nexus-approvals/SKILL.md
+    source_file: backend/routes/routes_approvals.py
+    endpoints: 4
+  - name: nexus-archimedes
+    version: "1.0.0"
+    surface: archimedes
+    path: skills/agentskills/nexus-archimedes/SKILL.md
+    source_file: backend/routes/routes_archimedes.py
+    endpoints: 66
+  - name: nexus-archimedes-ai-training
+    version: "1.0.0"
+    surface: archimedes.ai.training
+    path: skills/agentskills/nexus-archimedes-ai-training/SKILL.md
+    source_file: backend/routes/routes_archimedes_ai_training.py
+    endpoints: 12
+  - name: nexus-archimedes-audio
+    version: "1.0.0"
+    surface: archimedes.audio
+    path: skills/agentskills/nexus-archimedes-audio/SKILL.md
+    source_file: backend/routes/routes_archimedes_audio.py
+    endpoints: 3
+  - name: nexus-archimedes-audio-streaming
+    version: "1.0.0"
+    surface: archimedes.audio.streaming
+    path: skills/agentskills/nexus-archimedes-audio-streaming/SKILL.md
+    source_file: backend/routes/routes_archimedes_audio_streaming.py
+    endpoints: 3
+    flags: [streaming]
+  - name: nexus-archimedes-capture
+    version: "1.0.0"
+    surface: archimedes.capture
+    path: skills/agentskills/nexus-archimedes-capture/SKILL.md
+    source_file: backend/routes/routes_archimedes_capture.py
+    endpoints: 4
+  - name: nexus-archimedes-connectors
+    version: "1.0.0"
+    surface: archimedes.connectors
+    path: skills/agentskills/nexus-archimedes-connectors/SKILL.md
+    source_file: backend/routes/routes_archimedes_connectors.py
+    endpoints: 4
+  - name: nexus-archimedes-conversations
+    version: "1.0.0"
+    surface: archimedes.conversations
+    path: skills/agentskills/nexus-archimedes-conversations/SKILL.md
+    source_file: backend/routes/routes_archimedes_conversations.py
+    endpoints: 5
+  - name: nexus-archimedes-debate
+    version: "1.0.0"
+    surface: archimedes.debate
+    path: skills/agentskills/nexus-archimedes-debate/SKILL.md
+    source_file: backend/routes/routes_archimedes_debate.py
+    endpoints: 1
+  - name: nexus-archimedes-documents
+    version: "1.0.0"
+    surface: archimedes.documents
+    path: skills/agentskills/nexus-archimedes-documents/SKILL.md
+    source_file: backend/routes/routes_archimedes_documents.py
+    endpoints: 2
+  - name: nexus-archimedes-evals
+    version: "1.0.0"
+    surface: archimedes.evals
+    path: skills/agentskills/nexus-archimedes-evals/SKILL.md
+    source_file: backend/routes/routes_archimedes_evals.py
+    endpoints: 2
+  - name: nexus-archimedes-judge
+    version: "1.0.0"
+    surface: archimedes.judge
+    path: skills/agentskills/nexus-archimedes-judge/SKILL.md
+    source_file: backend/routes/routes_archimedes_judge.py
+    endpoints: 2
+  - name: nexus-archimedes-lora
+    version: "1.0.0"
+    surface: archimedes.lora
+    path: skills/agentskills/nexus-archimedes-lora/SKILL.md
+    source_file: backend/routes/routes_archimedes_lora.py
+    endpoints: 5
+  - name: nexus-archimedes-mcp
+    version: "1.0.0"
+    surface: archimedes.mcp
+    path: skills/agentskills/nexus-archimedes-mcp/SKILL.md
+    source_file: backend/routes/routes_archimedes_mcp.py
+    endpoints: 3
+  - name: nexus-archimedes-native
+    version: "1.0.0"
+    surface: archimedes.native
+    path: skills/agentskills/nexus-archimedes-native/SKILL.md
+    source_file: backend/routes/routes_archimedes_native.py
+    endpoints: 1
+  - name: nexus-archimedes-personas
+    version: "1.0.0"
+    surface: archimedes.personas
+    path: skills/agentskills/nexus-archimedes-personas/SKILL.md
+    source_file: backend/routes/routes_archimedes_personas.py
+    endpoints: 5
+  - name: nexus-archimedes-recipes
+    version: "1.0.0"
+    surface: archimedes.recipes
+    path: skills/agentskills/nexus-archimedes-recipes/SKILL.md
+    source_file: backend/routes/routes_archimedes_recipes.py
+    endpoints: 3
+  - name: nexus-archimedes-router
+    version: "1.0.0"
+    surface: archimedes.router
+    path: skills/agentskills/nexus-archimedes-router/SKILL.md
+    source_file: backend/routes/routes_archimedes_router.py
+    endpoints: 2
+  - name: nexus-archimedes-scheduler
+    version: "1.0.0"
+    surface: archimedes.scheduler
+    path: skills/agentskills/nexus-archimedes-scheduler/SKILL.md
+    source_file: backend/routes/routes_archimedes_scheduler.py
+    endpoints: 2
+  - name: nexus-archimedes-synthetic-qa
+    version: "1.0.0"
+    surface: archimedes.synthetic.qa
+    path: skills/agentskills/nexus-archimedes-synthetic-qa/SKILL.md
+    source_file: backend/routes/routes_archimedes_synthetic_qa.py
+    endpoints: 2
+  - name: nexus-archimedes-training-api
+    version: "1.0.0"
+    surface: archimedes.training.api
+    path: skills/agentskills/nexus-archimedes-training-api/SKILL.md
+    source_file: backend/routes/routes_archimedes_training_api.py
+    endpoints: 7
+  - name: nexus-archimedes-voice
+    version: "1.0.0"
+    surface: archimedes.voice
+    path: skills/agentskills/nexus-archimedes-voice/SKILL.md
+    source_file: backend/routes/routes_archimedes_voice.py
+    endpoints: 3
+  - name: nexus-archimedes-workflows
+    version: "1.0.0"
+    surface: archimedes.workflows
+    path: skills/agentskills/nexus-archimedes-workflows/SKILL.md
+    source_file: backend/routes/routes_archimedes_workflows.py
+    endpoints: 7
+  - name: nexus-arena
+    version: "1.0.0"
+    surface: arena
+    path: skills/agentskills/nexus-arena/SKILL.md
+    source_file: backend/routes/routes_arena.py
+    endpoints: 5
+  - name: nexus-auth-email
+    version: "1.0.0"
+    surface: auth.email
+    path: skills/agentskills/nexus-auth-email/SKILL.md
+    source_file: backend/routes/routes_auth_email.py
+    endpoints: 8
+  - name: nexus-auto-refresh
+    version: "1.0.0"
+    surface: auto.refresh
+    path: skills/agentskills/nexus-auto-refresh/SKILL.md
+    source_file: backend/routes/routes_auto_refresh.py
+    endpoints: 2
+  - name: nexus-background-tasks
+    version: "1.0.0"
+    surface: background.tasks
+    path: skills/agentskills/nexus-background-tasks/SKILL.md
+    source_file: backend/routes/routes_background_tasks.py
+    endpoints: 3
+  - name: nexus-benchmarks
+    version: "1.0.0"
+    surface: benchmarks
+    path: skills/agentskills/nexus-benchmarks/SKILL.md
+    source_file: backend/routes/routes_benchmarks.py
+    endpoints: 6
+  - name: nexus-billing
+    version: "1.0.0"
+    surface: billing
+    path: skills/agentskills/nexus-billing/SKILL.md
+    source_file: backend/routes/routes_billing.py
+    endpoints: 7
+  - name: nexus-billing-advanced
+    version: "1.0.0"
+    surface: billing.advanced
+    path: skills/agentskills/nexus-billing-advanced/SKILL.md
+    source_file: backend/routes/routes_billing_advanced.py
+    endpoints: 18
+  - name: nexus-branch-protection
+    version: "1.0.0"
+    surface: branch.protection
+    path: skills/agentskills/nexus-branch-protection/SKILL.md
+    source_file: backend/routes/routes_branch_protection.py
+    endpoints: 4
+  - name: nexus-build
+    version: "1.0.0"
+    surface: build
+    path: skills/agentskills/nexus-build/SKILL.md
+    source_file: backend/routes/routes_build.py
+    endpoints: 11
+  - name: nexus-channels
+    version: "1.0.0"
+    surface: channels
+    path: skills/agentskills/nexus-channels/SKILL.md
+    source_file: backend/routes/routes_channels.py
+    endpoints: 7
+  - name: nexus-cloud-storage
+    version: "1.0.0"
+    surface: cloud.storage
+    path: skills/agentskills/nexus-cloud-storage/SKILL.md
+    source_file: backend/routes/routes_cloud_storage.py
+    endpoints: 9
+  - name: nexus-cloudflare
+    version: "1.0.0"
+    surface: cloudflare
+    path: skills/agentskills/nexus-cloudflare/SKILL.md
+    source_file: backend/routes/routes_cloudflare.py
+    endpoints: 11
+  - name: nexus-code
+    version: "1.0.0"
+    surface: code
+    path: skills/agentskills/nexus-code/SKILL.md
+    source_file: backend/routes/routes_code.py
+    endpoints: 1
+  - name: nexus-code-dev
+    version: "1.0.0"
+    surface: code.dev
+    path: skills/agentskills/nexus-code-dev/SKILL.md
+    source_file: backend/routes/routes_code_dev.py
+    endpoints: 20
+  - name: nexus-code-repo
+    version: "1.0.0"
+    surface: code.repo
+    path: skills/agentskills/nexus-code-repo/SKILL.md
+    source_file: backend/routes/routes_code_repo.py
+    endpoints: 35
+  - name: nexus-code-repo-ai-complete-stream
+    version: "1.0.0"
+    surface: code.repo.ai.complete.stream
+    path: skills/agentskills/nexus-code-repo-ai-complete-stream/SKILL.md
+    source_file: backend/routes/routes_code_repo_ai_complete_stream.py
+    endpoints: 1
+    flags: [streaming]
+  - name: nexus-code-repo-ai-editor
+    version: "1.0.0"
+    surface: code.repo.ai.editor
+    path: skills/agentskills/nexus-code-repo-ai-editor/SKILL.md
+    source_file: backend/routes/routes_code_repo_ai_editor.py
+    endpoints: 7
+  - name: nexus-code-repo-branches
+    version: "1.0.0"
+    surface: code.repo.branches
+    path: skills/agentskills/nexus-code-repo-branches/SKILL.md
+    source_file: backend/routes/routes_code_repo_branches.py
+    endpoints: 5
+  - name: nexus-code-repo-github
+    version: "1.0.0"
+    surface: code.repo.github
+    path: skills/agentskills/nexus-code-repo-github/SKILL.md
+    source_file: backend/routes/routes_code_repo_github.py
+    endpoints: 8
+  - name: nexus-code-repo-issues
+    version: "1.0.0"
+    surface: code.repo.issues
+    path: skills/agentskills/nexus-code-repo-issues/SKILL.md
+    source_file: backend/routes/routes_code_repo_issues.py
+    endpoints: 12
+  - name: nexus-code-repo-pr-collab
+    version: "1.0.0"
+    surface: code.repo.pr.collab
+    path: skills/agentskills/nexus-code-repo-pr-collab/SKILL.md
+    source_file: backend/routes/routes_code_repo_pr_collab.py
+    endpoints: 19
+  - name: nexus-code-review
+    version: "1.0.0"
+    surface: code.review
+    path: skills/agentskills/nexus-code-review/SKILL.md
+    source_file: backend/routes/routes_code_review.py
+    endpoints: 2
+  - name: nexus-code-search
+    version: "1.0.0"
+    surface: code.search
+    path: skills/agentskills/nexus-code-search/SKILL.md
+    source_file: backend/routes/routes_code_search.py
+    endpoints: 1
+  - name: nexus-coding-runner
+    version: "1.0.0"
+    surface: coding.runner
+    path: skills/agentskills/nexus-coding-runner/SKILL.md
+    source_file: backend/routes/routes_coding_runner.py
+    endpoints: 2
+  - name: nexus-coding-sessions
+    version: "1.0.0"
+    surface: coding.sessions
+    path: skills/agentskills/nexus-coding-sessions/SKILL.md
+    source_file: backend/routes/routes_coding_sessions.py
+    endpoints: 5
+  - name: nexus-command-center
+    version: "1.0.0"
+    surface: command.center
+    path: skills/agentskills/nexus-command-center/SKILL.md
+    source_file: backend/routes/routes_command_center.py
+    endpoints: 8
+  - name: nexus-computer-use
+    version: "1.0.0"
+    surface: computer.use
+    path: skills/agentskills/nexus-computer-use/SKILL.md
+    source_file: backend/routes/routes_computer_use.py
+    endpoints: 4
+  - name: nexus-content-gen
+    version: "1.0.0"
+    surface: content.gen
+    path: skills/agentskills/nexus-content-gen/SKILL.md
+    source_file: backend/routes/routes_content_gen.py
+    endpoints: 10
+  - name: nexus-context-ledger
+    version: "1.0.0"
+    surface: context.ledger
+    path: skills/agentskills/nexus-context-ledger/SKILL.md
+    source_file: backend/routes/routes_context_ledger.py
+    endpoints: 3
+  - name: nexus-contracts
+    version: "1.0.0"
+    surface: contracts
+    path: skills/agentskills/nexus-contracts/SKILL.md
+    source_file: backend/routes/routes_contracts.py
+    endpoints: 9
+  - name: nexus-coordination
+    version: "1.0.0"
+    surface: coordination
+    path: skills/agentskills/nexus-coordination/SKILL.md
+    source_file: backend/routes/routes_coordination.py
+    endpoints: 13
+  - name: nexus-cost-alerts
+    version: "1.0.0"
+    surface: cost.alerts
+    path: skills/agentskills/nexus-cost-alerts/SKILL.md
+    source_file: backend/routes/routes_cost_alerts.py
+    endpoints: 3
+  - name: nexus-cost-dashboard
+    version: "1.0.0"
+    surface: cost.dashboard
+    path: skills/agentskills/nexus-cost-dashboard/SKILL.md
+    source_file: backend/routes/routes_cost_dashboard.py
+    endpoints: 4
+  - name: nexus-cost-intelligence
+    version: "1.0.0"
+    surface: cost.intelligence
+    path: skills/agentskills/nexus-cost-intelligence/SKILL.md
+    source_file: backend/routes/routes_cost_intelligence.py
+    endpoints: 7
+  - name: nexus-cursor
+    version: "1.0.0"
+    surface: cursor
+    path: skills/agentskills/nexus-cursor/SKILL.md
+    source_file: backend/routes/routes_cursor.py
+    endpoints: 7
+  - name: nexus-custom-roles
+    version: "1.0.0"
+    surface: custom.roles
+    path: skills/agentskills/nexus-custom-roles/SKILL.md
+    source_file: backend/routes/routes_custom_roles.py
+    endpoints: 8
+  - name: nexus-custom-tools
+    version: "1.0.0"
+    surface: custom.tools
+    path: skills/agentskills/nexus-custom-tools/SKILL.md
+    source_file: backend/routes/routes_custom_tools.py
+    endpoints: 11
+  - name: nexus-deployments
+    version: "1.0.0"
+    surface: deployments
+    path: skills/agentskills/nexus-deployments/SKILL.md
+    source_file: backend/routes/routes_deployments.py
+    endpoints: 24
+  - name: nexus-directive-engine
+    version: "1.0.0"
+    surface: directive.engine
+    path: skills/agentskills/nexus-directive-engine/SKILL.md
+    source_file: backend/routes/routes_directive_engine.py
+    endpoints: 23
+  - name: nexus-discussions
+    version: "1.0.0"
+    surface: discussions
+    path: skills/agentskills/nexus-discussions/SKILL.md
+    source_file: backend/routes/routes_discussions.py
+    endpoints: 21
+  - name: nexus-dispatch
+    version: "1.0.0"
+    surface: dispatch
+    path: skills/agentskills/nexus-dispatch/SKILL.md
+    source_file: backend/routes/routes_dispatch.py
+    endpoints: 5
+  - name: nexus-dojo
+    version: "1.0.0"
+    surface: dojo
+    path: skills/agentskills/nexus-dojo/SKILL.md
+    source_file: backend/routes/routes_dojo.py
+    endpoints: 73
+  - name: nexus-drive
+    version: "1.0.0"
+    surface: drive
+    path: skills/agentskills/nexus-drive/SKILL.md
+    source_file: backend/routes/routes_drive.py
+    endpoints: 13
+  - name: nexus-email
+    version: "1.0.0"
+    surface: email
+    path: skills/agentskills/nexus-email/SKILL.md
+    source_file: backend/routes/routes_email.py
+    endpoints: 8
+  - name: nexus-embed-chat
+    version: "1.0.0"
+    surface: embed.chat
+    path: skills/agentskills/nexus-embed-chat/SKILL.md
+    source_file: backend/routes/routes_embed_chat.py
+    endpoints: 8
+  - name: nexus-enhancements
+    version: "1.0.0"
+    surface: enhancements
+    path: skills/agentskills/nexus-enhancements/SKILL.md
+    source_file: backend/routes/routes_enhancements.py
+    endpoints: 14
+  - name: nexus-error-tracking
+    version: "1.0.0"
+    surface: error.tracking
+    path: skills/agentskills/nexus-error-tracking/SKILL.md
+    source_file: backend/routes/routes_error_tracking.py
+    endpoints: 5
+  - name: nexus-evaluations
+    version: "1.0.0"
+    surface: evaluations
+    path: skills/agentskills/nexus-evaluations/SKILL.md
+    source_file: backend/routes/routes_evaluations.py
+    endpoints: 9
+  - name: nexus-export-audit
+    version: "1.0.0"
+    surface: export.audit
+    path: skills/agentskills/nexus-export-audit/SKILL.md
+    source_file: backend/routes/routes_export_audit.py
+    endpoints: 7
+  - name: nexus-extended-tools
+    version: "1.0.0"
+    surface: extended.tools
+    path: skills/agentskills/nexus-extended-tools/SKILL.md
+    source_file: backend/routes/routes_extended_tools.py
+    endpoints: 15
+  - name: nexus-features
+    version: "1.0.0"
+    surface: features
+    path: skills/agentskills/nexus-features/SKILL.md
+    source_file: backend/routes/routes_features.py
+    endpoints: 5
+  - name: nexus-federated-search
+    version: "1.0.0"
+    surface: federated.search
+    path: skills/agentskills/nexus-federated-search/SKILL.md
+    source_file: backend/routes/routes_federated_search.py
+    endpoints: 2
+  - name: nexus-files
+    version: "1.0.0"
+    surface: files
+    path: skills/agentskills/nexus-files/SKILL.md
+    source_file: backend/routes/routes_files.py
+    endpoints: 11
+    flags: [multipart]
+  - name: nexus-finetune
+    version: "1.0.0"
+    surface: finetune
+    path: skills/agentskills/nexus-finetune/SKILL.md
+    source_file: backend/routes/routes_finetune.py
+    endpoints: 8
+  - name: nexus-forks
+    version: "1.0.0"
+    surface: forks
+    path: skills/agentskills/nexus-forks/SKILL.md
+    source_file: backend/routes/routes_forks.py
+    endpoints: 3
+  - name: nexus-gdpr
+    version: "1.0.0"
+    surface: gdpr
+    path: skills/agentskills/nexus-gdpr/SKILL.md
+    source_file: backend/routes/routes_gdpr.py
+    endpoints: 5
+  - name: nexus-global-search
+    version: "1.0.0"
+    surface: global.search
+    path: skills/agentskills/nexus-global-search/SKILL.md
+    source_file: backend/routes/routes_global_search.py
+    endpoints: 1
+  - name: nexus-gmail
+    version: "1.0.0"
+    surface: gmail
+    path: skills/agentskills/nexus-gmail/SKILL.md
+    source_file: backend/routes/routes_gmail.py
+    endpoints: 13
+  - name: nexus-google-auth
+    version: "1.0.0"
+    surface: google.auth
+    path: skills/agentskills/nexus-google-auth/SKILL.md
+    source_file: backend/routes/routes_google_auth.py
+    endpoints: 7
+  - name: nexus-google-calendar
+    version: "1.0.0"
+    surface: google.calendar
+    path: skills/agentskills/nexus-google-calendar/SKILL.md
+    source_file: backend/routes/routes_google_calendar.py
+    endpoints: 13
+  - name: nexus-growth
+    version: "1.0.0"
+    surface: growth
+    path: skills/agentskills/nexus-growth/SKILL.md
+    source_file: backend/routes/routes_growth.py
+    endpoints: 4
+  - name: nexus-guardrails
+    version: "1.0.0"
+    surface: guardrails
+    path: skills/agentskills/nexus-guardrails/SKILL.md
+    source_file: backend/routes/routes_guardrails.py
+    endpoints: 6
+  - name: nexus-guide-me
+    version: "1.0.0"
+    surface: guide.me
+    path: skills/agentskills/nexus-guide-me/SKILL.md
+    source_file: backend/routes/routes_guide_me.py
+    endpoints: 5
+  - name: nexus-handoffs-memory
+    version: "1.0.0"
+    surface: handoffs.memory
+    path: skills/agentskills/nexus-handoffs-memory/SKILL.md
+    source_file: backend/routes/routes_handoffs_memory.py
+    endpoints: 10
+  - name: nexus-ideation
+    version: "1.0.0"
+    surface: ideation
+    path: skills/agentskills/nexus-ideation/SKILL.md
+    source_file: backend/routes/routes_ideation.py
+    endpoints: 17
+  - name: nexus-image-gen
+    version: "1.0.0"
+    surface: image.gen
+    path: skills/agentskills/nexus-image-gen/SKILL.md
+    source_file: backend/routes/routes_image_gen.py
+    endpoints: 6
+    flags: [multipart]
+  - name: nexus-image-understanding
+    version: "1.0.0"
+    surface: image.understanding
+    path: skills/agentskills/nexus-image-understanding/SKILL.md
+    source_file: backend/routes/routes_image_understanding.py
+    endpoints: 2
+    flags: [multipart]
+  - name: nexus-insights
+    version: "1.0.0"
+    surface: insights
+    path: skills/agentskills/nexus-insights/SKILL.md
+    source_file: backend/routes/routes_insights.py
+    endpoints: 3
+  - name: nexus-integrations
+    version: "1.0.0"
+    surface: integrations
+    path: skills/agentskills/nexus-integrations/SKILL.md
+    source_file: backend/routes/routes_integrations.py
+    endpoints: 10
+  - name: nexus-intelligence
+    version: "1.0.0"
+    surface: intelligence
+    path: skills/agentskills/nexus-intelligence/SKILL.md
+    source_file: backend/routes/routes_intelligence.py
+    endpoints: 13
+  - name: nexus-keystone
+    version: "1.0.0"
+    surface: keystone
+    path: skills/agentskills/nexus-keystone/SKILL.md
+    source_file: backend/routes/routes_keystone.py
+    endpoints: 14
+  - name: nexus-knowledge-graph
+    version: "1.0.0"
+    surface: knowledge.graph
+    path: skills/agentskills/nexus-knowledge-graph/SKILL.md
+    source_file: backend/routes/routes_knowledge_graph.py
+    endpoints: 14
+  - name: nexus-knowledge-packs
+    version: "1.0.0"
+    surface: knowledge.packs
+    path: skills/agentskills/nexus-knowledge-packs/SKILL.md
+    source_file: backend/routes/routes_knowledge_packs.py
+    endpoints: 2
+  - name: nexus-legal
+    version: "1.0.0"
+    surface: legal
+    path: skills/agentskills/nexus-legal/SKILL.md
+    source_file: backend/routes/routes_legal.py
+    endpoints: 12
+  - name: nexus-mail-audit
+    version: "1.0.0"
+    surface: mail.audit
+    path: skills/agentskills/nexus-mail-audit/SKILL.md
+    source_file: backend/routes/routes_mail_audit.py
+    endpoints: 2
+  - name: nexus-mail-connections
+    version: "1.0.0"
+    surface: mail.connections
+    path: skills/agentskills/nexus-mail-connections/SKILL.md
+    source_file: backend/routes/routes_mail_connections.py
+    endpoints: 5
+  - name: nexus-mail-rules
+    version: "1.0.0"
+    surface: mail.rules
+    path: skills/agentskills/nexus-mail-rules/SKILL.md
+    source_file: backend/routes/routes_mail_rules.py
+    endpoints: 4
+  - name: nexus-managed-keys
+    version: "1.0.0"
+    surface: managed.keys
+    path: skills/agentskills/nexus-managed-keys/SKILL.md
+    source_file: backend/routes/routes_managed_keys.py
+    endpoints: 21
+  - name: nexus-marketplace
+    version: "1.0.0"
+    surface: marketplace
+    path: skills/agentskills/nexus-marketplace/SKILL.md
+    source_file: backend/routes/routes_marketplace.py
+    endpoints: 18
+  - name: nexus-marketplace-payouts
+    version: "1.0.0"
+    surface: marketplace.payouts
+    path: skills/agentskills/nexus-marketplace-payouts/SKILL.md
+    source_file: backend/routes/routes_marketplace_payouts.py
+    endpoints: 6
+  - name: nexus-mcp-servers
+    version: "1.0.0"
+    surface: mcp.servers
+    path: skills/agentskills/nexus-mcp-servers/SKILL.md
+    source_file: backend/routes/routes_mcp_servers.py
+    endpoints: 6
+  - name: nexus-media
+    version: "1.0.0"
+    surface: media
+    path: skills/agentskills/nexus-media/SKILL.md
+    source_file: backend/routes/routes_media.py
+    endpoints: 40
+    flags: [multipart]
+  - name: nexus-memgraph
+    version: "1.0.0"
+    surface: memgraph
+    path: skills/agentskills/nexus-memgraph/SKILL.md
+    source_file: backend/routes/routes_memgraph.py
+    endpoints: 49
+  - name: nexus-messages
+    version: "1.0.0"
+    surface: messages
+    path: skills/agentskills/nexus-messages/SKILL.md
+    source_file: backend/routes/routes_messages.py
+    endpoints: 8
+  - name: nexus-metrics
+    version: "1.0.0"
+    surface: metrics
+    path: skills/agentskills/nexus-metrics/SKILL.md
+    source_file: backend/routes/routes_metrics.py
+    endpoints: 3
+  - name: nexus-mfa
+    version: "1.0.0"
+    surface: mfa
+    path: skills/agentskills/nexus-mfa/SKILL.md
+    source_file: backend/routes/routes_mfa.py
+    endpoints: 6
+  - name: nexus-model-perf
+    version: "1.0.0"
+    surface: model.perf
+    path: skills/agentskills/nexus-model-perf/SKILL.md
+    source_file: backend/routes/routes_model_perf.py
+    endpoints: 12
+  - name: nexus-module-assignments
+    version: "1.0.0"
+    surface: module.assignments
+    path: skills/agentskills/nexus-module-assignments/SKILL.md
+    source_file: backend/routes/routes_module_assignments.py
+    endpoints: 5
+  - name: nexus-module-roles
+    version: "1.0.0"
+    surface: module.roles
+    path: skills/agentskills/nexus-module-roles/SKILL.md
+    source_file: backend/routes/routes_module_roles.py
+    endpoints: 4
+  - name: nexus-modules
+    version: "1.0.0"
+    surface: modules
+    path: skills/agentskills/nexus-modules/SKILL.md
+    source_file: backend/routes/routes_modules.py
+    endpoints: 16
+  - name: nexus-nexus-agents
+    version: "1.0.0"
+    surface: nexus.agents
+    path: skills/agentskills/nexus-nexus-agents/SKILL.md
+    source_file: backend/routes/routes_nexus_agents.py
+    endpoints: 6
+  - name: nexus-nexus-browser
+    version: "1.0.0"
+    surface: nexus.browser
+    path: skills/agentskills/nexus-nexus-browser/SKILL.md
+    source_file: backend/routes/routes_nexus_browser.py
+    endpoints: 9
+  - name: nexus-nexus-connect
+    version: "1.0.0"
+    surface: nexus.connect
+    path: skills/agentskills/nexus-nexus-connect/SKILL.md
+    source_file: backend/routes/routes_nexus_connect.py
+    endpoints: 5
+  - name: nexus-notifications
+    version: "1.0.0"
+    surface: notifications
+    path: skills/agentskills/nexus-notifications/SKILL.md
+    source_file: backend/routes/routes_notifications.py
+    endpoints: 10
+  - name: nexus-nx-features
+    version: "1.0.0"
+    surface: nx.features
+    path: skills/agentskills/nexus-nx-features/SKILL.md
+    source_file: backend/routes/routes_nx_features.py
+    endpoints: 26
+  - name: nexus-observability
+    version: "1.0.0"
+    surface: observability
+    path: skills/agentskills/nexus-observability/SKILL.md
+    source_file: backend/routes/routes_observability.py
+    endpoints: 8
+  - name: nexus-onboarding-progress
+    version: "1.0.0"
+    surface: onboarding.progress
+    path: skills/agentskills/nexus-onboarding-progress/SKILL.md
+    source_file: backend/routes/routes_onboarding_progress.py
+    endpoints: 2
+  - name: nexus-openclaw
+    version: "1.0.0"
+    surface: openclaw
+    path: skills/agentskills/nexus-openclaw/SKILL.md
+    source_file: backend/routes/routes_openclaw.py
+    endpoints: 20
+  - name: nexus-operator
+    version: "1.0.0"
+    surface: operator
+    path: skills/agentskills/nexus-operator/SKILL.md
+    source_file: backend/routes/routes_operator.py
+    endpoints: 16
+  - name: nexus-orch-schedules
+    version: "1.0.0"
+    surface: orch.schedules
+    path: skills/agentskills/nexus-orch-schedules/SKILL.md
+    source_file: backend/routes/routes_orch_schedules.py
+    endpoints: 4
+  - name: nexus-orchestration
+    version: "1.0.0"
+    surface: orchestration
+    path: skills/agentskills/nexus-orchestration/SKILL.md
+    source_file: backend/routes/routes_orchestration.py
+    endpoints: 7
+  - name: nexus-org-branding
+    version: "1.0.0"
+    surface: org.branding
+    path: skills/agentskills/nexus-org-branding/SKILL.md
+    source_file: backend/routes/routes_org_branding.py
+    endpoints: 2
+  - name: nexus-orgs
+    version: "1.0.0"
+    surface: orgs
+    path: skills/agentskills/nexus-orgs/SKILL.md
+    source_file: backend/routes/routes_orgs.py
+    endpoints: 33
+  - name: nexus-pam
+    version: "1.0.0"
+    surface: pam
+    path: skills/agentskills/nexus-pam/SKILL.md
+    source_file: backend/routes/routes_pam.py
+    endpoints: 8
+  - name: nexus-partner-portal
+    version: "1.0.0"
+    surface: partner.portal
+    path: skills/agentskills/nexus-partner-portal/SKILL.md
+    source_file: backend/routes/routes_partner_portal.py
+    endpoints: 9
+  - name: nexus-partner-program
+    version: "1.0.0"
+    surface: partner.program
+    path: skills/agentskills/nexus-partner-program/SKILL.md
+    source_file: backend/routes/routes_partner_program.py
+    endpoints: 8
+  - name: nexus-partners
+    version: "1.0.0"
+    surface: partners
+    path: skills/agentskills/nexus-partners/SKILL.md
+    source_file: backend/routes/routes_partners.py
+    endpoints: 11
+  - name: nexus-permission-audit
+    version: "1.0.0"
+    surface: permission.audit
+    path: skills/agentskills/nexus-permission-audit/SKILL.md
+    source_file: backend/routes/routes_permission_audit.py
+    endpoints: 3
+  - name: nexus-plan-management
+    version: "1.0.0"
+    surface: plan.management
+    path: skills/agentskills/nexus-plan-management/SKILL.md
+    source_file: backend/routes/routes_plan_management.py
+    endpoints: 9
+  - name: nexus-platform-profile
+    version: "1.0.0"
+    surface: platform.profile
+    path: skills/agentskills/nexus-platform-profile/SKILL.md
+    source_file: backend/routes/routes_platform_profile.py
+    endpoints: 3
+  - name: nexus-plm-advanced
+    version: "1.0.0"
+    surface: plm.advanced
+    path: skills/agentskills/nexus-plm-advanced/SKILL.md
+    source_file: backend/routes/routes_plm_advanced.py
+    endpoints: 42
+  - name: nexus-plugin-manifest
+    version: "1.0.0"
+    surface: plugin.manifest
+    path: skills/agentskills/nexus-plugin-manifest/SKILL.md
+    source_file: backend/routes/routes_plugin_manifest.py
+    endpoints: 8
+  - name: nexus-plugins
+    version: "1.0.0"
+    surface: plugins
+    path: skills/agentskills/nexus-plugins/SKILL.md
+    source_file: backend/routes/routes_plugins.py
+    endpoints: 14
+  - name: nexus-pricing
+    version: "1.0.0"
+    surface: pricing
+    path: skills/agentskills/nexus-pricing/SKILL.md
+    source_file: backend/routes/routes_pricing.py
+    endpoints: 9
+  - name: nexus-pricing-forecaster
+    version: "1.0.0"
+    surface: pricing.forecaster
+    path: skills/agentskills/nexus-pricing-forecaster/SKILL.md
+    source_file: backend/routes/routes_pricing_forecaster.py
+    endpoints: 2
+  - name: nexus-project-boards
+    version: "1.0.0"
+    surface: project.boards
+    path: skills/agentskills/nexus-project-boards/SKILL.md
+    source_file: backend/routes/routes_project_boards.py
+    endpoints: 12
+  - name: nexus-projects
+    version: "1.0.0"
+    surface: projects
+    path: skills/agentskills/nexus-projects/SKILL.md
+    source_file: backend/routes/routes_projects.py
+    endpoints: 40
+  - name: nexus-prompt-library
+    version: "1.0.0"
+    surface: prompt.library
+    path: skills/agentskills/nexus-prompt-library/SKILL.md
+    source_file: backend/routes/routes_prompt_library.py
+    endpoints: 10
+  - name: nexus-qbr
+    version: "1.0.0"
+    surface: qbr
+    path: skills/agentskills/nexus-qbr/SKILL.md
+    source_file: backend/routes/routes_qbr.py
+    endpoints: 3
+  - name: nexus-rag
+    version: "1.0.0"
+    surface: rag
+    path: skills/agentskills/nexus-rag/SKILL.md
+    source_file: backend/routes/routes_rag.py
+    endpoints: 8
+  - name: nexus-rbac
+    version: "1.0.0"
+    surface: rbac
+    path: skills/agentskills/nexus-rbac/SKILL.md
+    source_file: backend/routes/routes_rbac.py
+    endpoints: 10
+  - name: nexus-releases
+    version: "1.0.0"
+    surface: releases
+    path: skills/agentskills/nexus-releases/SKILL.md
+    source_file: backend/routes/routes_releases.py
+    endpoints: 5
+  - name: nexus-repo-ci
+    version: "1.0.0"
+    surface: repo.ci
+    path: skills/agentskills/nexus-repo-ci/SKILL.md
+    source_file: backend/routes/routes_repo_ci.py
+    endpoints: 4
+  - name: nexus-repo-ci-shell
+    version: "1.0.0"
+    surface: repo.ci.shell
+    path: skills/agentskills/nexus-repo-ci-shell/SKILL.md
+    source_file: backend/routes/routes_repo_ci_shell.py
+    endpoints: 1
+  - name: nexus-repo-deploy-keys
+    version: "1.0.0"
+    surface: repo.deploy.keys
+    path: skills/agentskills/nexus-repo-deploy-keys/SKILL.md
+    source_file: backend/routes/routes_repo_deploy_keys.py
+    endpoints: 4
+  - name: nexus-repo-environments
+    version: "1.0.0"
+    surface: repo.environments
+    path: skills/agentskills/nexus-repo-environments/SKILL.md
+    source_file: backend/routes/routes_repo_environments.py
+    endpoints: 7
+  - name: nexus-repo-labels
+    version: "1.0.0"
+    surface: repo.labels
+    path: skills/agentskills/nexus-repo-labels/SKILL.md
+    source_file: backend/routes/routes_repo_labels.py
+    endpoints: 4
+  - name: nexus-repo-milestones
+    version: "1.0.0"
+    surface: repo.milestones
+    path: skills/agentskills/nexus-repo-milestones/SKILL.md
+    source_file: backend/routes/routes_repo_milestones.py
+    endpoints: 8
+  - name: nexus-repo-security
+    version: "1.0.0"
+    surface: repo.security
+    path: skills/agentskills/nexus-repo-security/SKILL.md
+    source_file: backend/routes/routes_repo_security.py
+    endpoints: 1
+  - name: nexus-repo-templates
+    version: "1.0.0"
+    surface: repo.templates
+    path: skills/agentskills/nexus-repo-templates/SKILL.md
+    source_file: backend/routes/routes_repo_templates.py
+    endpoints: 5
+  - name: nexus-reporting
+    version: "1.0.0"
+    surface: reporting
+    path: skills/agentskills/nexus-reporting/SKILL.md
+    source_file: backend/routes/routes_reporting.py
+    endpoints: 19
+  - name: nexus-reports
+    version: "1.0.0"
+    surface: reports
+    path: skills/agentskills/nexus-reports/SKILL.md
+    source_file: backend/routes/routes_reports.py
+    endpoints: 7
+  - name: nexus-repository
+    version: "1.0.0"
+    surface: repository
+    path: skills/agentskills/nexus-repository/SKILL.md
+    source_file: backend/routes/routes_repository.py
+    endpoints: 16
+  - name: nexus-research
+    version: "1.0.0"
+    surface: research
+    path: skills/agentskills/nexus-research/SKILL.md
+    source_file: backend/routes/routes_research.py
+    endpoints: 11
+  - name: nexus-research-chat
+    version: "1.0.0"
+    surface: research.chat
+    path: skills/agentskills/nexus-research-chat/SKILL.md
+    source_file: backend/routes/routes_research_chat.py
+    endpoints: 1
+  - name: nexus-research-library
+    version: "1.0.0"
+    surface: research.library
+    path: skills/agentskills/nexus-research-library/SKILL.md
+    source_file: backend/routes/routes_research_library.py
+    endpoints: 18
+  - name: nexus-revenue-sharing
+    version: "1.0.0"
+    surface: revenue.sharing
+    path: skills/agentskills/nexus-revenue-sharing/SKILL.md
+    source_file: backend/routes/routes_revenue_sharing.py
+    endpoints: 7
+  - name: nexus-reviews
+    version: "1.0.0"
+    surface: reviews
+    path: skills/agentskills/nexus-reviews/SKILL.md
+    source_file: backend/routes/routes_reviews.py
+    endpoints: 6
+  - name: nexus-roi-calculator
+    version: "1.0.0"
+    surface: roi.calculator
+    path: skills/agentskills/nexus-roi-calculator/SKILL.md
+    source_file: backend/routes/routes_roi_calculator.py
+    endpoints: 4
+  - name: nexus-roi-comparison
+    version: "1.0.0"
+    surface: roi.comparison
+    path: skills/agentskills/nexus-roi-comparison/SKILL.md
+    source_file: backend/routes/routes_roi_comparison.py
+    endpoints: 2
+  - name: nexus-runner
+    version: "1.0.0"
+    surface: runner
+    path: skills/agentskills/nexus-runner/SKILL.md
+    source_file: backend/routes/routes_runner.py
+    endpoints: 5
+  - name: nexus-runtime-config
+    version: "1.0.0"
+    surface: runtime.config
+    path: skills/agentskills/nexus-runtime-config/SKILL.md
+    source_file: backend/routes/routes_runtime_config.py
+    endpoints: 1
+  - name: nexus-scenario
+    version: "1.0.0"
+    surface: scenario
+    path: skills/agentskills/nexus-scenario/SKILL.md
+    source_file: backend/routes/routes_scenario.py
+    endpoints: 22
+  - name: nexus-scim
+    version: "1.0.0"
+    surface: scim
+    path: skills/agentskills/nexus-scim/SKILL.md
+    source_file: backend/routes/routes_scim.py
+    endpoints: 10
+  - name: nexus-self-improvement
+    version: "1.0.0"
+    surface: self.improvement
+    path: skills/agentskills/nexus-self-improvement/SKILL.md
+    source_file: backend/routes/routes_self_improvement.py
+    endpoints: 6
+  - name: nexus-service-accounts
+    version: "1.0.0"
+    surface: service.accounts
+    path: skills/agentskills/nexus-service-accounts/SKILL.md
+    source_file: backend/routes/routes_service_accounts.py
+    endpoints: 7
+  - name: nexus-sharing
+    version: "1.0.0"
+    surface: sharing
+    path: skills/agentskills/nexus-sharing/SKILL.md
+    source_file: backend/routes/routes_sharing.py
+    endpoints: 4
+  - name: nexus-skill-marketplace
+    version: "1.0.0"
+    surface: skill.marketplace
+    path: skills/agentskills/nexus-skill-marketplace/SKILL.md
+    source_file: backend/routes/routes_skill_marketplace.py
+    endpoints: 16
+  - name: nexus-slash
+    version: "1.0.0"
+    surface: slash
+    path: skills/agentskills/nexus-slash/SKILL.md
+    source_file: backend/routes/routes_slash.py
+    endpoints: 2
+  - name: nexus-smart-inbox
+    version: "1.0.0"
+    surface: smart.inbox
+    path: skills/agentskills/nexus-smart-inbox/SKILL.md
+    source_file: backend/routes/routes_smart_inbox.py
+    endpoints: 18
+  - name: nexus-soc2
+    version: "1.0.0"
+    surface: soc2
+    path: skills/agentskills/nexus-soc2/SKILL.md
+    source_file: backend/routes/routes_soc2.py
+    endpoints: 4
+  - name: nexus-social-publish
+    version: "1.0.0"
+    surface: social.publish
+    path: skills/agentskills/nexus-social-publish/SKILL.md
+    source_file: backend/routes/routes_social_publish.py
+    endpoints: 9
+  - name: nexus-sovereign
+    version: "1.0.0"
+    surface: sovereign
+    path: skills/agentskills/nexus-sovereign/SKILL.md
+    source_file: backend/routes/routes_sovereign.py
+    endpoints: 4
+  - name: nexus-spaces
+    version: "1.0.0"
+    surface: spaces
+    path: skills/agentskills/nexus-spaces/SKILL.md
+    source_file: backend/routes/routes_spaces.py
+    endpoints: 6
+  - name: nexus-sso
+    version: "1.0.0"
+    surface: sso
+    path: skills/agentskills/nexus-sso/SKILL.md
+    source_file: backend/routes/routes_sso.py
+    endpoints: 10
+  - name: nexus-status
+    version: "1.0.0"
+    surface: status
+    path: skills/agentskills/nexus-status/SKILL.md
+    source_file: backend/routes/routes_status.py
+    endpoints: 12
+  - name: nexus-strategic-v2
+    version: "1.0.0"
+    surface: strategic.v2
+    path: skills/agentskills/nexus-strategic-v2/SKILL.md
+    source_file: backend/routes/routes_strategic_v2.py
+    endpoints: 20
+  - name: nexus-sub-agents
+    version: "1.0.0"
+    surface: sub.agents
+    path: skills/agentskills/nexus-sub-agents/SKILL.md
+    source_file: backend/routes/routes_sub_agents.py
+    endpoints: 3
+  - name: nexus-support-desk
+    version: "1.0.0"
+    surface: support.desk
+    path: skills/agentskills/nexus-support-desk/SKILL.md
+    source_file: backend/routes/routes_support_desk.py
+    endpoints: 19
+  - name: nexus-task-checkpoints
+    version: "1.0.0"
+    surface: task.checkpoints
+    path: skills/agentskills/nexus-task-checkpoints/SKILL.md
+    source_file: backend/routes/routes_task_checkpoints.py
+    endpoints: 5
+  - name: nexus-task-sessions
+    version: "1.0.0"
+    surface: task.sessions
+    path: skills/agentskills/nexus-task-sessions/SKILL.md
+    source_file: backend/routes/routes_task_sessions.py
+    endpoints: 11
+  - name: nexus-tasks
+    version: "1.0.0"
+    surface: tasks
+    path: skills/agentskills/nexus-tasks/SKILL.md
+    source_file: backend/routes/routes_tasks.py
+    endpoints: 7
+  - name: nexus-threading
+    version: "1.0.0"
+    surface: threading
+    path: skills/agentskills/nexus-threading/SKILL.md
+    source_file: backend/routes/routes_threading.py
+    endpoints: 3
+  - name: nexus-tier23
+    version: "1.0.0"
+    surface: tier23
+    path: skills/agentskills/nexus-tier23/SKILL.md
+    source_file: backend/routes/routes_tier23.py
+    endpoints: 21
+  - name: nexus-training-analytics
+    version: "1.0.0"
+    surface: training.analytics
+    path: skills/agentskills/nexus-training-analytics/SKILL.md
+    source_file: backend/routes/routes_training_analytics.py
+    endpoints: 3
+  - name: nexus-transparency
+    version: "1.0.0"
+    surface: transparency
+    path: skills/agentskills/nexus-transparency/SKILL.md
+    source_file: backend/routes/routes_transparency.py
+    endpoints: 3
+  - name: nexus-trust-portal
+    version: "1.0.0"
+    surface: trust.portal
+    path: skills/agentskills/nexus-trust-portal/SKILL.md
+    source_file: backend/routes/routes_trust_portal.py
+    endpoints: 5
+  - name: nexus-turboquant
+    version: "1.0.0"
+    surface: turboquant
+    path: skills/agentskills/nexus-turboquant/SKILL.md
+    source_file: backend/routes/routes_turboquant.py
+    endpoints: 20
+  - name: nexus-url-preview
+    version: "1.0.0"
+    surface: url.preview
+    path: skills/agentskills/nexus-url-preview/SKILL.md
+    source_file: backend/routes/routes_url_preview.py
+    endpoints: 1
+  - name: nexus-usage-metering
+    version: "1.0.0"
+    surface: usage.metering
+    path: skills/agentskills/nexus-usage-metering/SKILL.md
+    source_file: backend/routes/routes_usage_metering.py
+    endpoints: 9
+  - name: nexus-user-prefs
+    version: "1.0.0"
+    surface: user.prefs
+    path: skills/agentskills/nexus-user-prefs/SKILL.md
+    source_file: backend/routes/routes_user_prefs.py
+    endpoints: 9
+  - name: nexus-verticals
+    version: "1.0.0"
+    surface: verticals
+    path: skills/agentskills/nexus-verticals/SKILL.md
+    source_file: backend/routes/routes_verticals.py
+    endpoints: 4
+  - name: nexus-walkthroughs-builder
+    version: "1.0.0"
+    surface: walkthroughs.builder
+    path: skills/agentskills/nexus-walkthroughs-builder/SKILL.md
+    source_file: backend/routes/routes_walkthroughs_builder.py
+    endpoints: 20
+  - name: nexus-wiki
+    version: "1.0.0"
+    surface: wiki
+    path: skills/agentskills/nexus-wiki/SKILL.md
+    source_file: backend/routes/routes_wiki.py
+    endpoints: 14
+  - name: nexus-workflow-versioning
+    version: "1.0.0"
+    surface: workflow.versioning
+    path: skills/agentskills/nexus-workflow-versioning/SKILL.md
+    source_file: backend/routes/routes_workflow_versioning.py
+    endpoints: 5
+  - name: nexus-workflows
+    version: "1.0.0"
+    surface: workflows
+    path: skills/agentskills/nexus-workflows/SKILL.md
+    source_file: backend/routes/routes_workflows.py
+    endpoints: 28
+  - name: nexus-workspace-agents
+    version: "1.0.0"
+    surface: workspace.agents
+    path: skills/agentskills/nexus-workspace-agents/SKILL.md
+    source_file: backend/routes/routes_workspace_agents.py
+    endpoints: 7
+  - name: nexus-workspace-deletion
+    version: "1.0.0"
+    surface: workspace.deletion
+    path: skills/agentskills/nexus-workspace-deletion/SKILL.md
+    source_file: backend/routes/routes_workspace_deletion.py
+    endpoints: 3
+  - name: nexus-workspace-teams
+    version: "1.0.0"
+    surface: workspace.teams
+    path: skills/agentskills/nexus-workspace-teams/SKILL.md
+    source_file: backend/routes/routes_workspace_teams.py
+    endpoints: 7
+  - name: nexus-workspace-templates
+    version: "1.0.0"
+    surface: workspace.templates
+    path: skills/agentskills/nexus-workspace-templates/SKILL.md
+    source_file: backend/routes/routes_workspace_templates.py
+    endpoints: 3
+  - name: nexus-workspaces
+    version: "1.0.0"
+    surface: workspaces
+    path: skills/agentskills/nexus-workspaces/SKILL.md
+    source_file: backend/routes/routes_workspaces.py
+    endpoints: 13
+skipped:
+  - routes_admin.py
+  - routes_admin_billing.py
+  - routes_admin_cold_tier.py
+  - routes_admin_cost.py
+  - routes_admin_eks.py
+  - routes_admin_feature_flags.py
+  - routes_admin_hooks.py
+  - routes_admin_sharding.py
+  - routes_admin_workers.py
+  - routes_archimedes_admin.py
+  - routes_dispatch_push.py
+  - routes_encryption_admin.py
+  - routes_health.py
+  - routes_internal.py
+  - routes_kms_admin.py
+  - routes_residency_admin.py
+  - routes_training_ws.py
+  - routes_webhook_admin.py
+  - routes_webhooks.py
+  - routes_widget_loader.py
+  - routes_widgets.py
+  - routes_yjs.py
