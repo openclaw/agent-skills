@@ -1,0 +1,21 @@
+{
+  "$schema": "https://skills.sh/schemas/skills.sh.schema.json",
+  "notGrouped": "bottom",
+  "groupings": [
+    {
+      "title": "Review",
+      "description": "Skills for code review closeout and remote validation.",
+      "skills": ["autoreview", "crabbox"]
+    },
+    {
+      "title": "Handoff",
+      "description": "Skills for sharing context across agents, PRs, and issues.",
+      "skills": ["handoff", "agent-transcript"]
+    },
+    {
+      "title": "Sessions",
+      "description": "Skills for inspecting and sharing local agent sessions.",
+      "skills": ["session-viewer"]
+    }
+  ]
+}
