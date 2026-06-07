@@ -57,6 +57,12 @@ export AUTOREVIEW_HARNESS=".agents/skills/autoreview/scripts/test-review-harness
 ```
 
 ```bash
+# Source checkout of openclaw/agent-skills:
+export AUTOREVIEW="skills/autoreview/scripts/autoreview"
+export AUTOREVIEW_HARNESS="skills/autoreview/scripts/test-review-harness"
+```
+
+```bash
 # Global skill:
 export AGENTS_HOME="${AGENTS_HOME:-$HOME/.agents}"
 export AUTOREVIEW="$AGENTS_HOME/skills/autoreview/scripts/autoreview"
