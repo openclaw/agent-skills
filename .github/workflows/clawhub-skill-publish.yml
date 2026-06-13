@@ -1,0 +1,40 @@
+name: clawhub-skill-publish
+
+on:
+  pull_request:
+    paths:
+      - "skills/**"
+      - "skills.sh.json"
+      - "README.md"
+      - ".github/workflows/clawhub-skill-publish.yml"
+  workflow_dispatch:
+    inputs:
+      skill_path:
+        description: Optional single skill folder to publish, for example skills/repository-gardener.
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  dry-run:
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      id-token: write
+    uses: openclaw/clawhub/.github/workflows/skill-publish.yml@v0.21.0
+    with:
+      owner: openclaw
+      dry_run: true
+
+  publish:
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      id-token: write
+    uses: openclaw/clawhub/.github/workflows/skill-publish.yml@v0.21.0
+    with:
+      owner: openclaw
+      dry_run: false
+      skill_path: ${{ inputs.skill_path }}
+    secrets:
+      clawhub_token: ${{ secrets.CLAWHUB_TOKEN }}

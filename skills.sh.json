@@ -3,6 +3,11 @@
   "notGrouped": "bottom",
   "groupings": [
     {
+      "title": "Maintenance",
+      "description": "Skills for bounded repository health reports and entropy reduction.",
+      "skills": ["repository-gardener"]
+    },
+    {
       "title": "Review",
       "description": "Skills for code review closeout and remote validation.",
       "skills": ["autoreview", "crabbox"]

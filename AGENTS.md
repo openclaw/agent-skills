@@ -15,5 +15,9 @@ Public shared skills for agent workflows.
 
 ## Layout
 
+- `skills/agent-transcript`: local-only redacted transcript provenance helper.
 - `skills/autoreview`: shared closeout/code-review helper.
 - `skills/crabbox`: shared Crabbox/Testbox remote validation workflow.
+- `skills/handoff`: path-free prompt handoff for delegating tasks across agents.
+- `skills/repository-gardener`: report-first entropy reduction with guarded fixes (ClawHub publishable).
+- `skills/session-viewer`: local JSONL session to searchable HTML renderer.

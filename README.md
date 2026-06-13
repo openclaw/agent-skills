@@ -17,6 +17,8 @@ repo.
   proof.
 - `handoff`: path-free prompt handoff workflow for delegating a task to another
   agent.
+- `repository-gardener`: report-first repository entropy reduction workflow
+  with guarded fix rules.
 - `session-viewer`: local searchable HTML viewer for agent session JSONL.
 
 Repo-specific product skills should stay in the repo they describe. For example,
@@ -138,6 +140,8 @@ skills/
   crabbox/
     SKILL.md
   handoff/
+    SKILL.md
+  repository-gardener/
     SKILL.md
   session-viewer/
     SKILL.md
