@@ -167,6 +167,25 @@ node --check skills/agent-transcript/scripts/agent-transcript
 node --test skills/agent-transcript/scripts/agent-transcript.test.mjs skills/session-viewer/scripts/session-viewer.test.ts
 ```
 
+## Publishing to ClawHub
+
+This repo is the *source of truth* for shared agent skills. ClawHub (clawhub.ai + the `clawhub` CLI) is the *registry and distribution surface*.
+
+To make a skill (including `repository-gardener`) appear in `clawhub search`, `clawhub install openclaw/<slug>`, and the ClawHub site:
+
+1. Add or update the skill under `skills/<name>/SKILL.md` (plus any `scripts/`).
+2. Update `README.md`, `skills.sh.json` (grouping), and this repo's `AGENTS.md` Layout if needed.
+3. Open a PR. The `clawhub-skill-publish.yml` workflow automatically runs a dry-run publish (via the reusable ClawHub action) for changes under `skills/**`, the manifest, README, or the workflow itself. This validates packaging without mutating the registry.
+4. After merge to `main`, a maintainer (or authorized user with the `CLAWHUB_TOKEN` secret) triggers publication:
+   - GitHub UI: Actions → "clawhub-skill-publish" → "Run workflow" (optionally pass `skill_path: skills/repository-gardener` for a single skill).
+   - Or locally: `clawhub login`, then `clawhub skill publish skills/<name>` (or `clawhub sync` for the catalog).
+
+The workflow lives at `.github/workflows/clawhub-skill-publish.yml` and calls `openclaw/clawhub/.github/workflows/skill-publish.yml@v0.21.0`.
+
+Never commit raw `SKILL.md` sources directly into the `openclaw/clawhub` repo — it deliberately ignores skill folders. Publish through the supported path instead.
+
+See also the `publish` mode in individual skills (e.g. `skills/repository-gardener/SKILL.md`).
+
 The validator checks every `skills/*/SKILL.md` for YAML frontmatter plus required
 `name` and `description`.
 

@@ -161,10 +161,15 @@ Disallowed fix classes:
 
 For OpenClaw ecosystem work, prefer this route:
 
-1. Keep the reusable gardening workflow as an installable skill.
-2. Publish or sync the skill through ClawHub.
-3. Use OpenClaw cron to schedule a prompt that invokes the skill in `report`
-   mode.
+1. Keep the reusable gardening workflow as an installable skill (source lives in
+   `openclaw/agent-skills`).
+2. Publish the skill through ClawHub using this repo's
+   `.github/workflows/clawhub-skill-publish.yml` (PR dry-run + manual dispatch
+   with `CLAWHUB_TOKEN`) or `clawhub skill publish skills/repository-gardener`.
+   This makes it discoverable via `clawhub search` / `clawhub install` and the
+   ClawHub site without ever checking SKILL.md sources into the clawhub repo.
+3. Use OpenClaw cron / Lobster / repo automation to schedule a prompt that
+   invokes the skill in `report` mode.
 4. Use repo-local policy to decide checks, exclusions, thresholds, and allowed
    fix classes.
 5. Open a core or product issue only after a real gardening run proves a
