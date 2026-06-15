@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import concurrent.futures
 import copy
 import json
@@ -684,6 +685,90 @@ def codex_config_isolation_flags(repo: Path) -> list[str]:
     ]
 
 
+def parse_codex_auth_config_fallback(text: str) -> dict[str, Any]:
+    config: dict[str, Any] = {}
+    pending_key: str | None = None
+    pending_value: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if pending_key is not None:
+            pending_value.append(raw_line)
+            try:
+                config[pending_key] = ast.literal_eval("\n".join(pending_value))
+            except SyntaxError:
+                continue
+            except ValueError:
+                pending_key = None
+                pending_value = []
+                continue
+            pending_key = None
+            pending_value = []
+            continue
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            break
+        match = re.fullmatch(
+            r"(cli_auth_credentials_store|forced_login_method|forced_chatgpt_workspace_id)\s*=\s*(.+)",
+            line,
+        )
+        if not match:
+            continue
+        key, value_text = match.groups()
+        try:
+            config[key] = ast.literal_eval(value_text)
+        except SyntaxError:
+            if value_text.lstrip().startswith("["):
+                pending_key = key
+                pending_value = [value_text]
+        except ValueError:
+            continue
+    return config
+
+
+def load_codex_auth_config(path: Path) -> dict[str, Any]:
+    try:
+        text = path.read_text()
+    except OSError:
+        return {}
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        return parse_codex_auth_config_fallback(text)
+    try:
+        config = tomllib.loads(text)
+    except ValueError:
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def codex_auth_config_flags() -> list[str]:
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    config = load_codex_auth_config(codex_home / "config.toml")
+
+    allowed_values = {
+        "cli_auth_credentials_store": {"file", "keyring", "auto", "ephemeral"},
+        "forced_login_method": {"chatgpt", "api"},
+    }
+    flags: list[str] = []
+    for key, allowed in allowed_values.items():
+        value = config.get(key)
+        if isinstance(value, str) and value in allowed:
+            flags.extend(["-c", f"{key}={json.dumps(value)}"])
+    workspace_ids = config.get("forced_chatgpt_workspace_id")
+    if isinstance(workspace_ids, str) and workspace_ids.strip():
+        flags.extend(["-c", f"forced_chatgpt_workspace_id={json.dumps(workspace_ids.strip())}"])
+    elif isinstance(workspace_ids, list):
+        normalized_workspace_ids = [
+            value.strip()
+            for value in workspace_ids
+            if isinstance(value, str) and value.strip()
+        ]
+        if normalized_workspace_ids:
+            flags.extend(["-c", f"forced_chatgpt_workspace_id={json.dumps(normalized_workspace_ids)}"])
+    return flags
+
+
 def codex_exec_isolation_flags() -> list[str]:
     return ["--ignore-user-config", "--ignore-rules"]
 
@@ -788,6 +873,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     if args.thinking:
         cmd.extend(["-c", f'model_reasoning_effort="{args.thinking}"'])
     cmd.extend(codex_config_isolation_flags(repo))
+    cmd.extend(codex_auth_config_flags())
     cmd.append("exec")
     if args.stream_engine_output:
         cmd.append("--json")
@@ -1447,6 +1533,16 @@ def self_test_engine_isolation() -> int:
 
         os.environ["AUTOREVIEW_FAKE_RECORD"] = str(record_path)
         os.environ["AUTOREVIEW_FAKE_PI_INVOCATIONS"] = str(pi_invocations_path)
+        codex_home = root / "codex-home"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text(
+            'model = "hostile-user-model"\n'
+            'cli_auth_credentials_store = "auto"\n'
+            'forced_login_method = "chatgpt"\n'
+            'forced_chatgpt_workspace_id = ["", " workspace-one ", "workspace-two"]\n'
+        )
+        old_codex_home = os.environ.get("CODEX_HOME")
+        os.environ["CODEX_HOME"] = str(codex_home)
         old_path = os.environ.get("PATH", "")
         os.environ["PATH"] = f"{repo}{os.pathsep}{old_path}"
         try:
@@ -1463,12 +1559,18 @@ def self_test_engine_isolation() -> int:
                 "--ignore-rules",
                 "project_doc_max_bytes=0",
                 expected_project_override,
+                'cli_auth_credentials_store="auto"',
+                'forced_login_method="chatgpt"',
+                'forced_chatgpt_workspace_id=["workspace-one", "workspace-two"]',
                 "--ephemeral",
                 str(repo),
                 "read-only",
             ]:
                 if required not in codex_argv:
                     raise SystemExit(f"codex isolation self-test failed: missing {required}")
+            for forbidden in ["hostile-user-model"]:
+                if forbidden in codex_argv:
+                    raise SystemExit(f"codex isolation self-test failed: leaked {forbidden}")
             if Path(codex_record["cwd"]).resolve() != repo.resolve():
                 raise SystemExit("codex isolation self-test failed: wrong cwd")
 
@@ -1573,6 +1675,10 @@ def self_test_engine_isolation() -> int:
             os.environ.pop("AUTOREVIEW_FAKE_PI_HELP", None)
             os.environ.pop("AUTOREVIEW_FAKE_PI_INVOCATIONS", None)
             os.environ["PATH"] = old_path
+            if old_codex_home is None:
+                os.environ.pop("CODEX_HOME", None)
+            else:
+                os.environ["CODEX_HOME"] = old_codex_home
 
     if parse_cli_version("2.1.169 (Claude Code)") != CLAUDE_SAFE_MODE_MIN_VERSION:
         raise SystemExit("claude version parsing self-test failed")
@@ -1580,6 +1686,23 @@ def self_test_engine_isolation() -> int:
         raise SystemExit("claude version parsing prefix self-test failed")
     if parse_cli_version("pi 0.79.0") != PI_TRUST_ISOLATION_MIN_VERSION:
         raise SystemExit("pi version parsing self-test failed")
+    fallback_config = parse_codex_auth_config_fallback(
+        'cli_auth_credentials_store = "ephemeral"\n'
+        'forced_login_method = "api"\n'
+        'forced_chatgpt_workspace_id = [\n'
+        '  "workspace-one",\n'
+        '  "workspace-two", # trailing comments are valid TOML\n'
+        ']\n'
+        'model = "must-not-be-forwarded"\n'
+        '[projects."/tmp/hostile"]\n'
+        'trust_level = "trusted"\n'
+    )
+    if fallback_config != {
+        "cli_auth_credentials_store": "ephemeral",
+        "forced_login_method": "api",
+        "forced_chatgpt_workspace_id": ["workspace-one", "workspace-two"],
+    }:
+        raise SystemExit("codex auth config fallback parser self-test failed")
     if "none" not in THINKING_LEVELS_BY_ENGINE["codex"]:
         raise SystemExit("codex thinking self-test failed")
     print("autoreview engine isolation self-test: ok")
