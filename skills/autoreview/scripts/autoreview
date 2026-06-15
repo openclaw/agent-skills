@@ -20,6 +20,69 @@ from typing import Any, Callable
 
 
 ENGINES = ("codex", "claude", "droid", "copilot", "pi", "opencode")
+SAFE_GIT_CONFIG_ARGS = (
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.pager=cat",
+    "-c",
+    "diff.external=",
+    "-c",
+    "diff.renames=false",
+    "-c",
+    "pager.diff=cat",
+    "-c",
+    "pager.log=cat",
+    "-c",
+    "pager.show=cat",
+)
+SAFE_DIFF_FLAGS = ("--no-ext-diff", "--no-textconv", "--no-renames")
+ENGINE_GIT_CONFIG_OVERRIDES = (
+    ("core.fsmonitor", "false"),
+    ("core.pager", "cat"),
+    ("diff.external", ""),
+    ("diff.renames", "false"),
+    ("pager.diff", "cat"),
+    ("pager.log", "cat"),
+    ("pager.show", "cat"),
+)
+SENSITIVE_PATH_PARTS = {
+    ".aws",
+    ".azure",
+    ".config/gcloud",
+    ".docker",
+    ".gnupg",
+    ".ssh",
+    "private",
+    "secrets",
+}
+SENSITIVE_NAME_PATTERNS = [
+    re.compile(r"(^|/)\.env($|[._/-])", re.IGNORECASE),
+    re.compile(r"(^|/)(id_rsa|id_dsa|id_ecdsa|id_ed25519)(\.pub)?$", re.IGNORECASE),
+    re.compile(r"\.(pem|p12|pfx|key)$", re.IGNORECASE),
+    re.compile(
+        r"(^|/)[^/]*(secret|token|credential|credentials|service[-_]?account|private[-_]?key|apikey|api[-_]?key)[^/]*$",
+        re.IGNORECASE,
+    ),
+]
+SECRET_VALUE_PATTERNS = [
+    re.compile(r"-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----"),
+    re.compile(
+        r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*(?:[\"'][A-Za-z0-9_./+=-]{12,}[\"']|[A-Za-z0-9_+=/-]{20,})"
+    ),
+    re.compile(r"(?i)bearer\s+[A-Za-z0-9._-]{20,}"),
+    re.compile(r"\b(?:sk|rk|pk|org|proj)-[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"\bnpm_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"),
+    re.compile(r"\b(?:A3T|AKIA|ASIA)[A-Z0-9]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
+    re.compile(r"\bya29\.[0-9A-Za-z_-]{20,}\b"),
+]
+MAX_BUNDLE_TEXT_BYTES = 180_000
+DEFAULT_ENGINE_PATHS = ("/usr/local/bin", "/usr/bin", "/bin")
 DEFAULT_MODEL_BY_ENGINE = {
     "codex": "gpt-5.5",
     "claude": "claude-fable-5",
@@ -93,7 +156,14 @@ SCHEMA: dict[str, Any] = {
 }
 
 
-def run(args: list[str], cwd: Path, *, input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run(
+    args: list[str],
+    cwd: Path,
+    *,
+    input_text: str | None = None,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         args,
         cwd=cwd,
@@ -101,6 +171,7 @@ def run(args: list[str], cwd: Path, *, input_text: str | None = None, check: boo
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=env,
     )
     if check and result.returncode != 0:
         cmd = " ".join(args)
@@ -114,6 +185,82 @@ def subprocess_env(extra: dict[str, str] | None) -> dict[str, str] | None:
     merged = os.environ.copy()
     merged.update(extra)
     return merged
+
+
+def safe_git_env() -> dict[str, str]:
+    return {
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": os.environ.get("HOME", str(Path.home())),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": os.pathsep.join(DEFAULT_ENGINE_PATHS),
+    }
+
+
+def safe_engine_path(repo: Path, extra_paths: list[Path] | None = None) -> str:
+    entries: list[str] = []
+    resolved_repo = repo.resolve()
+
+    def add(path: str | Path) -> None:
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute() or not candidate.exists():
+            return
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return
+        if is_within(resolved, resolved_repo):
+            return
+        value = str(resolved)
+        if value not in entries:
+            entries.append(value)
+
+    for path in extra_paths or []:
+        add(path)
+    for part in os.environ.get("PATH", "").split(os.pathsep):
+        if part:
+            add(part)
+    for path in DEFAULT_ENGINE_PATHS:
+        add(path)
+    return os.pathsep.join(entries)
+
+
+def safe_engine_env(
+    repo: Path,
+    extra_paths: list[Path] | None = None,
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    blocked_exact = {
+        "BASH_ENV",
+        "ENV",
+        "GIT_CONFIG",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_OPTIONAL_LOCKS",
+        "GIT_TERMINAL_PROMPT",
+        "LD_PRELOAD",
+        "NODE_OPTIONS",
+        "PYTHONHOME",
+        "PYTHONPATH",
+    }
+    blocked_prefixes = ("GIT_", "DYLD_")
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in blocked_exact and not any(key.startswith(prefix) for prefix in blocked_prefixes)
+    }
+    env["PATH"] = safe_engine_path(repo, extra_paths)
+    env["GIT_CONFIG_COUNT"] = str(len(ENGINE_GIT_CONFIG_OVERRIDES))
+    for index, (key, value) in enumerate(ENGINE_GIT_CONFIG_OVERRIDES):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
+    env.update(extra or {})
+    return env
 
 
 def parse_ps_time(value: str) -> float:
@@ -308,7 +455,7 @@ def run_with_heartbeat(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        env=subprocess_env(env),
+        env=env,
     )
     first_communicate = True
     metrics = sample_process_metrics(resolve_root, proc.pid)
@@ -344,7 +491,7 @@ def run_with_stream(
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
-        env=subprocess_env(env),
+        env=env,
     )
     events: queue.Queue[tuple[str, str | None]] = queue.Queue()
     stdout_parts: list[str] = []
@@ -404,7 +551,16 @@ def run_with_stream(
 
 
 def git(repo: Path, *args: str, check: bool = True) -> str:
-    return run([resolve_command("git", repo), *args], repo, check=check).stdout
+    return run(
+        [resolve_command("git", repo), "--no-optional-locks", *SAFE_GIT_CONFIG_ARGS, *args],
+        repo,
+        check=check,
+        env=safe_git_env(),
+    ).stdout
+
+
+def git_path_list(repo: Path, *args: str, check: bool = True) -> list[str]:
+    return [path for path in git(repo, *args, check=check).split("\0") if path]
 
 
 def repo_root() -> Path:
@@ -414,10 +570,11 @@ def repo_root() -> Path:
     if not git_bin:
         raise SystemExit("git executable not found. Install Git or add it to PATH.")
     result = subprocess.run(
-        [git_bin, "rev-parse", "--show-toplevel"],
+        [git_bin, "--no-optional-locks", *SAFE_GIT_CONFIG_ARGS, "rev-parse", "--show-toplevel"],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=safe_git_env(),
     )
     if result.returncode != 0:
         raise SystemExit("autoreview must run inside a git repository")
@@ -523,6 +680,23 @@ def first_executable_candidate(path: Path, *, reject_root: Path | None = None) -
     return None
 
 
+def validate_git_ref(repo: Path, ref: str, label: str) -> str:
+    if not ref or ref.startswith("-") or ":" in ref or "\0" in ref or any(char.isspace() for char in ref):
+        raise SystemExit(f"unsafe {label} ref: {ref}")
+    result = git(
+        repo,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "--end-of-options",
+        f"{ref}^{{commit}}",
+        check=False,
+    )
+    if not result:
+        raise SystemExit(f"unknown {label} ref: {ref}")
+    return ref
+
+
 def bounded(text: str, limit: int = 180_000) -> str:
     if len(text) <= limit:
         return text
@@ -536,29 +710,139 @@ def bounded_field(text: str, limit: int) -> str:
     return text[: max(0, limit - len(suffix))] + suffix
 
 
-def read_text(path: Path, limit: int = 40_000) -> str:
+def read_prefix(path: Path, limit: int) -> tuple[bytes, bool]:
     try:
-        data = path.read_bytes()
+        with path.open("rb") as handle:
+            data = handle.read(limit + 1)
     except OSError as exc:
+        raise SystemExit(f"unreadable file: {path}: {exc}") from exc
+    return data[:limit], len(data) > limit
+
+
+def read_text(path: Path, limit: int = MAX_BUNDLE_TEXT_BYTES) -> str:
+    try:
+        data, truncated = read_prefix(path, limit)
+    except SystemExit as exc:
         return f"[unreadable: {exc}]"
     if b"\0" in data:
         return "[binary file omitted]"
     text = data.decode("utf-8", errors="replace")
-    return bounded(text, limit)
+    if len(text) > limit:
+        text = text[:limit]
+        truncated = True
+    if truncated:
+        return text + f"\n\n[truncated at {limit} characters]\n"
+    return text
+
+
+def path_has_sensitive_part(rel: str | Path) -> bool:
+    normalized = Path(rel).as_posix().lower()
+    if "/.config/gcloud/" in f"/{normalized}/":
+        return True
+    return any(part.lower() in SENSITIVE_PATH_PARTS for part in Path(rel).parts)
+
+
+def raw_repo_path_has_symlink_component(repo: Path, rel_path: Path) -> bool:
+    current = repo.resolve()
+    for part in rel_path.parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+        if not current.exists():
+            break
+    return False
+
+
+def secret_text_risk(text: str) -> bool:
+    return any(pattern.search(text) for pattern in SECRET_VALUE_PATTERNS)
+
+
+def require_no_secret_values(label: str, text: str) -> None:
+    if secret_text_risk(text):
+        raise SystemExit(
+            "refusing to include secret-like content in review bundle; "
+            f"clean or redact {label} before running autoreview"
+        )
+
+
+def file_bundle_risk(
+    repo: Path,
+    path: Path,
+    rel: str,
+    *,
+    allow_binary_omission: bool = False,
+) -> str | None:
+    normalized = rel.replace(os.sep, "/")
+    if path_has_sensitive_part(normalized):
+        return "sensitive path"
+    for pattern in SENSITIVE_NAME_PATTERNS:
+        if pattern.search(normalized):
+            return "sensitive filename"
+    if path.is_symlink():
+        return "symlink"
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        return f"unreadable file: {exc}"
+    if not is_within(resolved, repo.resolve()):
+        return "path outside repository"
+    if not path.is_file():
+        return "not a regular file"
+    try:
+        data, _ = read_prefix(path, MAX_BUNDLE_TEXT_BYTES)
+    except SystemExit as exc:
+        return str(exc)
+    if b"\0" in data:
+        return None if allow_binary_omission else "binary file"
+    if secret_text_risk(data.decode("utf-8", errors="replace")):
+        return "secret-like content"
+    return None
+
+
+def safe_untracked_files(repo: Path) -> list[str]:
+    files = git_path_list(repo, "ls-files", "--others", "--exclude-standard", "-z")
+    blocked: list[str] = []
+    included: list[str] = []
+    for rel in files:
+        risk = file_bundle_risk(repo, repo / rel, rel, allow_binary_omission=True)
+        if risk:
+            blocked.append(f"{rel} ({risk})")
+        else:
+            included.append(rel)
+    if blocked:
+        details = "\n".join(f"- {item}" for item in blocked[:20])
+        more = f"\n... {len(blocked) - 20} more" if len(blocked) > 20 else ""
+        raise SystemExit(
+            "refusing to include untracked sensitive files in review bundle; "
+            "stage, ignore, remove, or redact them before running autoreview:\n"
+            f"{details}{more}"
+        )
+    return included
+
+
+def local_status(repo: Path, untracked: list[str]) -> str:
+    status = git(repo, "status", "--short", "--untracked-files=no").rstrip()
+    lines = [status] if status else []
+    lines.extend(f"?? {rel}" for rel in untracked)
+    return "\n".join(lines)
 
 
 def local_bundle(repo: Path) -> str:
+    staged_patch = git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--patch")
+    unstaged_patch = git(repo, "diff", *SAFE_DIFF_FLAGS, "--patch")
+    untracked = safe_untracked_files(repo)
+    if not staged_patch.strip() and not unstaged_patch.strip() and not untracked:
+        raise SystemExit("no local changes to review")
     parts = [
         "# Git Status",
-        git(repo, "status", "--short"),
+        local_status(repo, untracked),
         "# Staged Diff",
-        git(repo, "diff", "--cached", "--stat"),
-        bounded(git(repo, "diff", "--cached", "--patch", "--find-renames")),
+        git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--stat"),
+        bounded(staged_patch),
         "# Unstaged Diff",
-        git(repo, "diff", "--stat"),
-        bounded(git(repo, "diff", "--patch", "--find-renames")),
+        git(repo, "diff", *SAFE_DIFF_FLAGS, "--stat"),
+        bounded(unstaged_patch),
     ]
-    untracked = [line for line in git(repo, "ls-files", "--others", "--exclude-standard").splitlines() if line]
     if untracked:
         parts.append("# Untracked Files")
         for rel in untracked:
@@ -568,24 +852,57 @@ def local_bundle(repo: Path) -> str:
 
 
 def branch_bundle(repo: Path, base_ref: str) -> str:
-    git(repo, "fetch", "origin", "--quiet", check=False)
+    base_ref = validate_git_ref(repo, base_ref, "base")
+    branch_patch = git(
+        repo,
+        "diff",
+        *SAFE_DIFF_FLAGS,
+        "--patch",
+        "--end-of-options",
+        f"{base_ref}...HEAD",
+    )
     return "\n\n".join(
         [
             "# Branch Diff",
             f"base: {base_ref}",
-            git(repo, "diff", "--stat", f"{base_ref}...HEAD"),
-            bounded(git(repo, "diff", "--patch", "--find-renames", f"{base_ref}...HEAD")),
+            git(
+                repo,
+                "diff",
+                *SAFE_DIFF_FLAGS,
+                "--stat",
+                "--end-of-options",
+                f"{base_ref}...HEAD",
+            ),
+            bounded(branch_patch),
         ]
     )
 
 
 def commit_bundle(repo: Path, commit_ref: str) -> str:
+    commit_ref = validate_git_ref(repo, commit_ref, "commit")
+    commit_patch = git(
+        repo,
+        "show",
+        *SAFE_DIFF_FLAGS,
+        "--patch",
+        "--format=fuller",
+        "--end-of-options",
+        commit_ref,
+    )
     return "\n\n".join(
         [
             "# Commit Diff",
             f"commit: {commit_ref}",
-            git(repo, "show", "--stat", "--format=fuller", commit_ref),
-            bounded(git(repo, "show", "--patch", "--find-renames", "--format=fuller", commit_ref)),
+            git(
+                repo,
+                "show",
+                *SAFE_DIFF_FLAGS,
+                "--stat",
+                "--format=fuller",
+                "--end-of-options",
+                commit_ref,
+            ),
+            bounded(commit_patch),
         ]
     )
 
@@ -593,40 +910,77 @@ def commit_bundle(repo: Path, commit_ref: str) -> str:
 def review_paths(repo: Path, target: str, target_ref: str | None, commit_ref: str) -> set[str]:
     names: set[str] = set()
     if target == "local":
-        sources = [
-            git(repo, "diff", "--name-only", "--cached"),
-            git(repo, "diff", "--name-only"),
-            git(repo, "ls-files", "--others", "--exclude-standard"),
-        ]
+        names.update(git_path_list(repo, "diff", *SAFE_DIFF_FLAGS, "--name-only", "--cached", "-z"))
+        names.update(git_path_list(repo, "diff", *SAFE_DIFF_FLAGS, "--name-only", "-z"))
+        names.update(safe_untracked_files(repo))
     elif target == "branch":
         assert target_ref
-        sources = [git(repo, "diff", "--name-only", f"{target_ref}...HEAD")]
+        target_ref = validate_git_ref(repo, target_ref, "base")
+        names.update(
+            git_path_list(
+                repo,
+                "diff",
+                *SAFE_DIFF_FLAGS,
+                "--name-only",
+                "-z",
+                "--end-of-options",
+                f"{target_ref}...HEAD",
+            )
+        )
     else:
-        sources = [git(repo, "show", "--name-only", "--format=", commit_ref)]
-    for source in sources:
-        for line in source.splitlines():
-            path = line.strip()
-            if path:
-                names.add(path)
+        commit_ref = validate_git_ref(repo, commit_ref, "commit")
+        names.update(
+            git_path_list(
+                repo,
+                "show",
+                *SAFE_DIFF_FLAGS,
+                "--name-only",
+                "--format=",
+                "-z",
+                "--end-of-options",
+                commit_ref,
+            )
+        )
     return names
 
 
-def load_extra_prompt(args: argparse.Namespace) -> str:
+def validate_evidence_file(repo: Path, raw_path: str, label: str) -> tuple[Path, str]:
+    original = Path(raw_path)
+    if original.is_absolute() or ".." in original.parts or not original.parts:
+        raise SystemExit(f"{label} must be a repo-relative path: {raw_path}")
+    raw_rel = original.as_posix()
+    if path_has_sensitive_part(raw_rel):
+        raise SystemExit(f"refusing to include sensitive {label}: {raw_rel}")
+    if raw_repo_path_has_symlink_component(repo, original):
+        raise SystemExit(f"refusing to include symlinked {label}: {raw_path}")
+    path = (repo / original).resolve()
+    if not is_within(path, repo.resolve()):
+        raise SystemExit(f"{label} must be inside the reviewed repository: {raw_path}")
+    rel = str(path.relative_to(repo.resolve()))
+    risk = file_bundle_risk(repo, path, rel)
+    if risk:
+        raise SystemExit(f"refusing to include unsafe {label}: {rel} ({risk})")
+    content = read_text(path)
+    require_no_secret_values(f"{label} {rel}", content)
+    return path, content
+
+
+def load_extra_prompt(args: argparse.Namespace, repo: Path) -> str:
     chunks: list[str] = []
     for value in args.prompt or []:
+        require_no_secret_values("--prompt", value)
         chunks.append(value)
     for path in args.prompt_file or []:
-        chunks.append(Path(path).read_text())
+        _, content = validate_evidence_file(repo, path, "--prompt-file")
+        chunks.append(content)
     return "\n\n".join(chunks)
 
 
-def load_datasets(args: argparse.Namespace) -> str:
+def load_datasets(args: argparse.Namespace, repo: Path) -> str:
     chunks: list[str] = []
     for spec in args.dataset or []:
-        path = Path(spec)
-        if path.is_dir():
-            raise SystemExit(f"--dataset must be a file, got directory: {path}")
-        chunks.append(f"# Dataset: {path}\n{read_text(path)}")
+        path, content = validate_evidence_file(repo, spec, "--dataset")
+        chunks.append(f"# Dataset: {path.relative_to(repo.resolve())}\n{content}")
     return "\n\n".join(chunks)
 
 
@@ -805,7 +1159,8 @@ def parse_cli_version(text: str) -> tuple[int, int, int] | None:
 
 def ensure_claude_isolation_supported(args: argparse.Namespace, repo: Path) -> None:
     claude_bin = resolve_command(args.claude_bin, repo)
-    result = run([claude_bin, "--version"], repo, check=False)
+    engine_env = safe_engine_env(repo, [Path(claude_bin).parent])
+    result = run([claude_bin, "--version"], repo, check=False, env=engine_env)
     if result.returncode != 0:
         raise SystemExit(f"claude engine requires Claude Code >= {format_version(CLAUDE_SAFE_MODE_MIN_VERSION)}; --version failed")
     version = parse_cli_version(result.stdout or result.stderr)
@@ -816,7 +1171,7 @@ def ensure_claude_isolation_supported(args: argparse.Namespace, repo: Path) -> N
             f"claude engine requires Claude Code >= {format_version(CLAUDE_SAFE_MODE_MIN_VERSION)} "
             f"for --safe-mode (found {format_version(version)})"
         )
-    help_result = run([claude_bin, "--help"], repo, check=False)
+    help_result = run([claude_bin, "--help"], repo, check=False, env=engine_env)
     help_text = f"{help_result.stdout}\n{help_result.stderr}"
     required_flags = ["--safe-mode", "--setting-sources", "--strict-mcp-config", "--disallowedTools"]
     missing = [flag for flag in required_flags if flag not in help_text]
@@ -827,10 +1182,11 @@ def ensure_claude_isolation_supported(args: argparse.Namespace, repo: Path) -> N
 
 def ensure_pi_isolation_supported(args: argparse.Namespace, repo: Path) -> str:
     pi_bin = resolve_command(args.pi_bin, repo)
+    engine_env = safe_engine_env(repo, [Path(pi_bin).parent])
     with tempfile.TemporaryDirectory(prefix="autoreview-pi-probe.") as tempdir:
         probe_cwd = Path(tempdir)
-        result = run([pi_bin, "--version"], probe_cwd, check=False)
-        help_result = run([pi_bin, "--help"], probe_cwd, check=False)
+        result = run([pi_bin, "--version"], probe_cwd, check=False, env=engine_env)
+        help_result = run([pi_bin, "--help"], probe_cwd, check=False, env=engine_env)
     if result.returncode != 0:
         raise SystemExit(f"pi engine requires Pi >= {format_version(PI_TRUST_ISOLATION_MIN_VERSION)}; --version failed")
     version = parse_cli_version(f"{result.stdout}\n{result.stderr}")
@@ -899,6 +1255,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         label="codex",
         stream_output=args.stream_engine_output,
         stream_display=CodexStreamDisplay() if args.stream_engine_output else None,
+        env=safe_engine_env(repo, [Path(cmd[0]).parent]),
     )
     try:
         output = output_path.read_text()
@@ -941,6 +1298,7 @@ def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         label="claude",
         stream_output=args.stream_engine_output,
         stream_display=ClaudeStreamDisplay() if args.stream_engine_output else None,
+        env=safe_engine_env(repo, [Path(cmd[0]).parent]),
     )
     if result.returncode != 0:
         raise SystemExit(f"claude engine failed ({result.returncode})\n{result.stderr or result.stdout}")
@@ -966,7 +1324,13 @@ def run_droid(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         cmd.extend(["-r", args.thinking])
     if not args.tools:
         cmd.extend(["--disabled-tools", "*"])
-    result = run_with_heartbeat(cmd, repo, label="droid", stream_output=args.stream_engine_output)
+    result = run_with_heartbeat(
+        cmd,
+        repo,
+        label="droid",
+        stream_output=args.stream_engine_output,
+        env=safe_engine_env(repo, [Path(cmd[0]).parent]),
+    )
     prompt_path.unlink(missing_ok=True)
     if result.returncode != 0:
         raise SystemExit(f"droid engine failed ({result.returncode})\n{result.stderr or result.stdout}")
@@ -997,18 +1361,23 @@ def run_copilot(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         ]
         if args.model:
             cmd.extend(["--model", args.model])
-        cmd.extend(
-            [
-                "--available-tools=read_agent,rg,view,web_fetch",
-                "--allow-tool=read_agent",
-                "--allow-tool=rg",
-                "--allow-tool=view",
-                "--allow-tool=web_fetch",
-            ]
-        )
+        available_tools = ["read_agent", "rg", "view"]
+        allowed_tools = available_tools[:]
         if args.web_search:
+            available_tools.append("web_fetch")
+            allowed_tools.append("web_fetch")
             cmd.append("--allow-all-urls")
-        result = run_with_heartbeat(cmd, Path(tempdir), label="copilot", stream_output=args.stream_engine_output, resolve_root=repo)
+        cmd.append(f"--available-tools={','.join(available_tools)}")
+        for tool in allowed_tools:
+            cmd.append(f"--allow-tool={tool}")
+        result = run_with_heartbeat(
+            cmd,
+            Path(tempdir),
+            label="copilot",
+            stream_output=args.stream_engine_output,
+            resolve_root=repo,
+            env=safe_engine_env(repo, [Path(cmd[0]).parent]),
+        )
     if result.returncode != 0:
         raise SystemExit(f"copilot engine failed ({result.returncode})\n{result.stderr or result.stdout}")
     return result.stdout
@@ -1042,7 +1411,11 @@ def run_opencode(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             input_text=prompt,
             label="opencode",
             stream_output=args.stream_engine_output,
-            env=opencode_review_env(args.web_search),
+            env=safe_engine_env(
+                repo,
+                [Path(cmd[0]).parent],
+                opencode_review_env(args.web_search),
+            ),
             resolve_root=repo,
         )
     if result.returncode != 0:
@@ -1073,6 +1446,7 @@ def run_pi(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             label="pi",
             stream_output=args.stream_engine_output,
             resolve_root=repo,
+            env=safe_engine_env(repo, [Path(cmd[0]).parent]),
         )
     if result.returncode != 0:
         raise SystemExit(f"pi engine failed ({result.returncode})\n{result.stderr or result.stdout}")
@@ -2580,7 +2954,14 @@ def main() -> int:
     else:
         bundle = commit_bundle(repo, args.commit)
         target_ref = args.commit
-    prompt = build_prompt(repo, target, target_ref, bundle, load_extra_prompt(args), load_datasets(args))
+    prompt = build_prompt(
+        repo,
+        target,
+        target_ref,
+        bundle,
+        load_extra_prompt(args, repo),
+        load_datasets(args, repo),
+    )
     changed_paths = review_paths(repo, target, target_ref, args.commit)
     print(f"bundle: {len(prompt)} chars")
 

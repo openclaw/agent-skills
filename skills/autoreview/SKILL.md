@@ -92,10 +92,10 @@ Branch/PR work:
 "$AUTOREVIEW" --mode branch --base origin/main
 ```
 
-Optional review context is first-class:
+Optional review context is first-class. Prompt files and datasets must be repo-relative so review bundles cannot pull arbitrary host files:
 
 ```bash
-"$AUTOREVIEW" --mode branch --base origin/main --prompt-file /tmp/review-notes.md --dataset /tmp/evidence.json
+"$AUTOREVIEW" --mode branch --base origin/main --prompt-file review-notes.md --dataset evidence.json
 ```
 
 If an open PR exists, use its actual base:
@@ -278,12 +278,13 @@ The helper:
 - accepts `--mode uncommitted` as an alias for `--mode local`
 - otherwise uses current PR base if `gh pr view` works
 - otherwise uses `origin/main` for non-main branches
+- does not fetch automatically during branch review; the selected base ref must already resolve locally
 - supports `--engine codex`, `claude`, `droid`, `copilot`, `pi`, and `opencode`; default is `AUTOREVIEW_ENGINE` or `codex`; Codex should remain the default when nothing is set
 - resolves bare `git`, `gh`, reviewer, and PowerShell shell commands from absolute `PATH` entries only, never from the reviewed checkout; explicit relative `--*-bin` paths are resolved from the reviewed repository root
 - use `--mode commit --commit <ref>` for already-committed work, especially clean `main` after landing
 - should be left in `--mode auto` or forced to `--mode branch` for PR/branch work; do not force `--mode local` after committing
 - writes only to stdout unless `--output`, `--json-output`, or live streamed engine stderr is set
-- supports `--dry-run`, `--parallel-tests`, `--parallel-tests-shell`, `--prompt`, `--prompt-file`, `--dataset`, `--no-tools`, `--no-web-search`, and commit refs
+- supports `--dry-run`, `--parallel-tests`, `--parallel-tests-shell`, `--prompt`, repo-relative `--prompt-file`, repo-relative `--dataset`, `--no-tools`, `--no-web-search`, and commit refs
 - supports `--stream-engine-output` or `AUTOREVIEW_STREAM_ENGINE_OUTPUT=1` for live engine text while preserving structured validation; Codex and Claude hide tool/file event details, emit compact activity summaries, and report usage at turn completion
 - supports opt-in review panels with `--panel` / `--reviewers`, plus per-engine `--model`, `--thinking`, and Claude `--fallback-model`
 - uses built-in model defaults `codex=gpt-5.5` and `claude=claude-fable-5`; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
