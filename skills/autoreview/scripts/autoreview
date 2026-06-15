@@ -131,9 +131,12 @@ def parse_ps_time(value: str) -> float:
         return 0.0
 
 
-def process_pids(pid: int) -> list[str]:
+def process_pids(repo: Path, pid: int) -> list[str]:
+    ps = find_command("ps", repo)
+    if not ps:
+        return [str(pid)]
     result = subprocess.run(
-        ["ps", "-A", "-o", "pid=", "-o", "ppid="],
+        [ps, "-A", "-o", "pid=", "-o", "ppid="],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -149,11 +152,14 @@ def process_pids(pid: int) -> list[str]:
     return pids
 
 
-def sample_process_metrics(pid: int) -> tuple[float, float, int, str] | None:
+def sample_process_metrics(repo: Path, pid: int) -> tuple[float, float, int, str] | None:
+    ps = find_command("ps", repo)
+    if not ps:
+        return None
     try:
         result = subprocess.run(
             [
-                "ps",
+                ps,
                 "-o",
                 "state=",
                 "-o",
@@ -161,7 +167,7 @@ def sample_process_metrics(pid: int) -> tuple[float, float, int, str] | None:
                 "-o",
                 "time=",
                 "-p",
-                ",".join(process_pids(pid)),
+                ",".join(process_pids(repo, pid)),
             ],
             text=True,
             stdout=subprocess.PIPE,
@@ -210,12 +216,13 @@ def format_process_metrics(
 
 def emit_heartbeat(
     label: str,
+    repo: Path,
     started: float,
     proc: subprocess.Popen,
     metrics: tuple[float, float, int, str] | None,
 ) -> tuple[float, float, int, str] | None:
     elapsed = int(time.monotonic() - started)
-    next_metrics = sample_process_metrics(proc.pid)
+    next_metrics = sample_process_metrics(repo, proc.pid)
     metrics_text = format_process_metrics(metrics, next_metrics)
     print(f"review still running: {label} elapsed={elapsed}s pid={proc.pid}{metrics_text}", file=sys.stderr, flush=True)
     return next_metrics or metrics
@@ -278,7 +285,9 @@ def run_with_heartbeat(
     stream_output: bool = False,
     stream_display: Callable[[str, str], str | None] | None = None,
     env: dict[str, str] | None = None,
+    resolve_root: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    resolve_root = resolve_root or cwd
     if stream_output:
         return run_with_stream(
             args,
@@ -288,6 +297,7 @@ def run_with_heartbeat(
             heartbeat_seconds=heartbeat_seconds,
             stream_display=stream_display,
             env=env,
+            resolve_root=resolve_root,
         )
     started = time.monotonic()
     proc = subprocess.Popen(
@@ -300,7 +310,7 @@ def run_with_heartbeat(
         env=subprocess_env(env),
     )
     first_communicate = True
-    metrics = sample_process_metrics(proc.pid)
+    metrics = sample_process_metrics(resolve_root, proc.pid)
     while True:
         try:
             stdout, stderr = proc.communicate(
@@ -310,7 +320,7 @@ def run_with_heartbeat(
             return subprocess.CompletedProcess(args, int(proc.returncode or 0), stdout, stderr)
         except subprocess.TimeoutExpired:
             first_communicate = False
-            metrics = emit_heartbeat(label, started, proc, metrics)
+            metrics = emit_heartbeat(label, resolve_root, started, proc, metrics)
 
 
 def run_with_stream(
@@ -322,6 +332,7 @@ def run_with_stream(
     heartbeat_seconds: int,
     stream_display: Callable[[str, str], str | None] | None,
     env: dict[str, str] | None = None,
+    resolve_root: Path,
 ) -> subprocess.CompletedProcess[str]:
     started = time.monotonic()
     proc = subprocess.Popen(
@@ -362,14 +373,14 @@ def run_with_stream(
         thread.start()
     stdin_thread = threading.Thread(target=write_stdin, daemon=True)
     stdin_thread.start()
-    metrics = sample_process_metrics(proc.pid)
+    metrics = sample_process_metrics(resolve_root, proc.pid)
 
     open_streams = 2
     while open_streams:
         try:
             name, line = events.get(timeout=heartbeat_seconds)
         except queue.Empty:
-            metrics = emit_heartbeat(label, started, proc, metrics)
+            metrics = emit_heartbeat(label, resolve_root, started, proc, metrics)
             continue
         if line is None:
             open_streams -= 1
@@ -911,7 +922,7 @@ def run_copilot(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         )
         if args.web_search:
             cmd.append("--allow-all-urls")
-        result = run_with_heartbeat(cmd, Path(tempdir), label="copilot", stream_output=args.stream_engine_output)
+        result = run_with_heartbeat(cmd, Path(tempdir), label="copilot", stream_output=args.stream_engine_output, resolve_root=repo)
     if result.returncode != 0:
         raise SystemExit(f"copilot engine failed ({result.returncode})\n{result.stderr or result.stdout}")
     return result.stdout
@@ -946,6 +957,7 @@ def run_opencode(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             label="opencode",
             stream_output=args.stream_engine_output,
             env=opencode_review_env(args.web_search),
+            resolve_root=repo,
         )
     if result.returncode != 0:
         raise SystemExit(f"opencode engine failed ({result.returncode})\n{result.stderr or result.stdout}")
@@ -974,6 +986,7 @@ def run_pi(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             input_text=prompt,
             label="pi",
             stream_output=args.stream_engine_output,
+            resolve_root=repo,
         )
     if result.returncode != 0:
         raise SystemExit(f"pi engine failed ({result.returncode})\n{result.stderr or result.stdout}")
@@ -1412,10 +1425,12 @@ def self_test_engine_isolation() -> int:
         opencode_bin = root / "opencode"
         record_path = root / "record.json"
         pi_invocations_path = root / "pi-invocations.jsonl"
+        hostile_ps_path = root / "hostile-ps-ran"
         write_executable(codex_bin, fake_codex_script())
         write_executable(claude_bin, fake_claude_script())
         write_executable(pi_bin, fake_pi_script())
         write_executable(opencode_bin, fake_opencode_script())
+        write_executable(repo / "ps", f"#!/usr/bin/env python3\nfrom pathlib import Path\nPath({str(hostile_ps_path)!r}).write_text('ran')\n")
 
         args = argparse.Namespace(
             codex_bin=str(codex_bin),
@@ -1432,7 +1447,13 @@ def self_test_engine_isolation() -> int:
 
         os.environ["AUTOREVIEW_FAKE_RECORD"] = str(record_path)
         os.environ["AUTOREVIEW_FAKE_PI_INVOCATIONS"] = str(pi_invocations_path)
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{repo}{os.pathsep}{old_path}"
         try:
+            sample_process_metrics(repo, os.getpid())
+            if hostile_ps_path.exists():
+                raise SystemExit("heartbeat metrics isolation self-test failed: repo-local ps executed")
+
             run_codex(args, repo, "review hostile patch")
             codex_record = json.loads(record_path.read_text())
             codex_argv = codex_record["argv"]
@@ -1506,6 +1527,8 @@ def self_test_engine_isolation() -> int:
             for disabled_tool in ("bash", "edit", "skill", "task", "todowrite", "write"):
                 if config.get("tools", {}).get(disabled_tool) is not False:
                     raise SystemExit(f"opencode isolation self-test failed: {disabled_tool} tool not disabled")
+            if hostile_ps_path.exists():
+                raise SystemExit("heartbeat metrics isolation self-test failed: repo-local ps executed")
 
             os.environ["AUTOREVIEW_FAKE_CLAUDE_VERSION"] = "2.1.168 (Claude Code)"
             try:
@@ -1549,6 +1572,7 @@ def self_test_engine_isolation() -> int:
             os.environ.pop("AUTOREVIEW_FAKE_PI_VERSION", None)
             os.environ.pop("AUTOREVIEW_FAKE_PI_HELP", None)
             os.environ.pop("AUTOREVIEW_FAKE_PI_INVOCATIONS", None)
+            os.environ["PATH"] = old_path
 
     if parse_cli_version("2.1.169 (Claude Code)") != CLAUDE_SAFE_MODE_MIN_VERSION:
         raise SystemExit("claude version parsing self-test failed")
