@@ -102,6 +102,8 @@ CLAUDE_SAFE_MODE_MIN_VERSION = (2, 1, 169)
 # @earendil-works/pi-coding-agent 0.79.0 CLI line. Older legacy binaries can
 # ignore unknown flags, so the Pi engine must fail closed below this floor.
 PI_TRUST_ISOLATION_MIN_VERSION = (0, 79, 0)
+SUBPROCESS_TEXT_ENCODING = "utf-8"
+SUBPROCESS_TEXT_ERRORS = "replace"
 
 
 SCHEMA: dict[str, Any] = {
@@ -171,6 +173,8 @@ def run(
         cwd=cwd,
         input=input_text,
         text=True,
+        encoding=SUBPROCESS_TEXT_ENCODING,
+        errors=SUBPROCESS_TEXT_ERRORS,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=env,
@@ -209,9 +213,9 @@ def safe_engine_path(repo: Path, extra_paths: list[Path] | None = None) -> str:
 
     def add(path: str | Path) -> None:
         candidate = Path(path).expanduser()
-        if not candidate.is_absolute() or not candidate.exists():
-            return
         try:
+            if not candidate.is_absolute() or not candidate.exists():
+                return
             resolved = candidate.resolve()
         except OSError:
             return
@@ -288,6 +292,8 @@ def process_pids(repo: Path, pid: int) -> list[str]:
     result = subprocess.run(
         [ps, "-A", "-o", "pid=", "-o", "ppid="],
         text=True,
+        encoding=SUBPROCESS_TEXT_ENCODING,
+        errors=SUBPROCESS_TEXT_ERRORS,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         check=False,
@@ -320,6 +326,8 @@ def sample_process_metrics(repo: Path, pid: int) -> tuple[float, float, int, str
                 ",".join(process_pids(repo, pid)),
             ],
             text=True,
+            encoding=SUBPROCESS_TEXT_ENCODING,
+            errors=SUBPROCESS_TEXT_ERRORS,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             check=False,
@@ -457,6 +465,8 @@ def run_with_heartbeat(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding=SUBPROCESS_TEXT_ENCODING,
+        errors=SUBPROCESS_TEXT_ERRORS,
         env=env,
     )
     first_communicate = True
@@ -492,6 +502,8 @@ def run_with_stream(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding=SUBPROCESS_TEXT_ENCODING,
+        errors=SUBPROCESS_TEXT_ERRORS,
         bufsize=1,
         env=env,
     )
@@ -574,6 +586,8 @@ def repo_root() -> Path:
     result = subprocess.run(
         [git_bin, "--no-optional-locks", *SAFE_GIT_CONFIG_ARGS, "rev-parse", "--show-toplevel"],
         text=True,
+        encoding=SUBPROCESS_TEXT_ENCODING,
+        errors=SUBPROCESS_TEXT_ERRORS,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=safe_git_env(),
@@ -2010,9 +2024,14 @@ def is_structured_output_failure(message: str) -> bool:
     )
 
 
-def write_executable(path: Path, text: str) -> None:
-    path.write_text(text)
+def write_executable(path: Path, text: str) -> Path:
+    path.write_text(text, encoding="utf-8")
     path.chmod(0o755)
+    if os.name != "nt":
+        return path
+    wrapper = path.with_name(f"{path.name}.cmd")
+    wrapper.write_text(f'@echo off\r\n"{sys.executable}" "{path}" %*\r\n', encoding="utf-8")
+    return wrapper
 
 
 def create_hostile_repo(repo: Path) -> None:
@@ -2290,12 +2309,12 @@ def self_test_engine_isolation() -> int:
         pi_invocations_path = root / "pi-invocations.jsonl"
         hostile_ps_path = root / "hostile-ps-ran"
         cursor_invocations_path = root / "cursor-invocations.jsonl"
-        write_executable(codex_bin, fake_codex_script())
-        write_executable(claude_bin, fake_claude_script())
-        write_executable(pi_bin, fake_pi_script())
-        write_executable(opencode_bin, fake_opencode_script())
+        codex_bin = write_executable(codex_bin, fake_codex_script())
+        claude_bin = write_executable(claude_bin, fake_claude_script())
+        pi_bin = write_executable(pi_bin, fake_pi_script())
+        opencode_bin = write_executable(opencode_bin, fake_opencode_script())
         write_executable(repo / "ps", f"#!/usr/bin/env python3\nfrom pathlib import Path\nPath({str(hostile_ps_path)!r}).write_text('ran')\n")
-        write_executable(cursor_bin, fake_cursor_script())
+        cursor_bin = write_executable(cursor_bin, fake_cursor_script())
 
         args = argparse.Namespace(
             codex_bin=str(codex_bin),
@@ -2740,6 +2759,8 @@ def self_test_opencode_real_project_isolation(args: argparse.Namespace) -> None:
             [opencode_bin, "debug", "config", "--pure"],
             cwd=repo,
             text=True,
+            encoding=SUBPROCESS_TEXT_ENCODING,
+            errors=SUBPROCESS_TEXT_ERRORS,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=subprocess_env(opencode_review_env(False)),

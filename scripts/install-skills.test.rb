@@ -7,6 +7,12 @@ require "open3"
 require "tmpdir"
 
 class InstallSkillsTest < Minitest::Test
+  def create_symlink_or_skip(source, target)
+    FileUtils.ln_s(source, target)
+  rescue NotImplementedError, Errno::EACCES
+    skip "symlink creation is not available for this user"
+  end
+
   def test_force_skips_target_that_is_source
     Dir.mktmpdir do |dir|
       FileUtils.mkdir_p(File.join(dir, "scripts"))
@@ -37,7 +43,7 @@ class InstallSkillsTest < Minitest::Test
       FileUtils.mkdir_p(File.join(dir, "target"))
       FileUtils.cp(File.join(__dir__, "install-skills"), File.join(dir, "repo", "scripts", "install-skills"))
       File.write(File.join(dir, "repo", "skills", "sample", "SKILL.md"), "---\nname: sample\ndescription: sample\n---\n")
-      FileUtils.ln_s(File.join(dir, "repo", "skills", "sample"), File.join(dir, "target", "sample"))
+      create_symlink_or_skip(File.join(dir, "repo", "skills", "sample"), File.join(dir, "target", "sample"))
 
       stdout, stderr, status = Open3.capture3(
         RbConfig.ruby,

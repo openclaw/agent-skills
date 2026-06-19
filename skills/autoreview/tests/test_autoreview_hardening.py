@@ -5,8 +5,10 @@ import argparse
 import os
 import runpy
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -82,6 +84,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.helper["branch_bundle"](repo, "origin/main")
 
     def test_git_path_list_preserves_newline_filenames(self) -> None:
+        if os.name == "nt":
+            self.skipTest("Windows filesystems do not support newline path components")
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
             rel = "line\nbreak.txt"
@@ -120,7 +124,12 @@ class AutoreviewHardeningTests(unittest.TestCase):
             target = repo / "notes.md"
             target.write_text("notes\n", encoding="utf-8")
             link = repo / "link.md"
-            link.symlink_to(target)
+            try:
+                link.symlink_to(target)
+            except OSError as exc:
+                if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                    self.skipTest("Windows symlink privilege is not available")
+                raise
             with self.assertRaisesRegex(SystemExit, "symlinked"):
                 self.helper["validate_evidence_file"](repo, "link.md", "--dataset")
 
@@ -158,6 +167,44 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 os.environ["PATH"] = old_path
 
             self.assertNotIn(str(repo.resolve()), env["PATH"].split(os.pathsep))
+
+    def test_safe_engine_env_ignores_inaccessible_path_entries(self) -> None:
+        old_path = os.environ.get("PATH", "")
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            blocked = root / "blocked"
+            os.environ["PATH"] = f"{blocked}{os.pathsep}{old_path}"
+            original_exists = Path.exists
+
+            def fake_exists(path: Path) -> bool:
+                if str(path) == str(blocked):
+                    raise PermissionError("access denied")
+                return original_exists(path)
+
+            try:
+                with mock.patch.object(Path, "exists", fake_exists):
+                    env = self.helper["safe_engine_env"](repo)
+            finally:
+                os.environ["PATH"] = old_path
+
+            self.assertNotIn(str(blocked), env["PATH"].split(os.pathsep))
+
+    def test_run_with_heartbeat_replaces_undecodable_engine_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            result = self.helper["run_with_heartbeat"](
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.stdout.buffer.write(b'\\x90\\n')",
+                ],
+                Path(tempdir),
+                label="decode-test",
+                heartbeat_seconds=1,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("\ufffd", result.stdout)
 
     def test_large_repo_relative_evidence_file_is_truncated(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -205,8 +252,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertIn("--allow-all-urls", captured[-1])
 
     def test_self_test_shortcut_runs_deterministic_checks(self) -> None:
+        command = [str(SCRIPT), "--self-test"]
+        if os.name == "nt":
+            command = [sys.executable, str(SCRIPT), "--self-test"]
         result = subprocess.run(
-            [str(SCRIPT), "--self-test"],
+            command,
             check=False,
             text=True,
             stdout=subprocess.PIPE,
