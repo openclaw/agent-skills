@@ -9,8 +9,10 @@ require "tmpdir"
 class InstallSkillsTest < Minitest::Test
   def create_symlink_or_skip(source, target)
     FileUtils.ln_s(source, target)
-  rescue NotImplementedError, Errno::EACCES
-    skip "symlink creation is not available for this user"
+  rescue NotImplementedError, SystemCallError => e
+    raise unless Gem.win_platform?
+
+    skip "symlink creation is not available for this Windows user: #{e.class}"
   end
 
   def test_force_skips_target_that_is_source
