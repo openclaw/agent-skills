@@ -1,91 +1,111 @@
-#!/usr/bin/env ruby
-# frozen_string_literal: true
+#!/usr/bin/env python3
 
-require "fileutils"
-require "optparse"
+from __future__ import annotations
 
-def same_real_path?(left, right)
-  File.realpath(left) == File.realpath(right)
-rescue Errno::ENOENT
-  false
-end
+import argparse
+import shutil
+import sys
+from pathlib import Path
 
-root = File.expand_path("..", __dir__)
-skills_root = File.join(root, "skills")
 
-options = {
-  target: File.expand_path("~/.agents/skills"),
-  mode: "symlink",
-  dry_run: false,
-  force: false,
-  list: false,
-  skills: []
-}
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="scripts/install-skills",
+        usage="scripts/install-skills [options] [skill ...]",
+    )
+    parser.add_argument(
+        "--target",
+        default="~/.agents/skills",
+        metavar="DIR",
+        help="Install target. Default: ~/.agents/skills",
+    )
+    parser.add_argument(
+        "--mode",
+        default="symlink",
+        metavar="MODE",
+        help="symlink or copy. Default: symlink",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print actions without changing files"
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="Replace an existing skill at the target path"
+    )
+    parser.add_argument("--list", action="store_true", help="List available skills and exit")
+    parser.add_argument("skills", nargs="*")
+    return parser.parse_args(argv)
 
-parser = OptionParser.new do |opts|
-  opts.banner = "Usage: scripts/install-skills [options] [skill ...]"
-  opts.on("--target DIR", "Install target. Default: ~/.agents/skills") { |v| options[:target] = File.expand_path(v) }
-  opts.on("--mode MODE", "symlink or copy. Default: symlink") { |v| options[:mode] = v }
-  opts.on("--dry-run", "Print actions without changing files") { options[:dry_run] = true }
-  opts.on("--force", "Replace an existing skill at the target path") { options[:force] = true }
-  opts.on("--list", "List available skills and exit") { options[:list] = true }
-  opts.on("-h", "--help", "Show help") do
-    puts opts
-    exit
-  end
-end
 
-parser.parse!(ARGV)
-options[:skills] = ARGV
+def same_real_path(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve(strict=True) == right.resolve(strict=True)
+    except FileNotFoundError:
+        return False
 
-unless %w[symlink copy].include?(options[:mode])
-  warn "invalid --mode: #{options[:mode]}"
-  exit 2
-end
 
-available = Dir.children(skills_root).select { |name| File.file?(File.join(skills_root, name, "SKILL.md")) }.sort
+def remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    else:
+        shutil.rmtree(path)
 
-if options[:list]
-  puts available.join("\n")
-  exit
-end
 
-selected = options[:skills].empty? ? available : options[:skills]
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.mode not in {"symlink", "copy"}:
+        print(f"invalid --mode: {args.mode}", file=sys.stderr)
+        return 2
 
-missing = selected - available
-if missing.any?
-  warn "unknown skill(s): #{missing.join(", ")}"
-  warn "available: #{available.join(", ")}"
-  exit 1
-end
+    root = Path(__file__).resolve().parent.parent
+    skills_root = root / "skills"
+    available = sorted(
+        path.name for path in skills_root.iterdir() if (path / "SKILL.md").is_file()
+    )
 
-FileUtils.mkdir_p(options[:target]) unless options[:dry_run]
+    if args.list:
+        print("\n".join(available))
+        return 0
 
-selected.each do |name|
-  source = File.join(skills_root, name)
-  target = File.join(options[:target], name)
+    selected = available if not args.skills else args.skills
+    missing = [name for name in selected if name not in available]
+    if missing:
+        print(f"unknown skill(s): {', '.join(missing)}", file=sys.stderr)
+        print(f"available: {', '.join(available)}", file=sys.stderr)
+        return 1
 
-  if File.exist?(target) || File.symlink?(target)
-    unless options[:force]
-      warn "exists, skipping: #{target}"
-      next
-    end
+    target_root = Path(args.target).expanduser().absolute()
+    if not args.dry_run:
+        target_root.mkdir(parents=True, exist_ok=True)
 
-    if !File.symlink?(target) && same_real_path?(source, target)
-      warn "target is source, skipping: #{target}"
-      next
-    end
+    for name in selected:
+        source = skills_root / name
+        target = target_root / name
 
-    puts "remove #{target}" if options[:dry_run]
-    FileUtils.rm_rf(target) unless options[:dry_run]
-  end
+        if target.exists() or target.is_symlink():
+            if not args.force:
+                print(f"exists, skipping: {target}", file=sys.stderr)
+                continue
 
-  if options[:mode] == "symlink"
-    FileUtils.ln_s(source, target) unless options[:dry_run]
-  else
-    FileUtils.cp_r(source, target) unless options[:dry_run]
-  end
+            if not target.is_symlink() and same_real_path(source, target):
+                print(f"target is source, skipping: {target}", file=sys.stderr)
+                continue
 
-  prefix = options[:dry_run] ? "would #{options[:mode]}" : options[:mode]
-  puts "#{prefix} #{name} -> #{target}"
-end
+            if args.dry_run:
+                print(f"remove {target}")
+            else:
+                remove_path(target)
+
+        if not args.dry_run:
+            if args.mode == "symlink":
+                target.symlink_to(source, target_is_directory=True)
+            else:
+                shutil.copytree(source, target)
+
+        prefix = f"would {args.mode}" if args.dry_run else args.mode
+        print(f"{prefix} {name} -> {target}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

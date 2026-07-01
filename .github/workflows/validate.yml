@@ -26,11 +26,13 @@ jobs:
       - name: Validate skill frontmatter
         run: ruby scripts/validate-skills
       - name: Check Ruby scripts
-        run: ruby -c scripts/install-skills && ruby -c scripts/validate-skills && ruby scripts/install-skills.test.rb
+        run: ruby -c scripts/validate-skills
       - name: Check shell scripts
         run: bash -n skills/autoreview/scripts/test-review-harness
       - name: Check Python scripts
-        run: python -m py_compile skills/autoreview/scripts/autoreview skills/autoreview/scripts/test-review-harness.py skills/autoreview/scripts/autoreview_test.py
+        run: python -m py_compile scripts/install-skills scripts/install-skills.test.py skills/autoreview/scripts/autoreview skills/autoreview/scripts/test-review-harness.py skills/autoreview/scripts/autoreview_test.py
+      - name: Run installer tests
+        run: python scripts/install-skills.test.py
       - name: Run autoreview self-tests
         run: |
           python skills/autoreview/scripts/autoreview --self-test-config-defaults

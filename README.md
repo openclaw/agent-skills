@@ -161,7 +161,9 @@ Run this after edits:
 
 ```sh
 scripts/validate-skills
-ruby -c scripts/install-skills && ruby -c scripts/validate-skills
+ruby -c scripts/validate-skills
+python3 -m py_compile scripts/install-skills scripts/install-skills.test.py
+python3 scripts/install-skills.test.py
 bash -n skills/autoreview/scripts/test-review-harness
 python3 -m py_compile skills/autoreview/scripts/autoreview skills/autoreview/scripts/test-review-harness.py
 node --check skills/agent-transcript/scripts/agent-transcript
