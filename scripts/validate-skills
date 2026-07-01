@@ -1,49 +1,77 @@
-#!/usr/bin/env ruby
-# frozen_string_literal: true
+#!/usr/bin/env python3
 
-require "yaml"
+from __future__ import annotations
 
-root = File.expand_path("..", __dir__)
-skill_files = Dir.glob(File.join(root, "skills", "*", "SKILL.md")).sort
+import sys
+from pathlib import Path
 
-if skill_files.empty?
-  warn "No skills/*/SKILL.md files found."
-  exit 1
-end
+try:
+    import yaml
+except ModuleNotFoundError:
+    print(
+        "PyYAML is required; run: python3 -m pip install -r requirements-dev.txt",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
-errors = []
 
-skill_files.each do |path|
-  rel = path.delete_prefix("#{root}/")
-  text = File.read(path)
-  unless text.start_with?("---\n")
-    errors << "#{rel}: missing YAML frontmatter"
-    next
-  end
+class NoAliasSafeLoader(yaml.SafeLoader):
+    def compose_node(self, parent: object, index: object) -> yaml.Node:
+        if self.check_event(yaml.AliasEvent):
+            event = self.get_event()
+            raise yaml.YAMLError(f"YAML aliases are not allowed: {event.anchor}")
+        return super().compose_node(parent, index)
 
-  close = text.index("\n---", 4)
-  unless close
-    errors << "#{rel}: unterminated YAML frontmatter"
-    next
-  end
 
-  yaml_text = text[4...close]
-  begin
-    data = YAML.safe_load(yaml_text, permitted_classes: [], aliases: false) || {}
-  rescue Psych::Exception => e
-    errors << "#{rel}: invalid YAML: #{e.message}"
-    next
-  end
+def load_frontmatter(text: str) -> tuple[dict[object, object] | None, str | None]:
+    if not text.startswith("---\n"):
+        return None, "missing YAML frontmatter"
 
-  name = data["name"]
-  description = data["description"]
-  errors << "#{rel}: missing name" unless name.is_a?(String) && !name.strip.empty?
-  errors << "#{rel}: missing description" unless description.is_a?(String) && !description.strip.empty?
-end
+    close = text.find("\n---", 4)
+    if close == -1:
+        return None, "unterminated YAML frontmatter"
 
-if errors.any?
-  warn errors.join("\n")
-  exit 1
-end
+    try:
+        data = yaml.load(text[4:close], Loader=NoAliasSafeLoader) or {}
+    except yaml.YAMLError as error:
+        return None, f"invalid YAML: {error}"
 
-puts "validated #{skill_files.length} skills"
+    if not isinstance(data, dict):
+        return None, "YAML frontmatter must be a mapping"
+    return data, None
+
+
+def main() -> int:
+    root = Path(__file__).resolve().parent.parent
+    skill_files = sorted((root / "skills").glob("*/SKILL.md"))
+
+    if not skill_files:
+        print("No skills/*/SKILL.md files found.", file=sys.stderr)
+        return 1
+
+    errors: list[str] = []
+    for path in skill_files:
+        rel = path.relative_to(root)
+        data, error = load_frontmatter(path.read_text(encoding="utf-8"))
+        if error is not None:
+            errors.append(f"{rel}: {error}")
+            continue
+
+        assert data is not None
+        name = data.get("name")
+        description = data.get("description")
+        if not isinstance(name, str) or not name.strip():
+            errors.append(f"{rel}: missing name")
+        if not isinstance(description, str) or not description.strip():
+            errors.append(f"{rel}: missing description")
+
+    if errors:
+        print("\n".join(errors), file=sys.stderr)
+        return 1
+
+    print(f"validated {len(skill_files)} skills")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

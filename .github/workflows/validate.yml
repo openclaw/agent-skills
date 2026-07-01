@@ -17,22 +17,21 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.3'
       - uses: actions/setup-python@v6
         with:
           python-version: '3.x'
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements-dev.txt
       - name: Validate skill frontmatter
-        run: ruby scripts/validate-skills
-      - name: Check Ruby scripts
-        run: ruby -c scripts/validate-skills
+        run: python scripts/validate-skills
       - name: Check shell scripts
         run: bash -n skills/autoreview/scripts/test-review-harness
       - name: Check Python scripts
-        run: python -m py_compile scripts/install-skills scripts/install-skills.test.py skills/autoreview/scripts/autoreview skills/autoreview/scripts/test-review-harness.py skills/autoreview/scripts/autoreview_test.py
-      - name: Run installer tests
-        run: python scripts/install-skills.test.py
+        run: python -m py_compile scripts/install-skills scripts/install-skills.test.py scripts/validate-skills scripts/validate-skills.test.py skills/autoreview/scripts/autoreview skills/autoreview/scripts/test-review-harness.py skills/autoreview/scripts/autoreview_test.py
+      - name: Run repository script tests
+        run: |
+          python scripts/install-skills.test.py
+          python scripts/validate-skills.test.py
       - name: Run autoreview self-tests
         run: |
           python skills/autoreview/scripts/autoreview --self-test-config-defaults

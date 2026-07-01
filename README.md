@@ -160,10 +160,11 @@ belong inside that skill's `scripts/` directory.
 Run this after edits:
 
 ```sh
+python3 -m pip install -r requirements-dev.txt
 scripts/validate-skills
-ruby -c scripts/validate-skills
-python3 -m py_compile scripts/install-skills scripts/install-skills.test.py
+python3 -m py_compile scripts/install-skills scripts/install-skills.test.py scripts/validate-skills scripts/validate-skills.test.py
 python3 scripts/install-skills.test.py
+python3 scripts/validate-skills.test.py
 bash -n skills/autoreview/scripts/test-review-harness
 python3 -m py_compile skills/autoreview/scripts/autoreview skills/autoreview/scripts/test-review-harness.py
 node --check skills/agent-transcript/scripts/agent-transcript
