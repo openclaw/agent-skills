@@ -160,13 +160,23 @@ belong inside that skill's `scripts/` directory.
 Run this after edits:
 
 ```sh
-python3 -m pip install -r requirements-dev.txt
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements-dev.txt
 scripts/validate-skills
 python3 -m py_compile scripts/install-skills scripts/install-skills.test.py scripts/validate-skills scripts/validate-skills.test.py
 python3 scripts/install-skills.test.py
 python3 scripts/validate-skills.test.py
 bash -n skills/autoreview/scripts/test-review-harness
-python3 -m py_compile skills/autoreview/scripts/autoreview skills/autoreview/scripts/test-review-harness.py
+python3 -m py_compile skills/autoreview/scripts/autoreview skills/autoreview/scripts/test-review-harness.py skills/autoreview/scripts/autoreview_test.py
+python3 skills/autoreview/scripts/autoreview --self-test-config-defaults
+python3 skills/autoreview/scripts/autoreview --self-test-fallback-scope
+python3 skills/autoreview/scripts/autoreview --self-test-engine-isolation
+python3 skills/autoreview/scripts/autoreview --self-test-json-array-parser
+python3 skills/autoreview/scripts/autoreview --self-test-opencode-jsonl-parser
+python3 skills/autoreview/scripts/autoreview --self-test-opencode-isolation
+python3 skills/autoreview/scripts/autoreview --self-test-cursor-jsonl-parser
+python3 -m unittest skills/autoreview/scripts/autoreview_test.py
 node --check skills/agent-transcript/scripts/agent-transcript
 node --test skills/agent-transcript/scripts/agent-transcript.test.mjs skills/session-viewer/scripts/session-viewer.test.ts
 ```
