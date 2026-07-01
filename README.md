@@ -7,7 +7,7 @@ Shared skills for coding agents that work on OpenClaw projects.
 This repo is the public canonical source for common workflows such as review
 closeout and remote validation. The goal is simple: write a workflow once,
 reuse it everywhere, and avoid hand-copying long `SKILL.md` files across every
-repo.
+repo. See [VISION.md](VISION.md) for catalog boundaries and admission principles.
 
 ## Included Skills
 
