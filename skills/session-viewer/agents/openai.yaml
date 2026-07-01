@@ -1,3 +1,4 @@
-display_name: Session Viewer
-short_description: Render agent session JSONL as searchable one-file HTML.
-default_prompt: View this session log in a browser.
+interface:
+  display_name: "Session Viewer"
+  short_description: "Render session JSONL as searchable HTML"
+  default_prompt: "Use $session-viewer to render this agent session as searchable, shareable HTML."
