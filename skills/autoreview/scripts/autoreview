@@ -1279,6 +1279,16 @@ def codex_config_overrides(args: argparse.Namespace) -> list[str]:
     return overrides
 
 
+def codex_speed_override(args: argparse.Namespace) -> str | None:
+    speed = getattr(args, "codex_speed", None) or os.environ.get("AUTOREVIEW_CODEX_SPEED", "").strip() or None
+    if speed is None:
+        return None
+    speed = speed.strip().lower()
+    if speed not in {"fast", "flex", "default"}:
+        raise SystemExit(f"invalid Codex speed: {speed} (valid: fast, flex, default)")
+    return f'service_tier="{speed}"'
+
+
 def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     if not args.tools:
         raise SystemExit("--no-tools is not supported by the Codex engine; use --engine claude --no-tools for a no-tools run")
@@ -1294,6 +1304,10 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     # User overrides go before the isolation flags so isolation stays authoritative on conflicts.
     for override in codex_config_overrides(args):
         cmd.extend(["-c", override])
+    # After --codex-config so an explicit speed wins over a service_tier value in the raw overrides.
+    speed_override = codex_speed_override(args)
+    if speed_override is not None:
+        cmd.extend(["-c", speed_override])
     cmd.extend(codex_config_isolation_flags(repo))
     cmd.extend(codex_auth_config_flags())
     cmd.append("exec")
@@ -3017,6 +3031,11 @@ def parse_args() -> argparse.Namespace:
         action="append",
         help='Extra Codex "-c key=value" config override (TOML value), codex reviewer only. Repeatable. Env default: AUTOREVIEW_CODEX_CONFIG (semicolon-separated), e.g. service_tier="fast". Reviewed-repo isolation flags still take precedence.',
     )
+    parser.add_argument(
+        "--codex-speed",
+        choices=["fast", "flex", "default"],
+        help="Codex service tier: fast (priority processing), flex, or default. Env default: AUTOREVIEW_CODEX_SPEED. Silently standard when the model catalog does not list the tier.",
+    )
     parser.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
     parser.add_argument("--droid-bin", default=os.environ.get("DROID_BIN", "droid"))
     parser.add_argument("--copilot-bin", default=os.environ.get("COPILOT_BIN", "copilot"))
@@ -3192,6 +3211,8 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
         raise SystemExit("--fallback-model is only supported for claude; no claude reviewer selected")
     if getattr(args, "codex_config", None) and "codex" not in selected_engines:
         raise SystemExit("--codex-config is only supported for codex; no codex reviewer selected")
+    if getattr(args, "codex_speed", None) and "codex" not in selected_engines:
+        raise SystemExit("--codex-speed is only supported for codex; no codex reviewer selected")
 
     seen: set[str] = set()
     result: list[argparse.Namespace] = []
@@ -3330,6 +3351,7 @@ def reviewer_test_args(**overrides: Any) -> argparse.Namespace:
         "thinking": None,
         "fallback_model": None,
         "codex_config": None,
+        "codex_speed": None,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -3363,6 +3385,7 @@ def self_test_config_defaults() -> None:
         "AUTOREVIEW_CODEX_THINKING",
         "AUTOREVIEW_CLAUDE_THINKING",
         "AUTOREVIEW_CODEX_CONFIG",
+        "AUTOREVIEW_CODEX_SPEED",
     ]
     with preserve_env(keys):
         default_codex = reviewer_args(reviewer_test_args(engine="codex"))[0]
@@ -3420,6 +3443,28 @@ def self_test_config_defaults() -> None:
         try:
             reviewer_args(reviewer_test_args(engine="claude", codex_config=['service_tier="fast"']))
             raise SystemExit("self-test config defaults failed: --codex-config accepted without codex reviewer")
+        except SystemExit as error:
+            if "only supported for codex" not in str(error):
+                raise
+        os.environ["AUTOREVIEW_CODEX_SPEED"] = "fast"
+        env_speed = codex_speed_override(reviewer_test_args(engine="codex"))
+        if env_speed != 'service_tier="fast"':
+            raise SystemExit(f"self-test config defaults failed: codex speed env override={env_speed!r}")
+        flag_speed = codex_speed_override(reviewer_test_args(engine="codex", codex_speed="flex"))
+        if flag_speed != 'service_tier="flex"':
+            raise SystemExit(f"self-test config defaults failed: codex speed flag should override env, got {flag_speed!r}")
+        os.environ["AUTOREVIEW_CODEX_SPEED"] = "warp"
+        rejected = False
+        try:
+            codex_speed_override(reviewer_test_args(engine="codex"))
+        except SystemExit as error:
+            rejected = "invalid Codex speed" in str(error)
+        if not rejected:
+            raise SystemExit("self-test config defaults failed: invalid codex speed accepted")
+        os.environ.pop("AUTOREVIEW_CODEX_SPEED")
+        try:
+            reviewer_args(reviewer_test_args(engine="claude", codex_speed="fast"))
+            raise SystemExit("self-test config defaults failed: --codex-speed accepted without codex reviewer")
         except SystemExit as error:
             if "only supported for codex" not in str(error):
                 raise
@@ -3570,6 +3615,9 @@ def main() -> int:
             overrides = codex_config_overrides(reviewers[0])
             if overrides:
                 print(f"codex_config: {'; '.join(overrides)}")
+            speed = codex_speed_override(reviewers[0])
+            if speed:
+                print(f"codex_speed: {speed}")
     else:
         print(f"reviewers: {', '.join(reviewer_label(reviewer) for reviewer in reviewers)}")
     print(f"tools: {'on' if args.tools else 'off'}")
