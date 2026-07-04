@@ -1263,6 +1263,22 @@ def format_version(version: tuple[int, int, int]) -> str:
     return ".".join(str(part) for part in version)
 
 
+def codex_config_overrides(args: argparse.Namespace) -> list[str]:
+    raw = list(getattr(args, "codex_config", None) or [])
+    if not raw:
+        raw = os.environ.get("AUTOREVIEW_CODEX_CONFIG", "").split(";")
+    overrides: list[str] = []
+    for item in raw:
+        item = item.strip()
+        if not item:
+            continue
+        key, sep, value = item.partition("=")
+        if not sep or not value.strip() or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", key.strip()):
+            raise SystemExit(f"invalid Codex config override (expected key=value): {item}")
+        overrides.append(item)
+    return overrides
+
+
 def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     if not args.tools:
         raise SystemExit("--no-tools is not supported by the Codex engine; use --engine claude --no-tools for a no-tools run")
@@ -1275,6 +1291,9 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         cmd.extend(["--model", args.model])
     if args.thinking:
         cmd.extend(["-c", f'model_reasoning_effort="{args.thinking}"'])
+    # User overrides go before the isolation flags so isolation stays authoritative on conflicts.
+    for override in codex_config_overrides(args):
+        cmd.extend(["-c", override])
     cmd.extend(codex_config_isolation_flags(repo))
     cmd.extend(codex_auth_config_flags())
     cmd.append("exec")
@@ -2993,6 +3012,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--allow-partial-panel", action="store_true", help="Continue panel output when one reviewer fails.")
     parser.add_argument("--codex-bin", default=os.environ.get("CODEX_BIN", "codex"))
+    parser.add_argument(
+        "--codex-config",
+        action="append",
+        help='Extra Codex "-c key=value" config override (TOML value), codex reviewer only. Repeatable. Env default: AUTOREVIEW_CODEX_CONFIG (semicolon-separated), e.g. service_tier="fast". Reviewed-repo isolation flags still take precedence.',
+    )
     parser.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
     parser.add_argument("--droid-bin", default=os.environ.get("DROID_BIN", "droid"))
     parser.add_argument("--copilot-bin", default=os.environ.get("COPILOT_BIN", "copilot"))
@@ -3166,6 +3190,8 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
         raise SystemExit(f"--fallback-model is only supported for claude, not {engine_list}")
     if (global_fallback or env_global_fallback) and "claude" not in selected_engines:
         raise SystemExit("--fallback-model is only supported for claude; no claude reviewer selected")
+    if getattr(args, "codex_config", None) and "codex" not in selected_engines:
+        raise SystemExit("--codex-config is only supported for codex; no codex reviewer selected")
 
     seen: set[str] = set()
     result: list[argparse.Namespace] = []
@@ -3303,6 +3329,7 @@ def reviewer_test_args(**overrides: Any) -> argparse.Namespace:
         "model": None,
         "thinking": None,
         "fallback_model": None,
+        "codex_config": None,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -3335,6 +3362,7 @@ def self_test_config_defaults() -> None:
         "AUTOREVIEW_THINKING",
         "AUTOREVIEW_CODEX_THINKING",
         "AUTOREVIEW_CLAUDE_THINKING",
+        "AUTOREVIEW_CODEX_CONFIG",
     ]
     with preserve_env(keys):
         default_codex = reviewer_args(reviewer_test_args(engine="codex"))[0]
@@ -3371,6 +3399,30 @@ def self_test_config_defaults() -> None:
         )[0]
         if inline.model != "inline-model" or inline.thinking != "minimal":
             raise SystemExit("self-test config defaults failed: inline reviewer values should override CLI/env")
+        os.environ["AUTOREVIEW_CODEX_CONFIG"] = ' service_tier="fast" ; '
+        env_overrides = codex_config_overrides(reviewer_test_args(engine="codex"))
+        if env_overrides != ['service_tier="fast"']:
+            raise SystemExit(f"self-test config defaults failed: codex config env overrides={env_overrides!r}")
+        flag_overrides = codex_config_overrides(
+            reviewer_test_args(engine="codex", codex_config=['model_verbosity="low"'])
+        )
+        if flag_overrides != ['model_verbosity="low"']:
+            raise SystemExit(f"self-test config defaults failed: codex config flag should override env, got {flag_overrides!r}")
+        os.environ["AUTOREVIEW_CODEX_CONFIG"] = "no-equals-sign"
+        rejected = False
+        try:
+            codex_config_overrides(reviewer_test_args(engine="codex"))
+        except SystemExit as error:
+            rejected = "invalid Codex config override" in str(error)
+        if not rejected:
+            raise SystemExit("self-test config defaults failed: malformed codex config override accepted")
+        os.environ.pop("AUTOREVIEW_CODEX_CONFIG")
+        try:
+            reviewer_args(reviewer_test_args(engine="claude", codex_config=['service_tier="fast"']))
+            raise SystemExit("self-test config defaults failed: --codex-config accepted without codex reviewer")
+        except SystemExit as error:
+            if "only supported for codex" not in str(error):
+                raise
     print("self-test config defaults: ok")
 
 
@@ -3514,6 +3566,10 @@ def main() -> int:
             print(f"fallback_model: {reviewers[0].fallback_model}")
         if reviewers[0].thinking:
             print(f"thinking: {reviewers[0].thinking}")
+        if reviewers[0].engine == "codex":
+            overrides = codex_config_overrides(reviewers[0])
+            if overrides:
+                print(f"codex_config: {'; '.join(overrides)}")
     else:
         print(f"reviewers: {', '.join(reviewer_label(reviewer) for reviewer in reviewers)}")
     print(f"tools: {'on' if args.tools else 'off'}")
