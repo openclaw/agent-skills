@@ -99,6 +99,24 @@ class AutoreviewCursorTests(unittest.TestCase):
             AUTOREVIEW.extract_json(stream)
         self.assertIn("review engine result was not structured JSON", str(exc_info.exception))
 
+
+class AutoreviewCompatibilityTests(unittest.TestCase):
+    def test_cursor_agent_reviewer_alias_normalizes_to_cursor(self) -> None:
+        self.assertEqual(
+            AUTOREVIEW.parse_reviewer_token("cursor-agent:auto"),
+            ("cursor", "auto", None),
+        )
+
+    def test_cursor_agent_keyed_option_normalizes_to_cursor(self) -> None:
+        self.assertEqual(
+            AUTOREVIEW.parse_keyed_options(["cursor-agent=auto"], "model"),
+            (None, {"cursor": "auto"}),
+        )
+
+    def test_codex_config_status_exposes_keys_only(self) -> None:
+        args = argparse.Namespace(codex_config=['model_provider="private-value"'])
+        self.assertEqual(AUTOREVIEW.codex_config_keys(args), ["model_provider"])
+
     def test_extract_json_accepts_dict_result_payload(self) -> None:
         payload = {
             "type": "result",
@@ -212,7 +230,11 @@ class AutoreviewCursorTests(unittest.TestCase):
             self.assertIn("--print", record["argv"])
             self.assertIn("--output-format", record["argv"])
             self.assertIn("json", record["argv"])
-            for unsupported in ("--workspace", "--trust", "--mode", "--sandbox"):
+            self.assertIn("--mode", record["argv"])
+            self.assertIn("ask", record["argv"])
+            self.assertIn("--sandbox", record["argv"])
+            self.assertIn("enabled", record["argv"])
+            for unsupported in ("--workspace", "--trust"):
                 self.assertNotIn(unsupported, record["argv"])
 
     def test_cursor_engine_runs_end_to_end_with_sanitized_environment(self) -> None:
