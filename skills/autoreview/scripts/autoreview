@@ -9628,6 +9628,31 @@ def codex_speed_override(args: argparse.Namespace) -> str | None:
     return f'service_tier="{speed}"'
 
 
+def codex_uses_non_openai_provider(args: argparse.Namespace) -> bool:
+    """Return whether Codex is routed through a known non-OpenAI provider."""
+    profile = (getattr(args, "codex_profile", None) or "").strip().lower()
+    if profile == "bedrock":
+        return True
+    for override in codex_config_overrides(args):
+        key, _, value = override.partition("=")
+        if key.strip() != "model_provider":
+            continue
+        provider = value.strip().strip('"').strip("'").lower()
+        if provider and provider != "openai":
+            return True
+    return False
+
+
+def codex_use_output_schema(args: argparse.Namespace) -> bool:
+    """Return whether to enforce Codex structured output at the CLI layer."""
+    if getattr(args, "codex_no_output_schema", False):
+        return False
+    env_opt = os.environ.get("AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA", "").strip().lower()
+    if env_opt in {"1", "true", "yes", "on"}:
+        return False
+    return not codex_uses_non_openai_provider(args)
+
+
 def codex_error_messages(result: subprocess.CompletedProcess[str]) -> list[str]:
     messages: list[str] = []
     for stream, accept_plain_text in (
@@ -9712,14 +9737,23 @@ def codex_command(
     cmd.append("exec")
     if args.stream_engine_output:
         cmd.append("--json")
+    use_output_schema = codex_use_output_schema(args)
     cmd.extend(
         [
             *codex_exec_isolation_flags(),
             "--ephemeral",
             "-C",
             str(review_root),
-            "--output-schema",
-            str(schema_path),
+        ]
+    )
+    # OpenAI-compatible relays (Amazon Bedrock's Responses shim) hang when a strict
+    # JSON schema runs alongside a tool-using turn (openai/codex#15451). The prompt
+    # already embeds the schema and demands one JSON object, so we drop the flag for
+    # those providers and parse the fenced/plain JSON from the last message instead.
+    if use_output_schema:
+        cmd.extend(["--output-schema", str(schema_path)])
+    cmd.extend(
+        [
             "--output-last-message",
             str(output_path),
             "-",
@@ -11631,6 +11665,11 @@ def parse_args() -> argparse.Namespace:
         choices=["fast", "flex", "default"],
         help="Codex service tier: fast (priority processing), flex, or default. Env default: AUTOREVIEW_CODEX_SPEED. Silently standard when the model catalog does not list the tier.",
     )
+    parser.add_argument(
+        "--codex-no-output-schema",
+        action="store_true",
+        help="Do not pass --output-schema to codex exec; rely on the prompt-embedded schema and parse JSON from the final message. Auto-enabled for non-OpenAI providers (e.g. model_provider=amazon-bedrock), which hang when a strict schema runs with tool calls (openai/codex#15451). Env default: AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA.",
+    )
     parser.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
     parser.add_argument("--droid-bin", default=os.environ.get("DROID_BIN", "droid"))
     parser.add_argument("--copilot-bin", default=os.environ.get("COPILOT_BIN", "copilot"))
@@ -12017,6 +12056,7 @@ def reviewer_test_args(**overrides: Any) -> argparse.Namespace:
         "fallback_model": None,
         "codex_config": None,
         "codex_speed": None,
+        "codex_no_output_schema": False,
         "tools": True,
     }
     defaults.update(overrides)
@@ -12164,6 +12204,27 @@ def self_test_config_defaults() -> None:
         except SystemExit as error:
             if "only supported for codex" not in str(error):
                 raise
+    # codex --output-schema opt-out: on by default; explicit flag / env / a
+    # non-OpenAI model_provider (e.g. amazon-bedrock, which deadlocks on
+    # schema+tools per openai/codex#15451) all disable it.
+    with preserve_env(["AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA"]):
+        if not codex_use_output_schema(reviewer_test_args(engine="codex")):
+            raise SystemExit("self-test config defaults failed: output-schema should default ON for codex")
+        if codex_use_output_schema(reviewer_test_args(engine="codex", codex_no_output_schema=True)):
+            raise SystemExit("self-test config defaults failed: --codex-no-output-schema should disable output-schema")
+        bedrock = reviewer_test_args(
+            engine="codex", codex_config=['model_provider="amazon-bedrock"']
+        )
+        if codex_use_output_schema(bedrock):
+            raise SystemExit("self-test config defaults failed: non-OpenAI provider should auto-disable output-schema")
+        openai_provider = reviewer_test_args(
+            engine="codex", codex_config=['model_provider="openai"']
+        )
+        if not codex_use_output_schema(openai_provider):
+            raise SystemExit("self-test config defaults failed: explicit openai provider should keep output-schema ON")
+        os.environ["AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA"] = "1"
+        if codex_use_output_schema(reviewer_test_args(engine="codex")):
+            raise SystemExit("self-test config defaults failed: AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA=1 should disable output-schema")
     print("self-test config defaults: ok")
 
 
