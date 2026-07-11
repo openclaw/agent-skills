@@ -673,6 +673,64 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
 
+    def test_secret_detector_allows_public_call_arguments(self) -> None:
+        for content in (
+            "access_"
+            + 'token = credentials.get_token("https://management.azure.com/.default")',
+            "access_" + 'token = credentials.get_token("scope")',
+            "access_"
+            + 'token = credentials.get_token("api://00000000-0000-0000-0000-000000000000/.default")',
+            "access_"
+            + "to"
+            + 'ken = credentials.get_token("scope-a", '
+            + '"https://management.azure.com/.default")',
+            "access_"
+            + "to"
+            + 'ken = credentials.get_token("https://[")',
+            "pass" + 'word = input("Enter your password: ")',
+            "pass" + 'word = input("Password: ")',
+            "pass" + 'phrase = getpass.getpass("Passphrase: ")',
+            "pass"
+            + 'word = getpass.getpass(prompt="Enter your password: ")',
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_secret_shaped_public_arguments(self) -> None:
+        for content in (
+            "access_"
+            + "to"
+            + 'ken = credentials.get_token("https://api.example.test/?access_'
+            + 'token=hardcoded-secret")',
+            "access_"
+            + "to"
+            + 'ken = credentials.get_token("https://example.test:not-a-port/.default")',
+            "access_"
+            + "to"
+            + 'ken = credentials.get_token("https://example.test/.default?x=%67%68%70")',
+            "access_"
+            + "to"
+            + 'ken = credentials.get_token("https://gl'
+            + 'pat-abcdefghijklmnopqrst.example.com/.default")',
+            "access_"
+            + "to"
+            + 'ken = credentials.get_token("https://gl%09'
+            + 'pat-abcdefghijklmnopqrst.example.com/.default")',
+            "access_"
+            + "to"
+            + 'ken = credentials.get_token("https://example.test/'
+            + 'correct-horse-battery-staple")',
+            "pass" + 'word = decode("correct horse battery staple?")',
+            "pass"
+            + "word = in"
+            + 'put("correct horse battery staple?")',
+            "access_"
+            + "to"
+            + 'ken = custom_client.get_token("correct-horse-battery-staple")',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
     def test_secret_detector_rejects_short_reference_fallback_literals(self) -> None:
         for expression in ("env.TOKEN", "getToken()"):
             content = (

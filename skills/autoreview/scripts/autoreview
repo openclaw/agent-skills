@@ -1895,12 +1895,98 @@ def safe_credential_lookup_argument(
     )
 
 
-def call_arguments_risk(arguments: str, call_target: str) -> bool:
-    return any(
-        not safe_credential_lookup_argument(call_target, argument, index)
-        and fallback_secret_risk(argument)
-        for index, argument in enumerate(split_top_level_call_arguments(arguments))
+def public_call_argument_risk(
+    call_target: str,
+    argument: str,
+    argument_index: int,
+) -> bool | None:
+    normalized_target = call_target.replace("?.", ".")
+    target_parts = normalized_target.split(".")
+    credential_scope_call = (
+        len(target_parts) >= 2
+        and target_parts[-2] in {"credential", "credentials"}
+        and target_parts[-1] == "get_token"
     )
+    if not credential_scope_call and normalized_target not in {
+        "input",
+        "getpass.getpass",
+    }:
+        return None
+    if not credential_scope_call and argument_index != 0:
+        return None
+    literal_argument = argument
+    if normalized_target == "getpass.getpass":
+        literal_argument = re.sub(
+            r"^\s*prompt\s*=\s*",
+            "",
+            literal_argument,
+            count=1,
+        )
+    match = re.fullmatch(r"\s*([\"'])([^\"'\r\n]+)\1\s*", literal_argument)
+    if match is None:
+        return None
+    value = match.group(2)
+    if credential_scope_call:
+        decoded_value = value
+        for _ in range(8):
+            next_value = urllib.parse.unquote(decoded_value)
+            if next_value == decoded_value:
+                break
+            decoded_value = next_value
+        else:
+            return True
+        if any(ord(char) < 32 or ord(char) == 127 for char in decoded_value):
+            return True
+        if secret_text_risk(decoded_value):
+            return True
+        if "://" not in decoded_value:
+            return None
+        try:
+            parsed = urllib.parse.urlsplit(decoded_value)
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            return None
+        valid_authority = (
+            parsed.username is None
+            and parsed.password is None
+            and hostname is not None
+            and re.fullmatch(
+                r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+                r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*",
+                hostname,
+            )
+            is not None
+            and (port is None or 1 <= port <= 65535)
+        )
+        valid_scope_uri = (
+            parsed.scheme in {"api", "https"}
+            and valid_authority
+            and parsed.path == "/.default"
+            and not parsed.query
+            and not parsed.fragment
+        )
+        return False if valid_scope_uri else None
+    generic_prompt = re.fullmatch(
+        r"(?i)\s*(?:(?:enter|type|provide)\s+(?:your\s+)?)?"
+        r"(?:password|passphrase)\s*[:?]\s*",
+        value,
+    )
+    return False if generic_prompt is not None else None
+
+
+def call_arguments_risk(arguments: str, call_target: str) -> bool:
+    for index, argument in enumerate(split_top_level_call_arguments(arguments)):
+        public_risk = public_call_argument_risk(call_target, argument, index)
+        if public_risk is not None:
+            if public_risk:
+                return True
+            continue
+        if not safe_credential_lookup_argument(
+            call_target, argument, index
+        ) and fallback_secret_risk(argument):
+            return True
+    return False
 
 
 def safe_secret_call_suffix(text: str, end: int, call_target: str) -> bool:
