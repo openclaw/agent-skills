@@ -197,6 +197,13 @@ UNQUOTED_SECRET_REFERENCE_PATTERNS = (
         r"token_response|api_response|authentication|credentials|settings|self|this)"
         r"(?:[.\[].*)$"
     ),
+    re.compile(
+        r"^(?:cached|current|existing|loaded|previous|resolved|saved|stored)_"
+        r"(?:api[_-]?key|aws[_-]?secret[_-]?access[_-]?key|client[_-]?secret|"
+        r"refresh[_-]?token|access[_-]?token|auth[_-]?token|id[_-]?token|"
+        r"token|secret|password)$",
+        re.IGNORECASE,
+    ),
 )
 DEFAULT_ENGINE_PATHS = ("/usr/local/bin", "/usr/bin", "/bin")
 MULTI_PROVIDER_CREDENTIAL_SUFFIXES = (
@@ -663,11 +670,16 @@ def safe_engine_env(
         "OPENAI_ORGANIZATION",
         "OPENAI_PROJECT",
     } | MULTI_PROVIDER_ENV_KEYS
+    pi_allowed_exact = multi_provider_allowed_exact | {
+        "PI_OFFLINE",
+        "PI_SKIP_VERSION_CHECK",
+        "PI_TELEMETRY",
+    }
     engine_allowed_exact = {
         "claude": claude_allowed_exact,
         "codex": codex_allowed_exact,
         "opencode": multi_provider_allowed_exact,
-        "pi": multi_provider_allowed_exact,
+        "pi": pi_allowed_exact,
     }.get(engine or "", set())
     allowed_prefixes = ("AUTOREVIEW_FAKE_",)
     allow_multi_provider_credentials = engine in {"opencode", "pi"}
@@ -748,6 +760,13 @@ def safe_engine_env(
     env.update(extra or {})
     if engine == "claude":
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+    return env
+
+
+def safe_test_env(repo: Path) -> dict[str, str]:
+    env = safe_engine_env(repo)
+    if path := os.environ.get("PATH"):
+        env["PATH"] = path
     return env
 
 
@@ -1389,6 +1408,8 @@ def unified_diff_contents(patch: str) -> tuple[str, str]:
 def sensitive_repo_path_risk(rel: str) -> str | None:
     normalized = rel.replace(os.sep, "/")
     path = Path(normalized)
+    if secret_text_risk(normalized):
+        return "secret-like path"
     credential_directory = any(
         TRACKED_CREDENTIAL_DIR_PATTERN.fullmatch(part)
         for part in path.parts[:-1]
@@ -1400,7 +1421,10 @@ def sensitive_repo_path_risk(rel: str) -> str | None:
         or token_credential_store_path(normalized)
     ):
         return "sensitive path"
-    if any(pattern.search(normalized) for pattern in SENSITIVE_NAME_PATTERNS):
+    if (
+        any(pattern.search(normalized) for pattern in SENSITIVE_NAME_PATTERNS)
+        and not design_token_artifact_path(path)
+    ):
         return "sensitive filename"
     return None
 
@@ -1412,6 +1436,14 @@ def token_credential_store_path(normalized: str) -> bool:
         bool(parts & {"token", "tokens"})
         and path.stem.lower() in TRACKED_TOKEN_CREDENTIAL_STEMS
         and path.suffix.lower() in TRACKED_TOKEN_CREDENTIAL_EXTENSIONS
+    )
+
+
+def design_token_artifact_path(path: Path) -> bool:
+    return (
+        len(path.parts) == 1
+        and re.fullmatch(r"design[-_]?tokens?\.json", path.name, re.IGNORECASE)
+        is not None
     )
 
 
@@ -1458,7 +1490,10 @@ def skill_instruction_path(path: Path) -> bool:
 
 def tracked_sensitive_repo_path_risk(rel: str) -> str | None:
     normalized = rel.replace(os.sep, "/")
-    parts = {part.lower() for part in Path(normalized).parts}
+    path = Path(normalized)
+    if secret_text_risk(normalized):
+        return "secret-like path"
+    parts = {part.lower() for part in path.parts}
     if (
         "/.config/gcloud/" in f"/{normalized.lower()}/"
         or f"/{normalized.lower()}".endswith("/.docker/config.json")
@@ -1467,7 +1502,10 @@ def tracked_sensitive_repo_path_risk(rel: str) -> str | None:
         or token_credential_store_path(normalized)
     ):
         return "sensitive path"
-    if any(pattern.search(normalized) for pattern in TRACKED_SENSITIVE_NAME_PATTERNS):
+    if (
+        any(pattern.search(normalized) for pattern in TRACKED_SENSITIVE_NAME_PATTERNS)
+        and not design_token_artifact_path(path)
+    ):
         return "sensitive filename"
     return None
 
@@ -4048,19 +4086,22 @@ def print_report(report: dict[str, Any], *, label: str = "autoreview") -> None:
 
 def start_parallel_tests(command: str, repo: Path, shell_kind: str) -> tuple[subprocess.Popen, float]:
     print(f"tests: {command}")
+    env = safe_test_env(repo)
     if shell_kind == "default" or shell_kind == "cmd":
-        return subprocess.Popen(command, cwd=repo, shell=True), time.time()
+        return subprocess.Popen(command, cwd=repo, shell=True, env=env), time.time()
     if shell_kind == "powershell":
         powershell = resolve_command("powershell", repo)
         return subprocess.Popen(
             [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
             cwd=repo,
+            env=env,
         ), time.time()
     if shell_kind == "pwsh":
         pwsh = resolve_command("pwsh", repo)
         return subprocess.Popen(
             [pwsh, "-NoProfile", "-Command", command],
             cwd=repo,
+            env=env,
         ), time.time()
     raise SystemExit(f"invalid --parallel-tests-shell/AUTOREVIEW_PARALLEL_TESTS_SHELL: {shell_kind}")
 

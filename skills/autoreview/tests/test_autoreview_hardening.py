@@ -375,6 +375,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "private/parser.py",
             ".agents/skills/openclaw-secret-scanning-maintainer/SKILL.md",
             "design-tokens/colors.json",
+            "design-tokens.json",
+            "design_tokens.json",
             "tokens/default.json",
             "token_count/generated.py",
             ".docker/Dockerfile",
@@ -395,6 +397,19 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.subTest(rel=rel):
                 self.assertIsNone(self.helper["sensitive_repo_path_risk"](rel))
 
+    def test_untracked_design_token_artifacts_remain_reviewable(self) -> None:
+        for rel in ("design-tokens.json", "design_tokens.json"):
+            with self.subTest(rel=rel):
+                self.assertIsNone(self.helper["sensitive_repo_path_risk"](rel))
+        self.assertIsNotNone(
+            self.helper["sensitive_repo_path_risk"](".env/design-tokens.json")
+        )
+        self.assertIsNotNone(
+            self.helper["tracked_sensitive_repo_path_risk"](
+                ".env/design-tokens.json"
+            )
+        )
+
     def test_sensitive_named_source_directories_are_blocked_untracked(self) -> None:
         for rel in (
             "credentials/prod.py",
@@ -404,6 +419,18 @@ class AutoreviewHardeningTests(unittest.TestCase):
         ):
             with self.subTest(rel=rel):
                 self.assertIsNotNone(self.helper["sensitive_repo_path_risk"](rel))
+
+    def test_secret_like_path_values_are_blocked(self) -> None:
+        secret_path = "notes-" + "ghp_" + "A" * 24 + ".txt"
+
+        self.assertEqual(
+            self.helper["sensitive_repo_path_risk"](secret_path),
+            "secret-like path",
+        )
+        self.assertEqual(
+            self.helper["tracked_sensitive_repo_path_risk"](secret_path),
+            "secret-like path",
+        )
 
     def test_tracked_env_variants_remain_sensitive(self) -> None:
         for rel in (
@@ -460,6 +487,29 @@ class AutoreviewHardeningTests(unittest.TestCase):
         content = '{"' + 'api_key": "' + realistic_secret_value() + '"}'
 
         self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_allows_bare_variable_secret_references(self) -> None:
+        for prefix in (
+            "cached",
+            "current",
+            "existing",
+            "loaded",
+            "previous",
+            "resolved",
+            "saved",
+            "stored",
+        ):
+            with self.subTest(prefix=prefix):
+                self.assertFalse(
+                    self.helper["secret_text_risk"](
+                        f"refresh_token = {prefix}_refresh_token"
+                    )
+                )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                "refresh_" + "token = " + "abcdefghijklmnopqrstuvwxyz"
+            )
+        )
 
     def test_secret_detector_handles_raw_jwt(self) -> None:
         content = ".".join(
@@ -1041,6 +1091,63 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 os.environ.clear()
                 os.environ.update(old)
 
+    def test_parallel_tests_use_sanitized_environment_for_every_shell(self) -> None:
+        observed: list[dict[str, object]] = []
+        sanitized_env = {"PATH": "/usr/bin", "HOME": "/safe/home"}
+
+        def fake_popen(command: object, **kwargs: object) -> mock.Mock:
+            observed.append({"command": command, **kwargs})
+            return mock.Mock()
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            with mock.patch.dict(
+                self.helper["start_parallel_tests"].__globals__,
+                {
+                    "safe_test_env": lambda actual_repo: (
+                        sanitized_env
+                        if actual_repo == repo
+                        else self.fail("parallel tests sanitized the wrong repository")
+                    ),
+                    "resolve_command": lambda name, actual_repo: (
+                        f"/usr/bin/{name}"
+                        if actual_repo == repo
+                        else self.fail("parallel tests resolved a shell for the wrong repository")
+                    ),
+                },
+            ), mock.patch("subprocess.Popen", side_effect=fake_popen):
+                for shell_kind in ("default", "cmd", "powershell", "pwsh"):
+                    self.helper["start_parallel_tests"]("run tests", repo, shell_kind)
+
+        self.assertEqual(len(observed), 4)
+        for invocation in observed:
+            self.assertEqual(invocation["cwd"], repo)
+            self.assertEqual(invocation["env"], sanitized_env)
+        self.assertTrue(observed[0]["shell"])
+        self.assertTrue(observed[1]["shell"])
+        self.assertNotIn("shell", observed[2])
+        self.assertNotIn("shell", observed[3])
+
+    def test_parallel_test_environment_preserves_path_without_credentials(self) -> None:
+        old = os.environ.copy()
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            local_bin = repo / ".venv" / "bin"
+            local_bin.mkdir(parents=True)
+            try:
+                os.environ["PATH"] = f"{local_bin}{os.pathsep}/usr/bin"
+                os.environ["GITHUB_TOKEN"] = "test-token-placeholder"
+                os.environ["NODE_OPTIONS"] = "--require=/tmp/unsafe.js"
+
+                env = self.helper["safe_test_env"](repo)
+
+                self.assertEqual(env["PATH"], os.environ["PATH"])
+                self.assertNotIn("GITHUB_TOKEN", env)
+                self.assertNotIn("NODE_OPTIONS", env)
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
     def test_safe_proxy_url_accepts_credential_free_formats(self) -> None:
         for value in (
             "http://proxy.example.invalid:8080",
@@ -1235,6 +1342,9 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 os.environ["GOOGLE_CLOUD_PROJECT"] = "test-project"
                 os.environ["CODEX_API_KEY"] = "test-token-placeholder"
                 os.environ["CODEX_CA_CERTIFICATE"] = str(root / "codex-ca.pem")
+                os.environ["PI_OFFLINE"] = "1"
+                os.environ["PI_SKIP_VERSION_CHECK"] = "1"
+                os.environ["PI_TELEMETRY"] = "0"
                 os.environ["NODE_OPTIONS"] = "--require=/tmp/unsafe.js"
                 os.environ["GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES"] = "1"
                 os.environ["XDG_DATA_HOME"] = str(root / "opencode-auth")
@@ -1273,6 +1383,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
                                 env["XDG_DATA_HOME"],
                                 str(root / "opencode-auth"),
                             )
+                        else:
+                            self.assertEqual(env["PI_OFFLINE"], "1")
+                            self.assertEqual(env["PI_SKIP_VERSION_CHECK"], "1")
+                            self.assertEqual(env["PI_TELEMETRY"], "0")
 
                 claude_env = self.helper["safe_engine_env"](repo, engine="claude")
                 for key in (
