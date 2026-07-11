@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import runpy
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -403,6 +405,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "design_tokens.json",
             "src/styles/design-tokens.json",
             "themes/dark/design_tokens.json",
+            "tokens/design-tokens.json",
+            "tokens/design_tokens.json",
         ):
             with self.subTest(rel=rel):
                 self.assertIsNone(self.helper["sensitive_repo_path_risk"](rel))
@@ -415,6 +419,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertIsNotNone(
             self.helper["tracked_sensitive_repo_path_risk"](
                 ".env/design-tokens.json"
+            )
+        )
+        self.assertIsNotNone(
+            self.helper["tracked_sensitive_repo_path_risk"](
+                ".env/tokens/design-tokens.json"
             )
         )
 
@@ -496,6 +505,170 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertTrue(self.helper["secret_text_risk"](content))
 
+    def test_secret_detector_handles_backtick_credential_literals(self) -> None:
+        content = "const pass" + "word = `" + realistic_secret_value() + "`;"
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_allows_op_backtick_credential_references(self) -> None:
+        for content in (
+            "pass" + "word=`op read op://vault/item/password`",
+            "pass" + "word=`op read --no-newline 'op://vault/item/password'`",
+            "pass" + "word=`op read 'op://vault/item name/password'`",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_op_backtick_shell_fallbacks(self) -> None:
+        content = (
+            "pass"
+            + "word=`op read op://vault/item/password || echo real-hardcoded-"
+            + "fallback`"
+        )
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_backtick_fallback_literals(self) -> None:
+        content = (
+            "const pass"
+            + 'word = `${user.password || "'
+            + "real-hardcoded-fallback"
+            + '"}`;'
+        )
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_member_reference_fallback_literals(self) -> None:
+        content = (
+            "pass"
+            + 'word = user.credentials.password || "'
+            + "real-hardcoded-fallback"
+            + '"'
+        )
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_reference_shaped_fallback_literals(self) -> None:
+        content = (
+            "pass"
+            + 'word = user.credentials.password || "'
+            + "user.ACTUAL_SECRET_VALUE"
+            + '"'
+        )
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_reference_shaped_backtick_literals(self) -> None:
+        content = "const pass" + "word = `user.ACTUAL_SECRET_VALUE`;"
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_python_reference_fallback_literals(self) -> None:
+        for operator in ("or", "and"):
+            content = (
+                "pass"
+                + f'word = user.credentials.password {operator} "'
+                + "real-hardcoded-fallback"
+                + '"'
+            )
+            with self.subTest(operator=operator):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+        conditional = (
+            "pass"
+            + 'word = user.credentials.password if user else "'
+            + "real-hardcoded-fallback"
+            + '"'
+        )
+        self.assertTrue(self.helper["secret_text_risk"](conditional))
+
+        cast_fallback = (
+            "pass"
+            + 'word = user.credentials.password as string || "'
+            + "real-hardcoded-fallback"
+            + '"'
+        )
+        self.assertTrue(self.helper["secret_text_risk"](cast_fallback))
+
+    def test_secret_detector_allows_nonsecret_fallback_values(self) -> None:
+        for content in (
+            "to" + "ken = retrieve_authentication_token(request) or None",
+            "pass" + "word = user.credentials.password || null",
+            "to" + "ken = provider.issue_token() ?? undefined",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_call_fallback_literals(self) -> None:
+        content = (
+            "to"
+            + 'ken = generate_secure_token() || "'
+            + "real-hardcoded-fallback"
+            + '"'
+        )
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_multiline_call_fallback_literals(self) -> None:
+        content = (
+            "to"
+            + "ken = provider.issue_token()\n"
+            + '  || "real-hardcoded-'
+            + 'fallback"'
+        )
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_operator_only_multiline_fallbacks(self) -> None:
+        content = (
+            "pass"
+            + "word = user.credentials.password ||\n"
+            + '  "actual-production-'
+            + 'secret"'
+        )
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_nested_multiline_fallbacks(self) -> None:
+        content = (
+            "pass"
+            + "word = user.credentials.password || getDefault(\n"
+            + '  "actual-production-'
+            + 'secret"\n)'
+        )
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_comment_separated_call_fallbacks(self) -> None:
+        content = (
+            "to"
+            + "ken = provider.issue_token()\n"
+            + "  // local fallback\n"
+            + '  || "real-hardcoded-'
+            + 'fallback"'
+        )
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_optional_call_fallback_literals(self) -> None:
+        content = (
+            "to"
+            + 'ken = provider?.issue_token() || "real-hardcoded-'
+            + 'fallback"'
+        )
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_ignores_comment_delimiters_in_calls(self) -> None:
+        content = (
+            "to"
+            + "ken = provider.issue_token(/* ) */ request)"
+            + ' || "real-hardcoded-'
+            + 'fallback"'
+        )
+
+        self.assertTrue(self.helper["secret_text_risk"](content))
+
     def test_secret_detector_allows_bare_variable_secret_references(self) -> None:
         for prefix in (
             "cached",
@@ -570,6 +743,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "token = response.authentication.accessToken",
             "token = request.headers.authorization",
             "password = account.credentials.password",
+            "password = user.credentials.password",
+            "password = user?.credentials?.password",
+            "password = `${process.env.PASSWORD}`",
+            "{ password: process.env.PASSWORD, username }",
+            "token = process.env.TOKEN as string",
             "self.access_token = self.authentication.access_token",
             "this.accessToken = this.authentication.accessToken",
             "api_key = client.settings.apiKey",
@@ -583,6 +761,19 @@ class AutoreviewHardeningTests(unittest.TestCase):
         ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
+
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                "pass"
+                + "word = user.credentials."
+                + "password\nif password is None:\n  reset()"
+            )
+        )
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                "pass" + "word = process.env.PASSWORD   "
+            )
+        )
 
     def test_fallback_self_test_ignores_ambient_model_overrides(self) -> None:
         with mock.patch.dict(
@@ -609,7 +800,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
         for content in (
             "token=secrets.token_urlsafe(32)",
             "token = provider.issue_token()",
+            "token = provider?.issue_token()",
             "token = generate_secure_token()",
+            "token = provider.issue_token().access_token",
+            "token = generate_secure_token().strip()",
+            "token = provider.issue_token()?.credentials.access_token",
+            "access_token = retrieve_authentication_token(request)",
+            'token = provider.issue_token(scope="review", retries=2)',
+            "token = provider.issue_token(\n  request,\n  retries=2,\n)",
         ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
@@ -1190,7 +1388,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertEqual(env["CI"], "1")
                 self.assertEqual(env["JAVA_HOME"], "/opt/jdk")
                 self.assertEqual(env["NODE_ENV"], "test")
-                self.assertNotIn("OPENCLAW_TESTBOX", env)
+                self.assertEqual(env["OPENCLAW_TESTBOX"], "1")
                 self.assertNotIn("PROJECT_FEATURE_MODE", env)
                 self.assertEqual(env["HOME"], str(isolated_home.resolve()))
                 self.assertEqual(env["RUSTUP_HOME"], str(rustup_home.resolve()))
@@ -1597,6 +1795,155 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 os.environ.clear()
                 os.environ.update(old)
 
+    def test_codex_runtime_home_copies_only_auth_and_syncs_refresh(self) -> None:
+        old = os.environ.copy()
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source_home = root / "host-home" / ".codex"
+            runtime_home = root / "runtime" / "codex-home"
+            source_home.mkdir(parents=True)
+            source_auth = source_home / "auth.json"
+            source_auth.write_text(
+                '{"token":"test-token-placeholder"}',
+                encoding="utf-8",
+            )
+            (source_home / "config.toml").write_text(
+                'cli_auth_credentials_store = "file"\n',
+                encoding="utf-8",
+            )
+            try:
+                os.environ["CODEX_HOME"] = str(source_home)
+                state = self.helper["prepare_codex_runtime_auth"](
+                    repo,
+                    runtime_home,
+                )
+                self.assertIsNotNone(state)
+                self.assertTrue((runtime_home / "auth.json").is_file())
+                self.assertFalse((runtime_home / "config.toml").exists())
+                self.assertIn(
+                    'cli_auth_credentials_store="file"',
+                    self.helper["codex_auth_config_flags"](
+                        repo,
+                        force_file=True,
+                    ),
+                )
+
+                (runtime_home / "auth.json").write_text(
+                    '{"token":"test-auth-token"}',
+                    encoding="utf-8",
+                )
+                updated_state = self.helper["sync_codex_runtime_auth"](
+                    state,
+                    runtime_home,
+                )
+                self.assertIsNotNone(updated_state)
+                self.assertEqual(
+                    json.loads(source_auth.read_text(encoding="utf-8"))["token"],
+                    "test-auth-token",
+                )
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
+    def test_codex_runtime_home_does_not_promote_keyring_fallback_file(self) -> None:
+        old = os.environ.copy()
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source_home = root / "host-home" / ".codex"
+            source_home.mkdir(parents=True)
+            (source_home / "auth.json").write_text(
+                '{"token":"test-token-placeholder"}',
+                encoding="utf-8",
+            )
+            (source_home / "config.toml").write_text(
+                'cli_auth_credentials_store = "keyring"\n',
+                encoding="utf-8",
+            )
+            try:
+                os.environ["CODEX_HOME"] = str(source_home)
+                self.assertIsNone(
+                    self.helper["prepare_codex_runtime_auth"](
+                        repo,
+                        root / "runtime" / "codex-home",
+                    )
+                )
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
+    def test_codex_runtime_home_preserves_auto_keyring_namespace(self) -> None:
+        old = os.environ.copy()
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source_home = root / "host-home" / ".codex"
+            runtime_home = root / "runtime" / "codex-home"
+            source_home.mkdir(parents=True)
+            (source_home / "auth.json").write_text(
+                '{"token":"test-token-placeholder"}',
+                encoding="utf-8",
+            )
+            (source_home / "config.toml").write_text(
+                'cli_auth_credentials_store = "auto"\n',
+                encoding="utf-8",
+            )
+            try:
+                os.environ["CODEX_HOME"] = str(source_home)
+                state = self.helper["prepare_codex_runtime_auth"](
+                    repo,
+                    runtime_home,
+                )
+                self.assertIsNone(state)
+                flags = self.helper["codex_auth_config_flags"](repo)
+                self.assertIn('cli_auth_credentials_store="auto"', flags)
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
+    def test_empty_codex_home_uses_external_default(self) -> None:
+        old = os.environ.copy()
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            default_home = root / "host-home" / ".codex"
+            default_home.mkdir(parents=True)
+            try:
+                os.environ["CODEX_HOME"] = ""
+                with mock.patch.object(
+                    Path,
+                    "home",
+                    return_value=default_home.parent,
+                ):
+                    self.assertEqual(
+                        self.helper["codex_source_home"](repo),
+                        default_home.resolve(),
+                    )
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
+    def test_empty_codex_home_ignores_missing_default(self) -> None:
+        old = os.environ.copy()
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            missing_home = root / "missing-home"
+            try:
+                os.environ["CODEX_HOME"] = ""
+                with mock.patch.object(
+                    Path,
+                    "home",
+                    return_value=missing_home,
+                ):
+                    self.assertIsNone(
+                        self.helper["codex_source_home"](repo)
+                    )
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
     def test_opencode_web_search_preserves_explicit_exa_opt_in(self) -> None:
         old = os.environ.copy()
         try:
@@ -1611,10 +1958,22 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
     def test_codex_isolation_restricts_tool_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
-            repo = init_repo(Path(tempdir))
-            flags = self.helper["codex_config_isolation_flags"](repo)
+            root = Path(tempdir)
+            repo = init_repo(root)
+            runtime_root = root / "runtime"
+            flags = self.helper["codex_config_isolation_flags"](
+                repo,
+                runtime_root,
+            )
 
         for required in (
+            f"sqlite_home={json.dumps(str((runtime_root / 'state').resolve()))}",
+            f"log_dir={json.dumps(str((runtime_root / 'log').resolve()))}",
+            "features.shell_snapshot=false",
+            "features.hooks=false",
+            "features.plugins=false",
+            "skills.include_instructions=false",
+            "skills.config=[]",
             'shell_environment_policy.inherit="core"',
             "shell_environment_policy.ignore_default_excludes=false",
             "shell_environment_policy.experimental_use_profile=false",

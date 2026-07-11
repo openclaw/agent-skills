@@ -144,6 +144,7 @@ SECRET_ASSIGNMENT_PATTERN = re.compile(
     r")\s*[:=]\s*"
     r"(?:\"(?P<double_value>[^\"\r\n]{12,})\"|"
     r"'(?P<single_value>[^'\r\n]{12,})'|"
+    r"`(?P<backtick_value>[^`\r\n]{12,})`|"
     r"(?P<bare_value>[A-Za-z0-9_./+=:@#$%&*!?-]{20,}))"
 )
 SECRET_VALUE_PATTERNS = [
@@ -188,15 +189,22 @@ QUOTED_SECRET_REFERENCE_PATTERNS = (
     re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*\}$"),
     re.compile(r"^\$\{\{\s*[A-Za-z_][A-Za-z0-9_.-]*\s*\}\}$"),
     re.compile(r"^\{\{\s*[A-Za-z_][A-Za-z0-9_.-]*\s*\}\}$"),
+    re.compile(
+        r"^\$\{(?:process\.env|os\.environ|env|cfg|config|params|payload|provider|user|"
+        r"request|response|result|account|client|auth|auth_response|oauth_response|"
+        r"token_response|api_response|authentication|credentials|settings|self|this)"
+        r"(?:(?:\?\.|\.)[A-Za-z_$][A-Za-z0-9_$]*"
+        r"|\[(?:[\"'][A-Za-z_$][A-Za-z0-9_$]*[\"']|[0-9]+)\])+\}$"
+    ),
     re.compile(r"^op://[^\r\n]+$"),
 )
 UNQUOTED_SECRET_REFERENCE_PATTERNS = (
     *QUOTED_SECRET_REFERENCE_PATTERNS,
     re.compile(
-        r"^(?:process\.env|os\.environ|env|cfg|config|params|payload|provider|"
+        r"^(?:process\.env|os\.environ|env|cfg|config|params|payload|provider|user|"
         r"request|response|result|account|client|auth|auth_response|oauth_response|"
         r"token_response|api_response|authentication|credentials|settings|self|this)"
-        r"(?:[.\[].*)$"
+        r"(?:(?:\?\.|[.\[]).*)$"
     ),
     re.compile(
         r"^(?:cached|current|existing|loaded|previous|resolved|saved|stored)_"
@@ -204,6 +212,14 @@ UNQUOTED_SECRET_REFERENCE_PATTERNS = (
         r"refresh[_-]?token|access[_-]?token|auth[_-]?token|id[_-]?token|"
         r"token|secret|password)$",
         re.IGNORECASE,
+    ),
+)
+BACKTICK_SECRET_REFERENCE_PATTERNS = (
+    re.compile(
+        r"^op\s+read(?:\s+--no-newline)?\s+(?:"
+        r"op://[A-Za-z0-9._~:/@%+=,-]+|"
+        r"(?P<op_quote>[\"'])op://[^`\"'\r\n]+(?P=op_quote)"
+        r")$"
     ),
 )
 DEFAULT_ENGINE_PATHS = ("/usr/local/bin", "/usr/bin", "/bin")
@@ -297,6 +313,7 @@ TEST_ENV_ALLOWED_EXACT = {
     "NO_PROXY",
     "NVM_BIN",
     "NVM_DIR",
+    "OPENCLAW_TESTBOX",
     "PATH",
     "PATHEXT",
     "PNPM_HOME",
@@ -1449,6 +1466,278 @@ def raw_repo_path_has_symlink_component(repo: Path, rel_path: Path) -> bool:
     return False
 
 
+def fallback_expression(text: str) -> str:
+    operator = re.match(r"\s*(?:\|\||&&|\?\?|\+|\?|or\b|and\b|if\b|unless\b)", text)
+    cursor = operator.end() if operator is not None else 0
+    stack: list[str] = []
+    operand_started = False
+    quote: str | None = None
+    escaped = False
+    line_comment = False
+    block_comment = False
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    while cursor < len(text):
+        char = text[cursor]
+        next_char = text[cursor + 1] if cursor + 1 < len(text) else ""
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+                if operand_started and not stack:
+                    break
+            cursor += 1
+            continue
+        if block_comment:
+            if char == "*" and next_char == "/":
+                block_comment = False
+                cursor += 2
+            else:
+                cursor += 1
+            continue
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            cursor += 1
+            continue
+        if char == "/" and next_char == "/":
+            line_comment = True
+            cursor += 2
+            continue
+        if char == "/" and next_char == "*":
+            block_comment = True
+            cursor += 2
+            continue
+        if char == "#":
+            line_comment = True
+            cursor += 1
+            continue
+        if char in {'"', "'", "`"}:
+            quote = char
+            operand_started = True
+            cursor += 1
+            continue
+        if char in pairs:
+            stack.append(pairs[char])
+            operand_started = True
+            cursor += 1
+            continue
+        if stack and char == stack[-1]:
+            stack.pop()
+            cursor += 1
+            continue
+        if not stack and char in ",;)]}":
+            break
+        if char == "\n" and operand_started and not stack:
+            break
+        if not char.isspace():
+            operand_started = True
+        cursor += 1
+    return text[:cursor]
+
+
+def fallback_secret_risk(text: str) -> bool:
+    expression = fallback_expression(text)
+    if any(pattern.search(expression) for pattern in SECRET_VALUE_PATTERNS):
+        return True
+    value_pattern = re.compile(
+        r'"(?P<double>[^"\r\n]{12,})"'
+        r"|'(?P<single>[^'\r\n]{12,})'"
+        r"|`(?P<backtick>[^`\r\n]{12,})`"
+        r"|(?P<bare>[A-Za-z0-9_./+=:@#$%&*!?-]{20,})"
+    )
+    for match in value_pattern.finditer(expression):
+        value = next(group for group in match.groups() if group is not None)
+        if value.lower() in SECRET_PLACEHOLDER_VALUES:
+            continue
+        if match.group("backtick") is not None and any(
+            pattern.fullmatch(value)
+            for pattern in BACKTICK_SECRET_REFERENCE_PATTERNS
+        ):
+            continue
+        reference_patterns = (
+            UNQUOTED_SECRET_REFERENCE_PATTERNS
+            if match.group("bare") is not None
+            else QUOTED_SECRET_REFERENCE_PATTERNS
+        )
+        if any(pattern.fullmatch(value) for pattern in reference_patterns):
+            continue
+        if match.group("bare") is not None:
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+                continue
+            suffix = expression[match.end() :].lstrip()
+            if suffix.startswith("("):
+                continue
+        return True
+    return False
+
+
+def safe_secret_assignment_suffix(text: str, end: int) -> bool:
+    cursor = end
+    raw_diff = text.startswith("diff --git ")
+    while cursor < len(text):
+        while cursor < len(text) and text[cursor] in " \t\r":
+            cursor += 1
+        if cursor >= len(text):
+            return True
+        if cursor < len(text) and text[cursor] == "\n":
+            cursor += 1
+            while cursor < len(text):
+                if raw_diff and text[cursor : cursor + 1] in {"+", "-", " "}:
+                    cursor += 1
+                while cursor < len(text) and text[cursor] in " \t\r":
+                    cursor += 1
+                if text.startswith("//", cursor) or text.startswith("#", cursor):
+                    newline = text.find("\n", cursor)
+                    if newline < 0:
+                        return True
+                    cursor = newline + 1
+                    continue
+                if text.startswith("/*", cursor):
+                    comment_end = text.find("*/", cursor + 2)
+                    if comment_end < 0:
+                        return False
+                    cursor = comment_end + 2
+                    continue
+                break
+            suffix = text[cursor:]
+            if (
+                suffix.startswith(("||", "&&", "??", "+"))
+                or (suffix.startswith("?") and not suffix.startswith("?."))
+                or re.match(r"(?:or|and)\b", suffix) is not None
+            ):
+                return not fallback_secret_risk(suffix)
+            return True
+        if text.startswith("//", cursor) or text.startswith("#", cursor):
+            cursor = text.find("\n", cursor)
+            if cursor < 0:
+                return True
+            continue
+        if text.startswith("/*", cursor):
+            comment_end = text.find("*/", cursor + 2)
+            if comment_end < 0:
+                return False
+            cursor = comment_end + 2
+            continue
+        suffix = text[cursor:]
+        if (
+            suffix.startswith(("||", "&&", "??", "+"))
+            or (suffix.startswith("?") and not suffix.startswith("?."))
+            or re.match(r"(?:or|and|if|unless)\b", suffix) is not None
+        ):
+            return not fallback_secret_risk(suffix)
+        if text[cursor] in ",;)]}":
+            return True
+        if text[cursor] in {'"', "'", "`"}:
+            after_quote = cursor + 1
+            while after_quote < len(text) and text[after_quote] in " \t\r":
+                after_quote += 1
+            if after_quote >= len(text) or text[after_quote] in ",;)]}":
+                return True
+            quote = text[cursor]
+            cursor += 1
+            escaped = False
+            while cursor < len(text):
+                char = text[cursor]
+                cursor += 1
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    break
+            continue
+        cursor += 1
+    return True
+
+
+def safe_secret_call_suffix(text: str, end: int) -> bool:
+    if end >= len(text) or text[end] != "(":
+        return False
+
+    def balanced_end(start: int, opener: str, closer: str) -> int | None:
+        depth = 0
+        quote: str | None = None
+        escaped = False
+        line_comment = False
+        block_comment = False
+        index = start
+        while index < len(text):
+            char = text[index]
+            next_char = text[index + 1] if index + 1 < len(text) else ""
+            if line_comment:
+                if char == "\n":
+                    line_comment = False
+                index += 1
+                continue
+            if block_comment:
+                if char == "*" and next_char == "/":
+                    block_comment = False
+                    index += 2
+                else:
+                    index += 1
+                continue
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+                index += 1
+                continue
+            if char == "/" and next_char == "/":
+                line_comment = True
+                index += 2
+            elif char == "/" and next_char == "*":
+                block_comment = True
+                index += 2
+            elif char == "#":
+                line_comment = True
+                index += 1
+            elif char in {'"', "'", "`"}:
+                quote = char
+                index += 1
+            elif char == opener:
+                depth += 1
+                index += 1
+            elif char == closer:
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+                index += 1
+            elif depth == 0:
+                return None
+            else:
+                index += 1
+        return None
+
+    cursor = balanced_end(end, "(", ")")
+    if cursor is None:
+        return False
+    while True:
+        match = re.match(r"\s*(?:\?\.|\.)[A-Za-z_][A-Za-z0-9_]*", text[cursor:])
+        if match is not None:
+            cursor += match.end()
+            continue
+        whitespace = re.match(r"\s*", text[cursor:])
+        assert whitespace is not None
+        call_start = cursor + whitespace.end()
+        if call_start < len(text) and text[call_start] == "(":
+            cursor = balanced_end(call_start, "(", ")")
+            if cursor is None:
+                return False
+            continue
+        if call_start < len(text) and text[call_start] == "[":
+            cursor = balanced_end(call_start, "[", "]")
+            if cursor is None:
+                return False
+            continue
+        return safe_secret_assignment_suffix(text, cursor)
+
+
 def secret_text_risk(text: str) -> bool:
     if any(pattern.search(text) for pattern in SECRET_VALUE_PATTERNS):
         return True
@@ -1457,22 +1746,41 @@ def secret_text_risk(text: str) -> bool:
         value = (
             match.group("double_value")
             or match.group("single_value")
+            or match.group("backtick_value")
             or match.group("bare_value")
         )
         if value is None:
             continue
-        if value.lower() in SECRET_PLACEHOLDER_VALUES:
+        if (
+            match.group("backtick_value") is not None
+            and any(
+                pattern.fullmatch(value)
+                for pattern in BACKTICK_SECRET_REFERENCE_PATTERNS
+            )
+            and safe_secret_assignment_suffix(text, match.end())
+        ):
             continue
+        if value.lower() in SECRET_PLACEHOLDER_VALUES:
+            if safe_secret_assignment_suffix(text, match.end()):
+                continue
+            return True
         reference_patterns = (
             QUOTED_SECRET_REFERENCE_PATTERNS
             if quoted
             else UNQUOTED_SECRET_REFERENCE_PATTERNS
         )
-        if any(pattern.fullmatch(value) for pattern in reference_patterns):
-            continue
-        call_target = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", value)
+        call_target = re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*(?:(?:\.|\?\.)[A-Za-z_][A-Za-z0-9_]*)*",
+            value,
+        )
         if not quoted and call_target and text[match.end() :].startswith("("):
-            continue
+            if safe_secret_call_suffix(text, match.end()):
+                continue
+            return True
+        if any(pattern.fullmatch(value) for pattern in reference_patterns):
+            if safe_secret_assignment_suffix(text, match.end()):
+                continue
+            return True
         return True
     return False
 
@@ -1559,9 +1867,18 @@ def design_token_artifact_path(
 ) -> bool:
     if re.fullmatch(r"design[-_]?tokens?\.json", path.name, re.IGNORECASE) is None:
         return False
-    parent = path.parent.as_posix()
-    return parent == "." or not any(
-        pattern.search(parent) for pattern in sensitive_patterns
+    allowed_design_token_dirs = {
+        "design-token",
+        "design-tokens",
+        "design_token",
+        "design_tokens",
+        "token",
+        "tokens",
+    }
+    return not any(
+        part.lower() not in allowed_design_token_dirs
+        and any(pattern.search(part) for pattern in sensitive_patterns)
+        for part in path.parts[:-1]
     )
 
 
@@ -2179,11 +2496,29 @@ def toml_inline_string_table(values: dict[str, str]) -> str:
     return "{" + entries + "}"
 
 
-def codex_config_isolation_flags(repo: Path) -> list[str]:
+def codex_config_isolation_flags(repo: Path, runtime_root: Path) -> list[str]:
     tool_env = toml_inline_string_table(codex_tool_git_env())
+    state_home = runtime_root / "state"
+    log_dir = runtime_root / "log"
+    state_home.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
     return [
         "-c",
         "project_doc_max_bytes=0",
+        "-c",
+        f"sqlite_home={json.dumps(str(state_home.resolve()))}",
+        "-c",
+        f"log_dir={json.dumps(str(log_dir.resolve()))}",
+        "-c",
+        "features.shell_snapshot=false",
+        "-c",
+        "features.hooks=false",
+        "-c",
+        "features.plugins=false",
+        "-c",
+        "skills.include_instructions=false",
+        "-c",
+        "skills.config=[]",
         "-c",
         f"projects.{toml_quoted_key_segment(str(repo.resolve()))}.trust_level=\"untrusted\"",
         "-c",
@@ -2260,17 +2595,36 @@ def load_codex_auth_config(path: Path) -> dict[str, Any]:
     return config if isinstance(config, dict) else {}
 
 
-def codex_auth_config_flags(repo: Path) -> list[str]:
-    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-    if not external_env_path(repo, str(codex_home)):
-        return []
+def codex_source_home(repo: Path) -> Path | None:
+    raw = os.environ.get("CODEX_HOME", "").strip()
+    candidate = Path(raw).expanduser() if raw else Path.home() / ".codex"
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return None
+    return (
+        resolved
+        if resolved.is_dir() and external_env_path(repo, str(resolved))
+        else None
+    )
+
+
+def codex_auth_config_flags(repo: Path, *, force_file: bool = False) -> list[str]:
+    codex_home = codex_source_home(repo)
+    if codex_home is None:
+        return ["-c", 'cli_auth_credentials_store="file"'] if force_file else []
     config = load_codex_auth_config(codex_home / "config.toml")
 
     allowed_values = {
-        "cli_auth_credentials_store": {"file", "keyring", "auto", "ephemeral"},
         "forced_login_method": {"chatgpt", "api"},
     }
-    flags: list[str] = []
+    flags: list[str] = (
+        ["-c", 'cli_auth_credentials_store="file"'] if force_file else []
+    )
+    if not force_file:
+        value = config.get("cli_auth_credentials_store")
+        if isinstance(value, str) and value in {"file", "keyring", "auto", "ephemeral"}:
+            flags.extend(["-c", f"cli_auth_credentials_store={json.dumps(value)}"])
     for key, allowed in allowed_values.items():
         value = config.get(key)
         if isinstance(value, str) and value in allowed:
@@ -2287,6 +2641,79 @@ def codex_auth_config_flags(repo: Path) -> list[str]:
         if normalized_workspace_ids:
             flags.extend(["-c", f"forced_chatgpt_workspace_id={json.dumps(normalized_workspace_ids)}"])
     return flags
+
+
+def prepare_codex_runtime_auth(
+    repo: Path,
+    runtime_codex_home: Path,
+) -> tuple[Path, bytes, str | None] | None:
+    source_home = codex_source_home(repo)
+    if source_home is None:
+        return None
+    config = load_codex_auth_config(source_home / "config.toml")
+    credential_store = config.get("cli_auth_credentials_store")
+    if credential_store not in {None, "file"}:
+        return None
+    source_auth = source_home / "auth.json"
+    try:
+        source_stat = source_auth.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(source_stat.st_mode):
+        return None
+    try:
+        data, truncated = read_prefix(source_auth, 1_000_000)
+        parsed = json.loads(data)
+    except (SystemExit, json.JSONDecodeError):
+        return None
+    if truncated or not isinstance(parsed, dict):
+        return None
+    runtime_codex_home.mkdir(parents=True, exist_ok=True)
+    runtime_auth = runtime_codex_home / "auth.json"
+    runtime_auth.write_bytes(data)
+    runtime_auth.chmod(0o600)
+    return source_auth, data, credential_store
+
+
+def sync_codex_runtime_auth(
+    auth_state: tuple[Path, bytes, str | None] | None,
+    runtime_codex_home: Path,
+) -> tuple[Path, bytes, str | None] | None:
+    if auth_state is None:
+        return None
+    source_auth, original, credential_store = auth_state
+    runtime_auth = runtime_codex_home / "auth.json"
+    try:
+        updated, updated_truncated = read_prefix(runtime_auth, 1_000_000)
+        current, current_truncated = read_prefix(source_auth, 1_000_000)
+        parsed = json.loads(updated)
+    except (SystemExit, json.JSONDecodeError):
+        return None
+    if (
+        updated_truncated
+        or current_truncated
+        or not isinstance(parsed, dict)
+        or current != original
+    ):
+        return None
+    if updated == original:
+        return auth_state
+    with tempfile.NamedTemporaryFile(
+        "wb",
+        delete=False,
+        dir=source_auth.parent,
+        prefix=".autoreview-auth.",
+    ) as handle:
+        handle.write(updated)
+        handle.flush()
+        os.fsync(handle.fileno())
+        replacement = Path(handle.name)
+    try:
+        replacement.chmod(0o600)
+        os.replace(replacement, source_auth)
+    finally:
+        replacement.unlink(missing_ok=True)
+    return source_auth, updated, credential_store
 
 
 def codex_exec_isolation_flags() -> list[str]:
@@ -2502,9 +2929,12 @@ def codex_command(
     args: argparse.Namespace,
     source_repo: Path,
     review_root: Path,
+    runtime_root: Path,
     schema_path: Path,
     output_path: Path,
     model: str | None,
+    *,
+    force_file_auth: bool = False,
 ) -> list[str]:
     cmd = [resolve_command(args.codex_bin, source_repo), "--ask-for-approval", "never"]
     if args.web_search:
@@ -2521,8 +2951,8 @@ def codex_command(
     speed_override = codex_speed_override(args)
     if speed_override is not None:
         cmd.extend(["-c", speed_override])
-    cmd.extend(codex_config_isolation_flags(review_root))
-    cmd.extend(codex_auth_config_flags(source_repo))
+    cmd.extend(codex_config_isolation_flags(review_root, runtime_root))
+    cmd.extend(codex_auth_config_flags(source_repo, force_file=force_file_auth))
     cmd.append("exec")
     if args.stream_engine_output:
         cmd.append("--json")
@@ -2566,32 +2996,80 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         with tempfile.TemporaryDirectory(
             prefix="autoreview-codex-workspace.",
             dir=temp_root,
-        ) as tempdir:
-            review_root = Path(tempdir)
+        ) as workspace_dir, tempfile.TemporaryDirectory(
+            prefix="autoreview-codex-runtime.",
+            dir=temp_root,
+        ) as runtime_dir:
+            review_root = Path(workspace_dir)
+            runtime_root = Path(runtime_dir)
+            runtime_home = runtime_root / "home"
+            runtime_config = runtime_home / ".config"
+            runtime_data = runtime_home / ".local" / "share"
+            runtime_state = runtime_home / ".local" / "state"
+            runtime_cache = runtime_home / ".cache"
+            runtime_codex_home = runtime_root / "codex-home"
+            for path in (
+                runtime_home,
+                runtime_config,
+                runtime_data,
+                runtime_state,
+                runtime_cache,
+                runtime_codex_home,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            auth_state = prepare_codex_runtime_auth(repo, runtime_codex_home)
+            source_codex_home = codex_source_home(repo)
+            active_codex_home = (
+                runtime_codex_home
+                if auth_state is not None or source_codex_home is None
+                else source_codex_home
+            )
             for index, model in enumerate(models):
                 output_path.write_text("")
                 cmd = codex_command(
                     args,
                     repo,
                     review_root,
+                    runtime_root,
                     schema_path,
                     output_path,
                     model,
-                )
-                result = run_with_heartbeat(
-                    cmd,
-                    review_root,
-                    input_text=prompt,
-                    label="codex",
-                    stream_output=args.stream_engine_output,
-                    stream_display=CodexStreamDisplay() if args.stream_engine_output else None,
-                    env=safe_engine_env(
-                        repo,
-                        [Path(cmd[0]).parent],
-                        engine="codex",
+                    force_file_auth=(
+                        auth_state is not None and auth_state[2] != "auto"
                     ),
-                    resolve_root=repo,
                 )
+                try:
+                    result = run_with_heartbeat(
+                        cmd,
+                        review_root,
+                        input_text=prompt,
+                        label="codex",
+                        stream_output=args.stream_engine_output,
+                        stream_display=CodexStreamDisplay() if args.stream_engine_output else None,
+                        env=safe_engine_env(
+                            repo,
+                            [Path(cmd[0]).parent],
+                            engine="codex",
+                            extra={
+                                "HOME": str(runtime_home),
+                                "USERPROFILE": str(runtime_home),
+                                "XDG_CACHE_HOME": str(runtime_cache),
+                                "XDG_CONFIG_HOME": str(runtime_config),
+                                "XDG_DATA_HOME": str(runtime_data),
+                                "XDG_STATE_HOME": str(runtime_state),
+                                # Keyring namespaces are derived from canonical CODEX_HOME.
+                                # File auth uses the isolated copy; keyring/auto must retain
+                                # the source namespace until Codex supports an auth-home split.
+                                "CODEX_HOME": str(active_codex_home),
+                            },
+                        ),
+                        resolve_root=repo,
+                    )
+                finally:
+                    auth_state = sync_codex_runtime_auth(
+                        auth_state,
+                        runtime_codex_home,
+                    )
                 output = output_path.read_text()
                 if result.returncode == 0:
                     return output or result.stdout
