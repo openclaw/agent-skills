@@ -252,6 +252,29 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     ["hostile-gitconfig", "visible.txt"],
                 )
 
+    def test_dirty_check_respects_trusted_global_excludes(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            home = root / "home"
+            home.mkdir()
+            excludes = root / "global-ignore"
+            excludes.write_text("ignored.local\n", encoding="utf-8")
+            (home / ".gitconfig").write_text(
+                f"[core]\n\texcludesFile = {excludes.as_posix()}\n",
+                encoding="utf-8",
+            )
+            (repo / "ignored.local").write_text("private notes\n", encoding="utf-8")
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": str(home),
+                    "USERPROFILE": str(home),
+                },
+            ):
+                self.assertFalse(self.helper["is_dirty"](repo))
+
     def test_oversized_text_is_rejected_without_scanning_binary_tail(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
@@ -661,13 +684,75 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + 'HORSEBATTERYSTAPLE")',
             "pass" + f'word = OS.GETENV("{opaque_value}")',
             "pass" + f'word = factory().os.getenv("{opaque_value}")',
+            "pass" + f'word = identity ("{literal_value}")',
+            "pass" + "word=correcthorsebatterystaple\n(echo ok)",
+            "pass" + "word=correcthorsebatterystaple\r(echo ok)",
+            "pass" + "word: correcthorsebatterystaple (production)",
+            "pass" + "word: correcthorsebatterystaple (primary)",
+            "pass" + "word = correcthorsebatterystaple (primary)",
         ):
             with self.subTest(content=content):
                 self.assertTrue(self.helper["secret_text_risk"](content))
 
+    def test_secret_detector_rejects_literals_after_javascript_regex_arguments(
+        self,
+    ) -> None:
+        literal_value = "actual-production-" + "secret"
+        for content in (
+            "to" + f'ken = provider.issue_token(/\\)/, "{literal_value}")',
+            "to" + f'ken = provider.issue_token(/a,b/, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(/[),]/gi, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(i++ / total, "{literal_value}" // note\n)',
+            "to"
+            + f'ken = provider.issue_token(i-- / total, "{literal_value}" // note\n)',
+            "to"
+            + f'ken = provider.issue_token(typeof /\\)/, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(() => {{ return /\\)/; }}, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(function*() {{ yield /\\)/; }}, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(of / total, "{literal_value}" // note\n)',
+            "to"
+            + f'ken = provider.issue_token(async () => await /\\);/, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(async () => await /\\)/\n, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(await /\\)/.test(input), "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(value! / divisor, "{literal_value}" // note\n)',
+            "to"
+            + f'ken = provider.issue_token(! /\\)/, "{literal_value}")',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_allows_safe_javascript_regex_arguments(self) -> None:
+        for content in (
+            "to" + "ken = provider.issue_token(/\\)/, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token(typeof /\\)/, process.env.TOKEN)",
+            "to" + "ken = provider.issue_token(total / count, process.env.TOKEN)",
+            "to" + "ken = provider.issue_token(of / total, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token(async () => await /\\);/, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token(async () => await /\\)/\n, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token(await /\\)/.test(input), process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token(value! / divisor, process.env.TOKEN)",
+            "to" + "ken = provider.issue_token(! /\\)/, process.env.TOKEN)",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
     def test_secret_detector_allows_credential_lookup_keys(self) -> None:
         for content in (
             'pass' + 'word = os.getenv("DATABASE_PASSWORD")',
+            'to' + 'ken = headers.get("Authorization")',
             'to' + 'ken = request.headers.get("Authorization")',
         ):
             with self.subTest(content=content):
@@ -680,6 +765,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "access_" + 'token = credentials.get_token("scope")',
             "access_"
             + 'token = credentials.get_token("api://00000000-0000-0000-0000-000000000000/.default")',
+            "access_"
+            + 'token = credentials.get_token("3db474b9-6a0c-4840-96ac-1fceb342124f/.default")',
             "access_"
             + "to"
             + 'ken = credentials.get_token("scope-a", '
@@ -720,6 +807,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + "to"
             + 'ken = credentials.get_token("https://example.test/'
             + 'correct-horse-battery-staple")',
+            "access_"
+            + "to"
+            + 'ken = credentials.get_token("3db474b9-6a0c-4840-96ac-'
+            + '1fceb342124f/actual-production-secret")',
             "pass" + 'word = decode("correct horse battery staple?")',
             "pass"
             + "word = in"
@@ -952,10 +1043,20 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
 
-    def test_secret_detector_allows_short_spaced_calls(self) -> None:
-        self.assertFalse(
-            self.helper["secret_text_risk"]("to" + "ken = mint_token ()")
-        )
+    def test_secret_detector_rejects_spaced_calls_without_language_context(
+        self,
+    ) -> None:
+        for content in (
+            "pass" + "word = retrieve_authentication_token (request)",
+            "to" + "ken: retrieve_authentication_token (request)",
+            "to" + "ken: derivePBKDF2SHA256Hash (request)",
+            "to" + "ken: acquireOAuth2TokenV2025 (request)",
+            "to" + "ken: enterpriseOAuth2ClientV123.getToken ()",
+            'pass' + 'word = os.getenv ("DATABASE_PASSWORD")',
+            "to" + "ken = mint_token ()",
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
 
     def test_secret_detector_rejects_ambiguous_bare_values(self) -> None:
         for content in (
@@ -1606,6 +1707,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     )
                 self.assertNotIn("PROJECT_FEATURE_MODE", env)
                 self.assertEqual(env["HOME"], str(isolated_home.resolve()))
+                self.assertNotIn("CARGO_HOME", env)
                 self.assertEqual(env["RUSTUP_HOME"], str(rustup_home.resolve()))
                 self.assertEqual(
                     env["XDG_CONFIG_HOME"],
@@ -1633,6 +1735,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     repo,
                     root / "windows-test-home",
                 )
+                self.assertNotIn("CARGO_HOME", windows_env)
                 self.assertEqual(
                     windows_env["RUSTUP_HOME"],
                     str(rustup_home.resolve()),
@@ -2093,6 +2196,9 @@ class AutoreviewHardeningTests(unittest.TestCase):
             try:
                 os.environ["XDG_DATA_HOME"] = str(repo / ".opencode-data")
                 os.environ["AWS_CONFIG_FILE"] = str(repo / ".aws-config")
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(
+                    repo / "provider-credentials.json"
+                )
                 os.environ["NODE_EXTRA_CA_CERTS"] = str(repo / "ca.pem")
                 os.environ["SSL_CERT_FILE"] = str(repo / "tls-ca.pem")
                 os.environ["SSL_CERT_DIR"] = os.pathsep.join(
@@ -2101,6 +2207,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 env = self.helper["safe_engine_env"](repo, engine="opencode")
                 self.assertNotIn("XDG_DATA_HOME", env)
                 self.assertNotIn("AWS_CONFIG_FILE", env)
+                self.assertNotIn("GOOGLE_APPLICATION_CREDENTIALS", env)
                 self.assertNotIn("NODE_EXTRA_CA_CERTS", env)
                 self.assertNotIn("SSL_CERT_FILE", env)
                 self.assertNotIn("SSL_CERT_DIR", env)

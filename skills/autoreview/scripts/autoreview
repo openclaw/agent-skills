@@ -146,7 +146,7 @@ SECRET_ASSIGNMENT_PATTERN = re.compile(
     r"'(?P<single_value>[^'\r\n]{12,})'|"
     r"`(?P<backtick_value>[^`\r\n]{12,})`|"
     r"(?P<call_value>[A-Za-z_$][A-Za-z0-9_$]*"
-    r"(?:(?:\?\.|\.)[A-Za-z_$][A-Za-z0-9_$]*)*)(?=\()|"
+    r"(?:(?:\?\.|\.)[A-Za-z_$][A-Za-z0-9_$]*)*)(?=[ \t]*\()|"
     r"(?P<reference_value>[A-Za-z_$][A-Za-z0-9_$]*"
     r"(?:(?:\?\.|\.)[A-Za-z_$][A-Za-z0-9_$]*"
     r"|\[(?:[\"'][A-Za-z_$][A-Za-z0-9_$]*[\"']|[0-9]+)\])+)"
@@ -597,6 +597,12 @@ def global_excludes_file(repo: Path) -> Path | None:
     return resolved
 
 
+def global_excludes_git_args(repo: Path) -> list[str]:
+    if excludes_file := global_excludes_file(repo):
+        return ["-c", f"core.excludesFile={excludes_file}"]
+    return []
+
+
 def safe_engine_path(repo: Path, extra_paths: list[Path] | None = None) -> str:
     entries: list[str] = []
     resolved_repo = repo.resolve()
@@ -915,6 +921,7 @@ def safe_engine_env(
             env["XDG_RUNTIME_DIR"] = xdg_runtime_dir
         for key in CODEX_TRUST_PATH_ENV_KEYS:
             value = os.environ.get(key)
+            env.pop(key, None)
             normalized = (
                 normalize_external_env_path_value(repo, key, value)
                 if value
@@ -925,6 +932,7 @@ def safe_engine_env(
     if engine in {"claude", "opencode", "pi"}:
         for key in PROVIDER_CREDENTIAL_PATH_ENV_KEYS:
             value = os.environ.get(key)
+            env.pop(key, None)
             normalized = (
                 normalize_external_env_path_value(repo, key, value)
                 if value
@@ -1410,7 +1418,14 @@ def current_branch(repo: Path) -> str:
 
 
 def is_dirty(repo: Path) -> bool:
-    return bool(git(repo, "status", "--porcelain").strip())
+    return bool(
+        git(
+            repo,
+            *global_excludes_git_args(repo),
+            "status",
+            "--porcelain",
+        ).strip()
+    )
 
 
 def choose_target(repo: Path, mode: str, base_ref: str | None) -> tuple[str, str | None]:
@@ -1698,8 +1713,7 @@ def fallback_expression(text: str) -> str:
     return text[:cursor]
 
 
-def fallback_secret_risk(text: str) -> bool:
-    expression = fallback_expression(text)
+def secret_literal_risk(expression: str) -> bool:
     if any(pattern.search(expression) for pattern in SECRET_VALUE_PATTERNS):
         return True
     value_pattern = re.compile(
@@ -1732,6 +1746,10 @@ def fallback_secret_risk(text: str) -> bool:
                 continue
         return True
     return False
+
+
+def fallback_secret_risk(text: str) -> bool:
+    return secret_literal_risk(fallback_expression(text))
 
 
 def safe_secret_assignment_suffix(text: str, end: int) -> bool:
@@ -1847,7 +1865,10 @@ def split_top_level_call_arguments(text: str) -> list[str]:
                 quote = None
             index += 1
             continue
-        if char == "/" and next_char == "/":
+        regex_end = javascript_regex_literal_end(text, index)
+        if regex_end is not None:
+            index = regex_end
+        elif char == "/" and next_char == "/":
             line_comment = True
             index += 2
         elif char == "/" and next_char == "*":
@@ -1872,6 +1893,98 @@ def split_top_level_call_arguments(text: str) -> list[str]:
     return arguments
 
 
+def javascript_regex_literal_end(text: str, start: int) -> int | None:
+    if text[start : start + 1] != "/" or text[start + 1 : start + 2] in {
+        "/",
+        "*",
+    }:
+        return None
+    previous = start - 1
+    while previous >= 0 and text[previous].isspace():
+        previous -= 1
+    if previous >= 0 and text[previous] not in "([{:;,=!?&|+-*%^~<>":
+        word_start = previous
+        while word_start >= 0 and (
+            text[word_start].isalnum() or text[word_start] in "_$"
+        ):
+            word_start -= 1
+        keyword = text[word_start + 1 : previous + 1]
+        if (
+            keyword
+            not in {
+                "case",
+                "delete",
+                "in",
+                "instanceof",
+                "new",
+                "return",
+                "throw",
+                "typeof",
+                "void",
+            }
+            or (word_start >= 0 and text[word_start] == ".")
+        ):
+            return None
+    if (
+        previous > 0
+        and text[previous] in "+-"
+        and text[previous - 1] == text[previous]
+    ):
+        return None
+    if text[previous : previous + 1] == "!":
+        before = previous - 1
+        while before >= 0 and text[before].isspace():
+            before -= 1
+        if before >= 0 and (
+            text[before].isalnum() or text[before] in "_$)]}"
+        ):
+            return None
+    escaped = False
+    character_class = False
+    cursor = start + 1
+    while cursor < len(text):
+        char = text[cursor]
+        if char in "\r\n":
+            return None
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "[":
+            character_class = True
+        elif char == "]" and character_class:
+            character_class = False
+        elif char == "/" and not character_class:
+            cursor += 1
+            while cursor < len(text) and text[cursor].isalpha():
+                cursor += 1
+            return cursor
+        cursor += 1
+    return None
+
+
+def premature_regex_tail(text: str, start: int) -> bool:
+    escaped = False
+    character_class = False
+    cursor = start
+    while cursor < len(text):
+        char = text[cursor]
+        if char in "\r\n":
+            return False
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == "[":
+            character_class = True
+        elif char == "]" and character_class:
+            character_class = False
+        elif char == "/" and not character_class:
+            return True
+        cursor += 1
+    return False
+
+
 def safe_credential_lookup_argument(
     call_target: str,
     argument: str,
@@ -1882,6 +1995,7 @@ def safe_credential_lookup_argument(
     normalized_target = call_target.replace("?.", ".")
     if (
         normalized_target not in {"os.getenv", "os.environ.get"}
+        and normalized_target != "headers.get"
         and not normalized_target.endswith(".headers.get")
     ):
         return False
@@ -1939,6 +2053,12 @@ def public_call_argument_risk(
             return True
         if secret_text_risk(decoded_value):
             return True
+        if re.fullmatch(
+            r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+            r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}/\.default",
+            decoded_value,
+        ):
+            return False
         if "://" not in decoded_value:
             return None
         try:
@@ -2024,7 +2144,10 @@ def safe_secret_call_suffix(text: str, end: int, call_target: str) -> bool:
                     quote = None
                 index += 1
                 continue
-            if char == "/" and next_char == "/":
+            regex_end = javascript_regex_literal_end(text, index)
+            if regex_end is not None:
+                index = regex_end
+            elif char == "/" and next_char == "/":
                 line_comment = True
                 index += 2
             elif char == "/" and next_char == "*":
@@ -2059,6 +2182,11 @@ def safe_secret_call_suffix(text: str, end: int, call_target: str) -> bool:
 
     cursor = safe_call_end(end, call_target)
     if cursor is None:
+        return False
+    if (
+        premature_regex_tail(text, cursor)
+        and secret_literal_risk(text[cursor:])
+    ):
         return False
     chained_target = "<call-result>"
     while True:
@@ -2157,8 +2285,22 @@ def secret_text_risk(text: str) -> bool:
             r"[A-Za-z_][A-Za-z0-9_]*(?:(?:\.|\?\.)[A-Za-z_][A-Za-z0-9_]*)*",
             value,
         )
-        if not quoted and call_target and text[match.end() :].startswith("("):
-            if safe_secret_call_suffix(text, match.end(), value):
+        suffix = text[match.end() :]
+        # Crossing a newline can misread the next shell subshell as this value's call.
+        whitespace = re.match(r"[ \t]*", suffix)
+        assert whitespace is not None
+        call_start = match.end() + whitespace.end()
+        if (
+            call_start > match.end()
+            and text[call_start : call_start + 1] == "("
+        ):
+            return True
+        if (
+            not quoted
+            and call_target
+            and text[call_start : call_start + 1] == "("
+        ):
+            if safe_secret_call_suffix(text, call_start, value):
                 continue
             return True
         if any(pattern.fullmatch(value) for pattern in reference_patterns):
@@ -2464,12 +2606,9 @@ def file_bundle_snapshot(
 
 
 def safe_untracked_file_snapshots(repo: Path) -> list[tuple[str, str, bool]]:
-    args: list[str] = []
-    if excludes_file := global_excludes_file(repo):
-        args.extend(["-c", f"core.excludesFile={excludes_file}"])
     files = git_path_list(
         repo,
-        *args,
+        *global_excludes_git_args(repo),
         "ls-files",
         "--others",
         "--exclude-standard",
