@@ -1544,7 +1544,9 @@ def bounded_field(text: str, limit: int) -> str:
 def read_prefix(path: Path, limit: int) -> tuple[bytes, bool]:
     descriptor: int | None = None
     try:
-        before = path.stat(follow_symlinks=False)
+        # os.stat, not Path.stat: the follow_symlinks kwarg on pathlib needs
+        # Python 3.10+, and macOS system python3 is still 3.9.
+        before = os.stat(path, follow_symlinks=False)
         if not stat.S_ISREG(before.st_mode):
             raise OSError("not a regular file")
         flags = (
