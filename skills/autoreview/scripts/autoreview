@@ -5,6 +5,7 @@ import argparse
 import ast
 import concurrent.futures
 import copy
+import functools
 import json
 import os
 import queue
@@ -71,7 +72,12 @@ TRACKED_CREDENTIAL_DIR_PATTERN = re.compile(
     r"(?:[._-].*)?$",
     re.IGNORECASE,
 )
+CREDENTIAL_FILE_PATTERN = re.compile(
+    r"(^|/)(?:\.netrc|\.git-credentials)$",
+    re.IGNORECASE,
+)
 SENSITIVE_NAME_PATTERNS = [
+    CREDENTIAL_FILE_PATTERN,
     re.compile(r"(^|/)\.env($|[._/-])", re.IGNORECASE),
     re.compile(r"(^|/)(id_rsa|id_dsa|id_ecdsa|id_ed25519)(\.pub)?$", re.IGNORECASE),
     re.compile(r"\.(pem|p12|pfx|key)$", re.IGNORECASE),
@@ -81,6 +87,7 @@ SENSITIVE_NAME_PATTERNS = [
     ),
 ]
 TRACKED_SENSITIVE_NAME_PATTERNS = [
+    CREDENTIAL_FILE_PATTERN,
     re.compile(
         r"(^|/)\.env(?:$|/|[._-](?!(?:example|sample|template)$)[^/]*)",
         re.IGNORECASE,
@@ -142,16 +149,16 @@ SECRET_ASSIGNMENT_PATTERN = re.compile(
     r"[\"'](?:api[_-]?key|aws[_-]?secret[_-]?access[_-]?key|client[_-]?secret|refresh[_-]?token|access[_-]?token|auth[_-]?token|id[_-]?token|token|secret|password)[\"']"
     r"|(?:api[_-]?key|aws[_-]?secret[_-]?access[_-]?key|client[_-]?secret|refresh[_-]?token|access[_-]?token|auth[_-]?token|id[_-]?token|token|secret|password)"
     r")\s*[:=]\s*"
-    r"(?:\"(?P<double_value>[^\"\r\n]{12,})\"|"
-    r"'(?P<single_value>[^'\r\n]{12,})'|"
-    r"`(?P<backtick_value>[^`\r\n]{12,})`|"
+    r"(?:\"(?P<double_value>[^\"\r\n]{8,})\"|"
+    r"'(?P<single_value>[^'\r\n]{8,})'|"
+    r"`(?P<backtick_value>[^`\r\n]{8,})`|"
     r"(?P<call_value>[A-Za-z_$][A-Za-z0-9_$]*"
     r"(?:(?:\?\.|\.)[A-Za-z_$][A-Za-z0-9_$]*)*)(?=[ \t]*\()|"
     r"(?P<reference_value>[A-Za-z_$][A-Za-z0-9_$]*"
     r"(?:(?:\?\.|\.)[A-Za-z_$][A-Za-z0-9_$]*"
     r"|\[(?:[\"'][A-Za-z_$][A-Za-z0-9_$]*[\"']|[0-9]+)\])+)"
     r"(?![A-Za-z0-9_./+=:@#$%&*!?-])|"
-    r"(?P<bare_value>[A-Za-z0-9_./+=:@#$%&*!?-]{20,}))"
+    r"(?P<bare_value>[A-Za-z0-9_./+=:@#$%&*!?-]{8,}))"
 )
 SECRET_VALUE_PATTERNS = [
     re.compile(
@@ -170,6 +177,37 @@ SECRET_VALUE_PATTERNS = [
     re.compile(r"\bya29\.[0-9A-Za-z_-]{20,}\b"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{7,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
 ]
+URI_SCHEME_PATTERN = re.compile(
+    r"\b[A-Za-z][A-Za-z0-9+.-]*://",
+    re.IGNORECASE,
+)
+URI_PASSWORD_REFERENCE_PATTERNS = (
+    re.compile(r"^\$[A-Za-z_][A-Za-z0-9_]*$"),
+    re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*\}$"),
+    re.compile(r"^\{[A-Za-z_][A-Za-z0-9_]*\}$"),
+    re.compile(
+        r"^\$\{[A-Za-z_$][A-Za-z0-9_$]*"
+        r"(?:(?:\?\.|\.)[A-Za-z_$][A-Za-z0-9_$]*"
+        r"|\[(?:[0-9]+|[\"'][A-Za-z_$][A-Za-z0-9_$]*[\"'])\])+\}$"
+    ),
+    re.compile(
+        r"^\{[A-Za-z_$][A-Za-z0-9_$]*"
+        r"(?:(?:\?\.|\.)[A-Za-z_$][A-Za-z0-9_$]*"
+        r"|\[(?:[0-9]+|[\"'][A-Za-z_$][A-Za-z0-9_$]*[\"'])\])+\}$"
+    ),
+)
+URI_CREDENTIAL_REFERENCE_TEXT = (
+    r"[A-Za-z_$][A-Za-z0-9_$]*"
+    r"(?:(?:\?\.|\.)[A-Za-z_$][A-Za-z0-9_$]*"
+    r"|\[(?:[0-9]+|[\"'][A-Za-z_$][A-Za-z0-9_$]*[\"'])\])*"
+)
+URI_CREDENTIAL_REFERENCE_PATTERN = re.compile(
+    rf"^{URI_CREDENTIAL_REFERENCE_TEXT}$"
+)
+URI_COMPUTED_REFERENCE_PATTERN = re.compile(
+    rf"^{URI_CREDENTIAL_REFERENCE_TEXT}"
+    rf"\(\s*{URI_CREDENTIAL_REFERENCE_TEXT}\s*\)$"
+)
 MAX_BUNDLE_TEXT_BYTES = 180_000
 MAX_REVIEW_PROMPT_BYTES = 512_000
 SECRET_PLACEHOLDER_VALUES = {
@@ -1677,6 +1715,10 @@ def fallback_expression(text: str) -> str:
                 quote = None
             cursor += 1
             continue
+        regex_end = javascript_regex_literal_end(text, cursor)
+        if regex_end is not None:
+            cursor = regex_end
+            continue
         if char == "/" and next_char == "/":
             line_comment = True
             cursor += 2
@@ -1713,8 +1755,390 @@ def fallback_expression(text: str) -> str:
     return text[:cursor]
 
 
+def uri_authority_end(
+    text: str,
+    start: int,
+    context: tuple[str, int] | None,
+) -> int:
+    outer_quote = context[0] if context is not None else None
+    interpolation_depth = 0
+    interpolation_quote: str | None = None
+    escaped = False
+    outer_escaped = False
+    cursor = start
+    while cursor < len(text):
+        char = text[cursor]
+        if interpolation_quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == interpolation_quote:
+                interpolation_quote = None
+            cursor += 1
+            continue
+        if outer_quote is not None and not interpolation_depth:
+            if outer_escaped:
+                outer_escaped = False
+                cursor += 1
+                continue
+            if char == "\\":
+                outer_escaped = True
+                cursor += 1
+                continue
+        if interpolation_depth:
+            if char in {'"', "'", "`"}:
+                interpolation_quote = char
+            elif char == "{":
+                interpolation_depth += 1
+            elif char == "}":
+                interpolation_depth -= 1
+            cursor += 1
+            continue
+        if outer_quote == "`" and text.startswith("${", cursor):
+            interpolation_depth = 1
+            cursor += 2
+            continue
+        if char.isspace() or char in "/?#":
+            break
+        if outer_quote is not None and text.startswith(outer_quote, cursor):
+            break
+        if outer_quote is None and char in {'"', "'", "`"}:
+            break
+        cursor += 1
+    return cursor
+
+
+def credentialed_uri_risk(text: str) -> bool:
+    matches = list(URI_SCHEME_PATTERN.finditer(text))
+    contexts = string_contexts_at(
+        text,
+        {match.start() for match in matches},
+    )
+    for match in matches:
+        context = contexts.get(match.start())
+        authority_end = uri_authority_end(text, match.end(), context)
+        authority = text[match.end() : authority_end]
+        userinfo, authority_separator, _ = authority.rpartition("@")
+        if not authority_separator:
+            continue
+        _, separator, uri_password = userinfo.partition(":")
+        if not separator or not uri_password:
+            continue
+        if uri_password_is_interpolated(
+            text,
+            match.start(),
+            uri_password,
+            context,
+        ):
+            continue
+        return True
+    return False
+
+
+def string_contexts_at(
+    text: str,
+    positions: set[int],
+) -> dict[int, tuple[str, int] | None]:
+    contexts: dict[int, tuple[str, int] | None] = {}
+    quote: str | None = None
+    quote_start = -1
+    escaped = False
+    line_comment = False
+    block_comment = False
+    brace_depth = 0
+    class_depths: list[int] = []
+    pending_class = False
+    cursor = 0
+    while cursor < len(text) and len(contexts) < len(positions):
+        if cursor in positions:
+            contexts[cursor] = (
+                None if quote is None else (quote, quote_start)
+            )
+        char = text[cursor]
+        next_char = text[cursor + 1] if cursor + 1 < len(text) else ""
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+            cursor += 1
+            continue
+        if block_comment:
+            if char == "*" and next_char == "/":
+                block_comment = False
+                cursor += 2
+            else:
+                cursor += 1
+            continue
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif text.startswith(quote, cursor):
+                quote_length = len(quote)
+                quote = None
+                quote_start = -1
+                cursor += quote_length
+                continue
+        elif (
+            regex_end := javascript_regex_literal_end(text, cursor)
+        ) is not None:
+            cursor = regex_end
+            continue
+        elif text.startswith('"""', cursor) or text.startswith("'''", cursor):
+            quote = text[cursor : cursor + 3]
+            quote_start = cursor
+            cursor += 3
+            continue
+        elif char == "/" and next_char == "/":
+            line_comment = True
+            cursor += 2
+            continue
+        elif char == "/" and next_char == "*":
+            block_comment = True
+            cursor += 2
+            continue
+        elif char == "#" and not javascript_private_member_marker(
+            text,
+            cursor,
+            allow_bare=bool(class_depths),
+        ):
+            line_comment = True
+        elif char in {'"', "'", "`"}:
+            quote = char
+            quote_start = cursor
+        elif char.isalpha() or char in "_$":
+            word_end = cursor + 1
+            while word_end < len(text) and (
+                text[word_end].isalnum() or text[word_end] in "_$"
+            ):
+                word_end += 1
+            if text[cursor:word_end] == "class":
+                pending_class = True
+            cursor = word_end
+            continue
+        elif char == "{":
+            brace_depth += 1
+            if pending_class:
+                class_depths.append(brace_depth)
+                pending_class = False
+        elif char == "}":
+            if class_depths and class_depths[-1] == brace_depth:
+                class_depths.pop()
+            brace_depth = max(0, brace_depth - 1)
+        elif char == ";":
+            pending_class = False
+        cursor += 1
+    for position in positions - contexts.keys():
+        contexts[position] = None if quote is None else (quote, quote_start)
+    return contexts
+
+
+def uri_password_is_interpolated(
+    text: str,
+    scheme_start: int,
+    password: str,
+    context: tuple[str, int] | None,
+) -> bool:
+    if context is not None:
+        quote, quote_start = context
+        if quote == "`":
+            if any(
+                pattern.fullmatch(password)
+                for pattern in URI_PASSWORD_REFERENCE_PATTERNS[1:2]
+                + URI_PASSWORD_REFERENCE_PATTERNS[3:4]
+            ):
+                return True
+            return dynamic_uri_expression(password, "${", "}")
+        prefix = text[:quote_start]
+        if quote in {'"', "'", '"""', "'''"} and re.search(
+            r"(?i)(?:^|[^A-Za-z0-9_])(?:f|fr|rf)$",
+            prefix,
+        ):
+            if any(
+                pattern.fullmatch(password)
+                for pattern in URI_PASSWORD_REFERENCE_PATTERNS[2:3]
+                + URI_PASSWORD_REFERENCE_PATTERNS[4:5]
+            ):
+                return True
+            return dynamic_uri_expression(password, "{", "}")
+        line_start = max(prefix.rfind("\n"), prefix.rfind("\r"))
+        assignment = prefix[line_start + 1 :]
+        if quote == '"' and shell_assignment_prefix(assignment):
+            return any(
+                pattern.fullmatch(password)
+                for pattern in URI_PASSWORD_REFERENCE_PATTERNS[:2]
+            )
+        if quote == '"' and shell_command_prefix(text, quote_start):
+            return any(
+                pattern.fullmatch(password)
+                for pattern in URI_PASSWORD_REFERENCE_PATTERNS[:2]
+            )
+        return uri_password_is_format_placeholder(
+            text,
+            password,
+            quote,
+            quote_start,
+        )
+    if (
+        config_assignment_prefix(text, scheme_start)
+        or shell_command_prefix(text, scheme_start)
+    ) and any(
+        pattern.fullmatch(password)
+        for pattern in URI_PASSWORD_REFERENCE_PATTERNS[:2]
+    ):
+        return True
+    line_start = max(text.rfind("\n", 0, scheme_start), text.rfind("\r", 0, scheme_start))
+    assignment = text[line_start + 1 : scheme_start]
+    if not shell_assignment_prefix(assignment):
+        return False
+    return any(
+        pattern.fullmatch(password)
+        for pattern in URI_PASSWORD_REFERENCE_PATTERNS[:2]
+    )
+
+
+def dynamic_uri_expression(
+    password: str,
+    prefix: str,
+    suffix: str,
+) -> bool:
+    if not password.startswith(prefix) or not password.endswith(suffix):
+        return False
+    expression = password[len(prefix) : -len(suffix)]
+    return (
+        URI_CREDENTIAL_REFERENCE_PATTERN.fullmatch(expression) is not None
+        or URI_COMPUTED_REFERENCE_PATTERN.fullmatch(expression) is not None
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def quoted_string_end(
+    text: str,
+    quote: str,
+    quote_start: int,
+) -> int | None:
+    quote_end = quote_start + len(quote)
+    escaped = False
+    while quote_end < len(text):
+        char = text[quote_end]
+        if escaped:
+            escaped = False
+            quote_end += 1
+        elif char == "\\":
+            escaped = True
+            quote_end += 1
+        elif text.startswith(quote, quote_end):
+            quote_end += len(quote)
+            break
+        else:
+            quote_end += 1
+    else:
+        return None
+    return quote_end
+
+
+def uri_password_is_format_placeholder(
+    text: str,
+    password: str,
+    quote: str,
+    quote_start: int,
+) -> bool:
+    quote_end = quoted_string_end(text, quote, quote_start)
+    if quote_end is None:
+        return False
+    prefix = text[:quote_start]
+    suffix = text[quote_end:]
+    if password == "%s":
+        python_percent_format = re.match(
+            rf"\s*%\s*{URI_CREDENTIAL_REFERENCE_TEXT}\b",
+            suffix,
+        )
+        go_sprintf = re.search(r"\bfmt\.Sprintf\(\s*$", prefix) and re.match(
+            rf"\s*,\s*{URI_CREDENTIAL_REFERENCE_TEXT}\s*\)",
+            suffix,
+        )
+        return python_percent_format is not None or go_sprintf is not None
+    field_match = re.fullmatch(
+        r"\{(?P<field>[A-Za-z_][A-Za-z0-9_]*|[0-9]*)\}",
+        password,
+    )
+    if field_match is not None:
+        field = field_match.group("field")
+        positional = re.match(
+            rf"\s*\.format\s*\(\s*{URI_CREDENTIAL_REFERENCE_TEXT}\s*\)",
+            suffix,
+        )
+        if positional is not None:
+            return True
+        if field and not field.isdigit():
+            return (
+                re.match(
+                    rf"\s*\.format\s*\(\s*{re.escape(field)}\s*=\s*"
+                    rf"{URI_CREDENTIAL_REFERENCE_TEXT}\s*\)",
+                    suffix,
+                )
+                is not None
+            )
+    return False
+
+
+def config_assignment_prefix(text: str, position: int) -> bool:
+    line_start = max(text.rfind("\n", 0, position), text.rfind("\r", 0, position))
+    prefix = text[line_start + 1 : position]
+    match = re.fullmatch(
+        r"\s*(?P<comment>#\s*)?[\"']?"
+        r"(?:[A-Za-z_][A-Za-z0-9_.-]*)?(?:dsn|uri|url)"
+        r"[\"']?\s*(?P<separator>[:=])\s*[\"']?",
+        prefix,
+        re.IGNORECASE,
+    )
+    return match is not None and (
+        match.group("separator") == ":" or match.group("comment") is not None
+    )
+
+
+def shell_assignment_prefix(text: str) -> bool:
+    match = re.fullmatch(
+        r"\s*(?P<export>export\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)=",
+        text,
+    )
+    return match is not None and (
+        match.group("export") is not None
+        or match.group("name") == match.group("name").upper()
+    )
+
+
+def shell_command_prefix(text: str, position: int) -> bool:
+    line_start = max(text.rfind("\n", 0, position), text.rfind("\r", 0, position))
+    prefix = text[line_start + 1 : position]
+    match = re.fullmatch(
+        r"\s*(?P<command>[A-Za-z0-9_./-]+)"
+        r"(?:[ \t]+-[^ \t\"'`]+)*[ \t]+",
+        prefix,
+    )
+    if match is None:
+        return False
+    command = match.group("command").rsplit("/", 1)[-1]
+    return command not in {
+        "await",
+        "class",
+        "const",
+        "def",
+        "let",
+        "new",
+        "print",
+        "return",
+        "throw",
+        "var",
+        "yield",
+    }
+
+
 def secret_literal_risk(expression: str) -> bool:
-    if any(pattern.search(expression) for pattern in SECRET_VALUE_PATTERNS):
+    if credentialed_uri_risk(expression) or any(
+        pattern.search(expression) for pattern in SECRET_VALUE_PATTERNS
+    ):
         return True
     value_pattern = re.compile(
         r'"(?P<double>[^"\r\n]{12,})"'
@@ -1893,7 +2317,169 @@ def split_top_level_call_arguments(text: str) -> list[str]:
     return arguments
 
 
-def javascript_regex_literal_end(text: str, start: int) -> int | None:
+def javascript_private_member_marker(
+    text: str,
+    index: int,
+    *,
+    allow_bare: bool = False,
+) -> bool:
+    next_char = text[index + 1] if index + 1 < len(text) else ""
+    return (
+        text[index : index + 1] == "#"
+        and bool(next_char)
+        and (next_char.isalpha() or next_char in "_$")
+        and (
+            allow_bare
+            or (index > 0 and text[index - 1] == ".")
+        )
+    )
+
+
+@functools.lru_cache(maxsize=16)
+def javascript_control_contexts(text: str) -> frozenset[int]:
+    closes: set[int] = set()
+    stack: list[str | None] = []
+    quote: str | None = None
+    escaped = False
+    line_comment = False
+    block_comment = False
+    last_word: str | None = None
+    prior_word: str | None = None
+    last_word_is_member = False
+    after_dot = False
+    cursor = 0
+    while cursor < len(text):
+        char = text[cursor]
+        next_char = text[cursor + 1] if cursor + 1 < len(text) else ""
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+            cursor += 1
+            continue
+        if block_comment:
+            if char == "*" and next_char == "/":
+                block_comment = False
+                cursor += 2
+            else:
+                cursor += 1
+            continue
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            cursor += 1
+            continue
+        regex_end = javascript_regex_literal_end(
+            text,
+            cursor,
+            control_conditions=False,
+            known_control_closes=closes,
+        )
+        if regex_end is not None:
+            cursor = regex_end
+            last_word = None
+            prior_word = None
+            last_word_is_member = False
+            after_dot = False
+        elif char == "/" and next_char == "/":
+            line_comment = True
+            cursor += 2
+        elif char == "/" and next_char == "*":
+            block_comment = True
+            cursor += 2
+        elif char in {'"', "'", "`"}:
+            quote = char
+            cursor += 1
+            last_word = None
+            prior_word = None
+            last_word_is_member = False
+            after_dot = False
+        elif char.isalpha() or char in "_$":
+            word_end = cursor + 1
+            while word_end < len(text) and (
+                text[word_end].isalnum() or text[word_end] in "_$"
+            ):
+                word_end += 1
+            word = text[cursor:word_end]
+            prior_word = last_word if not after_dot else None
+            last_word = word
+            last_word_is_member = after_dot
+            after_dot = False
+            cursor = word_end
+        elif char == "(":
+            control_kind: str | None = None
+            if not last_word_is_member:
+                if last_word in {"if", "while", "with"}:
+                    control_kind = "control"
+                elif last_word == "for" or (
+                    prior_word == "for" and last_word == "await"
+                ):
+                    control_kind = "for"
+            stack.append(control_kind)
+            last_word = None
+            prior_word = None
+            last_word_is_member = False
+            after_dot = False
+            cursor += 1
+        elif char == ")":
+            if not stack:
+                cursor += 1
+                continue
+            if stack.pop() is not None:
+                closes.add(cursor)
+            last_word = None
+            prior_word = None
+            last_word_is_member = False
+            after_dot = False
+            cursor += 1
+        elif char == ".":
+            last_word = None
+            prior_word = None
+            last_word_is_member = False
+            after_dot = True
+            cursor += 1
+        elif javascript_private_member_marker(
+            text,
+            cursor,
+            allow_bare=True,
+        ):
+            last_word = None
+            prior_word = None
+            last_word_is_member = False
+            after_dot = True
+            cursor += 1
+        elif char == ";":
+            last_word = None
+            prior_word = None
+            last_word_is_member = False
+            after_dot = False
+            cursor += 1
+        elif char.isspace():
+            cursor += 1
+        else:
+            last_word = None
+            prior_word = None
+            last_word_is_member = False
+            after_dot = False
+            cursor += 1
+    return frozenset(closes)
+
+
+@functools.lru_cache(maxsize=16)
+def javascript_control_condition_closes(text: str) -> frozenset[int]:
+    return javascript_control_contexts(text)
+
+
+def javascript_regex_literal_end(
+    text: str,
+    start: int,
+    *,
+    control_conditions: bool = True,
+    known_control_closes: set[int] | frozenset[int] | None = None,
+) -> int | None:
     if text[start : start + 1] != "/" or text[start + 1 : start + 2] in {
         "/",
         "*",
@@ -1902,6 +2488,23 @@ def javascript_regex_literal_end(text: str, start: int) -> int | None:
     previous = start - 1
     while previous >= 0 and text[previous].isspace():
         previous -= 1
+    if (
+        previous >= 2
+        and text[previous - 2 : previous + 1] == "..."
+        and (previous == 2 or text[previous - 3] != ".")
+    ):
+        previous = -1
+    if previous >= 0 and text[previous] == ")":
+        closes_control_condition = (
+            previous in known_control_closes
+            if known_control_closes is not None
+            else (
+                control_conditions
+                and previous in javascript_control_condition_closes(text)
+            )
+        )
+        if closes_control_condition:
+            previous = -1
     if previous >= 0 and text[previous] not in "([{:;,=!?&|+-*%^~<>":
         word_start = previous
         while word_start >= 0 and (
@@ -1909,19 +2512,23 @@ def javascript_regex_literal_end(text: str, start: int) -> int | None:
         ):
             word_start -= 1
         keyword = text[word_start + 1 : previous + 1]
+        expression_keyword = keyword in {
+            "case",
+            "default",
+            "delete",
+            "do",
+            "else",
+            "extends",
+            "in",
+            "instanceof",
+            "new",
+            "return",
+            "throw",
+            "typeof",
+            "void",
+        }
         if (
-            keyword
-            not in {
-                "case",
-                "delete",
-                "in",
-                "instanceof",
-                "new",
-                "return",
-                "throw",
-                "typeof",
-                "void",
-            }
+            not expression_keyword
             or (word_start >= 0 and text[word_start] == ".")
         ):
             return None
@@ -1963,14 +2570,12 @@ def javascript_regex_literal_end(text: str, start: int) -> int | None:
     return None
 
 
-def premature_regex_tail(text: str, start: int) -> bool:
+def regex_tail_end(text: str, start: int, limit: int) -> int | None:
     escaped = False
     character_class = False
     cursor = start
-    while cursor < len(text):
+    while cursor < limit:
         char = text[cursor]
-        if char in "\r\n":
-            return False
         if escaped:
             escaped = False
         elif char == "\\":
@@ -1980,9 +2585,151 @@ def premature_regex_tail(text: str, start: int) -> bool:
         elif char == "]" and character_class:
             character_class = False
         elif char == "/" and not character_class:
-            return True
+            return cursor + 1
         cursor += 1
-    return False
+    return None
+
+
+def previous_regex_delimiter(text: str, start: int, lower: int) -> int | None:
+    character_class = False
+    cursor = start - 1
+    while cursor >= lower:
+        char = text[cursor]
+        backslashes = 0
+        previous = cursor - 1
+        while previous >= lower and text[previous] == "\\":
+            backslashes += 1
+            previous -= 1
+        escaped = backslashes % 2 == 1
+        if not escaped:
+            if char == "]":
+                character_class = True
+            elif char == "[" and character_class:
+                character_class = False
+            elif char == "/" and not character_class:
+                return cursor
+        cursor -= 1
+    return None
+
+
+def text_without_ranges(
+    text: str,
+    start: int,
+    end: int,
+    ranges: list[tuple[int, int]],
+) -> str:
+    parts: list[str] = []
+    cursor = start
+    for range_start, range_end in ranges:
+        if range_end <= cursor or range_start >= end:
+            continue
+        if cursor < range_start:
+            parts.append(text[cursor:range_start])
+        parts.append(" ")
+        cursor = max(cursor, range_end)
+    if cursor < end:
+        parts.append(text[cursor:end])
+    return "".join(parts)
+
+
+def premature_regex_call_tail(
+    text: str,
+    call_start: int,
+    cursor: int,
+) -> tuple[str, int] | None:
+    line_end = len(text)
+    for delimiter in ("\n", "\r"):
+        found = text.find(delimiter, cursor)
+        if found >= 0:
+            line_end = min(line_end, found)
+    line_start = max(
+        text.rfind("\n", 0, cursor),
+        text.rfind("\r", 0, cursor),
+    ) + 1
+    search_start = max(call_start, line_start)
+    nearest = previous_regex_delimiter(text, cursor, search_start)
+    candidates = []
+    if nearest is not None:
+        candidates.append(nearest)
+        previous = previous_regex_delimiter(text, nearest, search_start)
+        if previous is not None:
+            candidates.append(previous)
+    for regex_start in candidates:
+        regex_end = regex_tail_end(text, regex_start + 1, line_end)
+        if regex_end is None or ")" not in text[regex_start + 1 : regex_end - 1]:
+            continue
+        depth = 0
+        quote: str | None = None
+        escaped = False
+        line_comment = False
+        block_comment = False
+        regex_ranges = [(regex_start, regex_end)]
+        index = call_start
+        while index < len(text):
+            char = text[index]
+            next_char = text[index + 1] if index + 1 < len(text) else ""
+            if line_comment:
+                if char == "\n":
+                    line_comment = False
+                index += 1
+                continue
+            if block_comment:
+                if char == "*" and next_char == "/":
+                    block_comment = False
+                    index += 2
+                else:
+                    index += 1
+                continue
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+                index += 1
+                continue
+            if index == regex_start:
+                index = regex_end
+            elif (
+                later_regex_end := javascript_regex_literal_end(text, index)
+            ) is not None:
+                regex_ranges.append((index, later_regex_end))
+                index = later_regex_end
+            elif char == "/" and next_char == "/":
+                line_comment = True
+                index += 2
+            elif char == "/" and next_char == "*":
+                block_comment = True
+                index += 2
+            # This recovery scans JavaScript; `#name` is a private identifier,
+            # so only JavaScript's slash-delimited comment forms apply here.
+            elif char in {'"', "'", "`"}:
+                quote = char
+                index += 1
+            elif char == "(":
+                depth += 1
+                index += 1
+            elif char == ")":
+                depth -= 1
+                index += 1
+                if depth == 0:
+                    return (
+                        (
+                            text_without_ranges(
+                                text,
+                                cursor,
+                                index,
+                                regex_ranges,
+                            ),
+                            index,
+                        )
+                        if index > cursor
+                        else None
+                    )
+            else:
+                index += 1
+    return None
 
 
 def safe_credential_lookup_argument(
@@ -2089,7 +2836,7 @@ def public_call_argument_risk(
         return False if valid_scope_uri else None
     generic_prompt = re.fullmatch(
         r"(?i)\s*(?:(?:enter|type|provide)\s+(?:your\s+)?)?"
-        r"(?:password|passphrase)\s*[:?]\s*",
+        r"(?:password|passphrase|api[\s_-]*key)\s*[:?]\s*",
         value,
     )
     return False if generic_prompt is not None else None
@@ -2153,7 +2900,10 @@ def safe_secret_call_suffix(text: str, end: int, call_target: str) -> bool:
             elif char == "/" and next_char == "*":
                 block_comment = True
                 index += 2
-            elif char == "#":
+            elif char == "#" and not javascript_private_member_marker(
+                text,
+                index,
+            ):
                 line_comment = True
                 index += 1
             elif char in {'"', "'", "`"}:
@@ -2183,11 +2933,11 @@ def safe_secret_call_suffix(text: str, end: int, call_target: str) -> bool:
     cursor = safe_call_end(end, call_target)
     if cursor is None:
         return False
-    if (
-        premature_regex_tail(text, cursor)
-        and secret_literal_risk(text[cursor:])
-    ):
-        return False
+    regex_recovery = premature_regex_call_tail(text, end, cursor)
+    if regex_recovery is not None:
+        regex_tail, cursor = regex_recovery
+        if secret_literal_risk(regex_tail):
+            return False
     chained_target = "<call-result>"
     while True:
         match = re.match(r"\s*(?:\?\.|\.)[A-Za-z_][A-Za-z0-9_]*", text[cursor:])
@@ -2243,7 +2993,9 @@ def safe_backtick_secret_template(value: str) -> bool:
 
 
 def secret_text_risk(text: str) -> bool:
-    if any(pattern.search(text) for pattern in SECRET_VALUE_PATTERNS):
+    if credentialed_uri_risk(text) or any(
+        pattern.search(text) for pattern in SECRET_VALUE_PATTERNS
+    ):
         return True
     for match in SECRET_ASSIGNMENT_PATTERN.finditer(text):
         quoted = any(
@@ -2273,6 +3025,14 @@ def secret_text_risk(text: str) -> bool:
         ):
             continue
         if value.lower() in SECRET_PLACEHOLDER_VALUES:
+            if safe_secret_assignment_suffix(text, match.end()):
+                continue
+            return True
+        if (
+            match.group("bare_value") is not None
+            and len(value) < 12
+            and re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", value)
+        ):
             if safe_secret_assignment_suffix(text, match.end()):
                 continue
             return True

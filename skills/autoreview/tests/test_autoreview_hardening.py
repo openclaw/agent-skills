@@ -521,6 +521,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "client-secret.csv",
             ".docker/config.json",
             "deployment/.docker/config.json",
+            ".netrc",
+            "config/.netrc",
+            ".git-credentials",
+            "config/.git-credentials",
         ):
             with self.subTest(rel=rel):
                 self.assertIsNotNone(
@@ -652,14 +656,18 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertFalse(self.helper["secret_text_risk"](content))
 
     def test_secret_detector_rejects_call_fallback_literals(self) -> None:
-        content = (
+        for content in (
             "to"
             + 'ken = generate_secure_token() || "'
             + "real-hardcoded-fallback"
-            + '"'
-        )
-
-        self.assertTrue(self.helper["secret_text_risk"](content))
+            + '"',
+            "to"
+            + 'ken = process.env.TOKEN || choose(/\\)/, "'
+            + "actual-production-secret"
+            + '")',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
 
     def test_secret_detector_rejects_literal_secrets_in_call_arguments(
         self,
@@ -720,11 +728,88 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "to"
             + f'ken = provider.issue_token(async () => await /\\)/\n, "{literal_value}")',
             "to"
+            + f'ken = provider.issue_token(await /\\)/,\n  "{literal_value}")',
+            "to"
             + f'ken = provider.issue_token(await /\\)/.test(input), "{literal_value}")',
             "to"
             + f'ken = provider.issue_token(value! / divisor, "{literal_value}" // note\n)',
             "to"
             + f'ken = provider.issue_token(! /\\)/, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(value<int> / total, "{literal_value}"[0] / count)',
+            "to"
+            + f'ken = provider.issue_token(value<int> / total || "{literal_value}"[0] / count)',
+            "to"
+            + f'ken = provider.issue_token(counter++ / total || "{literal_value}"[0] / count)',
+            "to"
+            + f'ken = provider.issue_token(counter-- / total || "{literal_value}"[0] / count)',
+            "to"
+            + f'ken = provider.issue_token(value! / total || "{literal_value}"[0] / count)',
+            "to"
+            + f'ken = provider.issue_token(value<Array<number>> / total || "{literal_value}"[0] / count)',
+            "var await = value; to"
+            + f'ken = provider.issue_token(await / total || "{literal_value}"[0] / count)',
+            "var yield = value; to"
+            + f'ken = provider.issue_token(yield / total || "{literal_value}"[0] / count)',
+            "to"
+            + f'ken = provider.issue_token(() => {{ if (ok) /\\)/.test(x); }}, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(() => {{ if (x === "(") /\\)/.test(x); }}, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(a<b> /\\)/, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(() => {{ if (ok) use(); else /\\)/.test(x); }}, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(() => {{ do /\\)/.test(x); while (ok); }}, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(() => {{ for (const x of /\\)/) use(x); }}, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(() => {{ for await (const x of xs) /\\)/.test(x); }}, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(() => {{ if /*c*/ (ok) /\\)/.test(x); }}, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(() => {{ if (a) /\\(/.test(x); if (b) /\\)/.test(x); }}, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(.../\\)/.source, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(() => class C extends /\\)/.constructor {{}}, "{literal_value}")',
+            "// const await = harmless\n"
+            + "to"
+            + f'ken = provider.issue_token(await /\\)/, "{literal_value}")',
+            "to"
+            + "ken = provider.issue_token("
+            + f'() => {{ for (of / total; ok; of++) use(); next / 2; }}, "{literal_value}")',
+            "to"
+            + "ken = provider.issue_token("
+            + f'() => {{ for (let x = of / total; x; x++) use(); next / 2; }}, "{literal_value}")',
+            "to"
+            + "ken = provider.issue_token("
+            + f'() => {{ var await=n; if (await / total) /\\)/.test(x); }}, "{literal_value}")',
+            "to"
+            + "ken = provider.issue_token(await /\\)/, "
+            + "x" * 9000
+            + f', "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(await /\\)/, ok /* ) */, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(wrapper(await /\\)\\)/, process.env.TOKEN), "{literal_value}")',
+            "to"
+            + "ken = provider.issue_token(await /\\)/,\n"
+            + f'fallback = "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(await /foo(\\/a\\/bar)\\)/, "{literal_value}")',
+            "to"
+            + f'ken = provider.issue_token(await /\\)/, this.#field, "{literal_value}")',
+            "to"
+            + "ken = outer(wrapper(await /\\)/, process.env.TOKEN),\n"
+            + f'  "{literal_value}",\n'
+            + "  /foo/)",
+            "to"
+            + f'ken = get_token(await /\\)/, /x\\)/, "{literal_value}")',
+            "to"
+            + f'ken = get_token(await /\\)/, process.env.TOKEN) || "{literal_value}"',
+            "to"
+            + f'ken = get_token(this.#if(x) / total / count, "{literal_value}")',
         ):
             with self.subTest(content=content):
                 self.assertTrue(self.helper["secret_text_risk"](content))
@@ -741,10 +826,182 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "to"
             + "ken = provider.issue_token(async () => await /\\)/\n, process.env.TOKEN)",
             "to"
+            + "ken = provider.issue_token(await /\\)/,\n  process.env.TOKEN)",
+            "to"
             + "ken = provider.issue_token(await /\\)/.test(input), process.env.TOKEN)",
             "to"
             + "ken = provider.issue_token(value! / divisor, process.env.TOKEN)",
             "to" + "ken = provider.issue_token(! /\\)/, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token(value<int> / total, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token(value<int> / total || process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token("
+            + "() => { if (ok) /\\)/.test(x); }, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token("
+            + "items.with(0, x) / total, process.env.TOKEN / count)",
+            "to"
+            + "ken = provider.issue_token("
+            + "await / total, process.env.TOKEN / count)",
+            "to"
+            + "ken = provider.issue_token("
+            + "yield / total, process.env.TOKEN / count)",
+            "to"
+            + "ken = provider.issue_token("
+            + "value<Array<number[]>> / total, process.env.TOKEN / count)",
+            "to"
+            + "ken = provider.issue_token("
+            + "value<Foo | Bar> / total, process.env.TOKEN / count)",
+            "to"
+            + "ken = provider.issue_token("
+            + "a<b> /\\)/, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token("
+            + "() => { if (ok) use(); else /\\)/.test(x); }, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token("
+            + "() => { do /\\)/.test(x); while (ok); }, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token("
+            + "() => { for (const x of /\\)/) use(x); }, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token("
+            + "() => { for await (const x of xs) /\\)/.test(x); }, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token("
+            + "() => { if /*c*/ (ok) /\\)/.test(x); }, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token("
+            + "() => { if (a) /\\(/.test(x); if (b) /\\)/.test(x); }, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token("
+            + ".../\\)/.source, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token("
+            + "() => class C extends /\\)/.constructor {}, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token("
+            + "() => { for (of / total; ok; of++) use(); next / 2; }, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token("
+            + "() => { for (let x = of / total; x; x++) use(); next / 2; }, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token("
+            + "() => { for (const {x} of /\\)/) use(x); }, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token("
+            + "() => { var await=n; if (await / total) /\\)/.test(x); }, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token(await /\\)/, "
+            + "x" * 9000
+            + ", process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token(await /\\)/, ok /* ) */, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token(wrapper(await /\\)\\)/, process.env.TOKEN), process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token(await /\\)/,\n"
+            + "fallback = process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token(await /foo(\\/a\\/bar)\\)/, process.env.TOKEN)",
+            "to"
+            + "ken = provider.issue_token(await /\\)/, this.#field, process.env.TOKEN)",
+            "to"
+            + "ken = outer(wrapper(await /\\)/, process.env.TOKEN),\n"
+            + "  process.env.TOKEN,\n"
+            + "  /foo/)",
+            "to"
+            + 'ken = get_token(a / fn(x) / b)\nreport("actual-production-secret")',
+            "to"
+            + 'ken = get_token(await /\\)"actual-production-secret"/, process.env.TOKEN)',
+            "to"
+            + 'ken = get_token(await /\\)/, /x)"actual-production-secret"/, process.env.TOKEN)',
+            "to"
+            + "ken = get_token(await /\\)/, process.env.TOKEN) || process.env.FALLBACK",
+            "to"
+            + "ken = get_token(this.#if(x) / total / count, process.env.TOKEN)",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_regex_parser_accepts_expression_keyword_contexts(self) -> None:
+        for content in (
+            "class C extends /\\)/.constructor {}",
+            "export default /\\)/;",
+        ):
+            with self.subTest(content=content):
+                start = content.index("/")
+                self.assertIsNotNone(
+                    self.helper["javascript_regex_literal_end"](content, start)
+                )
+
+    def test_call_argument_split_preserves_secret_shaped_regex(self) -> None:
+        regex = "/password=" + "actual-production-secret" + ",foo/"
+
+        self.assertEqual(
+            self.helper["split_top_level_call_arguments"](
+                f"{regex}, process.env.TOKEN"
+            ),
+            [regex, " process.env.TOKEN"],
+        )
+
+    def test_call_argument_split_treats_contextual_of_as_identifier(self) -> None:
+        self.assertEqual(
+            self.helper["split_top_level_call_arguments"](
+                "of / total, other / +count, final"
+            ),
+            ["of / total", " other / +count", " final"],
+        )
+
+    def test_control_condition_scan_is_cached_per_source(self) -> None:
+        scan = self.helper["javascript_control_condition_closes"]
+        scan.cache_clear()
+        content = " ".join("if (ok) /a/.test(value);" for _ in range(32))
+        starts = [match.start() for match in re.finditer(r"/a/", content)]
+
+        for start in starts:
+            self.assertIsNotNone(
+                self.helper["javascript_regex_literal_end"](content, start)
+            )
+
+        cache = scan.cache_info()
+        self.assertEqual(cache.misses, 1)
+        self.assertGreaterEqual(cache.hits, len(starts) - 1)
+
+    def test_credential_uri_contexts_are_scanned_once(self) -> None:
+        scan = self.helper["string_contexts_at"]
+        wrapped = mock.Mock(wraps=scan)
+        content = "\n".join(
+            f"URL_{index}=postgres://"
+            f"user:$PASSWORD_{index}@db.example/app"
+            for index in range(64)
+        )
+        with mock.patch.dict(
+            self.helper["credentialed_uri_risk"].__globals__,
+            {"string_contexts_at": wrapped},
+        ):
+            self.assertFalse(self.helper["credentialed_uri_risk"](content))
+
+        wrapped.assert_called_once()
+
+    def test_secret_detector_scopes_premature_regex_tail_to_current_call(
+        self,
+    ) -> None:
+        literal_value = "actual-production-" + "secret"
+        for content in (
+            "to"
+            + "ken = get_token(await /\\)/, process.env.TOKEN)\n"
+            + f'const fixture = "{literal_value}"',
+            "to"
+            + 'ken = headers.get("Authorization"); const ratio = a / b\n'
+            + f'const fixture = "{literal_value}"',
+            "to"
+            + "ken = get_token(await /\\)/, process.env.TOKEN)\r\n"
+            + f'const fixture = "{literal_value}"',
+            "to"
+            + 'ken = issue(); route = "/health/status/check";',
         ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
@@ -779,6 +1036,12 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "pass" + 'phrase = getpass.getpass("Passphrase: ")',
             "pass"
             + 'word = getpass.getpass(prompt="Enter your password: ")',
+            "api_"
+            + 'key = input("Enter your API key: ")',
+            "api_"
+            + 'key = getpass.getpass("Enter your API key: ")',
+            "api_"
+            + 'key = getpass.getpass(prompt="Enter your API key: ")',
         ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
@@ -967,6 +1230,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_secret_detector_does_not_treat_code_expressions_as_values(self) -> None:
         for content in (
             "token = secrets.token_urlsafe(32)",
+            "token = response",
+            "password = undefined",
             "token = process.env.GITHUB_TOKEN",
             'token = os.environ["GITHUB_TOKEN"]',
             'password = payload.get("password")',
@@ -1088,9 +1353,178 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertTrue(self.helper["secret_text_risk"](content))
 
     def test_secret_detector_handles_low_diversity_passwords(self) -> None:
-        content = 'password="' + "letmeinletmein" + '"'
+        for content in (
+            'password="' + "letmeinletmein" + '"',
+            'password="' + "hunter2!" + '"',
+            "password=" + "hunter2!",
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
 
-        self.assertTrue(self.helper["secret_text_risk"](content))
+    def test_secret_detector_handles_credentialed_uris(self) -> None:
+        for content in (
+            'url="postgres://' + "user:pass@" + 'db.example/app"',
+            "DATABASE_URL=postgres://" + "user:pass@" + "db.example/app",
+            'url="redis://' + ":secret@" + 'db.example/app"',
+            'url="postgres://' + "user:pa$$word@" + 'db.example/app"',
+            'url="postgres://'
+            + "user:fixed-secret:${DB_PASSWORD}@"
+            + 'db.example/app"',
+            'url="postgres://' + "admin:$ecret123@" + 'db.example/app"',
+            'url="postgres://' + "admin:${DB_PASSWORD}@" + 'db.example/app"',
+            'url="postgres://' + "admin:{password}@" + 'db.example/app"',
+            'url="postgres://' + "admin:%s@" + 'db.example/app"',
+            'url="postgres://' + "admin:{}@" + 'db.example/app"',
+            'url="https://' + "alice@example.com:secret@" + 'host/app"',
+            'DATABASE_URL: "postgres:'
+            + '//user:${DB_PASSWORD}@db.example/app"',
+            "'database.url': 'postgres:"
+            + "//user:${DB_PASSWORD}@db.example/app'",
+            "const cfg = {\n"
+            + '  url: "postgres:'
+            + '//admin:$ecret123@db.example/app"\n'
+            + "}",
+            "const marker = /`/; "
+            + 'const url = "postgres:'
+            + '//user:${DB_PASSWORD}@db.example/app"',
+            "class C { #field = 1; "
+            + 'url = "postgres:'
+            + '//user:${DB_PASSWORD}@db.example/app"; }',
+            "const url = `postgres:"
+            + '//user:fixed-secret${process.env["SUFFIX"]}@db.example/app`',
+            'const url = "https:'
+            + '//alice:pa\\"ss@example.com/app"',
+            "const dsn = `postgres:"
+            + '//user:${String("hunter2!")}@db.example/app`',
+            'return "https:'
+            + '//user:${API_TOKEN}@host/app"',
+            'dsn = "postgres:'
+            + '//user:{password}@db.example/app".format('
+            + "pass"
+            + 'word="hunter2!")',
+            'dsn = "postgres:'
+            + '//user:{}@db.example/app".format("hunter2!")',
+            'dsn = "postgres:'
+            + '//user:%s@db.example/app" % ("hunter2!")',
+            'dsn = fmt.Sprintf("postgres:'
+            + '//user:%s@db.example/app", "hunter2!")',
+            "DATABASE_URL='"
+            + "postgres://"
+            + "admin:$ecret123@db.example/app"
+            + "'",
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_limits_uri_userinfo_to_authority(self) -> None:
+        for content in (
+            'url="https://example.com:443?email=user@example.org"',
+            'url="https://example.com:443#owner=user@example.org"',
+            'url="https://example.com:443" + "?email=user@example.org"',
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_allows_referenced_uri_credentials(self) -> None:
+        for content in (
+            "url=`postgres://" + "user:${DB_PASSWORD}@db.example/app`",
+            'url=f"postgres://' + 'user:{password}@db.example/app"',
+            'url=f"""postgres://' + 'user:{password}@db.example/app"""',
+            'dsn=f"connect to postgres://'
+            + 'user:{password}@db.example/app"',
+            "DATABASE_URL=postgres://" + "user:$DB_PASSWORD@db.example/app",
+            "DATABASE_URL: postgres://"
+            + "user:${DB_PASSWORD}@db.example/app",
+            "DATABASE_URL: postgres://"
+            + "user:$DB_PASSWORD@db.example/app",
+            "url: postgres://" + "user:${DB_PASSWORD}@db.example/app",
+            "uri: postgres://" + "user:${DB_PASSWORD}@db.example/app",
+            "dsn: postgres://" + "user:${DB_PASSWORD}@db.example/app",
+            "# DATABASE_URL: postgres://"
+            + "user:${DB_PASSWORD}@db.example/app",
+            "# DATABASE_URL=postgres://"
+            + "user:${DB_PASSWORD}@db.example/app",
+            '# DATABASE_URL="postgres://'
+            + 'user:$DB_PASSWORD@db.example/app"',
+            'dsn = "postgres://'
+            + 'user:%s@db.example/app" % password',
+            'dsn = fmt.Sprintf("postgres://'
+            + 'user:%s@db.example/app", password)',
+            'dsn = "postgres://'
+            + 'user:{}@db.example/app".format(password)',
+            'export DATABASE_URL="'
+            + "postgres://"
+            + "user:${DB_PASSWORD}@db.example/app"
+            + '"',
+            'DATABASE_URL="jdbc:postgresql://'
+            + "user:$DB_PASSWORD@db.example/app"
+            + '"',
+            "url=`postgres://"
+            + "user:${process.env.DB_PASSWORD}@db.example/app`",
+            'url=f"postgres://' + 'user:{config.password}@db.example/app"',
+            'url=f"postgres://'
+            + 'user:{passwords[0]}@db.example/app"',
+            "url=f'postgres://"
+            + 'user:{config["password"]}@db.example/app\'',
+            "// user's config\n"
+            + "const url = `postgres://"
+            + "user:${DB_PASSWORD}@db.example/app`",
+            "const x = this.#field; "
+            + "const url = `postgres://"
+            + "user:${DB_PASSWORD}@db.example/app`",
+            "class C { #field = 1; "
+            + "url = `postgres://"
+            + "user:${DB_PASSWORD}@db.example/app`; }",
+            "const url = `postgres://"
+            + "user:${passwords[0]}@db.example/app`",
+            "const url = `postgres://"
+            + 'user:${passwords["primary"]}@db.example/app`',
+            "const dsn = `postgres://"
+            + "user:${encodeURIComponent(process.env.DB_PASSWORD)}@db.example/app`",
+            'dsn = "postgres://'
+            + 'user:{password}@db.example/app".format('
+            + "pass"
+            + "word=password)",
+            'curl "https://'
+            + 'user:${API_TOKEN}@host/app"',
+            "curl https://" + "user:$API_TOKEN@host/app",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_template_uri_references_skip_format_scans(self) -> None:
+        original = self.helper["uri_password_is_format_placeholder"]
+        calls = 0
+
+        def counted(*args: object) -> bool:
+            nonlocal calls
+            calls += 1
+            return original(*args)
+
+        self.helper["uri_password_is_format_placeholder"] = counted
+        try:
+            content = "const urls = `" + " ".join(
+                "postgres:"
+                + f"//user:${{PASSWORD_{index}}}@db{index}.example/app"
+                for index in range(1000)
+            ) + "`"
+            self.assertFalse(self.helper["secret_text_risk"](content))
+            self.assertEqual(calls, 0)
+        finally:
+            self.helper["uri_password_is_format_placeholder"] = original
+
+    def test_format_uri_references_cache_string_boundaries(self) -> None:
+        quote_end = self.helper["quoted_string_end"]
+        quote_end.cache_clear()
+        content = 'dsn = "' + " ".join(
+            "postgres:" + f"//user:{{0}}@db{index}.example/app"
+            for index in range(1000)
+        ) + '".format(password)'
+
+        self.assertFalse(self.helper["secret_text_risk"](content))
+        cache_info = quote_end.cache_info()
+        self.assertEqual(cache_info.misses, 1)
+        self.assertGreaterEqual(cache_info.hits, 999)
 
     def test_secret_detector_handles_aws_secret_access_keys(self) -> None:
         content = (
@@ -1623,7 +2057,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             release.set()
             stderr_thread.join(timeout=1)
 
-    def test_parallel_test_environment_preserves_path_without_credentials(self) -> None:
+    def test_trusted_maintainer_testbox_preserves_only_credentials(self) -> None:
         old = os.environ.copy()
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
