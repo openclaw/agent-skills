@@ -2643,6 +2643,8 @@ def build_prompt(repo: Path, target: str, target_ref: str | None, bundle: str, e
         - Shell commands, if available, must be read-only inspection commands. Do not run tests, formatters, package installs, generators, network mutation commands, git mutation commands, or commands that write files.
         - Report only actionable defects introduced or exposed by this change.
         - Prefer high-signal findings over style feedback.
+        - Report EVERY distinct actionable defect in this single pass, ordered most severe first. Each review round costs the caller a full fix-test-review cycle; withholding a known defect until a later round wastes one.
+        - Before returning, sweep the bundle once more for independent defects in other files or failure modes that you may have stopped scanning for after an earlier find.
         - Include security findings: injection, secret leaks, authz/authn bypass, path traversal, unsafe deserialization, unsafe filesystem or shell use, privacy leaks, and credential handling.
         - Do not reject legitimate functionality merely because it touches shell, filesystem, network, auth, or sensitive data. Report a security finding only when the patch creates a concrete exploitable risk, removes an important safety check, or lacks validation at a trust boundary.
         - For each finding, use the smallest file/line location that demonstrates the issue.
