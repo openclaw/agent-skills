@@ -373,6 +373,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             'password = payload.get("password")',
             "token = auth_response.credentials.access_token",
             "token = response.authentication.accessToken",
+            "token = request.headers.authorization",
             "password = account.credentials.password",
             "api_key = client.settings.apiKey",
             'token = "$GITHUB_TOKEN"',
@@ -437,15 +438,24 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertTrue(self.helper["secret_text_risk"](content))
 
-    def test_secret_detector_allows_common_fixture_literals_and_pragmas(self) -> None:
+    def test_secret_detector_allows_common_fixture_literals(self) -> None:
         for content in (
             'token: "token-oversized"',
             'API_KEY = "clawrouter-e2e-secret"',
             'token: "very-long-browser-token-0123456789"',
-            'password="CorrectHorseBatteryStaple123!"  # pragma: allowlist secret',
         ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_does_not_trust_in_band_suppressions(self) -> None:
+        for marker in ("pragma: allowlist secret", "gitleaks:allow"):
+            with self.subTest(marker=marker):
+                content = (
+                    "pass"
+                    + 'word="CorrectHorseBatteryStaple123!"  # '
+                    + marker
+                )
+                self.assertTrue(self.helper["secret_text_risk"](content))
 
     def test_secret_detector_does_not_treat_quoted_code_text_as_a_reference(self) -> None:
         for content in (
