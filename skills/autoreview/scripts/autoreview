@@ -193,14 +193,10 @@ UNQUOTED_SECRET_REFERENCE_PATTERNS = (
     *QUOTED_SECRET_REFERENCE_PATTERNS,
     re.compile(
         r"^(?:process\.env|os\.environ|env|cfg|config|params|payload|provider|"
-        r"response|result|account|client|auth|auth_response|oauth_response|"
+        r"request|response|result|account|client|auth|auth_response|oauth_response|"
         r"token_response|api_response|authentication|credentials|settings)"
         r"(?:[.\[].*)$"
     ),
-)
-SECRET_ALLOWLIST_MARKERS = (
-    "pragma: allowlist secret",
-    "gitleaks:allow",
 )
 DEFAULT_ENGINE_PATHS = ("/usr/local/bin", "/usr/bin", "/bin")
 MULTI_PROVIDER_CREDENTIAL_SUFFIXES = (
@@ -1224,11 +1220,6 @@ def secret_text_risk(text: str) -> bool:
     if any(pattern.search(text) for pattern in SECRET_VALUE_PATTERNS):
         return True
     for match in SECRET_ASSIGNMENT_PATTERN.finditer(text):
-        line_start = text.rfind("\n", 0, match.start()) + 1
-        line_end = text.find("\n", match.end())
-        line = text[line_start : line_end if line_end >= 0 else len(text)].lower()
-        if any(marker in line for marker in SECRET_ALLOWLIST_MARKERS):
-            continue
         quoted = match.group("bare_value") is None
         value = (
             match.group("double_value")
