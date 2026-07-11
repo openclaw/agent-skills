@@ -2277,14 +2277,14 @@ def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
 def run_droid(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     raise SystemExit(
         "droid engine is unavailable: the current Droid CLI cannot disable project instructions and all tools; "
-        "use codex, claude, pi, or opencode"
+        "use codex, claude, or pi"
     )
 
 
 def run_copilot(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     raise SystemExit(
         "copilot engine is unavailable: its file tools cannot be confined to the reviewed bundle "
-        "without exposing ignored repository secrets; use codex, claude, pi, or opencode"
+        "without exposing ignored repository secrets; use codex, claude, or pi"
     )
 
 
