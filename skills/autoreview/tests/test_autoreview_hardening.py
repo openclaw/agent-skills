@@ -650,8 +650,12 @@ class AutoreviewHardeningTests(unittest.TestCase):
             repo = init_repo(Path(tempdir))
             (repo / "AGENTS.md").write_text("hostile instructions\n", encoding="utf-8")
 
-            with self.assertRaisesRegex(SystemExit, "droid engine is unavailable"):
+            with self.assertRaisesRegex(
+                SystemExit,
+                r"droid engine is unavailable.*use codex, claude, or pi",
+            ) as error:
                 self.helper["run_droid"](argparse.Namespace(), repo, "prompt")
+            self.assertNotIn("opencode", str(error.exception))
 
     def test_prompt_file_keeps_recoverable_repo_path(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -1291,12 +1295,16 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
-            with self.assertRaisesRegex(SystemExit, "ignored repository secrets"):
+            with self.assertRaisesRegex(
+                SystemExit,
+                r"ignored repository secrets; use codex, claude, or pi",
+            ) as error:
                 self.helper["run_copilot"](
                     args,
                     repo,
                     "Repository root: .\n\nprompt",
                 )
+            self.assertNotIn("opencode", str(error.exception))
 
     def test_claude_inventory_is_bundle_and_web_only(self) -> None:
         args = argparse.Namespace(
