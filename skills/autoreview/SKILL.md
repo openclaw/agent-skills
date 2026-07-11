@@ -91,9 +91,15 @@ Set the skill script paths once, then use `"$AUTOREVIEW"` and `"$AUTOREVIEW_HARN
 Choose one:
 
 ```bash
-# Project-local skill in the current repo:
+# Project-local skill in the current repo for Codex and other agents:
 export AUTOREVIEW=".agents/skills/autoreview/scripts/autoreview"
 export AUTOREVIEW_HARNESS=".agents/skills/autoreview/scripts/test-review-harness"
+```
+
+```bash
+# Claude Code project-local skill in the current repo:
+export AUTOREVIEW=".claude/skills/autoreview/scripts/autoreview"
+export AUTOREVIEW_HARNESS=".claude/skills/autoreview/scripts/test-review-harness"
 ```
 
 ```bash
@@ -109,14 +115,20 @@ export AUTOREVIEW="$AGENTS_HOME/skills/autoreview/scripts/autoreview"
 export AUTOREVIEW_HARNESS="$AGENTS_HOME/skills/autoreview/scripts/test-review-harness"
 ```
 
-When using Claude Code, set `AGENTS_HOME="$HOME/.claude"` for global skills. Project-local skills live under `.claude/skills/` in the current repo.
+When using Claude Code, set `AGENTS_HOME="$HOME/.claude"` for global skills.
 
 On native Windows, choose the matching pair:
 
 ```powershell
-# Project-local skill in the current repo:
+# Project-local skill in the current repo for Codex and other agents:
 $AUTOREVIEW = ".agents\skills\autoreview\scripts\autoreview"
 $AUTOREVIEW_HARNESS = ".agents\skills\autoreview\scripts\test-review-harness.ps1"
+```
+
+```powershell
+# Claude Code project-local skill in the current repo:
+$AUTOREVIEW = ".claude\skills\autoreview\scripts\autoreview"
+$AUTOREVIEW_HARNESS = ".claude\skills\autoreview\scripts\test-review-harness.ps1"
 ```
 
 ```powershell
@@ -188,6 +200,12 @@ Format first if formatting can change line locations. Then it is OK to run tests
 On Windows, the default `--parallel-tests` shell preserves the platform `cmd.exe`
 semantics used by Python `shell=True`. Use `--parallel-tests-shell powershell`
 or `--parallel-tests-shell pwsh` when the focused test command is PowerShell-specific.
+Parallel tests inherit only a small allowlist of ordinary OS, CI, and toolchain
+variables. Put additional non-secret project controls directly in the test command.
+Home and standard config directories point to a temporary isolated root that is
+removed after the command exits. Do not put secrets in the command because it is
+printed before execution. Run secret-bearing or credentialed tests separately in an
+appropriately isolated remote runner.
 
 Tradeoff: tests may force code changes that stale the review. If tests or review lead to code edits, rerun the affected tests and rerun review until no accepted/actionable findings remain. Once that rerun exits cleanly, stop; do not spend another long review cycle on redundant confirmation.
 

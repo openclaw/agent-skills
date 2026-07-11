@@ -398,9 +398,17 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertIsNone(self.helper["sensitive_repo_path_risk"](rel))
 
     def test_untracked_design_token_artifacts_remain_reviewable(self) -> None:
-        for rel in ("design-tokens.json", "design_tokens.json"):
+        for rel in (
+            "design-tokens.json",
+            "design_tokens.json",
+            "src/styles/design-tokens.json",
+            "themes/dark/design_tokens.json",
+        ):
             with self.subTest(rel=rel):
                 self.assertIsNone(self.helper["sensitive_repo_path_risk"](rel))
+                self.assertIsNone(
+                    self.helper["tracked_sensitive_repo_path_risk"](rel)
+                )
         self.assertIsNotNone(
             self.helper["sensitive_repo_path_risk"](".env/design-tokens.json")
         )
@@ -1097,16 +1105,18 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         def fake_popen(command: object, **kwargs: object) -> mock.Mock:
             observed.append({"command": command, **kwargs})
-            return mock.Mock()
+            proc = mock.Mock()
+            proc.returncode = 0
+            return proc
 
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
             with mock.patch.dict(
                 self.helper["start_parallel_tests"].__globals__,
                 {
-                    "safe_test_env": lambda actual_repo: (
+                    "safe_test_env": lambda actual_repo, test_home: (
                         sanitized_env
-                        if actual_repo == repo
+                        if actual_repo == repo and not test_home.is_relative_to(repo)
                         else self.fail("parallel tests sanitized the wrong repository")
                     ),
                     "resolve_command": lambda name, actual_repo: (
@@ -1117,7 +1127,13 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 },
             ), mock.patch("subprocess.Popen", side_effect=fake_popen):
                 for shell_kind in ("default", "cmd", "powershell", "pwsh"):
-                    self.helper["start_parallel_tests"]("run tests", repo, shell_kind)
+                    proc, started = self.helper["start_parallel_tests"](
+                        "run tests", repo, shell_kind
+                    )
+                    test_home = getattr(proc, "_autoreview_test_home")
+                    self.assertTrue(test_home.is_dir())
+                    self.helper["finish_parallel_tests"](proc, started)
+                    self.assertFalse(test_home.exists())
 
         self.assertEqual(len(observed), 4)
         for invocation in observed:
@@ -1131,19 +1147,83 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_parallel_test_environment_preserves_path_without_credentials(self) -> None:
         old = os.environ.copy()
         with tempfile.TemporaryDirectory() as tempdir:
-            repo = init_repo(Path(tempdir))
+            root = Path(tempdir)
+            repo = init_repo(root)
+            isolated_home = root / "test-home"
+            host_home = root / "host-home"
+            rustup_home = host_home / ".rustup"
+            rustup_home.mkdir(parents=True)
             local_bin = repo / ".venv" / "bin"
             local_bin.mkdir(parents=True)
             try:
                 os.environ["PATH"] = f"{local_bin}{os.pathsep}/usr/bin"
+                os.environ["CI"] = "1"
+                os.environ["HOME"] = str(host_home)
+                os.environ["JAVA_HOME"] = "/opt/jdk"
+                os.environ["NODE_ENV"] = "test"
+                os.environ["OPENCLAW_TESTBOX"] = "1"
+                os.environ["PROJECT_FEATURE_MODE"] = "strict"
+                os.environ["GH_CONFIG_DIR"] = "/host/gh"
+                os.environ["CLOUDSDK_CONFIG"] = "/host/gcloud"
+                os.environ["XDG_CONFIG_HOME"] = "/host/xdg"
                 os.environ["GITHUB_TOKEN"] = "test-token-placeholder"
+                os.environ["AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"] = (
+                    "/host/aws-token"
+                )
+                os.environ["AZURE_FEDERATED_TOKEN_FILE"] = "/host/azure-token"
+                os.environ["CI_JOB_JWT"] = "header.payload.signature"
+                os.environ["DOCKER_AUTH_CONFIG"] = '{"auths":{"registry":{}}}'
+                os.environ["PGPASSFILE"] = "/host/pgpass"
+                os.environ["PGPASSWORD"] = "short-password"
+                os.environ["REDISCLI_AUTH"] = "short-password"
+                os.environ["BASH_FUNC_testcmd%%"] = "() { echo injected; }"
+                os.environ["SHELLOPTS"] = "xtrace"
                 os.environ["NODE_OPTIONS"] = "--require=/tmp/unsafe.js"
+                os.environ["SERVICE_URL"] = (
+                    "https://review-user:review-password@example.invalid/api"
+                )
+                os.environ["UNRELATED_VALUE"] = "ghp_" + "A" * 24
 
-                env = self.helper["safe_test_env"](repo)
+                env = self.helper["safe_test_env"](repo, isolated_home)
 
                 self.assertEqual(env["PATH"], os.environ["PATH"])
+                self.assertEqual(env["CI"], "1")
+                self.assertEqual(env["JAVA_HOME"], "/opt/jdk")
+                self.assertEqual(env["NODE_ENV"], "test")
+                self.assertNotIn("OPENCLAW_TESTBOX", env)
+                self.assertNotIn("PROJECT_FEATURE_MODE", env)
+                self.assertEqual(env["HOME"], str(isolated_home.resolve()))
+                self.assertEqual(env["RUSTUP_HOME"], str(rustup_home.resolve()))
+                self.assertEqual(
+                    env["XDG_CONFIG_HOME"],
+                    str(isolated_home.resolve() / ".config"),
+                )
+                self.assertNotIn("GH_CONFIG_DIR", env)
+                self.assertNotIn("CLOUDSDK_CONFIG", env)
                 self.assertNotIn("GITHUB_TOKEN", env)
+                self.assertNotIn("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", env)
+                self.assertNotIn("AZURE_FEDERATED_TOKEN_FILE", env)
+                self.assertNotIn("CI_JOB_JWT", env)
+                self.assertNotIn("DOCKER_AUTH_CONFIG", env)
+                self.assertNotIn("PGPASSFILE", env)
+                self.assertNotIn("PGPASSWORD", env)
+                self.assertNotIn("REDISCLI_AUTH", env)
+                self.assertNotIn("BASH_FUNC_testcmd%%", env)
+                self.assertNotIn("SHELLOPTS", env)
                 self.assertNotIn("NODE_OPTIONS", env)
+                self.assertNotIn("SERVICE_URL", env)
+                self.assertNotIn("UNRELATED_VALUE", env)
+
+                os.environ.pop("HOME")
+                os.environ["USERPROFILE"] = str(host_home)
+                windows_env = self.helper["safe_test_env"](
+                    repo,
+                    root / "windows-test-home",
+                )
+                self.assertEqual(
+                    windows_env["RUSTUP_HOME"],
+                    str(rustup_home.resolve()),
+                )
             finally:
                 os.environ.clear()
                 os.environ.update(old)

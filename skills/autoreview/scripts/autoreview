@@ -9,6 +9,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -265,6 +266,59 @@ PROVIDER_CREDENTIAL_PATH_ENV_KEYS = {
     "SSL_CERT_DIR",
     "SSL_CERT_FILE",
 }
+TEST_ENV_ALLOWED_EXACT = {
+    "ALL_PROXY",
+    "ASDF_DATA_DIR",
+    "ASDF_DIR",
+    "BUN_INSTALL",
+    "CI",
+    "COLORTERM",
+    "COMSPEC",
+    "DISABLE_AUTOUPDATER",
+    "DISABLE_ERROR_REPORTING",
+    "DISABLE_TELEMETRY",
+    "DO_NOT_TRACK",
+    "FORCE_COLOR",
+    "GITHUB_ACTIONS",
+    "GOCACHE",
+    "GOMODCACHE",
+    "GOPATH",
+    "GOROOT",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "JAVA_HOME",
+    "LANG",
+    "LC_ALL",
+    "LOGNAME",
+    "NODENV_ROOT",
+    "NODENV_VERSION",
+    "NODE_ENV",
+    "NO_COLOR",
+    "NO_PROXY",
+    "NVM_BIN",
+    "NVM_DIR",
+    "PATH",
+    "PATHEXT",
+    "PNPM_HOME",
+    "PYENV_ROOT",
+    "PYENV_VERSION",
+    "RUNNER_ARCH",
+    "RUNNER_OS",
+    "RUNNER_TEMP",
+    "RUNNER_TOOL_CACHE",
+    "RUSTUP_TOOLCHAIN",
+    "SHELL",
+    "SYSTEMROOT",
+    "TERM",
+    "USER",
+    "VOLTA_HOME",
+    "WINDIR",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+}
+TEST_ENV_ALLOWED_PREFIXES = ("AUTOREVIEW_FAKE_", "LC_")
 DEFAULT_MODEL_BY_ENGINE = {
     "codex": "gpt-5.6-sol",
     "claude": "claude-fable-5",
@@ -763,10 +817,70 @@ def safe_engine_env(
     return env
 
 
-def safe_test_env(repo: Path) -> dict[str, str]:
-    env = safe_engine_env(repo)
-    if path := os.environ.get("PATH"):
-        env["PATH"] = path
+def safe_test_env(repo: Path, isolated_home: Path) -> dict[str, str]:
+    resolved_home = isolated_home.resolve()
+    if is_within(resolved_home, repo.resolve()):
+        raise SystemExit("parallel test home must be outside the reviewed repository")
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in TEST_ENV_ALLOWED_EXACT
+        or any(key.startswith(prefix) for prefix in TEST_ENV_ALLOWED_PREFIXES)
+    }
+    for key in (
+        "ALL_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+    ):
+        value = env.get(key)
+        if value and not safe_proxy_url(value):
+            raise SystemExit(
+                f"unsafe credentialed or malformed proxy URL in {key}; "
+                "configure a credential-free proxy URL before running autoreview"
+            )
+    config_home = resolved_home / ".config"
+    data_home = resolved_home / ".local" / "share"
+    state_home = resolved_home / ".local" / "state"
+    cache_home = resolved_home / ".cache"
+    temp_home = resolved_home / "tmp"
+    app_data = resolved_home / "AppData" / "Roaming"
+    local_app_data = resolved_home / "AppData" / "Local"
+    for path in (
+        config_home,
+        data_home,
+        state_home,
+        cache_home,
+        temp_home,
+        app_data,
+        local_app_data,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+    env.update(
+        {
+            "APPDATA": str(app_data),
+            "HOME": str(resolved_home),
+            "LOCALAPPDATA": str(local_app_data),
+            "TEMP": str(temp_home),
+            "TMP": str(temp_home),
+            "TMPDIR": str(temp_home),
+            "USERPROFILE": str(resolved_home),
+            "XDG_CACHE_HOME": str(cache_home),
+            "XDG_CONFIG_HOME": str(config_home),
+            "XDG_DATA_HOME": str(data_home),
+            "XDG_STATE_HOME": str(state_home),
+        }
+    )
+    original_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+    rustup_home = os.environ.get("RUSTUP_HOME")
+    if not rustup_home and original_home:
+        default_rustup_home = Path(original_home).expanduser() / ".rustup"
+        if default_rustup_home.is_dir():
+            rustup_home = str(default_rustup_home)
+    if rustup_home and external_env_path(repo, rustup_home):
+        env["RUSTUP_HOME"] = str(Path(rustup_home).expanduser().resolve())
     return env
 
 
@@ -1423,7 +1537,7 @@ def sensitive_repo_path_risk(rel: str) -> str | None:
         return "sensitive path"
     if (
         any(pattern.search(normalized) for pattern in SENSITIVE_NAME_PATTERNS)
-        and not design_token_artifact_path(path)
+        and not design_token_artifact_path(path, SENSITIVE_NAME_PATTERNS)
     ):
         return "sensitive filename"
     return None
@@ -1439,11 +1553,15 @@ def token_credential_store_path(normalized: str) -> bool:
     )
 
 
-def design_token_artifact_path(path: Path) -> bool:
-    return (
-        len(path.parts) == 1
-        and re.fullmatch(r"design[-_]?tokens?\.json", path.name, re.IGNORECASE)
-        is not None
+def design_token_artifact_path(
+    path: Path,
+    sensitive_patterns: list[re.Pattern[str]],
+) -> bool:
+    if re.fullmatch(r"design[-_]?tokens?\.json", path.name, re.IGNORECASE) is None:
+        return False
+    parent = path.parent.as_posix()
+    return parent == "." or not any(
+        pattern.search(parent) for pattern in sensitive_patterns
     )
 
 
@@ -1504,7 +1622,7 @@ def tracked_sensitive_repo_path_risk(rel: str) -> str | None:
         return "sensitive path"
     if (
         any(pattern.search(normalized) for pattern in TRACKED_SENSITIVE_NAME_PATTERNS)
-        and not design_token_artifact_path(path)
+        and not design_token_artifact_path(path, TRACKED_SENSITIVE_NAME_PATTERNS)
     ):
         return "sensitive filename"
     return None
@@ -4084,32 +4202,53 @@ def print_report(report: dict[str, Any], *, label: str = "autoreview") -> None:
     print(report["overall_explanation"])
 
 
-def start_parallel_tests(command: str, repo: Path, shell_kind: str) -> tuple[subprocess.Popen, float]:
+def start_parallel_tests(
+    command: str,
+    repo: Path,
+    shell_kind: str,
+) -> tuple[subprocess.Popen, float]:
     print(f"tests: {command}")
-    env = safe_test_env(repo)
-    if shell_kind == "default" or shell_kind == "cmd":
-        return subprocess.Popen(command, cwd=repo, shell=True, env=env), time.time()
-    if shell_kind == "powershell":
-        powershell = resolve_command("powershell", repo)
-        return subprocess.Popen(
-            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
-            cwd=repo,
-            env=env,
-        ), time.time()
-    if shell_kind == "pwsh":
-        pwsh = resolve_command("pwsh", repo)
-        return subprocess.Popen(
-            [pwsh, "-NoProfile", "-Command", command],
-            cwd=repo,
-            env=env,
-        ), time.time()
-    raise SystemExit(f"invalid --parallel-tests-shell/AUTOREVIEW_PARALLEL_TESTS_SHELL: {shell_kind}")
+    test_home = Path(
+        tempfile.mkdtemp(prefix="autoreview-test-home-", dir=safe_temp_root(repo))
+    )
+    try:
+        env = safe_test_env(repo, test_home)
+        if shell_kind == "default" or shell_kind == "cmd":
+            proc = subprocess.Popen(command, cwd=repo, shell=True, env=env)
+        elif shell_kind == "powershell":
+            powershell = resolve_command("powershell", repo)
+            proc = subprocess.Popen(
+                [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                cwd=repo,
+                env=env,
+            )
+        elif shell_kind == "pwsh":
+            pwsh = resolve_command("pwsh", repo)
+            proc = subprocess.Popen(
+                [pwsh, "-NoProfile", "-Command", command],
+                cwd=repo,
+                env=env,
+            )
+        else:
+            raise SystemExit(
+                f"invalid --parallel-tests-shell/AUTOREVIEW_PARALLEL_TESTS_SHELL: {shell_kind}"
+            )
+    except BaseException:
+        shutil.rmtree(test_home, ignore_errors=True)
+        raise
+    setattr(proc, "_autoreview_test_home", test_home)
+    return proc, time.time()
 
 
 def finish_parallel_tests(proc: subprocess.Popen, started: float) -> int:
-    proc.wait()
-    print(f"tests exit: {proc.returncode} after {int(time.time() - started)}s")
-    return int(proc.returncode or 0)
+    try:
+        proc.wait()
+        print(f"tests exit: {proc.returncode} after {int(time.time() - started)}s")
+        return int(proc.returncode or 0)
+    finally:
+        test_home = getattr(proc, "_autoreview_test_home", None)
+        if isinstance(test_home, Path):
+            shutil.rmtree(test_home, ignore_errors=True)
 
 
 def env_truthy(name: str) -> bool:
