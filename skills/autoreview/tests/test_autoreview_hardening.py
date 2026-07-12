@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import json
 import os
@@ -364,6 +365,70 @@ class AutoreviewHardeningTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, r"12 bytes; limit 10"):
             self.helper["validate_review_patch"]("local staged diff", ["safe.txt"], "界" * 4, 10)
 
+    def test_review_patch_escapes_controls_in_blocked_paths(self) -> None:
+        path = ".env.\x1b]52;c;VEVTVA==\x07\udc9b"
+
+        with self.assertRaises(SystemExit) as raised:
+            self.helper["validate_review_patch"](
+                "local staged diff",
+                [path],
+                "",
+            )
+
+        message = str(raised.exception)
+        self.assertNotIn("\x1b", message)
+        self.assertNotIn("\x07", message)
+        self.assertNotIn("\udc9b", message)
+        self.assertIn(
+            r".env.\x1b]52;c;VEVTVA==\x07\udc9b",
+            message,
+        )
+
+    def test_review_patch_scans_reconstructed_content_not_diff_markers(
+        self,
+    ) -> None:
+        patch = (
+            "@@ -0,0 +1,4 @@\n"
+            '+            "https://token=" + "hardcoded123@host/repo",\n'
+            '+            "DATABASE_URL=https:"\n'
+            '+            + f"//token={literal_username}:${{PASSWORD}}@host",\n'
+            '+            \'curl "https:\'\n'
+        )
+
+        self.assertTrue(self.helper["secret_text_risk"](patch))
+        self.assertFalse(
+            any(
+                self.helper["secret_text_risk"](line)
+                for line in patch.splitlines()
+            )
+        )
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["safe.py"],
+                patch,
+            ),
+            patch,
+        )
+
+    def test_review_patch_scans_diff_metadata_line_by_line(self) -> None:
+        credential = "AKIA" + "ABCDEFGHIJKLMNOP"
+        patch = (
+            f"diff --git a/{credential}.txt b/{credential}.txt\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            f"+++ b/{credential}.txt\n"
+            "@@ -0,0 +1 @@\n"
+            "+public content\n"
+        )
+
+        with self.assertRaisesRegex(SystemExit, "secret-like content"):
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["safe.txt"],
+                patch,
+            )
+
     def test_tracked_sensitive_paths_are_blocked_in_all_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
@@ -660,6 +725,30 @@ class AutoreviewHardeningTests(unittest.TestCase):
             )
         )
 
+    def test_secret_detector_stops_fallback_scan_at_sibling_commas(self) -> None:
+        for content in (
+            '{ password: process.env.PASSWORD, label: prefix + "production-east" }',
+            'const token = runtimeToken, checksum = value || "aB3$dE5!gH7#";',
+            'const password = runtimeToken, {checksum} = value || "aB3$dE5!gH7#";',
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_keeps_fallbacks_before_sibling_commas(self) -> None:
+        for content in (
+            "const to"
+            + 'ken = runtimeToken || "real-hardcoded-fallback", checksum = value;',
+            "pass"
+            + 'word = (lookupPrimary(), lookupSecondary()) || "hardcoded-secret"',
+            "pass"
+            + 'word = getSecret<string, string>() || "hardcoded-secret"',
+            "pass"
+            + 'word = primary, secondary == expected or "hardcoded-'
+            + 'secret"',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
     def test_secret_detector_rejects_call_fallback_literals(self) -> None:
         for content in (
             "to"
@@ -673,6 +762,56 @@ class AutoreviewHardeningTests(unittest.TestCase):
         ):
             with self.subTest(content=content):
                 self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_grouped_fallbacks_after_line_comments(
+        self,
+    ) -> None:
+        for content in (
+            "const pass"
+            + "word = lookup() // comment\n "
+            + "|| "
+            + '"top-level-hardcoded-'
+            + 'secret"',
+            "const pass"
+            + 'word = (lookup() // comment\n || "hardcoded-'
+            + 'secret")',
+            "const pass"
+            + "word = (lookup(), // comment\n"
+            + 'fallback = value || "real-hardcoded-'
+            + 'secret")',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_does_not_cross_top_level_line_comments(self) -> None:
+        for content in (
+            "const pass"
+            + 'word = lookup() // comment\nconst label = value || "hardcoded-'
+            + 'secret"',
+            "const pass"
+            + "word = ({source: lookup(), // note\n"
+            + 'label: value || "aB3$dE5!gH7#"});',
+            "const pass"
+            + "word = {source: lookup(), // note\n"
+            + 'label: value || "aB3$dE5!gH7#"};',
+            "const pass"
+            + "word = ({source: lookup(), // note\n"
+            + '["label"]: value || "aB3$dE5!gH7#"});',
+            "const pass"
+            + "word = ({source: lookup(), // note\n"
+            + '7: value || "aB3$dE5!gH7#"});',
+            "const pass"
+            + "word = ({source: lookup(), // note\n"
+            + "...defaults,\n"
+            + 'label: value || "aB3$dE5!gH7#"});',
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+        self.assertTrue(
+            self.helper["starts_sibling_assignment"](
+                "...defaults,\nlabel: value"
+            )
+        )
 
     def test_secret_detector_rejects_short_call_fallback_literals(self) -> None:
         for content in (
@@ -1483,6 +1622,13 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + "postgres://"
             + "admin:$ecret123@db.example/app"
             + "'",
+            '"dsn": "postgresql:\\/\\/alice:'
+            + "S3nsitiveValue99@"
+            + 'db.example/app"',
+            "database_url: postgres://svc:{"
+            + "N0tActuallyInterpolation}@db/app",
+            "const dsn = `https://user:password="
+            + "real-hardcoded-secret-${TOKEN}@host`",
         ):
             with self.subTest(content=content):
                 self.assertTrue(self.helper["secret_text_risk"](content))
@@ -1492,6 +1638,40 @@ class AutoreviewHardeningTests(unittest.TestCase):
             'url="https://example.com:443?email=user@example.org"',
             'url="https://example.com:443#owner=user@example.org"',
             'url="https://example.com:443" + "?email=user@example.org"',
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_handles_username_only_uri_credentials(self) -> None:
+        literal_username = "real-hardcoded-" + "secret"
+        hex_credential = "0123456789abcdef" + "0123456789abcdef01234567"
+        uuid_credential = "550e8400-e29b-41d4-a716-" + "446655440000"
+
+        for content in (
+            "https://actual-production-"
+            + "token@host/repo",
+            "https://actual-production-"
+            + "token"
+            + ":@host/repo",
+            "https://Ab9dEf2gHi4jKl6m" + "No8p@host/repo",
+            "https:" + f"//{hex_credential}@host/repo",
+            "https:" + f"//{uuid_credential}@host/repo",
+            "https://" + "$ecret123@host/repo",
+            "https://token=" + "hardcoded123@host/repo",
+            "DATABASE_URL=https:"
+            + f"//token={literal_username}:${{PASSWORD}}@host",
+            'curl "https:'
+            + "//Ab9dEf2gHi4jKl6m"
+            + 'No8p:${PASSWORD}@host"',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_allows_ordinary_uri_usernames(self) -> None:
+        for content in (
+            "https://git@github.com/example/repo",
+            "https://username@host/repo",
+            "https://username:@host/repo",
         ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
@@ -1508,6 +1688,16 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + 'user:{password}@db.example/app"',
             "DATABASE_URL=postgres://" + "user:$DB_PASSWORD@db.example/app",
             "DATABASE_URL=postgres:" + "//user:${DB_PASS}@db.example/app",
+            "DATABASE_URL=https://"
+            + "$TOKEN"
+            + ":@host/repo",
+            "DATABASE_URL=https://"
+            + "$TOKEN@host/repo",
+            "DATABASE_URL=https://" + "${TOKEN}@host/repo",
+            'curl "https://${API_USER}:'
+            + '${API_TOKEN}@host/app"',
+            "DATABASE_URL=https://john.smith."
+            + "department1:${PASSWORD}@host",
             "DATABASE_URL: postgres://"
             + "user:${DB_PASSWORD}@db.example/app",
             "DATABASE_URL: postgres://"
@@ -1582,6 +1772,18 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + 'user:{password}@db.example/app".format('
             + "pass"
             + "word=password)",
+            '$env:DATABASE_URL = "postgres://'
+            + 'svc:$env:DB_PASSWORD@db.example/app"',
+            '[string]$dsn = "postgres:'
+            + '//svc:$env:DB_PASSWORD@db.example/app"',
+            'var dsn = $@"postgres:'
+            + '//svc:{password}@db.example/app";',
+            'var dsn = @$"postgres:'
+            + '//svc:{password}@db.example/app";',
+            '"dsn": "postgresql:\\/\\/alice:'
+            + '${DB_PASSWORD}@db.example/app"',
+            '"dsn": "postgresql:\\/\\/user:'
+            + 'password@localhost\\/db"',
             'curl "https://'
             + 'user:${API_TOKEN}@host/app"',
             "curl https://" + "user:$API_TOKEN@host/app",
@@ -1594,6 +1796,22 @@ class AutoreviewHardeningTests(unittest.TestCase):
         ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_uri_language_references_require_proven_interpolation_context(
+        self,
+    ) -> None:
+        for content in (
+            'const dsn = "postgres:'
+            + '//svc:$env:DB_PASSWORD@db.example/app"',
+            '$dsn = "postgres:'
+            + '//svc:$env:Sup3rSecret@db.example/app";',
+            'var dsn = @"postgres:'
+            + '//svc:{password}@db.example/app";',
+            "database_url: postgres://svc:{"
+            + "password}@db.example/app",
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
 
     def test_uri_shell_inference_rejects_non_shell_language_keywords(self) -> None:
         for content in (
@@ -1631,11 +1849,20 @@ class AutoreviewHardeningTests(unittest.TestCase):
         )
 
     def test_secret_detector_handles_basic_authorization_headers(self) -> None:
-        self.assertTrue(
-            self.helper["secret_text_risk"](
-                "Author" + "ization: Basic " + "dXNlcjpwYXNz" + "d29yZA=="
-            )
-        )
+        for content in (
+            "Author" + "ization: Basic " + "dXNlcjpwYXNz" + "d29yZA==",
+            "Author" + "ization: Basic " + "dXNlcjpwYXNz" + "CXdvcmQ=",
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_allows_basic_authentication_prose(self) -> None:
+        for content in (
+            "Authorization: Basic authentication is required",
+            '"Authorization": "Basic authentication is required"',
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
 
     def test_template_uri_references_skip_format_scans(self) -> None:
         original = self.helper["uri_password_is_format_placeholder"]
@@ -2235,6 +2462,78 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.helper["source_tree_snapshot"](repo),
                 before,
             )
+
+    def test_source_tree_snapshot_supports_staged_files_before_first_commit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            source = repo / "source.txt"
+            source.write_text("before\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+
+            before = self.helper["source_tree_snapshot"](repo)
+            symbolic_head = git(repo, "symbolic-ref", "HEAD").strip()
+            self.assertEqual(before[0], f"unborn:{symbolic_head}")
+
+            git(repo, "symbolic-ref", "HEAD", "refs/heads/other")
+            self.assertNotEqual(
+                self.helper["source_tree_snapshot"](repo),
+                before,
+            )
+            git(repo, "symbolic-ref", "HEAD", symbolic_head)
+
+            source.write_text("after\n", encoding="utf-8")
+            self.assertNotEqual(
+                self.helper["source_tree_snapshot"](repo),
+                before,
+            )
+
+    @unittest.skipIf(os.name == "nt", "the true command is POSIX-only")
+    def test_cli_parallel_tests_supports_unborn_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / "source.txt"
+            source.write_text("staged\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            codex_bin = self.helper["write_executable"](
+                root / "codex",
+                self.helper["fake_codex_script"](),
+            )
+            record_path = root / "record.json"
+            env = os.environ.copy()
+            env.update(
+                {
+                    "AUTOREVIEW_FAKE_RECORD": str(record_path),
+                    "HOME": str(root),
+                    "USERPROFILE": str(root),
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--engine",
+                    "codex",
+                    "--codex-bin",
+                    str(codex_bin),
+                    "--parallel-tests",
+                    "true",
+                ],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("autoreview clean", result.stdout)
+            self.assertTrue(record_path.is_file())
 
     def test_source_tree_snapshot_hashes_binary_and_untracked_tail_bytes(
         self,
@@ -3306,6 +3605,85 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 "invalid code_location keys",
             ):
                 self.helper["validate_report"](report, repo, {"src/index.ts"}, [])
+
+    def test_print_report_escapes_terminal_controls(self) -> None:
+        report = {
+            "findings": [
+                {
+                    "title": "clear\x1b[2Jscreen",
+                    "body": "first line\nsecond\u202eline café\udc9b",
+                    "priority": "P1",
+                    "confidence": 0.9,
+                    "category": "security",
+                    "code_location": {
+                        "file_path": "src/\x9b2Jfile.py",
+                        "line": 1,
+                    },
+                }
+            ],
+            "overall_correctness": "patch is incorrect",
+            "overall_explanation": "explanation\x07",
+            "overall_confidence": 0.9,
+        }
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            self.helper["print_report"](report, label="review\x00label")
+
+        rendered = output.getvalue()
+        for control in (
+            "\x00",
+            "\x07",
+            "\x1b",
+            "\x9b",
+            "\u202e",
+            "\udc9b",
+        ):
+            self.assertNotIn(control, rendered)
+        for escaped in (
+            r"review\x00label",
+            r"clear\x1b[2Jscreen",
+            r"src/\x9b2Jfile.py",
+            r"second\u202eline café\udc9b",
+            r"explanation\x07",
+        ):
+            self.assertIn(escaped, rendered)
+        self.assertIn("first line\nsecond", rendered)
+
+    def test_validate_report_escapes_controls_in_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            report = {
+                "findings": [
+                    {
+                        "title": "Finding",
+                        "body": "Body",
+                        "priority": "P1\x1b]52;c;VEVTVA==\x07",
+                        "confidence": 0.9,
+                        "category": "security",
+                        "code_location": {
+                            "file_path": "src/index.py",
+                            "line": 1,
+                        },
+                    }
+                ],
+                "overall_correctness": "patch is incorrect",
+                "overall_explanation": "Explanation",
+                "overall_confidence": 0.9,
+            }
+
+            with self.assertRaises(SystemExit) as raised:
+                self.helper["validate_report"](
+                    report,
+                    repo,
+                    {"src/index.py"},
+                    [],
+                )
+
+        message = str(raised.exception)
+        self.assertNotIn("\x1b", message)
+        self.assertNotIn("\x07", message)
+        self.assertIn(r"P1\x1b]52;c;VEVTVA==\x07", message)
 
     def test_safe_engine_env_ignores_inaccessible_path_entries(self) -> None:
         old_path = os.environ.get("PATH", "")

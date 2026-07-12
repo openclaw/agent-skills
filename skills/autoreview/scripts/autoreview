@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
+import binascii
 import concurrent.futures
 import copy
 import functools
@@ -19,9 +21,10 @@ import tempfile
 import textwrap
 import threading
 import time
+import unicodedata
 import urllib.parse
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 
 ENGINES = ("codex", "claude", "droid", "copilot", "pi", "opencode", "cursor")
@@ -183,14 +186,15 @@ SECRET_VALUE_PATTERNS = [
     re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
     re.compile(r"\bya29\.[0-9A-Za-z_-]{20,}\b"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{7,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
-    re.compile(
-        r"(?i)(?:^|[^A-Za-z0-9_])[\"']?authorization[\"']?"
-        r"\s*[:=]\s*[\"']?"
-        r"basic\s+[A-Za-z0-9+/]{8,}={0,2}(?![A-Za-z0-9+/=])"
-    ),
 ]
+BASIC_AUTHORIZATION_PATTERN = re.compile(
+    r"(?i)(?:^|[^A-Za-z0-9_])[\"']?authorization[\"']?"
+    r"\s*[:=]\s*[\"']?"
+    r"basic\s+(?P<credential>[A-Za-z0-9+/]{8,}={0,2})"
+    r"(?![A-Za-z0-9+/=])"
+)
 URI_SCHEME_PATTERN = re.compile(
-    r"\b[A-Za-z][A-Za-z0-9+.-]*://",
+    r"\b[A-Za-z][A-Za-z0-9+.-]*:(?:\\?/){2}",
     re.IGNORECASE,
 )
 URI_PASSWORD_REFERENCE_PATTERNS = (
@@ -219,6 +223,10 @@ URI_CREDENTIAL_REFERENCE_PATTERN = re.compile(
 URI_COMPUTED_REFERENCE_PATTERN = re.compile(
     rf"^{URI_CREDENTIAL_REFERENCE_TEXT}"
     rf"\(\s*{URI_CREDENTIAL_REFERENCE_TEXT}\s*\)$"
+)
+POWERSHELL_ENV_REFERENCE_PATTERN = re.compile(
+    r"^\$env:[A-Za-z_][A-Za-z0-9_]*$",
+    re.IGNORECASE,
 )
 MAX_BUNDLE_TEXT_BYTES = 180_000
 MAX_REVIEW_PROMPT_BYTES = 512_000
@@ -1475,7 +1483,11 @@ def run_with_stream(
     return subprocess.CompletedProcess(args, returncode, "".join(stdout_parts), "".join(stderr_parts))
 
 
-def git(repo: Path, *args: str, check: bool = True) -> str:
+def git_result(
+    repo: Path,
+    *args: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
     try:
         return run(
             [resolve_command("git", repo), "--no-optional-locks", *SAFE_GIT_CONFIG_ARGS, *args],
@@ -1483,12 +1495,16 @@ def git(repo: Path, *args: str, check: bool = True) -> str:
             check=check,
             env=safe_git_env(repo),
             text_errors="strict",
-        ).stdout
+        )
     except UnicodeDecodeError as exc:
         raise SystemExit(
             "refusing non-UTF-8 Git output because paths and diff content "
             "cannot be validated without loss"
         ) from exc
+
+
+def git(repo: Path, *args: str, check: bool = True) -> str:
+    return git_result(repo, *args, check=check).stdout
 
 
 def git_path_list(repo: Path, *args: str, check: bool = True) -> list[str]:
@@ -1671,6 +1687,29 @@ def bounded_field(text: str, limit: int) -> str:
     return text[: max(0, limit - len(suffix))] + suffix
 
 
+def display_escape(text: object, limit: int, *, multiline: bool = False) -> str:
+    parts: list[str] = []
+    for char in str(text):
+        codepoint = ord(char)
+        if multiline and char == "\n":
+            parts.append(char)
+        elif codepoint < 32 or 127 <= codepoint <= 159:
+            parts.append(f"\\x{codepoint:02x}")
+        elif unicodedata.category(char) in {"Cf", "Cs"}:
+            parts.append(
+                f"\\u{codepoint:04x}"
+                if codepoint <= 0xFFFF
+                else f"\\U{codepoint:08x}"
+            )
+        else:
+            parts.append(char)
+    rendered = "".join(parts)
+    if len(rendered) <= limit:
+        return rendered
+    suffix = "...[truncated]"
+    return rendered[: max(0, limit - len(suffix))] + suffix[:limit]
+
+
 def read_prefix(path: Path, limit: int) -> tuple[bytes, bool]:
     descriptor: int | None = None
     try:
@@ -1708,7 +1747,10 @@ def read_prefix(path: Path, limit: int) -> tuple[bytes, bool]:
             raise OSError("file changed while reading")
         data = b"".join(chunks)
     except OSError as exc:
-        raise SystemExit(f"unreadable file: {path}: {exc}") from exc
+        raise SystemExit(
+            f"unreadable file: {display_escape(path, 500)}: "
+            f"{display_escape(exc, 500)}"
+        ) from exc
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -1853,7 +1895,29 @@ def top_level_fallback_suffix(text: str) -> str | None:
         char = text[cursor]
         next_char = text[cursor + 1] if cursor + 1 < len(text) else ""
         if line_comment:
-            return None
+            if char == "\n":
+                line_comment = False
+                object_member_context = any(
+                    closer == "}"
+                    for closer, _is_outer in stack
+                )
+                remaining = text[cursor + 1 :]
+                top_level_statement = (
+                    not stack
+                    and re.match(
+                        r"\s*(?:\|\||&&|\?\?|\+|\?(?!\.)|or\b)",
+                        remaining,
+                    )
+                    is None
+                )
+                object_sibling = (
+                    object_member_context
+                    and starts_sibling_assignment(remaining)
+                )
+                if top_level_statement or object_sibling:
+                    return None
+            cursor += 1
+            continue
         if block_comment:
             if char == "*" and next_char == "/":
                 block_comment = False
@@ -1896,6 +1960,12 @@ def top_level_fallback_suffix(text: str) -> str | None:
             continue
         fallback_depth = not stack or all(is_outer for _closer, is_outer in stack)
         if fallback_depth:
+            if (
+                char == ","
+                and not stack
+                and comma_starts_sibling_assignment(text, cursor)
+            ):
+                return None
             if text.startswith(("||", "&&", "??"), cursor):
                 return text[cursor:]
             if char in {"+", "?"} and not text.startswith("?.", cursor):
@@ -1916,6 +1986,27 @@ def top_level_fallback_suffix(text: str) -> str | None:
     return None
 
 
+def comma_starts_sibling_assignment(text: str, position: int) -> bool:
+    return starts_sibling_assignment(text[position + 1 :])
+
+
+def starts_sibling_assignment(text: str) -> bool:
+    return (
+        re.match(
+            r"\s*(?:"
+            r"\.\.\.[^,\r\n]+(?:,|$)"
+            r"|(?:[A-Za-z_$][A-Za-z0-9_$]*"
+            r"|[0-9]+(?:\.[0-9]+)?"
+            r"|[\"'][^\"'\r\n]+[\"']"
+            r"|\[[^\]\r\n]+\]"
+            r"|\{[^}\r\n]+\})\s*"
+            r"(?::(?![:=])|=(?!=|>)))",
+            text,
+        )
+        is not None
+    )
+
+
 def uri_authority_end(
     text: str,
     start: int,
@@ -1927,7 +2018,7 @@ def uri_authority_end(
     brace_interpolation = (
         outer_quote in {'"', "'", '"""', "'''"}
         and re.search(
-            r"(?i)(?:^|[^A-Za-z0-9_])(?:f|fr|rf|\$)$",
+            r"(?i)(?:^|[^A-Za-z0-9_])(?:f|fr|rf|\$|\$@|@\$)$",
             quote_prefix,
         )
         is not None
@@ -1939,6 +2030,7 @@ def uri_authority_end(
     cursor = start
     while cursor < len(text):
         char = text[cursor]
+        next_char = text[cursor + 1] if cursor + 1 < len(text) else ""
         if interpolation_quote is not None:
             if escaped:
                 escaped = False
@@ -1954,6 +2046,8 @@ def uri_authority_end(
                 cursor += 1
                 continue
             if char == "\\":
+                if next_char in "/?#":
+                    break
                 outer_escaped = True
                 cursor += 1
                 continue
@@ -1984,32 +2078,150 @@ def uri_authority_end(
     return cursor
 
 
-def credentialed_uri_risk(text: str) -> bool:
+def uri_authority_ranges(
+    text: str,
+) -> tuple[tuple[int, int, int, tuple[str, int] | None], ...]:
     matches = list(URI_SCHEME_PATTERN.finditer(text))
     contexts = string_contexts_at(
         text,
         {match.start() for match in matches},
     )
-    for match in matches:
-        context = contexts.get(match.start())
-        authority_end = uri_authority_end(text, match.end(), context)
-        authority = text[match.end() : authority_end]
-        userinfo, authority_separator, _ = authority.rpartition("@")
-        if not authority_separator:
+    return tuple(
+        (
+            match.start(),
+            match.end(),
+            uri_authority_end(
+                text,
+                match.end(),
+                contexts.get(match.start()),
+            ),
+            contexts.get(match.start()),
+        )
+        for match in matches
+    )
+
+
+def credentialed_uri_risk(
+    text: str,
+    authorities: tuple[
+        tuple[int, int, int, tuple[str, int] | None],
+        ...,
+    ] | None = None,
+) -> bool:
+    for authority_range in (
+        authorities if authorities is not None else uri_authority_ranges(text)
+    ):
+        credential = uri_authority_credential(text, authority_range)
+        if credential is None:
             continue
-        _, separator, uri_password = userinfo.partition(":")
-        if not separator or not uri_password:
+        if (
+            credential.has_password
+            and uri_userinfo_literal_risk(credential.username)
+            and not uri_password_is_interpolated(
+                text,
+                credential.scheme_start,
+                credential.username,
+                credential.host,
+                credential.context,
+            )
+        ):
+            return True
+        if uri_password_is_interpolated(
+            text,
+            credential.scheme_start,
+            credential.value,
+            credential.host,
+            credential.context,
+        ):
+            continue
+        if credential.has_password or uri_userinfo_literal_risk(
+            credential.value
+        ):
+            return True
+    return False
+
+
+class UriAuthorityCredential(NamedTuple):
+    username: str
+    value: str
+    host: str
+    has_password: bool
+    empty_password: bool
+    scheme_start: int
+    context: tuple[str, int] | None
+    value_start: int
+    value_end: int
+
+
+def uri_authority_credential(
+    text: str,
+    authority_range: tuple[
+        int,
+        int,
+        int,
+        tuple[str, int] | None,
+    ],
+) -> UriAuthorityCredential | None:
+    scheme_start, authority_start, authority_end, context = authority_range
+    authority = text[authority_start:authority_end]
+    userinfo, authority_separator, host = authority.rpartition("@")
+    if not authority_separator:
+        return None
+    username, password_separator, password = userinfo.partition(":")
+    has_password = bool(password_separator and password)
+    empty_password = bool(password_separator and not password)
+    value = password if has_password else (userinfo if not password_separator else username)
+    value_start = (
+        authority_start + len(username) + 1
+        if has_password
+        else authority_start
+    )
+    return UriAuthorityCredential(
+        username,
+        value,
+        host,
+        has_password,
+        empty_password,
+        scheme_start,
+        context,
+        value_start,
+        value_start + len(value),
+    )
+
+
+def interpolated_empty_password_uri_ranges(
+    text: str,
+    authorities: tuple[
+        tuple[int, int, int, tuple[str, int] | None],
+        ...,
+    ],
+) -> tuple[tuple[int, int], ...]:
+    safe: list[tuple[int, int]] = []
+    for authority_range in authorities:
+        credential = uri_authority_credential(text, authority_range)
+        if credential is None or not credential.empty_password:
             continue
         if uri_password_is_interpolated(
             text,
-            match.start(),
-            uri_password,
-            authority.rpartition("@")[2],
-            context,
+            credential.scheme_start,
+            credential.value,
+            credential.host,
+            credential.context,
         ):
-            continue
-        return True
-    return False
+            safe.append(
+                (credential.value_start, credential.value_end)
+            )
+    return tuple(safe)
+
+
+def position_in_ranges(
+    position: int,
+    ranges: tuple[tuple[int, int], ...],
+) -> bool:
+    return any(
+        start <= position < end
+        for start, end in ranges
+    )
 
 
 def string_contexts_at(
@@ -2130,7 +2342,7 @@ def uri_password_is_interpolated(
                 return True
             return dynamic_uri_expression(password, "${", "}")
         prefix = text[:quote_start]
-        if quote == '"' and prefix.endswith("$"):
+        if quote == '"' and re.search(r"(?:\$|\$@|@\$)$", prefix):
             if URI_PASSWORD_REFERENCE_PATTERNS[2].fullmatch(password):
                 return True
             return dynamic_uri_expression(password, "{", "}")
@@ -2163,6 +2375,12 @@ def uri_password_is_interpolated(
             return True
         line_start = max(prefix.rfind("\n"), prefix.rfind("\r"))
         assignment = prefix[line_start + 1 :]
+        if (
+            quote == '"'
+            and POWERSHELL_ENV_REFERENCE_PATTERN.fullmatch(password)
+            and powershell_assignment_prefix(assignment)
+        ):
+            return True
         if quote == '"' and shell_assignment_prefix(assignment):
             return any(
                 pattern.fullmatch(password)
@@ -2218,6 +2436,49 @@ def uri_placeholder_password_is_safe(password: str, host: str) -> bool:
         *SECRET_PLACEHOLDER_VALUES,
         "password",
     }
+
+
+def uri_userinfo_literal_risk(value: str) -> bool:
+    if value.lower() in URI_PASSWORD_PLACEHOLDER_VALUES:
+        return False
+    if value.startswith(("$", "{")):
+        return True
+    credential_name = URI_CREDENTIAL_NAME_PATTERN.search(value) is not None
+    structured_username = (
+        re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9]*(?:[._-][A-Za-z0-9]+)+",
+            value,
+        )
+        is not None
+    )
+    character_classes = sum(
+        (
+            any(char.islower() for char in value),
+            any(char.isupper() for char in value),
+            any(char.isdigit() for char in value),
+            any(not char.isalnum() for char in value),
+        )
+    )
+    opaque_alphanumeric = (
+        re.fullmatch(r"[A-Za-z0-9]{20,}", value) is not None
+        and character_classes >= 3
+    )
+    opaque_hex = (
+        re.fullmatch(r"[0-9A-Fa-f]{32,}", value) is not None
+        or re.fullmatch(
+            r"[0-9A-Fa-f]{8}-"
+            r"(?:[0-9A-Fa-f]{4}-){3}"
+            r"[0-9A-Fa-f]{12}",
+            value,
+        )
+        is not None
+    )
+    return len(value) >= 20 and (
+        credential_name
+        or opaque_alphanumeric
+        or opaque_hex
+        or (character_classes >= 4 and not structured_username)
+    )
 
 
 def uri_named_credential_reference(password: str) -> bool:
@@ -2393,7 +2654,7 @@ def config_uri_reference_is_safe(
     key, separator = context
     syntactic_reference = any(
         pattern.fullmatch(password)
-        for pattern in URI_PASSWORD_REFERENCE_PATTERNS[:3]
+        for pattern in URI_PASSWORD_REFERENCE_PATTERNS[:2]
     )
     return syntactic_reference and (
         uri_named_credential_reference(password)
@@ -2410,6 +2671,18 @@ def shell_assignment_prefix(text: str) -> bool:
     return match is not None and (
         match.group("export") is not None
         or match.group("name") == match.group("name").upper()
+    )
+
+
+def powershell_assignment_prefix(text: str) -> bool:
+    return (
+        re.match(
+            r"(?i)\s*(?:"
+            r"\[[^\]\r\n]+\]\s*\$[A-Za-z_][A-Za-z0-9_]*"
+            r"|\$env:[A-Za-z_][A-Za-z0-9_]*)\s*=",
+            text,
+        )
+        is not None
     )
 
 
@@ -2446,7 +2719,7 @@ def shell_command_prefix(text: str, position: int) -> bool:
 
 
 def secret_literal_risk(expression: str, minimum_length: int = 12) -> bool:
-    if credentialed_uri_risk(expression) or any(
+    if credentialed_uri_risk(expression) or basic_authorization_risk(expression) or any(
         pattern.search(expression) for pattern in SECRET_VALUE_PATTERNS
     ):
         return True
@@ -3328,16 +3601,36 @@ def bare_code_reference(text: str, start: int, value: str) -> bool:
     )
 
 
+def basic_authorization_risk(text: str) -> bool:
+    for match in BASIC_AUTHORIZATION_PATTERN.finditer(text):
+        encoded = match.group("credential")
+        padded = encoded + "=" * (-len(encoded) % 4)
+        try:
+            decoded = base64.b64decode(padded, validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        if b":" in decoded:
+            return True
+    return False
+
+
 def secret_text_risk(text: str) -> bool:
-    if credentialed_uri_risk(text) or any(
+    uri_authorities = uri_authority_ranges(text)
+    if credentialed_uri_risk(text, uri_authorities) or basic_authorization_risk(text) or any(
         pattern.search(text) for pattern in SECRET_VALUE_PATTERNS
     ):
         return True
+    safe_uri_credentials = interpolated_empty_password_uri_ranges(
+        text,
+        uri_authorities,
+    )
     for prefix in SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(text):
         fallback = top_level_fallback_suffix(text[prefix.end() :])
         if fallback is not None and fallback_secret_risk(fallback):
             return True
     for match in SECRET_ASSIGNMENT_PATTERN.finditer(text):
+        if position_in_ranges(match.start(), safe_uri_credentials):
+            continue
         quoted = any(
             match.group(name) is not None
             for name in ("double_value", "single_value", "backtick_value")
@@ -3595,7 +3888,7 @@ def validate_review_patch(
     limit: int = MAX_BUNDLE_TEXT_BYTES,
 ) -> str:
     blocked = [
-        f"{rel} ({risk})"
+        f"{display_escape(rel, 500)} ({risk})"
         for rel in paths
         if (risk := tracked_sensitive_repo_path_risk(rel)) is not None
     ]
@@ -3606,7 +3899,8 @@ def validate_review_patch(
             f"refusing to include tracked sensitive paths in {label}:\n"
             f"{details}{more}"
         )
-    require_no_secret_values(label, patch)
+    for line in patch.splitlines():
+        require_no_secret_values(label, line)
     for content in unified_diff_contents(patch):
         require_no_secret_values(label, content)
     patch_bytes = len(patch.encode("utf-8"))
@@ -3627,7 +3921,10 @@ def require_no_binary_diff(label: str, numstat: str) -> None:
         if len(fields) == 3 and fields[0] == "-" and fields[1] == "-":
             binary_paths.append(fields[2])
     if binary_paths:
-        details = "\n".join(f"- {path}" for path in binary_paths[:20])
+        details = "\n".join(
+            f"- {display_escape(path, 500)}"
+            for path in binary_paths[:20]
+        )
         more = f"\n... {len(binary_paths) - 20} more" if len(binary_paths) > 20 else ""
         raise SystemExit(
             f"refusing binary changes in {label} because their contents cannot be reviewed:\n"
@@ -3655,7 +3952,10 @@ def require_no_gitlink_diff(label: str, raw_diff: str) -> None:
         path = records[index + 1] if index + 1 < len(records) else "<unknown>"
         gitlink_paths.append(path or "<unknown>")
     if gitlink_paths:
-        details = "\n".join(f"- {path}" for path in gitlink_paths[:20])
+        details = "\n".join(
+            f"- {display_escape(path, 500)}"
+            for path in gitlink_paths[:20]
+        )
         more = (
             f"\n... {len(gitlink_paths) - 20} more"
             if len(gitlink_paths) > 20
@@ -3741,7 +4041,7 @@ def safe_untracked_file_snapshots(repo: Path) -> list[tuple[str, str, bool]]:
             allow_binary_omission=True,
         )
         if risk:
-            blocked.append(f"{rel} ({risk})")
+            blocked.append(f"{display_escape(rel, 500)} ({risk})")
         else:
             included.append((rel, content, truncated))
     if blocked:
@@ -3836,7 +4136,10 @@ def source_file_fingerprint(path: Path) -> tuple[str, int, int, str]:
             target = os.readlink(path)
             after = os.stat(path, follow_symlinks=False)
         except OSError as exc:
-            raise SystemExit(f"unreadable file: {path}: {exc}") from exc
+            raise SystemExit(
+                f"unreadable file: {display_escape(path, 500)}: "
+                f"{display_escape(exc, 500)}"
+            ) from exc
         if (
             before.st_dev,
             before.st_ino,
@@ -3850,7 +4153,9 @@ def source_file_fingerprint(path: Path) -> tuple[str, int, int, str]:
             after.st_size,
             after.st_mtime_ns,
         ):
-            raise SystemExit(f"file changed while reading: {path}")
+            raise SystemExit(
+                f"file changed while reading: {display_escape(path, 500)}"
+            )
         data = os.fsencode(target)
         return "symlink", file_mode, len(data), hashlib.sha256(data).hexdigest()
     if not stat.S_ISREG(before.st_mode):
@@ -3890,7 +4195,10 @@ def source_file_fingerprint(path: Path) -> tuple[str, int, int, str]:
         ):
             raise OSError("file changed while reading")
     except OSError as exc:
-        raise SystemExit(f"unreadable file: {path}: {exc}") from exc
+        raise SystemExit(
+            f"unreadable file: {display_escape(path, 500)}: "
+            f"{display_escape(exc, 500)}"
+        ) from exc
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -3904,7 +4212,36 @@ def source_tree_snapshot(
     str,
     tuple[tuple[str, object], ...],
 ]:
-    head = git(repo, "rev-parse", "HEAD").strip()
+    head_result = git_result(
+        repo,
+        "rev-parse",
+        "--verify",
+        "HEAD",
+        check=False,
+    )
+    head = head_result.stdout.strip()
+    if head_result.returncode != 0:
+        symbolic_result = git_result(
+            repo,
+            "symbolic-ref",
+            "-q",
+            "HEAD",
+            check=False,
+        )
+        symbolic_head = symbolic_result.stdout.strip()
+        if symbolic_result.returncode != 0 or not symbolic_head:
+            raise SystemExit("unable to resolve HEAD for source snapshot")
+        ref_result = git_result(
+            repo,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            symbolic_head,
+            check=False,
+        )
+        if ref_result.returncode != 1:
+            raise SystemExit("unable to verify unborn HEAD for source snapshot")
+        head = f"unborn:{symbolic_head}"
     index_entries = git(
         repo,
         "ls-files",
@@ -6288,7 +6625,12 @@ def self_test_heartbeat_metrics() -> None:
     print("autoreview heartbeat metrics self-test: ok")
 
 
-def validate_report(report: dict[str, Any], repo: Path, changed_paths: set[str], required: list[str]) -> None:
+def _validate_report(
+    report: dict[str, Any],
+    repo: Path,
+    changed_paths: set[str],
+    required: list[str],
+) -> None:
     allowed_top = {"findings", "overall_correctness", "overall_explanation", "overall_confidence"}
     extra_top = set(report) - allowed_top
     if extra_top:
@@ -6366,10 +6708,19 @@ def validate_report(report: dict[str, Any], repo: Path, changed_paths: set[str],
         for index, finding, rel, line in ignored_findings:
             title = finding.get("title", "<untitled>")
             print(
-                f"autoreview ignored out-of-scope finding {index}: {title} ({rel}:{line})",
+                "autoreview ignored out-of-scope finding "
+                f"{index}: {display_escape(title, 140)} "
+                f"({display_escape(rel, 500)}:{line})",
                 file=sys.stderr,
             )
-            print(bounded_field(str(finding.get("body", "")), 500), file=sys.stderr)
+            print(
+                display_escape(
+                    finding.get("body", ""),
+                    500,
+                    multiline=True,
+                ),
+                file=sys.stderr,
+            )
         report["findings"] = kept_findings
         if not kept_findings and report["overall_correctness"] == "patch is incorrect":
             note = f"Ignored {len(ignored_findings)} out-of-scope finding(s) outside the reviewed change."
@@ -6382,26 +6733,52 @@ def validate_report(report: dict[str, Any], repo: Path, changed_paths: set[str],
             raise SystemExit(f"required finding text not found: {needle}")
 
 
+def validate_report(
+    report: dict[str, Any],
+    repo: Path,
+    changed_paths: set[str],
+    required: list[str],
+) -> None:
+    try:
+        _validate_report(report, repo, changed_paths, required)
+    except SystemExit as exc:
+        if isinstance(exc.code, str):
+            raise SystemExit(
+                display_escape(exc.code, 4000, multiline=True)
+            ) from None
+        raise
+
+
 def number_in_range(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1
 
 
 def print_report(report: dict[str, Any], *, label: str = "autoreview") -> None:
     findings = report["findings"]
+    display_label = display_escape(label, 200)
     if findings:
-        print(f"{label} findings: {len(findings)}")
+        print(f"{display_label} findings: {len(findings)}")
     elif report["overall_correctness"] == "patch is incorrect":
-        print(f"{label} verdict: patch is incorrect without discrete findings")
+        print(
+            f"{display_label} verdict: "
+            "patch is incorrect without discrete findings"
+        )
     else:
-        print(f"{label} clean: no accepted/actionable findings reported")
+        print(
+            f"{display_label} clean: "
+            "no accepted/actionable findings reported"
+        )
     for finding in findings:
         loc = finding["code_location"]
-        print(f"[{finding['priority']}] {finding['title']}")
-        print(f"{loc['file_path']}:{loc['line']}")
-        print(f"{finding['body']}")
+        print(
+            f"[{finding['priority']}] "
+            f"{display_escape(finding['title'], 140)}"
+        )
+        print(f"{display_escape(loc['file_path'], 500)}:{loc['line']}")
+        print(display_escape(finding["body"], 2000, multiline=True))
         print()
     print(f"overall: {report['overall_correctness']} ({report['overall_confidence']})")
-    print(report["overall_explanation"])
+    print(display_escape(report["overall_explanation"], 3000, multiline=True))
 
 
 def start_parallel_tests(
@@ -6797,7 +7174,9 @@ def run_reviewer(
             if attempt >= attempts or not is_structured_output_failure(str(exc)):
                 raise
             print(
-                f"retrying {args.engine} structured output validation after attempt {attempt}: {exc}",
+                "retrying "
+                f"{args.engine} structured output validation after attempt "
+                f"{attempt}: {display_escape(exc, 4000, multiline=True)}",
                 file=sys.stderr,
             )
     raise SystemExit(f"{args.engine} structured output validation failed after {attempts} attempts")
@@ -7282,5 +7661,16 @@ class Tee:
             stream.flush()
 
 
+def sanitized_main() -> int:
+    try:
+        return main()
+    except SystemExit as exc:
+        if isinstance(exc.code, str):
+            raise SystemExit(
+                display_escape(exc.code, 4000, multiline=True)
+            ) from None
+        raise
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(sanitized_main())
