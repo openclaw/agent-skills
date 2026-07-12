@@ -654,6 +654,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
         ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
+        self.assertIsNone(
+            self.helper["top_level_fallback_suffix"](
+                'passwordGenerator("ordinary-option-value")'
+            )
+        )
 
     def test_secret_detector_rejects_call_fallback_literals(self) -> None:
         for content in (
@@ -665,6 +670,17 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + 'ken = process.env.TOKEN || choose(/\\)/, "'
             + "actual-production-secret"
             + '")',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_short_call_fallback_literals(self) -> None:
+        for content in (
+            "pass" + 'word = getpass() || "hunter' + '2!"',
+            "pass" + 'word = None or "actual-production-' + 'password"',
+            "pass" + 'word = x or "actual-production-' + 'password"',
+            "pass" + 'word = "" or "actual-production-' + 'password"',
+            "pass" + 'word = os.getenv("PASSWORD") or "real' + 'pass9"',
         ):
             with self.subTest(content=content):
                 self.assertTrue(self.helper["secret_text_risk"](content))
@@ -1019,6 +1035,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
         for content in (
             "access_"
             + 'token = credentials.get_token("https://management.azure.com/.default")',
+            "access_"
+            + 'token = self._credential.get_token("https://management.azure.com/.default")',
             "access_" + 'token = credentials.get_token("scope")',
             "access_"
             + 'token = credentials.get_token("api://00000000-0000-0000-0000-000000000000/.default")',
@@ -1042,6 +1060,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + 'key = getpass.getpass("Enter your API key: ")',
             "api_"
             + 'key = getpass.getpass(prompt="Enter your API key: ")',
+            "to" + 'ken = input("Enter API to' + 'ken: ")',
+            "to" + 'ken = input ("Enter API to' + 'ken: ")',
+            "api" + 'Key = prompt("Enter API key: ")',
+            "api" + 'Key = prompt("Enter API key: ", defaultApiKey)',
         ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
@@ -1075,6 +1097,17 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + 'ken = credentials.get_token("3db474b9-6a0c-4840-96ac-'
             + '1fceb342124f/actual-production-secret")',
             "pass" + 'word = decode("correct horse battery staple?")',
+            "api"
+            + "Key = prompt("
+            + '"Enter API key: ", "real'
+            + 'pass9")',
+            "pass"
+            + 'word = prompt("real'
+            + 'pass9")',
+            "api"
+            + "Key = prompt({default: "
+            + '"real'
+            + 'pass9"})',
             "pass"
             + "word = in"
             + 'put("correct horse battery staple?")',
@@ -1094,6 +1127,18 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 + '"'
             )
             with self.subTest(expression=expression):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_parenthesized_fallback_literals(self) -> None:
+        operator = "o" + "r"
+        for opening, closing in (("(", ")"), ("((", "))")):
+            content = (
+                "pass"
+                + f'word = {opening}os.getenv("PASS'
+                + f'WORD") {operator} "real'
+                + f'pass9"{closing}'
+            )
+            with self.subTest(opening=opening):
                 self.assertTrue(self.helper["secret_text_risk"](content))
 
     def test_secret_detector_rejects_bare_secret_with_reference_prefix(
@@ -1185,6 +1230,31 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 "refresh_" + "token = " + "abcdefghijklmnopqrstuvwxyz"
             )
         )
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                "const access_"
+                + "to"
+                + "ken = generated_password_"
+                + "value"
+            )
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                "ACCESS_"
+                + "TO"
+                + "KEN=generated_access_token_"
+                + realistic_secret_value()
+                + "_value"
+            )
+        )
+        for content in (
+            "const token = authenticationToken;",
+            "const token = longVariableReference;",
+            "const token = tokenFromEnvironment;",
+            "const password = databasePassword;",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
 
     def test_secret_detector_handles_raw_jwt(self) -> None:
         content = ".".join(
@@ -1331,6 +1401,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "to" + "ken: prod.A7f9K2m4Q8v6N3x5R1p0T9z8 (production)",
             "pass" + "word=correct.horse.battery.password",
             "pass" + "word=Correct.horse.battery.staple",
+            "access_" + "token=abcDefGhijk" + "LmnoPqrst",
             "pass" + "word=\"${{ 'Correct.horse.battery.staple' }}\"",
             "pass" + "word=\"{{ 'Correct.horse.battery.staple' }}\"",
         ):
@@ -1376,8 +1447,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             'url="postgres://' + "admin:%s@" + 'db.example/app"',
             'url="postgres://' + "admin:{}@" + 'db.example/app"',
             'url="https://' + "alice@example.com:secret@" + 'host/app"',
-            'DATABASE_URL: "postgres:'
-            + '//user:${DB_PASSWORD}@db.example/app"',
+            'url="https://admin:pass'
+            + 'word@prod.example/private"',
             "'database.url': 'postgres:"
             + "//user:${DB_PASSWORD}@db.example/app'",
             "const cfg = {\n"
@@ -1427,16 +1498,29 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
     def test_secret_detector_allows_referenced_uri_credentials(self) -> None:
         for content in (
+            "postgres:" + "//user:password@localhost/db",
+            "url=postgres:" + "//user:test-token-placeholder@host/db",
+            "url=postgres:" + "//user:placeholder@host/db",
             "url=`postgres://" + "user:${DB_PASSWORD}@db.example/app`",
             'url=f"postgres://' + 'user:{password}@db.example/app"',
             'url=f"""postgres://' + 'user:{password}@db.example/app"""',
             'dsn=f"connect to postgres://'
             + 'user:{password}@db.example/app"',
             "DATABASE_URL=postgres://" + "user:$DB_PASSWORD@db.example/app",
+            "DATABASE_URL=postgres:" + "//user:${DB_PASS}@db.example/app",
             "DATABASE_URL: postgres://"
             + "user:${DB_PASSWORD}@db.example/app",
             "DATABASE_URL: postgres://"
             + "user:$DB_PASSWORD@db.example/app",
+            'DATABASE_URL: "postgres://'
+            + 'user:${DB_PASSWORD}@db.example/app"',
+            'DATABASE_URL: "postgres://'
+            + 'user:${DB_PASS}@db.example/app"',
+            "DATABASE_URL: postgres://" + "user:${CRED}@db.example/app",
+            'DATABASE_URL: "postgres://' + 'user:${AUTH}@db.example/app"',
+            "url: postgres://" + "user:${CRED}@db.example/app",
+            "- DATABASE_URL=postgres://"
+            + "user:${DB_PASSWORD}@db.example/app",
             "url: postgres://" + "user:${DB_PASSWORD}@db.example/app",
             "uri: postgres://" + "user:${DB_PASSWORD}@db.example/app",
             "dsn: postgres://" + "user:${DB_PASSWORD}@db.example/app",
@@ -1450,8 +1534,21 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + 'user:%s@db.example/app" % password',
             'dsn = fmt.Sprintf("postgres://'
             + 'user:%s@db.example/app", password)',
+            'dsn = fmt.Sprintf("postgres://'
+            + '%s:%s@db.example/app", user, password)',
+            'dsn = fmt.Sprintf("postgres://'
+            + 'user:%s@%s/db", password, host)',
+            'dsn = "postgres://'
+            + '%s:%s@db.example/app" % (user, password)',
             'dsn = "postgres://'
             + 'user:{}@db.example/app".format(password)',
+            'dsn = "postgres://'
+            + 'user:{}@{}/db".format(password, host)',
+            'dsn = "postgres://'
+            + 'user:{password}@{host}/db".format(password=password, host=host)',
+            '$"postgres:' + '//user:{password}@db/app"',
+            'format!("postgres:' + '//user:{}@db/app", password)',
+            '$dsn = "postgres:' + '//user:$password@db/app"',
             'export DATABASE_URL="'
             + "postgres://"
             + "user:${DB_PASSWORD}@db.example/app"
@@ -1488,9 +1585,57 @@ class AutoreviewHardeningTests(unittest.TestCase):
             'curl "https://'
             + 'user:${API_TOKEN}@host/app"',
             "curl https://" + "user:$API_TOKEN@host/app",
+            'curl -X POST "https:' + '//user:$API_TOKEN@host/app"',
+            'curl -X POST "https:' + '//user:$CRED@host/app"',
+            'wget "https:' + '//user:${API_TOKEN}@host/app"',
+            'git clone https:' + '//user:$TOKEN@host/repo',
+            'sudo curl "https:' + '//user:$TOKEN@host/app"',
+            'http "https:' + '//user:${API_TOKEN}@host/app"',
         ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_uri_shell_inference_rejects_non_shell_language_keywords(self) -> None:
+        for content in (
+            'assert "postgres:' + '//user:$ecret123@db/app"',
+            'print "postgres:' + '//user:$ecret123@db/app"',
+            'return "postgres:' + '//user:$ecret123@db/app"',
+            'const url = "postgres:' + '//user:$ecret123@db/app"',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](content)
+                )
+
+    def test_uri_defaults_and_plain_strings_are_not_interpolation(self) -> None:
+        for content in (
+            "https:" + "//admin:change" + "me@production.example/",
+            'url = "https:' + '//admin:$pass' + 'word@prod.example/"',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_ignores_arrow_parameter_fallbacks(self) -> None:
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                'token => token || "ordinary-option-value"'
+            )
+        )
+
+    def test_uri_interpolation_rejects_literal_expressions(self) -> None:
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                'dsn = f"postgres:' + '//user:{ \'literal-'
+                + 'secret\' }@host/db"'
+            )
+        )
+
+    def test_secret_detector_handles_basic_authorization_headers(self) -> None:
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                "Author" + "ization: Basic " + "dXNlcjpwYXNz" + "d29yZA=="
+            )
+        )
 
     def test_template_uri_references_skip_format_scans(self) -> None:
         original = self.helper["uri_password_is_format_placeholder"]
@@ -2056,6 +2201,124 @@ class AutoreviewHardeningTests(unittest.TestCase):
         finally:
             release.set()
             stderr_thread.join(timeout=1)
+
+    def test_source_tree_snapshot_detects_parallel_test_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            source = repo / "source.txt"
+            source.write_text("before\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            git(repo, "commit", "-qm", "initial")
+            before = self.helper["source_tree_snapshot"](repo)
+
+            source.write_text("after\n", encoding="utf-8")
+            self.assertNotEqual(
+                self.helper["source_tree_snapshot"](repo),
+                before,
+            )
+            source.write_text("before\n", encoding="utf-8")
+            self.assertEqual(
+                self.helper["source_tree_snapshot"](repo),
+                before,
+            )
+
+            source.write_text("after\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            git(repo, "commit", "-qm", "mutated")
+            self.assertNotEqual(
+                self.helper["source_tree_snapshot"](repo),
+                before,
+            )
+
+            (repo / "generated.txt").write_text("generated\n", encoding="utf-8")
+            self.assertNotEqual(
+                self.helper["source_tree_snapshot"](repo),
+                before,
+            )
+
+    def test_source_tree_snapshot_hashes_binary_and_untracked_tail_bytes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            tracked = repo / "tracked.bin"
+            tracked.write_bytes(b"\0tracked-before")
+            git(repo, "add", "tracked.bin")
+            git(repo, "commit", "-qm", "initial")
+            limit = self.helper["MAX_BUNDLE_TEXT_BYTES"]
+            untracked = repo / "generated.bin"
+            untracked.write_bytes(b"\0" + b"a" * (limit + 16))
+            before = self.helper["source_tree_snapshot"](repo)
+
+            tracked.write_bytes(b"\0tracked-after!")
+            self.assertNotEqual(
+                self.helper["source_tree_snapshot"](repo),
+                before,
+            )
+            tracked.write_bytes(b"\0tracked-before")
+            self.assertEqual(
+                self.helper["source_tree_snapshot"](repo),
+                before,
+            )
+
+            with untracked.open("r+b") as stream:
+                stream.seek(-1, os.SEEK_END)
+                stream.write(b"b")
+            self.assertNotEqual(
+                self.helper["source_tree_snapshot"](repo),
+                before,
+            )
+
+    def test_source_tree_snapshot_includes_index_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            source = repo / "source.txt"
+            source.write_text("before\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            git(repo, "commit", "-qm", "initial")
+            before = self.helper["source_tree_snapshot"](repo)
+
+            source.write_text("staged\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            source.write_text("before\n", encoding="utf-8")
+            self.assertNotEqual(
+                self.helper["source_tree_snapshot"](repo),
+                before,
+            )
+
+    def test_source_tree_snapshot_includes_tracked_submodule_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            child = root / "child"
+            child.mkdir()
+            git(child, "init", "-q")
+            source = child / "source.txt"
+            source.write_text("before\n", encoding="utf-8")
+            git(child, "add", "source.txt")
+            git(child, "commit", "-qm", "initial")
+
+            repo = init_repo(root)
+            git(
+                repo,
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                str(child),
+                "vendor/dependency",
+            )
+            git(repo, "commit", "-qam", "add submodule")
+            before = self.helper["source_tree_snapshot"](repo)
+
+            (repo / "vendor/dependency/source.txt").write_text(
+                "after\n",
+                encoding="utf-8",
+            )
+            self.assertNotEqual(
+                self.helper["source_tree_snapshot"](repo),
+                before,
+            )
 
     def test_trusted_maintainer_testbox_preserves_only_credentials(self) -> None:
         old = os.environ.copy()

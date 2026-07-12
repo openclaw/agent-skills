@@ -6,6 +6,7 @@ import ast
 import concurrent.futures
 import copy
 import functools
+import hashlib
 import json
 import os
 import queue
@@ -160,6 +161,12 @@ SECRET_ASSIGNMENT_PATTERN = re.compile(
     r"(?![A-Za-z0-9_./+=:@#$%&*!?-])|"
     r"(?P<bare_value>[A-Za-z0-9_./+=:@#$%&*!?-]{8,}))"
 )
+SECRET_ASSIGNMENT_PREFIX_PATTERN = re.compile(
+    r"(?i)(?:"
+    r"[\"'](?:api[_-]?key|aws[_-]?secret[_-]?access[_-]?key|client[_-]?secret|refresh[_-]?token|access[_-]?token|auth[_-]?token|id[_-]?token|token|secret|password)[\"']"
+    r"|(?:api[_-]?key|aws[_-]?secret[_-]?access[_-]?key|client[_-]?secret|refresh[_-]?token|access[_-]?token|auth[_-]?token|id[_-]?token|token|secret|password)"
+    r")\s*(?:=(?!=|>)|:(?![:=]))\s*"
+)
 SECRET_VALUE_PATTERNS = [
     re.compile(
         r"-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP |ENCRYPTED )?"
@@ -176,6 +183,11 @@ SECRET_VALUE_PATTERNS = [
     re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
     re.compile(r"\bya29\.[0-9A-Za-z_-]{20,}\b"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{7,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+    re.compile(
+        r"(?i)(?:^|[^A-Za-z0-9_])[\"']?authorization[\"']?"
+        r"\s*[:=]\s*[\"']?"
+        r"basic\s+[A-Za-z0-9+/]{8,}={0,2}(?![A-Za-z0-9+/=])"
+    ),
 ]
 URI_SCHEME_PATTERN = re.compile(
     r"\b[A-Za-z][A-Za-z0-9+.-]*://",
@@ -227,6 +239,65 @@ SECRET_PLACEHOLDER_VALUES = {
     "clawrouter-e2e-secret",
     "very-long-browser-token-0123456789",
 }
+URI_PASSWORD_PLACEHOLDER_VALUES = {
+    "clawrouter-e2e-secret",
+    "dummy",
+    "example",
+    "fake",
+    "not-a-real",
+    "placeholder",
+    "redacted",
+    "sample",
+    "test-auth-token",
+    "test-token-placeholder",
+    "token-oversized",
+    "very-long-browser-token-0123456789",
+}
+URI_CREDENTIAL_NAME_PATTERN = re.compile(
+    r"(?:api[_-]?key|auth|credential|pass(?:word)?|pwd|secret|token)",
+    re.IGNORECASE,
+)
+SHELL_COMMAND_WRAPPERS = {"command", "env", "sudo"}
+NON_SHELL_COMMAND_WORDS = {
+    "assert",
+    "await",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "def",
+    "else",
+    "except",
+    "export",
+    "finally",
+    "for",
+    "from",
+    "function",
+    "if",
+    "import",
+    "include",
+    "interface",
+    "let",
+    "match",
+    "new",
+    "print",
+    "raise",
+    "require",
+    "return",
+    "switch",
+    "throw",
+    "try",
+    "type",
+    "var",
+    "while",
+    "with",
+    "yield",
+}
+PUBLIC_PROMPT_TARGETS = {"getpass.getpass", "input", "prompt"}
+GENERIC_CREDENTIAL_PROMPT_PATTERN = re.compile(
+    r"(?i)\s*(?:(?:enter|type|provide)\s+(?:your\s+)?)?"
+    r"(?:password|passphrase|api[\s_-]*(?:key|token))\s*[:?]\s*"
+)
 QUOTED_SECRET_REFERENCE_PATTERNS = (
     re.compile(r"^\$[A-Za-z_][A-Za-z0-9_]*$"),
     re.compile(r"^\$env:[A-Za-z_][A-Za-z0-9_]*$", re.IGNORECASE),
@@ -255,6 +326,12 @@ UNQUOTED_SECRET_REFERENCE_PATTERNS = (
         r"(?:api[_-]?key|aws[_-]?secret[_-]?access[_-]?key|client[_-]?secret|"
         r"refresh[_-]?token|access[_-]?token|auth[_-]?token|id[_-]?token|"
         r"token|secret|password)$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:computed|derived|generated|provided|runtime)_"
+        r"[A-Za-z0-9_]*(?:api[_-]?key|credential|password|secret|token)"
+        r"[A-Za-z0-9_]*(?:ref|reference)$",
         re.IGNORECASE,
     ),
 )
@@ -1755,12 +1832,106 @@ def fallback_expression(text: str) -> str:
     return text[:cursor]
 
 
+def top_level_fallback_suffix(text: str) -> str | None:
+    stack: list[tuple[str, bool]] = []
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    outer_group_openers: set[int] = set()
+    probe = 0
+    while probe < len(text) and text[probe].isspace():
+        probe += 1
+    while probe < len(text) and text[probe] == "(":
+        outer_group_openers.add(probe)
+        probe += 1
+        while probe < len(text) and text[probe].isspace():
+            probe += 1
+    quote: str | None = None
+    escaped = False
+    line_comment = False
+    block_comment = False
+    cursor = 0
+    while cursor < len(text):
+        char = text[cursor]
+        next_char = text[cursor + 1] if cursor + 1 < len(text) else ""
+        if line_comment:
+            return None
+        if block_comment:
+            if char == "*" and next_char == "/":
+                block_comment = False
+                cursor += 2
+            else:
+                cursor += 1
+            continue
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            cursor += 1
+            continue
+        regex_end = javascript_regex_literal_end(text, cursor)
+        if regex_end is not None:
+            cursor = regex_end
+            continue
+        if char == "/" and next_char == "/":
+            line_comment = True
+            cursor += 2
+            continue
+        if char == "/" and next_char == "*":
+            block_comment = True
+            cursor += 2
+            continue
+        if char in {'"', "'", "`"}:
+            quote = char
+            cursor += 1
+            continue
+        if char in pairs:
+            stack.append((pairs[char], cursor in outer_group_openers))
+            cursor += 1
+            continue
+        if stack and char == stack[-1][0]:
+            stack.pop()
+            cursor += 1
+            continue
+        fallback_depth = not stack or all(is_outer for _closer, is_outer in stack)
+        if fallback_depth:
+            if text.startswith(("||", "&&", "??"), cursor):
+                return text[cursor:]
+            if char in {"+", "?"} and not text.startswith("?.", cursor):
+                return text[cursor:]
+            left_boundary = cursor == 0 or not (
+                text[cursor - 1].isalnum() or text[cursor - 1] == "_"
+            )
+            word = (
+                re.match(r"(?:or|and|if|unless)\b", text[cursor:])
+                if left_boundary
+                else None
+            )
+            if word is not None:
+                return text[cursor:]
+            if char in "\n;" and not stack:
+                return None
+        cursor += 1
+    return None
+
+
 def uri_authority_end(
     text: str,
     start: int,
     context: tuple[str, int] | None,
 ) -> int:
     outer_quote = context[0] if context is not None else None
+    quote_start = context[1] if context is not None else -1
+    quote_prefix = text[:quote_start]
+    brace_interpolation = (
+        outer_quote in {'"', "'", '"""', "'''"}
+        and re.search(
+            r"(?i)(?:^|[^A-Za-z0-9_])(?:f|fr|rf|\$)$",
+            quote_prefix,
+        )
+        is not None
+    )
     interpolation_depth = 0
     interpolation_quote: str | None = None
     escaped = False
@@ -1799,6 +1970,10 @@ def uri_authority_end(
             interpolation_depth = 1
             cursor += 2
             continue
+        if brace_interpolation and char == "{":
+            interpolation_depth = 1
+            cursor += 1
+            continue
         if char.isspace() or char in "/?#":
             break
         if outer_quote is not None and text.startswith(outer_quote, cursor):
@@ -1829,6 +2004,7 @@ def credentialed_uri_risk(text: str) -> bool:
             text,
             match.start(),
             uri_password,
+            authority.rpartition("@")[2],
             context,
         ):
             continue
@@ -1938,8 +2114,11 @@ def uri_password_is_interpolated(
     text: str,
     scheme_start: int,
     password: str,
+    host: str,
     context: tuple[str, int] | None,
 ) -> bool:
+    if uri_placeholder_password_is_safe(password, host):
+        return True
     if context is not None:
         quote, quote_start = context
         if quote == "`":
@@ -1951,6 +2130,10 @@ def uri_password_is_interpolated(
                 return True
             return dynamic_uri_expression(password, "${", "}")
         prefix = text[:quote_start]
+        if quote == '"' and prefix.endswith("$"):
+            if URI_PASSWORD_REFERENCE_PATTERNS[2].fullmatch(password):
+                return True
+            return dynamic_uri_expression(password, "{", "}")
         if quote in {'"', "'", '"""', "'''"} and re.search(
             r"(?i)(?:^|[^A-Za-z0-9_])(?:f|fr|rf)$",
             prefix,
@@ -1962,6 +2145,22 @@ def uri_password_is_interpolated(
             ):
                 return True
             return dynamic_uri_expression(password, "{", "}")
+        if (
+            quote == '"'
+            and re.search(r"\$[A-Za-z_][A-Za-z0-9_]*\s*=\s*$", prefix)
+            and URI_PASSWORD_REFERENCE_PATTERNS[0].fullmatch(password)
+        ):
+            return True
+        if (
+            quote == '"'
+            and config_uri_reference_is_safe(
+                text,
+                scheme_start,
+                password,
+                allow_lowercase_key=False,
+            )
+        ):
+            return True
         line_start = max(prefix.rfind("\n"), prefix.rfind("\r"))
         assignment = prefix[line_start + 1 :]
         if quote == '"' and shell_assignment_prefix(assignment):
@@ -1980,10 +2179,14 @@ def uri_password_is_interpolated(
             quote,
             quote_start,
         )
-    if (
-        config_assignment_prefix(text, scheme_start)
-        or shell_command_prefix(text, scheme_start)
-    ) and any(
+    if config_uri_reference_is_safe(
+        text,
+        scheme_start,
+        password,
+        allow_lowercase_key=True,
+    ):
+        return True
+    if shell_command_prefix(text, scheme_start) and any(
         pattern.fullmatch(password)
         for pattern in URI_PASSWORD_REFERENCE_PATTERNS[:2]
     ):
@@ -1995,6 +2198,42 @@ def uri_password_is_interpolated(
     return any(
         pattern.fullmatch(password)
         for pattern in URI_PASSWORD_REFERENCE_PATTERNS[:2]
+    )
+
+
+def uri_placeholder_password_is_safe(password: str, host: str) -> bool:
+    normalized_password = password.lower()
+    if normalized_password in URI_PASSWORD_PLACEHOLDER_VALUES:
+        return True
+    normalized_host = host.lower()
+    if normalized_host.startswith("[") and "]" in normalized_host:
+        normalized_host = normalized_host[1 : normalized_host.index("]")]
+    elif normalized_host.count(":") == 1:
+        normalized_host = normalized_host.split(":", 1)[0]
+    localhost = (
+        normalized_host in {"127.0.0.1", "::1", "localhost"}
+        or normalized_host.endswith(".localhost")
+    )
+    return localhost and normalized_password in {
+        *SECRET_PLACEHOLDER_VALUES,
+        "password",
+    }
+
+
+def uri_named_credential_reference(password: str) -> bool:
+    if not any(
+        pattern.fullmatch(password)
+        for pattern in URI_PASSWORD_REFERENCE_PATTERNS[:3]
+    ):
+        return False
+    name = password
+    if name.startswith("${") and name.endswith("}"):
+        name = name[2:-1]
+    elif name.startswith(("$", "{")):
+        name = name[1:-1] if name.startswith("{") else name[1:]
+    return (
+        re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is not None
+        and URI_CREDENTIAL_NAME_PATTERN.search(name) is not None
     )
 
 
@@ -2049,58 +2288,123 @@ def uri_password_is_format_placeholder(
         return False
     prefix = text[:quote_start]
     suffix = text[quote_end:]
+    formatter = re.search(r"(?:\bfmt\.Sprintf|\bformat!)\(\s*$", prefix)
+    if formatter is not None:
+        arguments = re.match(r"\s*,\s*(?P<args>.*?)\s*\)", suffix, re.DOTALL)
+        if arguments is not None and format_arguments_are_references(
+            arguments.group("args")
+        ):
+            return password == "%s" or re.fullmatch(
+                r"\{(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]*)\}",
+                password,
+            ) is not None
     if password == "%s":
         python_percent_format = re.match(
-            rf"\s*%\s*{URI_CREDENTIAL_REFERENCE_TEXT}\b",
+            rf"\s*%\s*(?:"
+            rf"(?P<single>{URI_CREDENTIAL_REFERENCE_TEXT})\b"
+            rf"|\((?P<tuple>[^()]*)\)"
+            rf")",
             suffix,
         )
-        go_sprintf = re.search(r"\bfmt\.Sprintf\(\s*$", prefix) and re.match(
-            rf"\s*,\s*{URI_CREDENTIAL_REFERENCE_TEXT}\s*\)",
-            suffix,
-        )
-        return python_percent_format is not None or go_sprintf is not None
+        if python_percent_format is not None:
+            arguments = (
+                [python_percent_format.group("single")]
+                if python_percent_format.group("single") is not None
+                else split_top_level_call_arguments(
+                    python_percent_format.group("tuple") or ""
+                )
+            )
+            return all(
+                argument is not None
+                and URI_CREDENTIAL_REFERENCE_PATTERN.fullmatch(argument.strip())
+                for argument in arguments
+            )
+        return False
     field_match = re.fullmatch(
         r"\{(?P<field>[A-Za-z_][A-Za-z0-9_]*|[0-9]*)\}",
         password,
     )
     if field_match is not None:
         field = field_match.group("field")
-        positional = re.match(
-            rf"\s*\.format\s*\(\s*{URI_CREDENTIAL_REFERENCE_TEXT}\s*\)",
+        format_call = re.match(
+            r"\s*\.format\s*\((?P<args>.*?)\)",
             suffix,
+            re.DOTALL,
         )
-        if positional is not None:
+        if format_call is not None and format_arguments_are_references(
+            format_call.group("args")
+        ):
             return True
-        if field and not field.isdigit():
-            return (
-                re.match(
-                    rf"\s*\.format\s*\(\s*{re.escape(field)}\s*=\s*"
-                    rf"{URI_CREDENTIAL_REFERENCE_TEXT}\s*\)",
-                    suffix,
-                )
-                is not None
-            )
     return False
 
 
-def config_assignment_prefix(text: str, position: int) -> bool:
+def format_arguments_are_references(arguments: str) -> bool:
+    values = split_top_level_call_arguments(arguments)
+    if not values or any(not value.strip() for value in values):
+        return False
+    for value in values:
+        expression = value.strip()
+        named = re.fullmatch(
+            rf"[A-Za-z_][A-Za-z0-9_]*\s*=\s*"
+            rf"(?P<value>{URI_CREDENTIAL_REFERENCE_TEXT})",
+            expression,
+        )
+        if named is not None:
+            expression = named.group("value")
+        if URI_CREDENTIAL_REFERENCE_PATTERN.fullmatch(expression) is None:
+            return False
+    return True
+
+
+def config_assignment_context(
+    text: str,
+    position: int,
+) -> tuple[str, str] | None:
     line_start = max(text.rfind("\n", 0, position), text.rfind("\r", 0, position))
     prefix = text[line_start + 1 : position]
     match = re.fullmatch(
-        r"\s*(?P<comment>#\s*)?[\"']?"
-        r"(?:[A-Za-z_][A-Za-z0-9_.-]*)?(?:dsn|uri|url)"
+        r"\s*(?P<comment>#\s*)?(?:-\s+)?[\"']?"
+        r"(?P<key>(?:[A-Za-z_][A-Za-z0-9_.-]*)?(?:dsn|uri|url))"
         r"[\"']?\s*(?P<separator>[:=])\s*[\"']?",
         prefix,
         re.IGNORECASE,
     )
-    return match is not None and (
-        match.group("separator") == ":" or match.group("comment") is not None
+    if match is None or (
+        match.group("separator") != ":" and match.group("comment") is None
+    ):
+        return None
+    return match.group("key"), match.group("separator")
+
+
+def config_assignment_prefix(text: str, position: int) -> bool:
+    return config_assignment_context(text, position) is not None
+
+
+def config_uri_reference_is_safe(
+    text: str,
+    position: int,
+    password: str,
+    *,
+    allow_lowercase_key: bool,
+) -> bool:
+    context = config_assignment_context(text, position)
+    if context is None:
+        return False
+    key, separator = context
+    syntactic_reference = any(
+        pattern.fullmatch(password)
+        for pattern in URI_PASSWORD_REFERENCE_PATTERNS[:3]
+    )
+    return syntactic_reference and (
+        uri_named_credential_reference(password)
+        or key == key.upper()
+        or (allow_lowercase_key and separator == ":")
     )
 
 
 def shell_assignment_prefix(text: str) -> bool:
     match = re.fullmatch(
-        r"\s*(?P<export>export\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)=",
+        r"\s*(?:-\s+)?(?P<export>export\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)=",
         text,
     )
     return match is not None and (
@@ -2114,37 +2418,43 @@ def shell_command_prefix(text: str, position: int) -> bool:
     prefix = text[line_start + 1 : position]
     match = re.fullmatch(
         r"\s*(?P<command>[A-Za-z0-9_./-]+)"
-        r"(?:[ \t]+-[^ \t\"'`]+)*[ \t]+",
+        r"(?:[ \t]+[^ \t\"'`]+)*[ \t]+",
         prefix,
     )
     if match is None:
         return False
-    command = match.group("command").rsplit("/", 1)[-1]
-    return command not in {
-        "await",
-        "class",
-        "const",
-        "def",
-        "let",
-        "new",
-        "print",
-        "return",
-        "throw",
-        "var",
-        "yield",
-    }
+    tokens = prefix.split()
+    while tokens and tokens[0].rsplit("/", 1)[-1] in SHELL_COMMAND_WRAPPERS:
+        wrapper = tokens.pop(0).rsplit("/", 1)[-1]
+        while tokens and (
+            tokens[0].startswith("-")
+            or (wrapper == "env" and "=" in tokens[0])
+        ):
+            tokens.pop(0)
+    if not tokens:
+        return False
+    command = tokens[0].rsplit("/", 1)[-1]
+    return (
+        command == command.lower()
+        and command not in NON_SHELL_COMMAND_WORDS
+        and re.fullmatch(r"[a-z0-9][a-z0-9._+-]*", command) is not None
+        and not any(
+            token in {"=", "=>", ":", "::"} or token.endswith(("=", "=>"))
+            for token in tokens[1:]
+        )
+    )
 
 
-def secret_literal_risk(expression: str) -> bool:
+def secret_literal_risk(expression: str, minimum_length: int = 12) -> bool:
     if credentialed_uri_risk(expression) or any(
         pattern.search(expression) for pattern in SECRET_VALUE_PATTERNS
     ):
         return True
     value_pattern = re.compile(
-        r'"(?P<double>[^"\r\n]{12,})"'
-        r"|'(?P<single>[^'\r\n]{12,})'"
-        r"|`(?P<backtick>[^`\r\n]{12,})`"
-        r"|(?P<bare>[A-Za-z0-9_./+=:@#$%&*!?-]{20,})"
+        rf'"(?P<double>[^"\r\n]{{{minimum_length},}})"'
+        rf"|'(?P<single>[^'\r\n]{{{minimum_length},}})'"
+        rf"|`(?P<backtick>[^`\r\n]{{{minimum_length},}})`"
+        rf"|(?P<bare>[A-Za-z0-9_./+=:@#$%&*!?-]{{{max(20, minimum_length)},}})"
     )
     for match in value_pattern.finditer(expression):
         value = next(group for group in match.groups() if group is not None)
@@ -2172,8 +2482,11 @@ def secret_literal_risk(expression: str) -> bool:
     return False
 
 
-def fallback_secret_risk(text: str) -> bool:
-    return secret_literal_risk(fallback_expression(text))
+def fallback_secret_risk(text: str, minimum_length: int = 8) -> bool:
+    return secret_literal_risk(
+        fallback_expression(text),
+        minimum_length=minimum_length,
+    )
 
 
 def safe_secret_assignment_suffix(text: str, end: int) -> bool:
@@ -2765,14 +3078,23 @@ def public_call_argument_risk(
     target_parts = normalized_target.split(".")
     credential_scope_call = (
         len(target_parts) >= 2
-        and target_parts[-2] in {"credential", "credentials"}
+        and target_parts[-2].lstrip("_") in {"credential", "credentials"}
         and target_parts[-1] == "get_token"
     )
-    if not credential_scope_call and normalized_target not in {
-        "input",
-        "getpass.getpass",
-    }:
+    if (
+        not credential_scope_call
+        and normalized_target not in PUBLIC_PROMPT_TARGETS
+    ):
         return None
+    if normalized_target == "prompt":
+        match = re.fullmatch(r"\s*([\"'])([^\"'\r\n]+)\1\s*", argument)
+        if (
+            argument_index == 0
+            and match is not None
+            and GENERIC_CREDENTIAL_PROMPT_PATTERN.fullmatch(match.group(2))
+        ):
+            return False
+        return secret_literal_risk(argument, minimum_length=8)
     if not credential_scope_call and argument_index != 0:
         return None
     literal_argument = argument
@@ -2834,11 +3156,7 @@ def public_call_argument_risk(
             and not parsed.fragment
         )
         return False if valid_scope_uri else None
-    generic_prompt = re.fullmatch(
-        r"(?i)\s*(?:(?:enter|type|provide)\s+(?:your\s+)?)?"
-        r"(?:password|passphrase|api[\s_-]*key)\s*[:?]\s*",
-        value,
-    )
+    generic_prompt = GENERIC_CREDENTIAL_PROMPT_PATTERN.fullmatch(value)
     return False if generic_prompt is not None else None
 
 
@@ -2851,7 +3169,7 @@ def call_arguments_risk(arguments: str, call_target: str) -> bool:
             continue
         if not safe_credential_lookup_argument(
             call_target, argument, index
-        ) and fallback_secret_risk(argument):
+        ) and fallback_secret_risk(argument, minimum_length=12):
             return True
     return False
 
@@ -2992,11 +3310,33 @@ def safe_backtick_secret_template(value: str) -> bool:
     )
 
 
+def bare_code_reference(text: str, start: int, value: str) -> bool:
+    camel_reference = re.fullmatch(
+        r"[a-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*",
+        value,
+    )
+    snake_reference = re.fullmatch(
+        r"[a-z][a-z0-9]*(?:_[a-z0-9]+)+",
+        value,
+    )
+    if camel_reference is None and snake_reference is None:
+        return False
+    line_start = max(text.rfind("\n", 0, start), text.rfind("\r", 0, start))
+    declaration = text[line_start + 1 : start]
+    return (
+        re.search(r"\b(?:const|let|var)\s+$", declaration) is not None
+    )
+
+
 def secret_text_risk(text: str) -> bool:
     if credentialed_uri_risk(text) or any(
         pattern.search(text) for pattern in SECRET_VALUE_PATTERNS
     ):
         return True
+    for prefix in SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(text):
+        fallback = top_level_fallback_suffix(text[prefix.end() :])
+        if fallback is not None and fallback_secret_risk(fallback):
+            return True
     for match in SECRET_ASSIGNMENT_PATTERN.finditer(text):
         quoted = any(
             match.group(name) is not None
@@ -3036,6 +3376,12 @@ def secret_text_risk(text: str) -> bool:
             if safe_secret_assignment_suffix(text, match.end()):
                 continue
             return True
+        if (
+            match.group("bare_value") is not None
+            and bare_code_reference(text, match.start(), value)
+            and safe_secret_assignment_suffix(text, match.end())
+        ):
+            continue
         reference_patterns = (
             QUOTED_SECRET_REFERENCE_PATTERNS
             if quoted
@@ -3054,6 +3400,17 @@ def secret_text_risk(text: str) -> bool:
             call_start > match.end()
             and text[call_start : call_start + 1] == "("
         ):
+            if (
+                call_target
+                and call_target.group(0).replace("?.", ".")
+                in PUBLIC_PROMPT_TARGETS
+                and safe_secret_call_suffix(
+                    text,
+                    call_start,
+                    call_target.group(0),
+                )
+            ):
+                continue
             return True
         if (
             not quoted
@@ -3466,6 +3823,120 @@ def local_bundle(repo: Path) -> tuple[str, bool]:
             input_truncated = input_truncated or truncated
             parts.append(f"## {rel}\n{content}")
     return "\n\n".join(parts), input_truncated
+
+
+def source_file_fingerprint(path: Path) -> tuple[str, int, int, str]:
+    try:
+        before = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return "missing", 0, 0, ""
+    file_mode = stat.S_IMODE(before.st_mode)
+    if stat.S_ISLNK(before.st_mode):
+        try:
+            target = os.readlink(path)
+            after = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise SystemExit(f"unreadable file: {path}: {exc}") from exc
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise SystemExit(f"file changed while reading: {path}")
+        data = os.fsencode(target)
+        return "symlink", file_mode, len(data), hashlib.sha256(data).hexdigest()
+    if not stat.S_ISREG(before.st_mode):
+        return "other", file_mode, before.st_size, ""
+
+    descriptor: int | None = None
+    digest = hashlib.sha256()
+    try:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise OSError("file changed while opening")
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_size,
+            opened.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise OSError("file changed while reading")
+    except OSError as exc:
+        raise SystemExit(f"unreadable file: {path}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return "file", file_mode, before.st_size, digest.hexdigest()
+
+
+def source_tree_snapshot(
+    repo: Path,
+) -> tuple[
+    str,
+    str,
+    tuple[tuple[str, object], ...],
+]:
+    head = git(repo, "rev-parse", "HEAD").strip()
+    index_entries = git(
+        repo,
+        "ls-files",
+        "--stage",
+        "-z",
+    )
+    tracked = git_path_list(repo, "ls-files", "-z")
+    index_modes = {
+        rel: metadata.split(" ", 1)[0]
+        for record in index_entries.split("\0")
+        if record and "\t" in record
+        for metadata, rel in (record.split("\t", 1),)
+    }
+    untracked = git_path_list(
+        repo,
+        *global_excludes_git_args(repo),
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    )
+    fingerprints = tuple(
+        (
+            rel,
+            source_tree_snapshot(repo / rel)
+            if index_modes.get(rel) == "160000"
+            and (repo / rel / ".git").exists()
+            else source_file_fingerprint(repo / rel),
+        )
+        for rel in sorted(set(tracked + untracked))
+    )
+    return head, index_entries, fingerprints
 
 
 def branch_bundle(repo: Path, base_ref: str) -> tuple[str, bool]:
@@ -6744,6 +7215,9 @@ def main() -> int:
     print(f"bundle: {len(prompt)} chars")
 
     tests_proc: tuple[subprocess.Popen, float] | None = None
+    tests_source_snapshot = (
+        source_tree_snapshot(repo) if args.parallel_tests else None
+    )
     if args.parallel_tests:
         tests_proc = start_parallel_tests(args.parallel_tests, repo, args.parallel_tests_shell)
     try:
@@ -6760,19 +7234,31 @@ def main() -> int:
         else:
             report = run_panel(args, reviewers, repo, prompt, changed_paths, input_truncated)
             label = "autoreview panel"
-        if args.json_output:
-            Path(args.json_output).write_text(json.dumps(report, indent=2) + "\n")
-
-        if args.output:
-            original_stdout = sys.stdout
-            with Path(args.output).open("w") as handle:
-                sys.stdout = Tee(original_stdout, handle)
-                print_report(report, label=label)
-                sys.stdout = original_stdout
-        else:
-            print_report(report, label=label)
     finally:
         tests_status = finish_parallel_tests(*tests_proc) if tests_proc else 0
+
+    if (
+        tests_source_snapshot is not None
+        and source_tree_snapshot(repo) != tests_source_snapshot
+    ):
+        print(
+            "parallel tests changed the reviewed source; rerun autoreview "
+            "against the updated tree",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.json_output:
+        Path(args.json_output).write_text(json.dumps(report, indent=2) + "\n")
+
+    if args.output:
+        original_stdout = sys.stdout
+        with Path(args.output).open("w") as handle:
+            sys.stdout = Tee(original_stdout, handle)
+            print_report(report, label=label)
+            sys.stdout = original_stdout
+    else:
+        print_report(report, label=label)
 
     has_findings = bool(report["findings"])
     overall_incorrect = report["overall_correctness"] == "patch is incorrect"
