@@ -3789,6 +3789,341 @@ class AutoreviewHardeningTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "one explicit domain"):
             self.helper["claude_tool_inventory"](args)
 
+    def test_uri_reference_suppression_stays_within_credential_span(
+        self,
+    ) -> None:
+        for content in (
+            "DATABASE_URL=https://" + "$TOKEN:@host",
+            "DATABASE_URL=https://" + "${TOKEN}:@host",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+                self.assertFalse(
+                    self.helper["secret_text_risk"](content + "/path")
+                )
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        content
+                        + "/pass"
+                        + "word=real-hardcoded-"
+                        + "secret"
+                    )
+                )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                "TO"
+                + "KEN=https:"
+                + "//$USER:@host/actual-hardcoded-"
+                + "secret-123456"
+            )
+        )
+
+    def test_secret_detector_keeps_chained_assignment_fallbacks(self) -> None:
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                "pass"
+                + 'word = first, second = load_pair() or ("real-hardcoded-'
+                + 'secret", "x")'
+            )
+        )
+
+    def test_secret_detector_stops_at_sibling_argument_fallbacks(self) -> None:
+        for content in (
+            "login(pass"
+            + 'word=getpass.getpass(), second=load_pair() or ('
+            + '"ordinary-default-value", "x"))',
+            '{"pass'
+            + 'word": getpass.getpass(), "second": load_pair() or ('
+            + '"ordinary-default-value", "x")}',
+            "config = {\npass"
+            + "word: first,\n"
+            + 'second: load_pair() or ("ordinary-default-value", "x")\n}',
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_handles_many_sibling_assignments(self) -> None:
+        content = (
+            "pass"
+            + "word = source, "
+            + ", ".join(f"a{index}=source" for index in range(1500))
+        )
+
+        self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_precomputes_many_assignment_positions(
+        self,
+    ) -> None:
+        content = "\n".join(
+            "to" + "ken = process.env.TOKEN"
+            for _index in range(2000)
+        )
+        scanner = mock.Mock(
+            wraps=self.helper["top_level_line_assignment_positions"]
+        )
+        detector = self.helper["secret_text_risk"]
+
+        with mock.patch.dict(
+            detector.__globals__,
+            {"top_level_line_assignment_positions": scanner},
+        ):
+            self.assertFalse(detector(content))
+
+        scanner.assert_called_once()
+
+    def test_secret_detector_allows_structured_plus_username(self) -> None:
+        for content in (
+            "https://FirstName.LastName+123@host/repo",
+            "https://FirstName.LastName-123@host/repo",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_csharp_uri_interpolation_requires_csharp_declaration(
+        self,
+    ) -> None:
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                "url=$@"
+                + '"https:'
+                + '//user:{prodPasswordSecret12345}@host"'
+            )
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                "url=@$"
+                + '"https:'
+                + '//user:{prodPasswordSecret12345}@host"'
+            )
+        )
+        for content in (
+            'var dsn = $@"postgres:'
+            + '//svc:{password}@db.example/app";',
+            'var dsn = @$"postgres:'
+            + '//svc:{password}@db.example/app";',
+            'const string dsn = $@"postgres:'
+            + '//svc:{password}@db.example/app";',
+            'FormattableString? dsn =\n$@"postgres:'
+            + '//svc:{password}@db.example/app";',
+            'dsn = $@"postgres:'
+            + '//svc:{password}@db.example/app";',
+            'dsn=$@"postgres:'
+            + '//svc:{password}@db.example/app";',
+            'dsn ??= $@"postgres:'
+            + '//svc:{password}@db.example/app";',
+            'dsn+=$@"postgres:'
+            + '//svc:{password}@db.example/app";',
+            'new Config { Dsn = $@"postgres:'
+            + '//svc:{password}@db.example/app" }',
+            'return $@"postgres:'
+            + '//svc:{password}@db.example/app";',
+            'Connect($@"postgres:'
+            + '//svc:{password}@db.example/app");',
+            'Connect(dsn: $@"postgres:'
+            + '//svc:{password}@db.example/app");',
+            'Connect(enabled ? $@"postgres:'
+            + '//svc:{password}@db.example/app" : fallback);',
+            'Connect(enabled ? fallback : $@"postgres:'
+            + '//svc:{password}@db.example/app");',
+            'Connect(value ?? $@"postgres:'
+            + '//svc:{password}@db.example/app");',
+            'Connect(prefix + $@"postgres:'
+            + '//svc:{password}@db.example/app");',
+            'string Dsn => $@"postgres:'
+            + '//svc:{password}@db.example/app";',
+            'var dsn = enabled ? $@"postgres:'
+            + '//svc:{password}@db.example/app" : fallback;',
+            'dsn=enabled ? fallback : $@"postgres:'
+            + '//svc:{password}@db.example/app";',
+            'var dsn = prefix + $@"postgres:'
+            + '//svc:{password}@db.example/app";',
+            'var values = new[] { $@"postgres:'
+            + '//svc:{password}@db.example/app" };',
+            'var values = [$@"postgres:'
+            + '//svc:{password}@db.example/app"];',
+            'var text = $@"postgres:'
+            + '//svc:{password}@db.example/app".ToString();',
+            'var first = $@"postgres:'
+            + '//svc:{password}@db.example/app"[0];',
+            'var required = $@"postgres:'
+            + '//svc:{password}@db.example/app"!;',
+            'if ($@"postgres:'
+            + '//svc:{password}@db.example/app" == expected) {}',
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_review_patch_scans_multiline_diff_metadata(self) -> None:
+        patch = (
+            "Subject: example\n"
+            "    Author"
+            + "ization: Basic\n"
+            "    dXNlcjpwYXNzd29yZA==\n"
+            "diff --git a/safe.txt b/safe.txt\n"
+            "--- a/safe.txt\n"
+            "+++ b/safe.txt\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+
+        with self.assertRaisesRegex(SystemExit, "secret-like content"):
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["safe.txt"],
+                patch,
+            )
+
+    def test_secret_detector_handles_additional_credential_keys(self) -> None:
+        for content in (
+            "cred" + "ential = real-hardcoded-" + "secret",
+            "cred" + "entials = real-hardcoded-" + "secret",
+            "private_" + "key = real-hardcoded-" + "secret",
+            "github_to" + "ken = ordinary-hardcoded-value-12345",
+            "db_pass" + "word = ordinary-hardcoded-value-12345",
+            "stripe_api_" + "key = ordinary-hardcoded-value-12345",
+            "githubTo" + "ken = ordinary-hardcoded-value-12345",
+            "dbPass" + "word = ordinary-hardcoded-value-12345",
+            "awsCred" + "entials = ordinary-hardcoded-value-12345",
+            "githubAPI" + "Key = ordinary-hardcoded-value-12345",
+            "myAWSSecretAccess"
+            + "Key = ordinary-hardcoded-value-12345",
+            "userIDTo" + "ken = ordinary-hardcoded-value-12345",
+            "GITHUBTO" + "KEN = ordinary-hardcoded-value-12345",
+            "DBPASS" + "WORD = ordinary-hardcoded-value-12345",
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+        for content in (
+            "cred" + "ential = process.env.CREDENTIAL",
+            "cred" + "entials = config.credentials",
+            "safe_" + "credentials = config.credentials",
+            "safeCred" + "entials = config.credentials",
+            "credentializer = ordinary-hardcoded-value-12345",
+            "private_" + 'key = os.environ["PRIVATE_KEY"]',
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_allows_fetch_credential_modes(self) -> None:
+        for mode in ("include", "omit", "same-origin"):
+            with self.subTest(mode=mode):
+                self.assertFalse(
+                    self.helper["secret_text_risk"](
+                        "fetch(url, { cred"
+                        + f'entials: "{mode}" }})'
+                    )
+                )
+
+    def test_secret_detector_allows_punctuationless_password_prompt(
+        self,
+    ) -> None:
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                "pass" + 'word = getpass.getpass("Enter password")'
+            )
+        )
+
+    def test_review_patch_allows_safe_multiline_call_hunks(self) -> None:
+        patch = (
+            "diff --git a/safe.py b/safe.py\n"
+            "--- a/safe.py\n"
+            "+++ b/safe.py\n"
+            "@@ -0,0 +1,3 @@\n"
+            "+"
+            + "pass"
+            + "word = getpass.getpass(\n"
+            '+    "Password: ",\n'
+            "+)\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["safe.py"],
+                patch,
+            ),
+            patch,
+        )
+
+    def test_review_patch_rejects_size_before_secret_scanning(self) -> None:
+        scanner = mock.Mock()
+        validator = self.helper["validate_review_patch"]
+        with mock.patch.dict(
+            validator.__globals__,
+            {"require_no_secret_values": scanner},
+        ):
+            with self.assertRaisesRegex(SystemExit, r"20 bytes; limit 10"):
+                validator(
+                    "local unstaged diff",
+                    ["safe.txt"],
+                    "x\n" * 10,
+                    10,
+                )
+
+        scanner.assert_not_called()
+
+    def test_stream_displays_escape_terminal_controls(self) -> None:
+        control = chr(27) + "]52;c;VEVTVA==" + chr(7)
+        codex = self.helper["CodexStreamDisplay"]()
+        claude = self.helper["ClaudeStreamDisplay"]()
+        codex_message = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "agent_message",
+                    "text": control,
+                },
+            }
+        )
+
+        for displayed in (
+            codex("stdout", codex_message + "\n"),
+            codex("stderr", control + "\n"),
+            claude("stderr", control + "\n"),
+        ):
+            self.assertIsNotNone(displayed)
+            assert displayed is not None
+            self.assertNotIn(chr(27), displayed)
+            self.assertNotIn(chr(7), displayed)
+            self.assertIn(r"\x1b", displayed)
+            self.assertIn(r"\x07", displayed)
+            self.assertTrue(displayed.endswith("\n"))
+
+    def test_run_with_stream_escapes_terminal_output_only(self) -> None:
+        control = chr(27) + "]52;c;VEVTVA==" + chr(7)
+        script = (
+            "import sys;"
+            "value=chr(27)+']52;c;VEVTVA=='+chr(7);"
+            "sys.stdout.write(value+'\\n');"
+            "sys.stderr.write(value+'\\n')"
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = self.helper["run_with_stream"](
+                [sys.executable, "-c", script],
+                Path.cwd(),
+                input_text=None,
+                label="stream-test",
+                heartbeat_seconds=60,
+                stream_display=None,
+                resolve_root=Path.cwd(),
+            )
+
+        self.assertIn(control, result.stdout)
+        self.assertIn(control, result.stderr)
+        for displayed in (stdout.getvalue(), stderr.getvalue()):
+            self.assertNotIn(chr(27), displayed)
+            self.assertNotIn(chr(7), displayed)
+            self.assertIn(r"\x1b", displayed)
+            self.assertIn(r"\x07", displayed)
+            self.assertTrue(displayed.endswith("\n"))
+
     def test_self_test_shortcut_runs_deterministic_checks(self) -> None:
         command = [str(SCRIPT), "--self-test"]
         if os.name == "nt":

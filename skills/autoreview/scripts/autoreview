@@ -148,11 +148,34 @@ TRACKED_TOKEN_CREDENTIAL_EXTENSIONS = {
     ".yaml",
     ".yml",
 }
+SECRET_KEY_NAME_PATTERN = (
+    r"(?:api[_-]?key|aws[_-]?secret[_-]?access[_-]?key"
+    r"|client[_-]?secret|refresh[_-]?token|access[_-]?token"
+    r"|auth[_-]?token|id[_-]?token|token|secret|password"
+    r"|credentials?|private[_-]?key)"
+)
+SECRET_CAMEL_KEY_NAME_PATTERN = (
+    r"(?-i:[A-Za-z][A-Za-z0-9]*"
+    r"(?:ApiKey|APIKey|AwsSecretAccessKey|AWSSecretAccessKey"
+    r"|ClientSecret|RefreshToken|AccessToken|AuthToken|IdToken|IDToken"
+    r"|Token|Secret|Password"
+    r"|Credential|Credentials|PrivateKey))"
+)
+SECRET_UPPER_KEY_NAME_PATTERN = (
+    r"(?-i:[A-Z][A-Z0-9]*"
+    r"(?:APIKEY|AWSSECRETACCESSKEY|CLIENTSECRET|REFRESHTOKEN"
+    r"|ACCESSTOKEN|AUTHTOKEN|IDTOKEN|TOKEN|SECRET|PASSWORD"
+    r"|CREDENTIAL|CREDENTIALS|PRIVATEKEY))"
+)
+SECRET_ASSIGNMENT_KEY_PATTERN = (
+    rf"(?:[\"'](?:{SECRET_KEY_NAME_PATTERN}|{SECRET_CAMEL_KEY_NAME_PATTERN}"
+    rf"|{SECRET_UPPER_KEY_NAME_PATTERN})[\"']"
+    rf"|(?<![A-Za-z0-9]){SECRET_KEY_NAME_PATTERN}(?![A-Za-z0-9])"
+    rf"|(?<![A-Za-z0-9]){SECRET_CAMEL_KEY_NAME_PATTERN}(?![A-Za-z0-9])"
+    rf"|(?<![A-Za-z0-9]){SECRET_UPPER_KEY_NAME_PATTERN}(?![A-Za-z0-9]))"
+)
 SECRET_ASSIGNMENT_PATTERN = re.compile(
-    r"(?i)(?:"
-    r"[\"'](?:api[_-]?key|aws[_-]?secret[_-]?access[_-]?key|client[_-]?secret|refresh[_-]?token|access[_-]?token|auth[_-]?token|id[_-]?token|token|secret|password)[\"']"
-    r"|(?:api[_-]?key|aws[_-]?secret[_-]?access[_-]?key|client[_-]?secret|refresh[_-]?token|access[_-]?token|auth[_-]?token|id[_-]?token|token|secret|password)"
-    r")\s*[:=]\s*"
+    rf"(?i){SECRET_ASSIGNMENT_KEY_PATTERN}\s*[:=]\s*"
     r"(?:\"(?P<double_value>[^\"\r\n]{8,})\"|"
     r"'(?P<single_value>[^'\r\n]{8,})'|"
     r"`(?P<backtick_value>[^`\r\n]{8,})`|"
@@ -165,10 +188,8 @@ SECRET_ASSIGNMENT_PATTERN = re.compile(
     r"(?P<bare_value>[A-Za-z0-9_./+=:@#$%&*!?-]{8,}))"
 )
 SECRET_ASSIGNMENT_PREFIX_PATTERN = re.compile(
-    r"(?i)(?:"
-    r"[\"'](?:api[_-]?key|aws[_-]?secret[_-]?access[_-]?key|client[_-]?secret|refresh[_-]?token|access[_-]?token|auth[_-]?token|id[_-]?token|token|secret|password)[\"']"
-    r"|(?:api[_-]?key|aws[_-]?secret[_-]?access[_-]?key|client[_-]?secret|refresh[_-]?token|access[_-]?token|auth[_-]?token|id[_-]?token|token|secret|password)"
-    r")\s*(?:=(?!=|>)|:(?![:=]))\s*"
+    rf"(?i){SECRET_ASSIGNMENT_KEY_PATTERN}"
+    r"\s*(?:=(?!=|>)|:(?![:=]))\s*"
 )
 SECRET_VALUE_PATTERNS = [
     re.compile(
@@ -247,6 +268,7 @@ SECRET_PLACEHOLDER_VALUES = {
     "clawrouter-e2e-secret",
     "very-long-browser-token-0123456789",
 }
+FETCH_CREDENTIAL_MODE_VALUES = {"include", "omit", "same-origin"}
 URI_PASSWORD_PLACEHOLDER_VALUES = {
     "clawrouter-e2e-secret",
     "dummy",
@@ -304,7 +326,7 @@ NON_SHELL_COMMAND_WORDS = {
 PUBLIC_PROMPT_TARGETS = {"getpass.getpass", "input", "prompt"}
 GENERIC_CREDENTIAL_PROMPT_PATTERN = re.compile(
     r"(?i)\s*(?:(?:enter|type|provide)\s+(?:your\s+)?)?"
-    r"(?:password|passphrase|api[\s_-]*(?:key|token))\s*[:?]\s*"
+    r"(?:password|passphrase|api[\s_-]*(?:key|token))\s*[:?]?\s*"
 )
 QUOTED_SECRET_REFERENCE_PATTERNS = (
     re.compile(r"^\$[A-Za-z_][A-Za-z0-9_]*$"),
@@ -1473,7 +1495,7 @@ def run_with_stream(
         display = stream_display(name, line) if stream_display else line
         if display:
             target = sys.stdout if name == "stdout" else sys.stderr
-            target.write(display)
+            target.write(stream_display_escape(display))
             target.flush()
 
     for thread in threads:
@@ -1710,6 +1732,14 @@ def display_escape(text: object, limit: int, *, multiline: bool = False) -> str:
     return rendered[: max(0, limit - len(suffix))] + suffix[:limit]
 
 
+def stream_display_escape(text: str) -> str:
+    return display_escape(
+        text,
+        max(1000, len(text) * 10),
+        multiline=True,
+    )
+
+
 def read_prefix(path: Path, limit: int) -> tuple[bytes, bool]:
     descriptor: int | None = None
     try:
@@ -1874,7 +1904,11 @@ def fallback_expression(text: str) -> str:
     return text[:cursor]
 
 
-def top_level_fallback_suffix(text: str) -> str | None:
+def top_level_fallback_suffix(
+    text: str,
+    *,
+    allow_chained_assignment: bool = False,
+) -> str | None:
     stack: list[tuple[str, bool]] = []
     pairs = {"(": ")", "[": "]", "{": "}"}
     outer_group_openers: set[int] = set()
@@ -1963,7 +1997,11 @@ def top_level_fallback_suffix(text: str) -> str | None:
             if (
                 char == ","
                 and not stack
-                and comma_starts_sibling_assignment(text, cursor)
+                and comma_starts_sibling_assignment(
+                    text,
+                    cursor,
+                    allow_chained_assignment=allow_chained_assignment,
+                )
             ):
                 return None
             if text.startswith(("||", "&&", "??"), cursor):
@@ -1986,25 +2024,201 @@ def top_level_fallback_suffix(text: str) -> str | None:
     return None
 
 
-def comma_starts_sibling_assignment(text: str, position: int) -> bool:
-    return starts_sibling_assignment(text[position + 1 :])
+def comma_starts_sibling_assignment(
+    text: str,
+    position: int,
+    *,
+    allow_chained_assignment: bool,
+) -> bool:
+    suffix = text[position + 1 :]
+    match = sibling_assignment_match(suffix)
+    if match is None:
+        return False
+    if not allow_chained_assignment:
+        return True
+    fallback = top_level_fallback_suffix(
+        suffix[match.end() :],
+        allow_chained_assignment=False,
+    )
+    return (
+        fallback is None
+        or re.match(r"\s*(?:or|and|if|unless)\b", fallback) is None
+    )
 
 
 def starts_sibling_assignment(text: str) -> bool:
-    return (
-        re.match(
-            r"\s*(?:"
-            r"\.\.\.[^,\r\n]+(?:,|$)"
-            r"|(?:[A-Za-z_$][A-Za-z0-9_$]*"
-            r"|[0-9]+(?:\.[0-9]+)?"
-            r"|[\"'][^\"'\r\n]+[\"']"
-            r"|\[[^\]\r\n]+\]"
-            r"|\{[^}\r\n]+\})\s*"
-            r"(?::(?![:=])|=(?!=|>)))",
-            text,
+    return sibling_assignment_match(text) is not None
+
+
+def sibling_assignment_match(text: str) -> re.Match[str] | None:
+    return re.match(
+        r"\s*(?:"
+        r"\.\.\.[^,\r\n]+(?:,|$)"
+        r"|(?:[A-Za-z_$][A-Za-z0-9_$]*"
+        r"|[0-9]+(?:\.[0-9]+)?"
+        r"|[\"'][^\"'\r\n]+[\"']"
+        r"|\[[^\]\r\n]+\]"
+        r"|\{[^}\r\n]+\})\s*"
+        r"(?::(?![:=])|=(?!=|>)))",
+        text,
+    )
+
+
+def top_level_line_assignment_positions(
+    text: str,
+    positions: set[int],
+) -> set[int]:
+    top_level: set[int] = set()
+    stack: list[str] = []
+    quote: str | None = None
+    escaped = False
+    line_comment = False
+    block_comment = False
+    line_start = 0
+    cursor = 0
+    while cursor < len(text):
+        if (
+            cursor in positions
+            and not stack
+            and not text[line_start:cursor].strip()
+        ):
+            top_level.add(cursor)
+        char = text[cursor]
+        next_char = text[cursor + 1] if cursor + 1 < len(text) else ""
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+                line_start = cursor + 1
+            cursor += 1
+            continue
+        if block_comment:
+            if char == "*" and next_char == "/":
+                block_comment = False
+                cursor += 2
+            else:
+                if char == "\n":
+                    line_start = cursor + 1
+                cursor += 1
+            continue
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            if char == "\n":
+                line_start = cursor + 1
+            cursor += 1
+            continue
+        regex_end = javascript_regex_literal_end(text, cursor)
+        if regex_end is not None:
+            cursor = regex_end
+            continue
+        if char == "/" and next_char == "/":
+            line_comment = True
+            cursor += 2
+            continue
+        if char == "/" and next_char == "*":
+            block_comment = True
+            cursor += 2
+            continue
+        if char == "#" and not javascript_private_member_marker(text, cursor):
+            line_comment = True
+            cursor += 1
+            continue
+        if char in {'"', "'", "`"}:
+            quote = char
+        elif char == "(":
+            stack.append(")")
+        elif char == "[":
+            stack.append("]")
+        elif stack and char == stack[-1]:
+            stack.pop()
+        if char == "\n":
+            line_start = cursor + 1
+        cursor += 1
+    return top_level
+
+
+def csharp_interpolated_string_context(
+    text: str,
+    quote_start: int,
+) -> bool:
+    prefix = text[:quote_start]
+    statement_start = max(
+        prefix.rfind(";"),
+        prefix.rfind("{"),
+        prefix.rfind("}"),
+    )
+    statement = prefix[statement_start + 1 :]
+    marker = re.search(r"(?:\$@|@\$)$", statement)
+    if marker is None:
+        return False
+    quote_end = quoted_string_end(text, '"', quote_start)
+    if quote_end is None:
+        return False
+    terminator = re.match(
+        r"\s*(?:[,;)}:\[\].!?]|==|!=|<=|>=|>>>|>>|<<|&&|\|\||\?\?"
+        r"|\+\+|--|[+\-*/%&|^<>]|\b(?:as|is)\b)",
+        text[quote_end:],
+    )
+    if terminator is None:
+        return False
+    expression_prefix = statement[: marker.start()]
+    csharp_keyword = re.search(
+        r"\b(?:class|const|internal|namespace|new|private|protected"
+        r"|public|readonly|return|static|string|var)\b",
+        expression_prefix,
+    )
+    assignment_operator = (
+        r"(?<![=!<>])(?:=|[+\-*/%&|^]=|\?\?=|<<=|>>=|>>>=)"
+    )
+    named_argument = re.search(
+        r"(?:\(|,)\s*[A-Za-z_][A-Za-z0-9_]*\s*:\s*$",
+        expression_prefix,
+    )
+    conditional_assignment = re.search(
+        rf"{assignment_operator}[^;\r\n]*\?[^;\r\n]*:\s*$",
+        expression_prefix,
+    )
+    nested_operator = re.search(
+        r"(?:\?\?|\?|[+]|&&|\|\|)\s*$",
+        expression_prefix,
+    )
+    nested_call_expression = (
+        nested_operator is not None
+        and expression_prefix.count("(") > expression_prefix.count(")")
+    )
+    nested_call_false_branch = (
+        re.search(r"\?[^;\r\n]*:\s*$", expression_prefix) is not None
+        and expression_prefix.count("(") > expression_prefix.count(")")
+    )
+    nested_assignment_expression = re.search(
+        rf"{assignment_operator}[^;\r\n]*(?:\?\?|\?|[+]|&&|\|\|)\s*$",
+        expression_prefix,
+    )
+    expression_evidence = (
+        csharp_keyword is not None
+        or "=>" in expression_prefix
+        or re.search(
+            rf"{assignment_operator}\s*$",
+            expression_prefix,
         )
         is not None
+        or named_argument is not None
+        or conditional_assignment is not None
+        or nested_call_expression
+        or nested_call_false_branch
+        or nested_assignment_expression is not None
+        or re.search(r"(?:\(|,)\s*$", expression_prefix) is not None
+        or (
+            statement_start >= 0
+            and prefix[statement_start] == "{"
+            and terminator.group(0).strip() in {",", "}"}
+        )
     )
+    return expression_evidence
 
 
 def uri_authority_end(
@@ -2017,11 +2231,17 @@ def uri_authority_end(
     quote_prefix = text[:quote_start]
     brace_interpolation = (
         outer_quote in {'"', "'", '"""', "'''"}
-        and re.search(
-            r"(?i)(?:^|[^A-Za-z0-9_])(?:f|fr|rf|\$|\$@|@\$)$",
-            quote_prefix,
+        and (
+            re.search(
+                r"(?i)(?:^|[^A-Za-z0-9_])(?:f|fr|rf|(?<!@)\$)$",
+                quote_prefix,
+            )
+            is not None
+            or (
+                outer_quote == '"'
+                and csharp_interpolated_string_context(text, quote_start)
+            )
         )
-        is not None
     )
     interpolation_depth = 0
     interpolation_quote: str | None = None
@@ -2214,6 +2434,16 @@ def interpolated_empty_password_uri_ranges(
     return tuple(safe)
 
 
+def mask_ranges(
+    text: str,
+    ranges: tuple[tuple[int, int], ...],
+) -> str:
+    masked = list(text)
+    for start, end in ranges:
+        masked[start:end] = " " * (end - start)
+    return "".join(masked)
+
+
 def position_in_ranges(
     position: int,
     ranges: tuple[tuple[int, int], ...],
@@ -2222,6 +2452,25 @@ def position_in_ranges(
         start <= position < end
         for start, end in ranges
     )
+
+
+def secret_assignment_matches(
+    pattern: re.Pattern[str],
+    text: str,
+    masked_text: str,
+    safe_ranges: tuple[tuple[int, int], ...],
+) -> tuple[re.Match[str], ...]:
+    matches: list[re.Match[str]] = []
+    spans: set[tuple[int, int]] = set()
+    for match in pattern.finditer(text):
+        if position_in_ranges(match.start(), safe_ranges):
+            continue
+        matches.append(match)
+        spans.add(match.span())
+    for match in pattern.finditer(masked_text):
+        if match.span() not in spans:
+            matches.append(match)
+    return tuple(matches)
 
 
 def string_contexts_at(
@@ -2342,7 +2591,10 @@ def uri_password_is_interpolated(
                 return True
             return dynamic_uri_expression(password, "${", "}")
         prefix = text[:quote_start]
-        if quote == '"' and re.search(r"(?:\$|\$@|@\$)$", prefix):
+        if quote == '"' and (
+            re.search(r"(?<!@)\$$", prefix)
+            or csharp_interpolated_string_context(text, quote_start)
+        ):
             if URI_PASSWORD_REFERENCE_PATTERNS[2].fullmatch(password):
                 return True
             return dynamic_uri_expression(password, "{", "}")
@@ -2446,7 +2698,8 @@ def uri_userinfo_literal_risk(value: str) -> bool:
     credential_name = URI_CREDENTIAL_NAME_PATTERN.search(value) is not None
     structured_username = (
         re.fullmatch(
-            r"[A-Za-z][A-Za-z0-9]*(?:[._-][A-Za-z0-9]+)+",
+            r"(?=[^\r\n]*[._-])"
+            r"[A-Za-z][A-Za-z0-9]*(?:[._+-][A-Za-z0-9]+)+",
             value,
         )
         is not None
@@ -3624,13 +3877,33 @@ def secret_text_risk(text: str) -> bool:
         text,
         uri_authorities,
     )
-    for prefix in SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(text):
-        fallback = top_level_fallback_suffix(text[prefix.end() :])
+    assignment_scan_text = mask_ranges(text, safe_uri_credentials)
+    assignment_prefixes = secret_assignment_matches(
+        SECRET_ASSIGNMENT_PREFIX_PATTERN,
+        text,
+        assignment_scan_text,
+        safe_uri_credentials,
+    )
+    chained_assignment_positions = top_level_line_assignment_positions(
+        text,
+        {prefix.start() for prefix in assignment_prefixes},
+    )
+    for prefix in assignment_prefixes:
+        fallback = top_level_fallback_suffix(
+            text[prefix.end() :],
+            allow_chained_assignment=(
+                re.search(r"=(?!=|>)\s*$", prefix.group(0)) is not None
+                and prefix.start() in chained_assignment_positions
+            ),
+        )
         if fallback is not None and fallback_secret_risk(fallback):
             return True
-    for match in SECRET_ASSIGNMENT_PATTERN.finditer(text):
-        if position_in_ranges(match.start(), safe_uri_credentials):
-            continue
+    for match in secret_assignment_matches(
+        SECRET_ASSIGNMENT_PATTERN,
+        text,
+        assignment_scan_text,
+        safe_uri_credentials,
+    ):
         quoted = any(
             match.group(name) is not None
             for name in ("double_value", "single_value", "backtick_value")
@@ -3644,6 +3917,13 @@ def secret_text_risk(text: str) -> bool:
             or match.group("bare_value")
         )
         if value is None:
+            continue
+        key = re.split(r"\s*[:=]\s*", match.group(0), maxsplit=1)[0]
+        if (
+            key.strip("\"'").lower() == "credentials"
+            and value.lower() in FETCH_CREDENTIAL_MODE_VALUES
+            and safe_secret_assignment_suffix(text, match.end())
+        ):
             continue
         if (
             match.group("backtick_value") is not None
@@ -3761,6 +4041,32 @@ def unified_diff_contents(patch: str) -> tuple[str, str]:
                 old_content.append(content)
                 new_content.append(content)
     return "\n".join(old_content), "\n".join(new_content)
+
+
+def unified_diff_metadata(patch: str) -> str:
+    metadata: list[str] = []
+    in_hunk = False
+    prefix_columns = 1
+    for line in patch.splitlines():
+        hunk_header = re.match(r"^(@{2,})", line)
+        if hunk_header:
+            metadata.append(line)
+            in_hunk = True
+            prefix_columns = len(hunk_header.group(1)) - 1
+            continue
+        if line.startswith("diff --"):
+            metadata.append(line)
+            in_hunk = False
+            continue
+        prefix = line[:prefix_columns]
+        hunk_content = (
+            in_hunk
+            and len(prefix) == prefix_columns
+            and set(prefix) <= {"+", "-", " "}
+        )
+        if not hunk_content:
+            metadata.append(line)
+    return "\n".join(metadata)
 
 
 def sensitive_repo_path_risk(rel: str) -> str | None:
@@ -3899,16 +4205,15 @@ def validate_review_patch(
             f"refusing to include tracked sensitive paths in {label}:\n"
             f"{details}{more}"
         )
-    for line in patch.splitlines():
-        require_no_secret_values(label, line)
-    for content in unified_diff_contents(patch):
-        require_no_secret_values(label, content)
     patch_bytes = len(patch.encode("utf-8"))
     if patch_bytes > limit:
         raise SystemExit(
             f"{label} is too large to review safely "
             f"({patch_bytes} bytes; limit {limit}); split the change into smaller review targets"
         )
+    require_no_secret_values(label, unified_diff_metadata(patch))
+    for content in unified_diff_contents(patch):
+        require_no_secret_values(label, content)
     return patch
 
 
@@ -5453,7 +5758,7 @@ class CodexStreamDisplay:
 
     def __call__(self, name: str, line: str) -> str | None:
         if name != "stdout":
-            return line
+            return stream_display_escape(line)
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -5487,7 +5792,7 @@ class CodexStreamDisplay:
 
     def visible(self, text: str) -> str:
         self.last_visible = time.monotonic()
-        return text
+        return stream_display_escape(text)
 
 
 class ClaudeStreamDisplay:
@@ -5499,7 +5804,7 @@ class ClaudeStreamDisplay:
 
     def __call__(self, name: str, line: str) -> str | None:
         if name != "stdout":
-            return line
+            return stream_display_escape(line)
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -5561,7 +5866,7 @@ class ClaudeStreamDisplay:
 
     def visible(self, text: str) -> str:
         self.last_visible = time.monotonic()
-        return text
+        return stream_display_escape(text)
 
 
 class CursorStreamDisplay:
