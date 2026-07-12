@@ -5,10 +5,12 @@ import argparse
 import ast
 import base64
 import binascii
+import bisect
 import concurrent.futures
 import copy
 import functools
 import hashlib
+import io
 import json
 import os
 import queue
@@ -155,7 +157,8 @@ SECRET_KEY_NAME_PATTERN = (
     r"|credentials?|private[_-]?key)"
 )
 SECRET_SEPARATED_KEY_NAME_PATTERN = (
-    rf"(?:[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)*[_-]"
+    rf"(?:[A-Za-z0-9]{{1,64}}"
+    rf"(?:[_-][A-Za-z0-9]{{1,64}}){{0,15}}[_-]"
     rf"{SECRET_KEY_NAME_PATTERN})"
 )
 SECRET_LOWER_KEY_NAME_PATTERN = (
@@ -346,6 +349,56 @@ GENERIC_CREDENTIAL_PROMPT_PATTERN = re.compile(
     r"(?P<service>[A-Za-z][A-Za-z0-9 _-]{0,48}))?"
     r"\s*[:?]?\s*"
 )
+PROMPT_SECRET_THEME_WORDS = frozenset(
+    {
+        "admin",
+        "autumn",
+        "fall",
+        "password",
+        "secret",
+        "spring",
+        "summer",
+        "vacation",
+        "welcome",
+        "winter",
+    }
+)
+CSHARP_STANDALONE_REFERENCE_PATTERN = re.compile(
+    r"(?:credential|credentials|pass|passwd|password|pwd|secret|token)",
+    re.IGNORECASE,
+)
+CSHARP_METHOD_MODIFIERS_PATTERN = (
+    r"(?:(?:async|extern|internal|new|override|partial|private|protected"
+    r"|public|sealed|static|unsafe|virtual)\s+)*"
+)
+CSHARP_ATTRIBUTE_PATTERN = r"(?:\[[^\[\]{};]*\]\s*)*"
+CSHARP_TYPE_MODIFIERS_PATTERN = (
+    r"(?:(?:abstract|file|internal|new|partial|private|protected|public"
+    r"|readonly|ref|sealed|static|unsafe)\s+)*"
+)
+CSHARP_TYPE_PREFIX_PATTERN = (
+    rf"{CSHARP_ATTRIBUTE_PATTERN}"
+    rf"{CSHARP_TYPE_MODIFIERS_PATTERN}"
+    r"(?:class|interface|namespace|record(?:\s+(?:class|struct))?|struct)\s+"
+    r"[A-Za-z_][A-Za-z0-9_.]*(?:<[^{};]+>)?[^{;]*\{"
+)
+CSHARP_RETURN_TYPE_PATTERN = (
+    r"(?:(?:ref\s+(?:readonly\s+)?|scoped\s+)?"
+    r"(?:(?:[A-Za-z_][A-Za-z0-9_]*::)?"
+    r"[A-Za-z_][A-Za-z0-9_.]*"
+    r"(?:<[^{};]+>)?"
+    r"|\([^{};]+\))(?:\?|\*|\[[,\s]*\])*)"
+)
+CSHARP_METHOD_PREFIX_PATTERN = (
+    rf"{CSHARP_ATTRIBUTE_PATTERN}"
+    rf"{CSHARP_METHOD_MODIFIERS_PATTERN}"
+    r"(?!function\b)"
+    rf"{CSHARP_RETURN_TYPE_PATTERN}\s+"
+    r"[A-Za-z_][A-Za-z0-9_]*(?:<[^(){};]+>)?\s*"
+    r"\([^{};]*\)\s*"
+    r"(?:where\s+[^{;]+)?\{"
+)
+CSHARP_EVIDENCE_WINDOW = 8192
 QUOTED_SECRET_REFERENCE_PATTERNS = (
     re.compile(r"^\$[A-Za-z_][A-Za-z0-9_]*$"),
     re.compile(r"^\$env:[A-Za-z_][A-Za-z0-9_]*$", re.IGNORECASE),
@@ -1986,6 +2039,9 @@ def top_level_fallback_suffix(
                 quote = None
             cursor += 1
             continue
+        if char == "\\" and next_char:
+            cursor += 2
+            continue
         regex_end = javascript_regex_literal_end(text, cursor)
         if regex_end is not None:
             cursor = regex_end
@@ -2018,6 +2074,13 @@ def top_level_fallback_suffix(
                     if not allow_chained_assignment:
                         return None
                     value_start = cursor + 1 + sibling.end()
+                    value = fallback_expression(text[value_start:])
+                    if fallback_secret_risk(value):
+                        return value
+                    cursor = value_start + len(value)
+                    continue
+                if allow_chained_assignment:
+                    value_start = cursor + 1
                     value = fallback_expression(text[value_start:])
                     if fallback_secret_risk(value):
                         return value
@@ -2138,11 +2201,385 @@ def top_level_line_assignment_positions(
     return top_level
 
 
+def raw_double_quote_start(
+    text: str,
+    start: int,
+) -> tuple[str, int] | None:
+    if (
+        not text.startswith('"""', start)
+        or "@" in text[max(0, start - 2) : start]
+    ):
+        return None
+    width = 3
+    while start + width < len(text) and text[start + width] == '"':
+        width += 1
+    after = start + width
+    delimiter = '"' * width
+    return delimiter, after
+
+
+def raw_double_quote_end(
+    text: str,
+    start: int,
+    width: int,
+) -> int | None:
+    cursor = start
+    while cursor < len(text):
+        run_start = text.find('"', cursor)
+        if run_start < 0:
+            return None
+        run_end = run_start + 1
+        while run_end < len(text) and text[run_end] == '"':
+            run_end += 1
+        if run_end - run_start >= width:
+            return run_end
+        cursor = run_end
+    return None
+
+
+def csharp_quoted_literal_end(
+    text: str,
+    quote_start: int,
+    *,
+    verbatim: bool,
+    interpolated: bool,
+    nesting: int = 0,
+) -> int | None:
+    if nesting > 64:
+        return None
+    quote = text[quote_start]
+    cursor = quote_start + 1
+    interpolation_depth = 0
+    while cursor < len(text):
+        char = text[cursor]
+        next_char = text[cursor + 1] if cursor + 1 < len(text) else ""
+        if interpolation_depth:
+            if char == "/" and next_char == "/":
+                line_end = text.find("\n", cursor + 2)
+                cursor = len(text) if line_end < 0 else line_end
+                continue
+            if char == "/" and next_char == "*":
+                comment_end = text.find("*/", cursor + 2)
+                cursor = len(text) if comment_end < 0 else comment_end + 2
+                continue
+            if char == '"':
+                raw_start = raw_double_quote_start(text, cursor)
+                if raw_start is not None:
+                    delimiter, content_start = raw_start
+                    raw_end = raw_double_quote_end(
+                        text,
+                        content_start,
+                        len(delimiter),
+                    )
+                    if raw_end is None:
+                        return None
+                    cursor = raw_end
+                    continue
+            if char in {'"', "'"}:
+                marker = text[max(0, cursor - 2) : cursor]
+                nested_end = csharp_quoted_literal_end(
+                    text,
+                    cursor,
+                    verbatim=char == '"' and "@" in marker,
+                    interpolated=char == '"' and "$" in marker,
+                    nesting=nesting + 1,
+                )
+                if nested_end is None:
+                    return None
+                cursor = nested_end
+                continue
+            if char == "{":
+                interpolation_depth += 1
+            elif char == "}":
+                interpolation_depth -= 1
+            cursor += 1
+            continue
+        if interpolated and char == "{":
+            if next_char == "{":
+                cursor += 2
+                continue
+            interpolation_depth = 1
+            cursor += 1
+            continue
+        if interpolated and char == "}" and next_char == "}":
+            cursor += 2
+            continue
+        if verbatim and char == '"' and next_char == '"':
+            cursor += 2
+            continue
+        if not verbatim and char == "\\":
+            cursor += 2
+            continue
+        if char == quote:
+            return cursor + 1
+        cursor += 1
+    return None
+
+
+@functools.lru_cache(maxsize=8)
+def mask_csharp_evidence_prefix(text: str) -> str:
+    masked = list(text)
+
+    def mask_span(start: int, end: int) -> None:
+        for index in range(start, end):
+            if masked[index] not in "\r\n":
+                masked[index] = " "
+
+    cursor = 0
+    line_has_content = False
+    while cursor < len(text):
+        char = text[cursor]
+        next_char = text[cursor + 1] if cursor + 1 < len(text) else ""
+        line_leading = not line_has_content
+        if char == "\n":
+            line_has_content = False
+            cursor += 1
+            continue
+        if line_leading and char == "#":
+            line_end = text.find("\n", cursor)
+            line_end = len(text) if line_end < 0 else line_end
+            mask_span(cursor, line_end)
+            line_has_content = True
+            cursor = line_end
+            continue
+        if (
+            line_leading
+            and char == "["
+            and re.match(r"\[(?:assembly|module)\s*:", text[cursor:])
+        ):
+            depth = 0
+            end = cursor
+            quote: str | None = None
+            verbatim_quote = False
+            escaped = False
+            while end < len(text):
+                current = text[end]
+                if quote is not None:
+                    if escaped:
+                        escaped = False
+                    elif (
+                        verbatim_quote
+                        and quote == '"'
+                        and text.startswith('""', end)
+                    ):
+                        end += 2
+                        continue
+                    elif current == "\\" and not verbatim_quote:
+                        escaped = True
+                    elif current == quote:
+                        quote = None
+                        verbatim_quote = False
+                elif current in {'"', "'"}:
+                    quote = current
+                    verbatim_quote = (
+                        current == '"'
+                        and text[max(cursor, end - 1) : end] == "@"
+                    )
+                elif current == "[":
+                    depth += 1
+                elif current == "]":
+                    depth -= 1
+                    if depth == 0:
+                        end += 1
+                        break
+                end += 1
+            mask_span(cursor, end)
+            line_has_content = True
+            cursor = end
+            continue
+        if char == "/" and next_char == "/":
+            line_end = text.find("\n", cursor)
+            line_end = len(text) if line_end < 0 else line_end
+            mask_span(cursor, line_end)
+            line_has_content = True
+            cursor = line_end
+            continue
+        if char == "/" and next_char == "*":
+            comment_end = text.find("*/", cursor + 2)
+            comment_end = len(text) if comment_end < 0 else comment_end + 2
+            mask_span(cursor, comment_end)
+            line_has_content = True
+            cursor = comment_end
+            continue
+        if char in {'"', "'"}:
+            raw_start = raw_double_quote_start(text, cursor)
+            if raw_start is not None:
+                delimiter, content_start = raw_start
+                end = raw_double_quote_end(
+                    text,
+                    content_start,
+                    len(delimiter),
+                )
+                end = len(text) if end is None else end
+                mask_span(cursor, end)
+                line_has_content = True
+                cursor = end
+                continue
+            marker = text[max(0, cursor - 2) : cursor]
+            end = csharp_quoted_literal_end(
+                text,
+                cursor,
+                verbatim=char == '"' and "@" in marker,
+                interpolated=char == '"' and "$" in marker,
+            )
+            end = len(text) if end is None else end
+            mask_span(cursor, min(end, len(text)))
+            line_has_content = True
+            cursor = end
+            continue
+        if not char.isspace():
+            line_has_content = True
+        cursor += 1
+    return "".join(masked)
+
+
+def csharp_verbatim_string_content(text: str, quote_start: int) -> str:
+    quote_end = csharp_quoted_literal_end(
+        text,
+        quote_start,
+        verbatim=True,
+        interpolated=True,
+    )
+    end = len(text) if quote_end is None else quote_end - 1
+    return text[quote_start + 1 : end]
+
+
+@functools.lru_cache(maxsize=8)
+def mask_shell_heredoc_bodies(text: str) -> str:
+    masked = list(text)
+    pending: list[tuple[str, bool]] = []
+    offset = 0
+    code_keywords = {
+        "class",
+        "const",
+        "for",
+        "foreach",
+        "if",
+        "interface",
+        "namespace",
+        "new",
+        "record",
+        "return",
+        "struct",
+        "switch",
+        "using",
+        "var",
+        "while",
+    }
+    for line in text.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        if pending:
+            delimiter, strip_tabs = pending[0]
+            comparison = content.lstrip("\t") if strip_tabs else content
+            for index in range(offset, offset + len(content)):
+                masked[index] = " "
+            if comparison == delimiter:
+                pending.pop(0)
+            offset += len(line)
+            continue
+        for match in re.finditer(
+            r"<<(?P<strip>-)?[ \t]*(?P<quote>['\"]?)"
+            r"(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)"
+            r"(?P=quote)",
+            content,
+        ):
+            quote = match.group("quote")
+            prefix = content[: match.start()]
+            shell_segment = re.split(r"[;|&]", prefix)[-1].strip()
+            first_word = (
+                re.match(r"[A-Za-z_][A-Za-z0-9_.-]*", shell_segment)
+                if shell_segment
+                else None
+            )
+            shell_like = (
+                first_word is not None
+                and first_word.group(0) not in code_keywords
+                and re.fullmatch(
+                    r"[A-Za-z_][A-Za-z0-9_.-]*"
+                    r"(?:[ \t]+[^=(){}\[\];|&]+)*[ \t]*",
+                    shell_segment,
+                )
+                is not None
+            )
+            if shell_like:
+                for index in range(
+                    offset + match.start(),
+                    offset + match.end(),
+                ):
+                    masked[index] = " "
+                pending.append(
+                    (match.group("delimiter"), match.group("strip") is not None)
+                )
+        offset += len(line)
+    return "".join(masked)
+
+
+@functools.lru_cache(maxsize=8)
+def csharp_recognized_scope_intervals(
+    text: str,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    masked = mask_csharp_evidence_prefix(mask_shell_heredoc_bodies(text))
+    starts: list[int] = []
+    ends: list[int] = []
+    stack: list[bool] = []
+    recognized_start: int | None = None
+    for cursor, char in enumerate(masked):
+        if char == "{":
+            recognized = False
+            if recognized_start is None:
+                quick_prefix = masked[max(0, cursor - 256) : cursor]
+                scope_candidate = ")" in quick_prefix or re.search(
+                    r"\b(?:class|interface|namespace|record|struct)\b",
+                    quick_prefix,
+                )
+                if scope_candidate:
+                    prefix = masked[max(0, cursor - 4096) : cursor + 1]
+                    recognized = (
+                        re.search(
+                            rf"(?:^|[;}}])\s*"
+                            rf"{CSHARP_TYPE_PREFIX_PATTERN}\s*$",
+                            prefix,
+                            re.DOTALL,
+                        )
+                        is not None
+                        or re.search(
+                            rf"(?:^|[;{{}}])\s*"
+                            rf"{CSHARP_METHOD_PREFIX_PATTERN}\s*$",
+                            prefix,
+                            re.DOTALL,
+                        )
+                        is not None
+                    )
+            stack.append(recognized)
+            if recognized:
+                recognized_start = cursor
+        elif char == "}" and stack:
+            recognized = stack.pop()
+            if recognized:
+                assert recognized_start is not None
+                starts.append(recognized_start)
+                ends.append(cursor + 1)
+                recognized_start = None
+    if recognized_start is not None:
+        starts.append(recognized_start)
+        ends.append(len(text))
+    return tuple(starts), tuple(ends)
+
+
+def csharp_recognized_scope_at(text: str, position: int) -> bool:
+    starts, ends = csharp_recognized_scope_intervals(text)
+    index = bisect.bisect_right(starts, position) - 1
+    return index >= 0 and position < ends[index]
+
+
 def csharp_interpolated_string_context(
     text: str,
     quote_start: int,
 ) -> bool:
-    prefix = text[:quote_start]
+    masked = mask_csharp_evidence_prefix(mask_shell_heredoc_bodies(text))
+    prefix = masked[
+        max(0, quote_start - CSHARP_EVIDENCE_WINDOW) : quote_start
+    ]
     statement_start = max(
         prefix.rfind(";"),
         prefix.rfind("}"),
@@ -2151,11 +2588,11 @@ def csharp_interpolated_string_context(
     marker = re.search(r"(?:\$@|@\$)$", statement)
     if marker is None:
         return False
-    quote_end = quoted_string_end(
+    quote_end = csharp_quoted_literal_end(
         text,
-        '"',
         quote_start,
-        doubled_quote_escape=True,
+        verbatim=True,
+        interpolated=True,
     )
     if quote_end is None:
         return False
@@ -2183,9 +2620,13 @@ def csharp_interpolated_string_context(
         )
         is not None
         or re.search(
-            r"(?:^|[;}])\s*(?:(?:internal|private|protected|public|static)\s+)*"
-            r"(?:class|interface|namespace|record|struct)\s+"
-            r"[A-Za-z_][A-Za-z0-9_.<>]*[^{;]*\{.*$",
+            rf"(?:^|[;}}])\s*{CSHARP_TYPE_PREFIX_PATTERN}.*$",
+            expression_prefix,
+            re.DOTALL,
+        )
+        is not None
+        or re.search(
+            rf"(?:^|[;{{}}])\s*{CSHARP_METHOD_PREFIX_PATTERN}.*$",
             expression_prefix,
             re.DOTALL,
         )
@@ -2204,9 +2645,7 @@ def csharp_interpolated_string_context(
         )
         is not None
         or re.search(
-            r"(?:^|[;}])\s*(?:(?:internal|private|protected|public|static)\s+)*"
-            r"(?:class|interface|namespace|record|struct)\s+"
-            r"[A-Za-z_][A-Za-z0-9_.<>]*[^{;]*\{.*$",
+            rf"(?:^|[;}}])\s*{CSHARP_TYPE_PREFIX_PATTERN}.*$",
             surrounding_prefix,
             re.DOTALL,
         )
@@ -2217,6 +2656,12 @@ def csharp_interpolated_string_context(
         )
         is not None
         or re.search(
+            rf"(?:^|[;{{}}])\s*{CSHARP_METHOD_PREFIX_PATTERN}.*$",
+            surrounding_prefix,
+            re.DOTALL,
+        )
+        is not None
+        or re.search(
             r"(?:^|[;}\n])\s*(?:bool|byte|char|decimal|double|dynamic|float"
             r"|int|long|object|sbyte|short|string|uint|ulong|ushort|var|"
             r"[A-Z][A-Za-z0-9_.<>,?\[\]]*)\s+"
@@ -2224,6 +2669,10 @@ def csharp_interpolated_string_context(
             surrounding_prefix,
         )
         is not None
+    )
+    surrounding_csharp = surrounding_csharp or csharp_recognized_scope_at(
+        text,
+        quote_start,
     )
     csharp_control_context = (
         re.search(
@@ -2267,12 +2716,39 @@ def csharp_interpolated_string_context(
         )
         is not None
     )
+    spaced_assignment = (
+        re.search(
+            r"\b[A-Za-z_][A-Za-z0-9_]*[ \t]+"
+            r"(?<![=!<>])=(?!=)[ \t]*$",
+            expression_prefix,
+        )
+        is not None
+    )
+    standalone_content = csharp_verbatim_string_content(
+        text,
+        quote_start,
+    )
+    standalone_fields = re.findall(r"\{([^{}]*)\}", standalone_content)
+    standalone_reference_assignment = (
+        spaced_assignment
+        and bool(standalone_fields)
+        and standalone_content.count("{") == len(standalone_fields)
+        and standalone_content.count("}") == len(standalone_fields)
+        and all(
+            CSHARP_STANDALONE_REFERENCE_PATTERN.fullmatch(field)
+            is not None
+            for field in standalone_fields
+        )
+    )
     expression_evidence = (
         csharp_statement
         or csharp_control_context
         or typed_declaration is not None
         or "=>" in expression_prefix
         or open_parenthesized_call
+        # Standalone spaced assignments are ambiguous with shell commands, so
+        # recover only ordinary credential references in this C#-only shape.
+        or standalone_reference_assignment
         or (assignment_operator is not None and surrounding_csharp)
     )
     return expression_evidence
@@ -2291,6 +2767,44 @@ def quote_prefix_matches(
 
 def csharp_interpolated_marker(text: str, quote_start: int) -> bool:
     return text[max(0, quote_start - 2) : quote_start] in {"$@", "@$"}
+
+
+@functools.lru_cache(maxsize=8)
+def csharp_interpolated_verbatim_spans(
+    text: str,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    masked = mask_csharp_evidence_prefix(mask_shell_heredoc_bodies(text))
+    starts: list[int] = []
+    ends: list[int] = []
+    for marker in re.finditer(r"(?:\$@|@\$)(?=\")", text):
+        quote_start = marker.end()
+        if masked[marker.start() : quote_start] != text[marker.start() : quote_start]:
+            continue
+        quote_end = csharp_quoted_literal_end(
+            text,
+            quote_start,
+            verbatim=True,
+            interpolated=True,
+        )
+        if quote_end is None:
+            continue
+        starts.append(quote_start)
+        ends.append(quote_end)
+    return tuple(starts), tuple(ends)
+
+
+def explicit_csharp_interpolated_context(
+    text: str,
+    position: int,
+) -> tuple[str, int] | None:
+    starts, ends = csharp_interpolated_verbatim_spans(text)
+    index = bisect.bisect_right(starts, position) - 1
+    if index < 0 or position >= ends[index]:
+        return None
+    quote_start = starts[index]
+    if not csharp_interpolated_string_context(text, quote_start):
+        return None
+    return '"', quote_start
 
 
 def bounded_line_start(
@@ -2580,7 +3094,10 @@ def string_contexts_at(
     cursor = 0
     while cursor < len(text) and len(contexts) < len(positions):
         if cursor in positions:
-            contexts[cursor] = (
+            contexts[cursor] = explicit_csharp_interpolated_context(
+                text,
+                cursor,
+            ) or (
                 None if quote is None else (quote, quote_start)
             )
         char = text[cursor]
@@ -2621,8 +3138,13 @@ def string_contexts_at(
         ) is not None:
             cursor = regex_end
             continue
-        elif text.startswith('"""', cursor) or text.startswith("'''", cursor):
-            quote = text[cursor : cursor + 3]
+        elif text.startswith('"""', cursor):
+            quote = '"""'
+            quote_start = cursor
+            cursor += 3
+            continue
+        elif text.startswith("'''", cursor):
+            quote = "'''"
             quote_start = cursor
             cursor += 3
             continue
@@ -3805,6 +4327,26 @@ def safe_credential_lookup_argument(
     )
 
 
+def prompt_service_segment_is_secret_like(segment: str) -> bool:
+    suffix = re.search(r"\d{4,}$", segment)
+    if suffix is None:
+        return False
+    prefix = segment[: suffix.start()]
+    components = re.findall(
+        r"[A-Z]+(?=[A-Z][a-z]|$)|[A-Z]?[a-z]+",
+        prefix,
+    )
+    theme_phrase = bool(components) and all(
+        component.casefold() in PROMPT_SECRET_THEME_WORDS
+        for component in components
+    )
+    sequential_letters = len(prefix) >= 8 and all(
+        ord(right.casefold()) == ord(left.casefold()) + 1
+        for left, right in zip(prefix, prefix[1:])
+    )
+    return theme_phrase or sequential_letters
+
+
 def generic_credential_prompt_is_safe(value: str) -> bool:
     match = GENERIC_CREDENTIAL_PROMPT_PATTERN.fullmatch(value)
     if match is None:
@@ -3814,6 +4356,10 @@ def generic_credential_prompt_is_safe(value: str) -> bool:
         return True
     service = service.strip()
     segments = re.split(r"[ _-]+", service)
+    secret_like_version = any(
+        prompt_service_segment_is_secret_like(segment)
+        for segment in segments
+    )
     natural_service = bool(service) and len(segments) <= 5 and all(
         re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,23}", segment) is not None
         and sum(
@@ -3824,7 +4370,7 @@ def generic_credential_prompt_is_safe(value: str) -> bool:
         <= 4
         for segment in segments
     )
-    return natural_service and not any(
+    return natural_service and not secret_like_version and not any(
         pattern.search(service) for pattern in SECRET_VALUE_PATTERNS
     )
 
@@ -4080,6 +4626,137 @@ def safe_backtick_secret_template(value: str) -> bool:
     )
 
 
+def javascript_template_literal_end(
+    text: str,
+    start: int,
+    nesting: int = 0,
+) -> int | None:
+    if nesting > 64:
+        return None
+    cursor = start + 1
+    expression_depth = 0
+    while cursor < len(text):
+        char = text[cursor]
+        next_char = text[cursor + 1] if cursor + 1 < len(text) else ""
+        if expression_depth:
+            if char == "/" and next_char == "/":
+                line_end = text.find("\n", cursor + 2)
+                cursor = len(text) if line_end < 0 else line_end
+                continue
+            if char == "/" and next_char == "*":
+                comment_end = text.find("*/", cursor + 2)
+                cursor = len(text) if comment_end < 0 else comment_end + 2
+                continue
+            regex_end = javascript_regex_literal_end(text, cursor)
+            if regex_end is not None:
+                cursor = regex_end
+                continue
+            if char in {'"', "'"}:
+                string_end = csharp_quoted_literal_end(
+                    text,
+                    cursor,
+                    verbatim=False,
+                    interpolated=False,
+                )
+                if string_end is None:
+                    return None
+                cursor = string_end
+                continue
+            if char == "`":
+                nested_end = javascript_template_literal_end(
+                    text,
+                    cursor,
+                    nesting + 1,
+                )
+                if nested_end is None:
+                    return None
+                cursor = nested_end
+                continue
+            if char == "{":
+                expression_depth += 1
+            elif char == "}":
+                expression_depth -= 1
+            cursor += 1
+            continue
+        if char == "\\":
+            cursor += 2
+            continue
+        if char == "`":
+            return cursor + 1
+        if char == "$" and next_char == "{":
+            expression_depth = 1
+            cursor += 2
+            continue
+        cursor += 1
+    return None
+
+
+@functools.lru_cache(maxsize=8)
+def mask_reference_declaration_evidence(text: str) -> str:
+    masked = list(text)
+
+    def mask_span(start: int, end: int) -> None:
+        for index in range(start, end):
+            if masked[index] not in "\r\n":
+                masked[index] = " "
+
+    cursor = 0
+    while cursor < len(text):
+        char = text[cursor]
+        next_char = text[cursor + 1] if cursor + 1 < len(text) else ""
+        if char == "/" and next_char == "/":
+            line_end = text.find("\n", cursor + 2)
+            cursor = len(text) if line_end < 0 else line_end
+            continue
+        if char == "/" and next_char == "*":
+            comment_end = text.find("*/", cursor + 2)
+            cursor = len(text) if comment_end < 0 else comment_end + 2
+            continue
+        if char == "#" and not javascript_private_member_marker(text, cursor):
+            line_end = text.find("\n", cursor + 1)
+            line_end = len(text) if line_end < 0 else line_end
+            mask_span(cursor, line_end)
+            cursor = line_end
+            continue
+        regex_end = javascript_regex_literal_end(text, cursor)
+        if regex_end is not None:
+            mask_span(cursor, regex_end)
+            cursor = regex_end
+            continue
+        if char in {'"', "'"}:
+            raw_start = (
+                raw_double_quote_start(text, cursor)
+                if char == '"'
+                else None
+            )
+            if raw_start is not None:
+                delimiter, content_start = raw_start
+                raw_end = raw_double_quote_end(
+                    text,
+                    content_start,
+                    len(delimiter),
+                )
+                cursor = len(text) if raw_end is None else raw_end
+                continue
+            marker = text[max(0, cursor - 2) : cursor]
+            string_end = csharp_quoted_literal_end(
+                text,
+                cursor,
+                verbatim=char == '"' and "@" in marker,
+                interpolated=char == '"' and "$" in marker,
+            )
+            cursor = len(text) if string_end is None else string_end
+            continue
+        if char != "`":
+            cursor += 1
+            continue
+        template_end = javascript_template_literal_end(text, cursor)
+        template_end = len(text) if template_end is None else template_end
+        mask_span(cursor, min(template_end, len(text)))
+        cursor = template_end
+    return mask_csharp_evidence_prefix("".join(masked))
+
+
 def bare_code_reference(
     text: str,
     start: int,
@@ -4095,13 +4772,16 @@ def bare_code_reference(
         value,
     )
     line_start = max(text.rfind("\n", 0, start), text.rfind("\r", 0, start))
-    declaration = text[line_start + 1 : start]
+    masked_text = mask_reference_declaration_evidence(text)
+    declaration = masked_text[line_start + 1 : start]
     pascal_type_reference = re.fullmatch(
         r"[A-Z][A-Za-z]*(?:Credential|Credentials|Options|Config|Type|Enum)",
         value,
     )
     if separator == ":" and pascal_type_reference is not None:
-        type_prefix = text[max(0, start - 2048) : start]
+        type_prefix = masked_text[
+            max(0, start - 2048) : start
+        ]
         if re.search(
             r"\b(?:class|interface|record|struct|type)\b"
             r"[^{};\r\n]*\{[^}]*$",
@@ -4111,8 +4791,14 @@ def bare_code_reference(
             return True
     if camel_reference is None and snake_reference is None:
         return False
-    return (
-        re.search(r"\b(?:const|let|var)\s+$", declaration) is not None
+    return bool(
+        re.search(r"\b(?:const|let|var)\s+$", declaration)
+        or re.search(
+            r"\b(?:const|let|var)\s+[A-Za-z_$][A-Za-z0-9_$]*"
+            r"\s*=\s*\{[^{}]*$",
+            declaration,
+            re.DOTALL,
+        )
     )
 
 
@@ -7805,11 +8491,19 @@ def run_panel(
                 failures.append(f"{label}: {exc}")
             except Exception as exc:
                 failures.append(f"{label}: {exc}")
-    if failures and not args.allow_partial_panel:
-        raise SystemExit("autoreview panel failed\n" + "\n".join(failures))
-    if failures:
-        for failure in failures:
-            print(f"panel reviewer failed: {failure}")
+    escaped_failures = [
+        display_escape(failure, 4000, multiline=True)
+        for failure in failures
+    ]
+    if escaped_failures and not args.allow_partial_panel:
+        raise SystemExit(
+            "autoreview panel failed\n" + "\n".join(escaped_failures)
+        )
+    if escaped_failures:
+        for failure in escaped_failures:
+            print(
+                "panel reviewer failed: " + failure
+            )
     if not reports:
         raise SystemExit("autoreview panel produced no reports")
     reports.sort(key=lambda item: item[0])
@@ -8081,6 +8775,50 @@ def self_test() -> int:
     return self_test_engine_isolation()
 
 
+def reject_repo_output_paths(args: argparse.Namespace, repo: Path) -> None:
+    repo_root_path = repo.resolve()
+    for option, value in (
+        ("--json-output", args.json_output),
+        ("--output", args.output),
+    ):
+        if not value:
+            continue
+        path = Path(value).expanduser()
+        resolved = (
+            path if path.is_absolute() else Path.cwd() / path
+        ).resolve()
+        inside_repo = resolved.is_relative_to(repo_root_path)
+        if not inside_repo:
+            for ancestor in (resolved, *resolved.parents):
+                try:
+                    if os.path.samefile(ancestor, repo_root_path):
+                        inside_repo = True
+                        break
+                except OSError:
+                    continue
+        if not inside_repo:
+            continue
+        raise SystemExit(
+            f"{option} must point outside the reviewed repository: "
+            f"{display_escape(value, 500)}"
+        )
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    parent = path.parent
+    descriptor, temporary = tempfile.mkstemp(
+        dir=parent,
+        prefix=f".{path.name}.",
+    )
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 def main() -> int:
     args = parse_args()
     if args.self_test:
@@ -8113,6 +8851,7 @@ def main() -> int:
         return self_test_json_array_parser()
     reviewers = reviewer_args(args)
     repo = repo_root()
+    reject_repo_output_paths(args, repo)
     target, target_ref = choose_target(repo, args.mode, args.base)
     print(f"autoreview target: {target}")
     print(f"branch: {current_branch(repo)}")
@@ -8200,14 +8939,22 @@ def main() -> int:
         return 1
 
     if args.json_output:
-        Path(args.json_output).write_text(json.dumps(report, indent=2) + "\n")
+        atomic_write_text(
+            Path(args.json_output),
+            json.dumps(report, indent=2) + "\n",
+        )
 
     if args.output:
+        rendered = io.StringIO()
         original_stdout = sys.stdout
-        with Path(args.output).open("w") as handle:
-            sys.stdout = Tee(original_stdout, handle)
+        try:
+            sys.stdout = rendered
             print_report(report, label=label)
+        finally:
             sys.stdout = original_stdout
+        output = rendered.getvalue()
+        print(output, end="")
+        atomic_write_text(Path(args.output), output)
     else:
         print_report(report, label=label)
 
@@ -8218,19 +8965,6 @@ def main() -> int:
     if args.expect_findings:
         return 0 if has_findings else 1
     return 1 if has_findings or overall_incorrect else 0
-
-
-class Tee:
-    def __init__(self, *streams: Any) -> None:
-        self.streams = streams
-
-    def write(self, data: str) -> None:
-        for stream in self.streams:
-            stream.write(data)
-
-    def flush(self) -> None:
-        for stream in self.streams:
-            stream.flush()
 
 
 def sanitized_main() -> int:
