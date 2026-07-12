@@ -2533,6 +2533,55 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("autoreview clean", result.stdout)
+
+    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
+    def test_cli_detects_source_mutation_without_parallel_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / "source.txt"
+            source.write_text("before\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            git(repo, "commit", "-qm", "initial")
+            source.write_text("review me\n", encoding="utf-8")
+            codex_bin = self.helper["write_executable"](
+                root / "codex",
+                self.helper["fake_codex_script"](),
+            )
+            record_path = root / "record.json"
+            env = os.environ.copy()
+            env.update(
+                {
+                    "AUTOREVIEW_FAKE_MUTATE": str(source),
+                    "AUTOREVIEW_FAKE_RECORD": str(record_path),
+                    "HOME": str(root),
+                    "USERPROFILE": str(root),
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--engine",
+                    "codex",
+                    "--codex-bin",
+                    str(codex_bin),
+                ],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn(
+                "source changed after the review bundle was created",
+                result.stderr,
+            )
             self.assertTrue(record_path.is_file())
 
     def test_source_tree_snapshot_hashes_binary_and_untracked_tail_bytes(
@@ -3819,13 +3868,18 @@ class AutoreviewHardeningTests(unittest.TestCase):
         )
 
     def test_secret_detector_keeps_chained_assignment_fallbacks(self) -> None:
-        self.assertTrue(
-            self.helper["secret_text_risk"](
-                "pass"
-                + 'word = first, second = load_pair() or ("real-hardcoded-'
-                + 'secret", "x")'
-            )
-        )
+        for content in (
+            "pass"
+            + 'word = first, second = load_pair() or ("real-hardcoded-'
+            + 'secret", "x")',
+            "pass"
+            + 'word = first, second = ("ordinary-hardcoded-value-12345", "x")',
+            "db_pass"
+            + 'word = source, second = load_pair() or ("real-hardcoded-'
+            + 'secret", "x")',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
 
     def test_secret_detector_stops_at_sibling_argument_fallbacks(self) -> None:
         for content in (
@@ -3875,43 +3929,94 @@ class AutoreviewHardeningTests(unittest.TestCase):
         for content in (
             "https://FirstName.LastName+123@host/repo",
             "https://FirstName.LastName-123@host/repo",
+            "https://alice+MarketingTeam2026@example.com",
+            "https://user123+MarketingTeam2026@example.com",
+            "https://First.Name+campaign-2026@example.com",
+            "https://first_name+campaign.2026@example.com",
         ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
+        for content in (
+            "https://AbCdEfGh.IjKlMnOp"
+            + "+QrStUvWxYz012345@api.example/repo",
+            "https://Ab3dE5f"
+            + "+Gh7Jk9Lm2Np4Qr6St8Uv0Wx2@host/repo",
+            "https://service+Abcdefghijklmnop"
+            + "123456@host/repo",
+            "https://CorrectHorse"
+            + "+BatteryStaple2026@host/repo",
+            "https://FirstnameLastname"
+            + "+MarketingCampaign2026@example.com",
+            "https://user:correcthorse"
+            + "+BatteryStaple2026@host/repo",
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_scans_many_ordinary_uris_in_linear_time(
+        self,
+    ) -> None:
+        uri_expression = (
+            '"x:'
+            + '//u:%s@h" % p'
+        )
+        content = "\n".join(
+            f"x{index} = {uri_expression}"
+            for index in range(4000)
+        )
+        started = time.monotonic()
+
+        self.assertFalse(self.helper["secret_text_risk"](content))
+
+        self.assertLess(time.monotonic() - started, 8.0)
 
     def test_csharp_uri_interpolation_requires_csharp_declaration(
         self,
     ) -> None:
-        self.assertTrue(
-            self.helper["secret_text_risk"](
-                "url=$@"
-                + '"https:'
-                + '//user:{prodPasswordSecret12345}@host"'
-            )
-        )
-        self.assertTrue(
-            self.helper["secret_text_risk"](
-                "url=@$"
-                + '"https:'
-                + '//user:{prodPasswordSecret12345}@host"'
-            )
-        )
+        for content in (
+            "url=$@"
+            + '"https:'
+            + '//user:{prodPasswordSecret12345}@host"',
+            "url=@$"
+            + '"https:'
+            + '//user:{prodPasswordSecret12345}@host"',
+            "endpoint=$@"
+            + '"https:'
+            + '//user:{hunter2secret}@host";',
+            "dsn=$@"
+            + '"postgres:'
+            + '//svc:{password}@db.example/app";',
+            "(echo $@"
+            + '"https:'
+            + '//user:{prodPasswordSecret12345}@host")',
+            "if $@"
+            + '"https:'
+            + '//user:{prodPasswordSecret12345}@host"; then :; fi',
+            "test value == $@"
+            + '"https:'
+            + '//user:{prodPasswordSecret12345}@host";',
+            "echo using $@"
+            + '"https:'
+            + '//user:{prodPasswordSecret12345}@host";',
+            "export url=$@"
+            + '"https:'
+            + '//user:{prodPasswordSecret12345}@host";',
+            'var path = $@"C:\\'
+            + '"; // https:'
+            + '//user:{prodPasswordSecret12345}@host',
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
         for content in (
             'var dsn = $@"postgres:'
             + '//svc:{password}@db.example/app";',
             'var dsn = @$"postgres:'
             + '//svc:{password}@db.example/app";',
+            'var dsn = $@"postgres:'
+            + '//svc:{password}@db.example/app?x=""quoted""";',
             'const string dsn = $@"postgres:'
             + '//svc:{password}@db.example/app";',
             'FormattableString? dsn =\n$@"postgres:'
-            + '//svc:{password}@db.example/app";',
-            'dsn = $@"postgres:'
-            + '//svc:{password}@db.example/app";',
-            'dsn=$@"postgres:'
-            + '//svc:{password}@db.example/app";',
-            'dsn ??= $@"postgres:'
-            + '//svc:{password}@db.example/app";',
-            'dsn+=$@"postgres:'
             + '//svc:{password}@db.example/app";',
             'new Config { Dsn = $@"postgres:'
             + '//svc:{password}@db.example/app" }',
@@ -3919,11 +4024,15 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + '//svc:{password}@db.example/app";',
             'Connect($@"postgres:'
             + '//svc:{password}@db.example/app");',
+            'connect($@"postgres:'
+            + '//svc:{password}@db.example/app");',
             'Connect(dsn: $@"postgres:'
             + '//svc:{password}@db.example/app");',
             'Connect(enabled ? $@"postgres:'
             + '//svc:{password}@db.example/app" : fallback);',
             'Connect(enabled ? fallback : $@"postgres:'
+            + '//svc:{password}@db.example/app");',
+            'Connect(enabled\n ? fallback\n : $@"postgres:'
             + '//svc:{password}@db.example/app");',
             'Connect(value ?? $@"postgres:'
             + '//svc:{password}@db.example/app");',
@@ -3933,12 +4042,22 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + '//svc:{password}@db.example/app";',
             'var dsn = enabled ? $@"postgres:'
             + '//svc:{password}@db.example/app" : fallback;',
-            'dsn=enabled ? fallback : $@"postgres:'
-            + '//svc:{password}@db.example/app";',
             'var dsn = prefix + $@"postgres:'
             + '//svc:{password}@db.example/app";',
+            'var values = new[] { enabled ? $@"postgres:'
+            + '//svc:{password}@db.example/app" : fallback };',
+            'var values = new[] { enabled ? fallback : $@"postgres:'
+            + '//svc:{password}@db.example/app" };',
+            'var values = new[] { value ?? $@"postgres:'
+            + '//svc:{password}@db.example/app" };',
+            'var values = new[] { prefix + $@"postgres:'
+            + '//svc:{password}@db.example/app" + suffix };',
             'var values = new[] { $@"postgres:'
             + '//svc:{password}@db.example/app" };',
+            'var values = new[] { $@"postgres:'
+            + '//svc:{password}@db.example/app"[0] };',
+            'var values = new[] { $@"postgres:'
+            + '//svc:{password}@db.example/app".ToString() };',
             'var values = [$@"postgres:'
             + '//svc:{password}@db.example/app"];',
             'var text = $@"postgres:'
@@ -3947,8 +4066,30 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + '//svc:{password}@db.example/app"[0];',
             'var required = $@"postgres:'
             + '//svc:{password}@db.example/app"!;',
-            'if ($@"postgres:'
+            'using System; if ($@"postgres:'
             + '//svc:{password}@db.example/app" == expected) {}',
+            'using System; if (dsn == $@"postgres:'
+            + '//svc:{password}@db.example/app") {}',
+            'Log(); dsn = $@"postgres:'
+            + '//svc:{password}@db.example/app";',
+            'Log(); dsn += $@"postgres:'
+            + '//svc:{password}@db.example/app";',
+            'Log(); connect($@"postgres:'
+            + '//svc:{password}@db.example/app");',
+            'int retries = 3; dsn = $@"postgres:'
+            + '//svc:{password}@db.example/app";',
+            'if (enabled) { dsn = $@"postgres:'
+            + '//svc:{password}@db.example/app"; }',
+            'record Worker { void Run() { dsn = $@"postgres:'
+            + '//svc:{password}@db.example/app"; } }',
+            'struct Worker { void Run() { dsn = $@"postgres:'
+            + '//svc:{password}@db.example/app"; } }',
+            'interface Worker { void Run() { dsn = $@"postgres:'
+            + '//svc:{password}@db.example/app"; } }',
+            'class C { public string Dsn { get; set; } = $@"postgres:'
+            + '//svc:{password}@db.example/app"; }',
+            'class C { void Run() { if (ready) { Log(); } dsn = $@"postgres:'
+            + '//svc:{password}@db.example/app"; } }',
         ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
@@ -3991,6 +4132,12 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "userIDTo" + "ken = ordinary-hardcoded-value-12345",
             "GITHUBTO" + "KEN = ordinary-hardcoded-value-12345",
             "DBPASS" + "WORD = ordinary-hardcoded-value-12345",
+            "githubto" + "ken = ordinary-hardcoded-value-12345",
+            "dbpass" + 'word = "Summer2026!"',
+            "pass" + "word: CorrectHorseBatteryStaple",
+            "PASS" + "WORD=CorrectHorseBatteryConfig",
+            "pass" + "word: CorrectHorseBatteryOptions",
+            "cred" + "entials: CorrectHorseBatteryCredentials",
         ):
             with self.subTest(content=content):
                 self.assertTrue(self.helper["secret_text_risk"](content))
@@ -4001,6 +4148,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "safeCred" + "entials = config.credentials",
             "credentializer = ordinary-hardcoded-value-12345",
             "private_" + 'key = os.environ["PRIVATE_KEY"]',
+            "type AuthOptions = { cred"
+            + "entials: RequestCredentials };",
+            "const cred" + "entials = options.credentials",
+            "safe_uri_cred"
+            + "entials = interpolated_empty_password_uri_ranges(\n"
+            + "    text,\n"
+            + "    uri_authorities,\n"
+            + ")",
         ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
@@ -4018,11 +4173,84 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_secret_detector_allows_punctuationless_password_prompt(
         self,
     ) -> None:
-        self.assertFalse(
+        for prompt in (
+            "Enter password",
+            "Enter the password for the database: ",
+            "Enter password for GitHub: ",
+            "Enter password for PostgreSQL: ",
+            "Enter your password:",
+            "Password:",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertFalse(
+                    self.helper["secret_text_risk"](
+                        "pass"
+                        + f'word = getpass.getpass("{prompt}")'
+                    )
+                )
+        self.assertTrue(
             self.helper["secret_text_risk"](
-                "pass" + 'word = getpass.getpass("Enter password")'
+                "pass"
+                + 'word = getpass.getpass("Enter password for ghp_'
+                + 'ActualToken1234567890")'
             )
         )
+
+    def test_secret_detector_allows_chained_lookup_references(self) -> None:
+        lookup = (
+            "to"
+            + 'ken = response.json().get("access_'
+            + 'token")'
+        )
+
+        self.assertFalse(self.helper["secret_text_risk"](lookup))
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                "to"
+                + 'ken = client().headers.get("Authorization")'
+            )
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                lookup + ' or "ordinary-hardcoded-value-12345"'
+            )
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                "to"
+                + 'ken = client.auth().get("ghp_'
+                + 'ActualToken1234567890")'
+            )
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                "to"
+                + 'ken = response.get("ghp_'
+                + 'ActualToken1234567890")'
+            )
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                "pass"
+                + 'word = response.get("CorrectHorse'
+                + 'BatteryStaple")'
+            )
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                "pass"
+                + 'word = response.get("CORRECTHORSE'
+                + 'BATTERYSTAPLE")'
+            )
+        )
+
+    def test_secret_detector_bounds_chained_receiver_tracking(self) -> None:
+        content = "to" + "ken = f()" + ".x()" * 20_000
+        started = time.monotonic()
+
+        self.assertFalse(self.helper["secret_text_risk"](content))
+
+        self.assertLess(time.monotonic() - started, 5.0)
 
     def test_review_patch_allows_safe_multiline_call_hunks(self) -> None:
         patch = (
