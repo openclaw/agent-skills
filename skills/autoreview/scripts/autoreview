@@ -801,6 +801,10 @@ THINKING_LEVELS_BY_ENGINE = {
 }
 CLAUDE_SAFE_MODE_MIN_VERSION = (2, 1, 169)
 CLAUDE_FABLE_MIN_VERSION = (2, 1, 170)
+CLAUDE_ISOLATION_PROBE_CONTROL_FLAG = "--autoreview-invalid-control"
+CLAUDE_EMPTY_PRINT_DIAGNOSTIC = (
+    "Input must be provided either through stdin or as a prompt argument when using --print"
+)
 # Pi's reviewed-repo trust override first appears in the current
 # @earendil-works/pi-coding-agent 0.79.0 CLI line. Older legacy binaries can
 # ignore unknown flags, so the Pi engine must fail closed below this floor.
@@ -9529,21 +9533,43 @@ def ensure_claude_isolation_supported(args: argparse.Namespace, repo: Path) -> N
             f"claude engine requires Claude Code >= {format_version(minimum_version)} "
             f"{version_reason} (found {format_version(version)})"
         )
-    isolation_probe = run(
-        [
-            claude_bin,
-            *claude_review_isolation_flags(),
-            "--tools",
-            "",
-            "--version",
-        ],
+    probe_command = [
+        claude_bin,
+        *claude_review_isolation_flags(),
+        "--tools",
+        "",
+    ]
+    control_probe = run(
+        [*probe_command, CLAUDE_ISOLATION_PROBE_CONTROL_FLAG, "--print"],
         temp_root,
+        input_text="",
         check=False,
         env=engine_env,
     )
-    if isolation_probe.returncode != 0:
-        detail = (isolation_probe.stderr or isolation_probe.stdout).strip()
-        suffix = f": {detail}" if detail else ""
+    control_detail = f"{control_probe.stderr}\n{control_probe.stdout}".strip()
+    if (
+        control_probe.returncode == 0
+        or CLAUDE_ISOLATION_PROBE_CONTROL_FLAG not in control_detail
+        or "unknown option" not in control_detail.lower()
+    ):
+        suffix = f": {control_detail}" if control_detail else ""
+        raise SystemExit(
+            "claude engine could not verify that the capability probe rejects unknown flags"
+            f"{suffix}"
+        )
+    isolation_probe = run(
+        [*probe_command, "--print"],
+        temp_root,
+        input_text="",
+        check=False,
+        env=engine_env,
+    )
+    isolation_detail = f"{isolation_probe.stderr}\n{isolation_probe.stdout}".strip()
+    if (
+        isolation_probe.returncode == 0
+        or CLAUDE_EMPTY_PRINT_DIAGNOSTIC not in isolation_detail
+    ):
+        suffix = f": {isolation_detail}" if isolation_detail else ""
         raise SystemExit(
             "claude engine requires Claude Code isolation flags rejected by capability probe"
             f"{suffix}"
@@ -10683,11 +10709,21 @@ if "--version" in args or "-v" in args:
 if "--help" in args or "-h" in args:
     print("--safe-mode\n--setting-sources\n--strict-mcp-config\n--disallowedTools\n--tools\n--print\n--json-schema")
     raise SystemExit(0)
+if "--autoreview-invalid-control" in args:
+    print("error: unknown option '--autoreview-invalid-control'", file=sys.stderr)
+    raise SystemExit(1)
+stdin = sys.stdin.read()
+if "--print" in args and not stdin:
+    print(
+        "Error: Input must be provided either through stdin or as a prompt argument when using --print",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 record = os.environ["AUTOREVIEW_FAKE_RECORD"]
 Path(record).write_text(json.dumps({
     "argv": args,
     "cwd": os.getcwd(),
-    "stdin": sys.stdin.read(),
+    "stdin": stdin,
     "auto_memory_disabled": os.environ.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY"),
 }))
 report = {

@@ -315,7 +315,7 @@ CLI flags and environment variables override these defaults. Pi does not get a b
 
 Claude also supports `--fallback-model a,b` for availability-based fallback chains ([model-config](https://code.claude.com/docs/en/model-config)). Current Claude docs note that auth, billing, rate-limit, request-size, and transport errors do not trigger fallback, and the changelog documents interactive-session support in `v2.1.166`.
 
-Claude's CLI reference warns that `--help` does not list every supported flag. The helper capability-checks isolation by passing the exact review flags with `--version`; it does not infer support from help text.
+Claude's CLI reference warns that `--help` does not list every supported flag. The helper capability-checks isolation through empty-print validation with the exact review flags, and verifies the same parser rejects an unknown control flag; it does not infer support from help text or early-exit version behavior.
 
 [OpenAI's model guidance](https://developers.openai.com/api/docs/guides/latest-model) identifies Sol as the GPT-5.6 frontier-capability route and documents `max` support. Autoreview keeps `high` as its default; use `max` only for the hardest quality-first reviews after comparing its latency and cost with `xhigh` on representative changes.
 

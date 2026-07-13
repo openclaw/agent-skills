@@ -5696,7 +5696,29 @@ class AutoreviewHardeningTests(unittest.TestCase):
             **_kwargs: object,
         ) -> subprocess.CompletedProcess[str]:
             commands.append(command)
-            return subprocess.CompletedProcess(command, 0, "2.1.207 (Claude Code)", "")
+            if command == ["/usr/bin/claude", "--version"]:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "2.1.207 (Claude Code)",
+                    "",
+                )
+            if "--autoreview-invalid-control" in command:
+                return subprocess.CompletedProcess(
+                    command,
+                    1,
+                    "",
+                    "error: unknown option '--autoreview-invalid-control'",
+                )
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                "",
+                (
+                    "Error: Input must be provided either through stdin or as a "
+                    "prompt argument when using --print"
+                ),
+            )
 
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
@@ -5713,12 +5735,18 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertEqual(commands[0], ["/usr/bin/claude", "--version"])
         self.assertNotIn("--help", commands[1])
-        self.assertIn("--safe-mode", commands[1])
-        self.assertIn("--setting-sources", commands[1])
-        self.assertIn("--strict-mcp-config", commands[1])
-        self.assertIn("--disallowedTools", commands[1])
-        self.assertIn("--tools", commands[1])
-        self.assertEqual(commands[1][-1], "--version")
+        self.assertIn("--autoreview-invalid-control", commands[1])
+        self.assertEqual(commands[1][-1], "--print")
+        self.assertNotIn("--autoreview-invalid-control", commands[2])
+        for required in (
+            "--safe-mode",
+            "--setting-sources",
+            "--strict-mcp-config",
+            "--disallowedTools",
+            "--tools",
+        ):
+            self.assertIn(required, commands[2])
+        self.assertEqual(commands[2][-1], "--print")
 
     def test_claude_isolation_support_fails_when_capability_probe_rejects_flags(self) -> None:
         args = argparse.Namespace(
@@ -5729,6 +5757,12 @@ class AutoreviewHardeningTests(unittest.TestCase):
         results = iter(
             [
                 subprocess.CompletedProcess([], 0, "2.1.207 (Claude Code)", ""),
+                subprocess.CompletedProcess(
+                    [],
+                    1,
+                    "",
+                    "error: unknown option '--autoreview-invalid-control'",
+                ),
                 subprocess.CompletedProcess([], 1, "", "unknown option --safe-mode"),
             ]
         )
@@ -5746,6 +5780,35 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ), self.assertRaisesRegex(
                 SystemExit,
                 "isolation flags rejected by capability probe",
+            ):
+                self.helper["ensure_claude_isolation_supported"](args, repo)
+
+    def test_claude_isolation_probe_fails_if_unknown_control_is_not_rejected(self) -> None:
+        args = argparse.Namespace(
+            claude_bin="claude",
+            fallback_model=None,
+            model="claude-fable-5",
+        )
+        results = iter(
+            [
+                subprocess.CompletedProcess([], 0, "2.1.207 (Claude Code)", ""),
+                subprocess.CompletedProcess([], 0, "2.1.207 (Claude Code)", ""),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            with mock.patch.dict(
+                self.helper["ensure_claude_isolation_supported"].__globals__,
+                {
+                    "resolve_command": lambda *_args: "/usr/bin/claude",
+                    "safe_engine_env": lambda *_args, **_kwargs: {},
+                    "safe_temp_root": lambda _repo: Path(tempdir),
+                    "run": lambda *_args, **_kwargs: next(results),
+                },
+            ), self.assertRaisesRegex(
+                SystemExit,
+                "capability probe rejects unknown flags",
             ):
                 self.helper["ensure_claude_isolation_supported"](args, repo)
 
