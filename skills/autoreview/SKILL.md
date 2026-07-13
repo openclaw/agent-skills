@@ -36,10 +36,10 @@ Use when:
 - Tools are useful in review mode. Codex receives the validated bundle in an empty workspace so ignored files and linked-worktree metadata remain unreadable; web search stays available for dependency contracts and upstream docs.
 - Security perspective is always included, but it should not cripple legitimate functionality. Report security findings only when the change creates a concrete, actionable risk or removes an important safety check.
 - Reviewer subprocesses preserve engine authentication and non-credentialed proxy variables needed by headless or restricted-network environments while stripping process-injection, Git override, and credentialed proxy values.
-- Review bundles fail closed before engine invocation when tracked or untracked paths look sensitive, patch text looks secret-like, or a Git diff exceeds the bundle limit. Redact/split the change; never accept a truncated patch as complete review proof.
+- Review bundles fail closed before engine invocation when tracked or untracked paths look sensitive or patch text looks secret-like. Safe large diffs are scanned in full, sent as one pass while they fit the aggregate prompt limit, then partitioned into complete bounded passes without truncation.
 - For regression provenance, keep roles separate: blamed code author, blamed PR author, PR merger/committer, current PR author, and PR/date. If no blamed PR is traceable, use the blamed commit as the provenance: commit SHA, date, and author username. Do not guess a merger or frame missing PR metadata as a separate finding.
 - If the blamed PR was merged by `clawsweeper[bot]` or another automation, identify the human trigger when practical. Check timeline/comments first; if rate-limited, use gitcrawl/cache or public PR HTML. Look for maintainer commands such as `@clawsweeper automerge`, `/landpr`, or labels/status comments that armed automerge. Report `automerge triggered by @login`; if not found, say trigger unknown.
-- Do not invoke built-in `codex review`, nested reviewers, or reviewer panels from inside the review. The helper builds one bundle, calls one selected engine, validates one structured result, and stops.
+- Do not invoke built-in `codex review`, nested reviewers, or reviewer panels from inside the review. The helper builds one validated bundle, calls the selected engine once for normal inputs or once per complete bounded chunk for oversized inputs, validates the structured results, and stops.
 - Stop as soon as the helper exits 0 with no accepted/actionable findings. Do not run an extra review just to get a nicer "clean" line, a second opinion, or clearer closeout wording.
 - Treat the helper's successful exit plus absence of actionable findings as the clean review result, even if the underlying Codex CLI output is terse.
 - Multi-reviewer panels are opt-in only. Use them when explicitly requested or when risk justifies the extra spend; the main agent still verifies every accepted finding before fixing.
@@ -189,43 +189,27 @@ clean `main` against `origin/main` is usually an empty diff after push. For a
 small stack, review each commit explicitly or review the branch before merging
 with `--base`.
 
-## Oversized Bundle Recovery
+## Oversized Bundles
 
-When a branch diff exceeds the bundle limit, preserve the full real-code review
-surface and remove only machine-generated noise:
+The helper scans the full patch before partitioning it. A safe bundle that fits
+the aggregate prompt limit remains one integrated review pass. Larger bundles
+are split at bundle sections and file boundaries where possible; an oversized
+single-file block is split at line boundaries with repeated file/hunk context
+and an absolute new- or old-file line offset. Untracked snapshots use
+injection-safe source-line records so continuation passes retain reportable
+locations.
+Every original bundle byte appears exactly once across the pass sequence, and
+all validated reports are merged before required-finding and exit-status checks.
+The helper caps one run at eight bounded passes so an unexpectedly huge branch
+cannot create unbounded model calls; split still-larger work into coherent review
+targets.
 
-1. Set `REVIEW_BASE` to the exact ref passed to `--base` in the failed review.
-   Record the delivery head and merge base, then classify generated paths with
-   an explicit merge-base-aware range:
-
-   ```bash
-   delivery_head=$(git rev-parse HEAD)
-   review_base=${REVIEW_BASE:?set REVIEW_BASE to the exact ref passed to --base}
-   merge_base=$(git merge-base "$review_base" "$delivery_head")
-   git diff --name-status "$merge_base" "$delivery_head"
-   ```
-
-2. Neutralize only paths the repository declares non-authoritative and
-   non-shipping. Verify the candidate against the delivery-head artifact by exact
-   comparison or the repository's semantic verifier in trusted CI or a
-   credential-free sandbox. Never execute unreviewed delivery-head generator
-   code on the host. Any executable verification chain must come from the merge
-   base or another trusted toolchain, or be reviewed separately before it runs.
-3. Reproducibility alone does not make an artifact noise. Lockfiles, generated
-   clients, policies, manifests, schemas, and every independently semantic
-   artifact remain in review scope. When their raw representation is too large,
-   provide a compact semantic diff or dataset that preserves the complete change.
-4. On a throwaway branch or worktree from `delivery_head`, restore verified
-   base-existing noise to its merge-base version and use `git rm` only for
-   verified noise added by the branch. Leave every genuine or unresolved change
-   untouched, commit the neutralization, and review against `review_base`.
-5. If genuine code still exceeds the limit, subtree passes are diagnostic and
-   partial only. Keep the merge gate blocked until the actual delivery change is
-   reduced or split into integrated branches or PRs that each fit the limit and
-   receive a complete review.
-
-Keep the delivery branch intact. Neutralization changes only the review surface,
-not the change that will ship.
+Chunking makes large-diff review usable, but it cannot give one model call every
+cross-file implementation detail. For architecture-heavy changes, still prefer
+a coherent branch or PR shape whose semantic decision surface fits one pass.
+Removing verified non-authoritative generated noise remains useful, but never
+drop lockfiles, generated clients, policies, manifests, schemas, or other
+independently semantic artifacts merely to shrink the review.
 
 ## Parallel Closeout
 
@@ -424,6 +408,7 @@ The helper:
 - recognizes `--engine droid`, `copilot`, `cursor`, and `opencode` only to fail closed with isolation errors; runnable engines are `codex`, `claude`, and `pi`; default is `AUTOREVIEW_ENGINE` or `codex`
 - resolves bare `git`, `gh`, reviewer, and PowerShell shell commands from absolute `PATH` entries only, never from the reviewed checkout; explicit `--*-bin` paths are interpreted from the reviewed repository root when relative and accepted only when both the supplied path and resolved target stay outside the reviewed repository
 - use `--mode commit --commit <ref>` for already-committed work, especially clean `main` after landing
+- scans safe Git patches in full, reviews them in one pass up to the aggregate prompt limit, and automatically uses complete bounded passes above it
 - should be left in `--mode auto` or forced to `--mode branch` for PR/branch work; do not force `--mode local` after committing
 - writes only to stdout unless `--output`, `--json-output`, or live streamed engine stderr is set
 - supports `--dry-run`, `--parallel-tests`, `--parallel-tests-shell`, `--prompt`, repo-relative `--prompt-file`, repo-relative `--dataset`, `--no-tools`, `--no-web-search`, repeatable Codex-only safe model/response tuning with `--codex-config key=value`, Codex-only `--codex-speed fast|flex|default`, and commit refs
