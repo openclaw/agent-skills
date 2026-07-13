@@ -5682,6 +5682,73 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ):
                 self.helper["ensure_claude_isolation_supported"](args, repo)
 
+    def test_claude_isolation_support_probes_hidden_flags_directly(self) -> None:
+        args = argparse.Namespace(
+            claude_bin="claude",
+            fallback_model=None,
+            model="claude-fable-5",
+        )
+        commands: list[list[str]] = []
+
+        def fake_run(
+            command: list[str],
+            *_args: object,
+            **_kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "2.1.207 (Claude Code)", "")
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            with mock.patch.dict(
+                self.helper["ensure_claude_isolation_supported"].__globals__,
+                {
+                    "resolve_command": lambda *_args: "/usr/bin/claude",
+                    "safe_engine_env": lambda *_args, **_kwargs: {},
+                    "safe_temp_root": lambda _repo: Path(tempdir),
+                    "run": fake_run,
+                },
+            ):
+                self.helper["ensure_claude_isolation_supported"](args, repo)
+
+        self.assertEqual(commands[0], ["/usr/bin/claude", "--version"])
+        self.assertNotIn("--help", commands[1])
+        self.assertIn("--safe-mode", commands[1])
+        self.assertIn("--setting-sources", commands[1])
+        self.assertIn("--strict-mcp-config", commands[1])
+        self.assertIn("--disallowedTools", commands[1])
+        self.assertIn("--tools", commands[1])
+        self.assertEqual(commands[1][-1], "--version")
+
+    def test_claude_isolation_support_fails_when_capability_probe_rejects_flags(self) -> None:
+        args = argparse.Namespace(
+            claude_bin="claude",
+            fallback_model=None,
+            model="claude-fable-5",
+        )
+        results = iter(
+            [
+                subprocess.CompletedProcess([], 0, "2.1.207 (Claude Code)", ""),
+                subprocess.CompletedProcess([], 1, "", "unknown option --safe-mode"),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            with mock.patch.dict(
+                self.helper["ensure_claude_isolation_supported"].__globals__,
+                {
+                    "resolve_command": lambda *_args: "/usr/bin/claude",
+                    "safe_engine_env": lambda *_args, **_kwargs: {},
+                    "safe_temp_root": lambda _repo: Path(tempdir),
+                    "run": lambda *_args, **_kwargs: next(results),
+                },
+            ), self.assertRaisesRegex(
+                SystemExit,
+                "isolation flags rejected by capability probe",
+            ):
+                self.helper["ensure_claude_isolation_supported"](args, repo)
+
     def test_claude_runs_outside_repo_with_auto_memory_disabled(self) -> None:
         args = argparse.Namespace(
             claude_allowed_tools=None,

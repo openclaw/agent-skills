@@ -9529,13 +9529,25 @@ def ensure_claude_isolation_supported(args: argparse.Namespace, repo: Path) -> N
             f"claude engine requires Claude Code >= {format_version(minimum_version)} "
             f"{version_reason} (found {format_version(version)})"
         )
-    help_result = run([claude_bin, "--help"], temp_root, check=False, env=engine_env)
-    help_text = f"{help_result.stdout}\n{help_result.stderr}"
-    required_flags = ["--safe-mode", "--setting-sources", "--strict-mcp-config", "--disallowedTools", "--tools"]
-    missing = [flag for flag in required_flags if flag not in help_text]
-    if help_result.returncode != 0 or missing:
-        detail = ", ".join(missing) if missing else "--help failed"
-        raise SystemExit(f"claude engine requires Claude Code isolation flags missing from --help: {detail}")
+    isolation_probe = run(
+        [
+            claude_bin,
+            *claude_review_isolation_flags(),
+            "--tools",
+            "",
+            "--version",
+        ],
+        temp_root,
+        check=False,
+        env=engine_env,
+    )
+    if isolation_probe.returncode != 0:
+        detail = (isolation_probe.stderr or isolation_probe.stdout).strip()
+        suffix = f": {detail}" if detail else ""
+        raise SystemExit(
+            "claude engine requires Claude Code isolation flags rejected by capability probe"
+            f"{suffix}"
+        )
 
 
 def ensure_pi_isolation_supported(args: argparse.Namespace, repo: Path) -> str:
