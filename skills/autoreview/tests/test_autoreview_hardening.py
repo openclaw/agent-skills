@@ -126,9 +126,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ):
                 bundle, truncated = self.helper["local_bundle"](repo)
 
+            expected_record = json.dumps("review me" + os.linesep)
             self.assertIn(
                 '# Untracked File\npath: "notes.txt"\n'
-                'source-line 1: "review me\\n"',
+                f"source-line 1: {expected_record}",
                 bundle,
             )
             self.assertFalse(truncated)
