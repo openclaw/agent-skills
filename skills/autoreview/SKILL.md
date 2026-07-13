@@ -189,6 +189,44 @@ clean `main` against `origin/main` is usually an empty diff after push. For a
 small stack, review each commit explicitly or review the branch before merging
 with `--base`.
 
+## Oversized Bundle Recovery
+
+When a branch diff exceeds the bundle limit, preserve the full real-code review
+surface and remove only machine-generated noise:
+
+1. Set `REVIEW_BASE` to the exact ref passed to `--base` in the failed review.
+   Record the delivery head and merge base, then classify generated paths with
+   an explicit merge-base-aware range:
+
+   ```bash
+   delivery_head=$(git rev-parse HEAD)
+   review_base=${REVIEW_BASE:?set REVIEW_BASE to the exact ref passed to --base}
+   merge_base=$(git merge-base "$review_base" "$delivery_head")
+   git diff --name-status "$merge_base" "$delivery_head"
+   ```
+
+2. Neutralize only paths the repository declares non-authoritative and
+   non-shipping. Verify the candidate against the delivery-head artifact by exact
+   comparison or the repository's semantic verifier in trusted CI or a
+   credential-free sandbox. Never execute unreviewed delivery-head generator
+   code on the host. Any executable verification chain must come from the merge
+   base or another trusted toolchain, or be reviewed separately before it runs.
+3. Reproducibility alone does not make an artifact noise. Lockfiles, generated
+   clients, policies, manifests, schemas, and every independently semantic
+   artifact remain in review scope. When their raw representation is too large,
+   provide a compact semantic diff or dataset that preserves the complete change.
+4. On a throwaway branch or worktree from `delivery_head`, restore verified
+   base-existing noise to its merge-base version and use `git rm` only for
+   verified noise added by the branch. Leave every genuine or unresolved change
+   untouched, commit the neutralization, and review against `review_base`.
+5. If genuine code still exceeds the limit, subtree passes are diagnostic and
+   partial only. Keep the merge gate blocked until the actual delivery change is
+   reduced or split into integrated branches or PRs that each fit the limit and
+   receive a complete review.
+
+Keep the delivery branch intact. Neutralization changes only the review surface,
+not the change that will ship.
+
 ## Parallel Closeout
 
 Format first if formatting can change line locations. Then it is OK to run tests and review in parallel:
