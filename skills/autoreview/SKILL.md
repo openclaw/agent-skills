@@ -197,7 +197,8 @@ are split at bundle sections and file boundaries where possible; an oversized
 single-file block is split at line boundaries with repeated file/hunk context
 and an absolute new- or old-file line offset. Untracked snapshots use
 injection-safe source-line records so continuation passes retain reportable
-locations.
+locations. A single physical diff line split across passes also retains its
+original addition, deletion, or context marker.
 Every original bundle byte appears exactly once across the pass sequence, and
 all validated reports are merged before required-finding and exit-status checks.
 The helper caps one run at eight bounded passes so an unexpectedly huge branch

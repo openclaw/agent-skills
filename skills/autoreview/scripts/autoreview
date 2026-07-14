@@ -5914,6 +5914,7 @@ def review_chunk_context(
     next_old_line: int | None,
     *,
     continued_line: bool = False,
+    diff_line_marker: str | None = None,
 ) -> str:
     lines = compact_review_chunk_context(context)
     if context and context[0] == "# Untracked File\n" and next_new_line is not None:
@@ -5926,7 +5927,13 @@ def review_chunk_context(
             "use this positive line for deleted content.]\n"
         )
     if continued_line:
-        lines.append("[The change content below continues the preceding long line.]\n")
+        if diff_line_marker:
+            lines.append(
+                "[The change content below continues a unified-diff line whose "
+                f"original marker is `{diff_line_marker}`.]\n"
+            )
+        else:
+            lines.append("[The change content below continues the preceding long line.]\n")
     text = "".join(lines)
     if utf8_size(text) > MAX_REVIEW_CHUNK_CONTEXT_BYTES:
         raise SystemExit(
@@ -5963,6 +5970,7 @@ def split_oversized_review_unit(
 
     for line in literal_lf_lines(unit):
         line_bytes = utf8_size(line)
+        diff_line_marker = line[0] if in_hunk and line.startswith(("+", "-", " ")) else None
         untracked_source_line = None
         if context and context[0] == "# Untracked File\n":
             match = re.match(r"^source-line (\d+): ", line)
@@ -5991,6 +5999,7 @@ def split_oversized_review_unit(
                         untracked_source_line or next_new_line,
                         next_old_line,
                         continued_line=True,
+                        diff_line_marker=diff_line_marker,
                     )
                     chunks.extend(
                         ReviewChunk(fragment, continued_context)
@@ -6024,6 +6033,7 @@ def split_oversized_review_unit(
                             untracked_source_line or next_new_line,
                             next_old_line,
                             continued_line=index > 0,
+                            diff_line_marker=diff_line_marker,
                         ),
                     )
                 )

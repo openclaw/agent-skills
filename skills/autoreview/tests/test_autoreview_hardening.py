@@ -499,6 +499,27 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertTrue(any("@@ -1 +1 @@\n" in chunk.content for chunk in chunks))
         self.assertEqual("".join(chunk.content for chunk in chunks), unit)
 
+    def test_long_diff_line_continuations_keep_their_original_marker(self) -> None:
+        for marker in ("+", "-", " "):
+            with self.subTest(marker=marker):
+                unit = (
+                    "diff --git a/large.txt b/large.txt\n"
+                    "--- a/large.txt\n"
+                    "+++ b/large.txt\n"
+                    "@@ -1 +1 @@\n"
+                    f"{marker}{'x' * 400}\n"
+                )
+
+                chunks = self.helper["split_oversized_review_unit"](unit, 140)
+
+                self.assertTrue(
+                    any(
+                        f"original marker is `{marker}`" in chunk.context
+                        for chunk in chunks[1:]
+                    )
+                )
+                self.assertEqual("".join(chunk.content for chunk in chunks), unit)
+
     def test_untracked_continuation_context_keeps_source_line(self) -> None:
         unit = (
             "# Untracked File\n"
