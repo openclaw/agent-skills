@@ -4946,6 +4946,72 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertNotIn("shell", observed[2])
         self.assertNotIn("shell", observed[3])
 
+    def test_claude_subscription_auth_ignores_provider_environment(self) -> None:
+        old = os.environ.copy()
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            try:
+                os.environ["ANTHROPIC_API_KEY"] = "test-api-key"
+                os.environ["ANTHROPIC_AUTH_TOKEN"] = "test-auth-token"
+                os.environ["ANTHROPIC_BASE_URL"] = "https://api.example.invalid"
+                os.environ["CLAUDE_CODE_USE_BEDROCK"] = "1"
+                os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "test-oauth-token"
+
+                subscription = self.helper["claude_engine_env"](
+                    argparse.Namespace(claude_auth="subscription"),
+                    repo,
+                )
+                default = self.helper["claude_engine_env"](
+                    argparse.Namespace(claude_auth="default"),
+                    repo,
+                )
+
+                for key in (
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_AUTH_TOKEN",
+                    "ANTHROPIC_BASE_URL",
+                    "CLAUDE_CODE_USE_BEDROCK",
+                ):
+                    self.assertNotIn(key, subscription)
+                self.assertEqual(
+                    subscription["CLAUDE_CODE_OAUTH_TOKEN"],
+                    "test-oauth-token",
+                )
+                self.assertEqual(
+                    subscription["CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"],
+                    "1",
+                )
+                self.assertEqual(default["ANTHROPIC_API_KEY"], "test-api-key")
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
+    def test_claude_refusal_fallback_is_detected(self) -> None:
+        output = json.dumps(
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "fallback",
+                                "from": {"model": "claude-fable-5"},
+                                "to": {"model": "claude-opus-4-8"},
+                            }
+                        ]
+                    },
+                },
+                {"type": "system", "subtype": "model_refusal_fallback"},
+            ]
+        )
+
+        self.assertTrue(self.helper["claude_refusal_fallback_detected"](output))
+        self.assertFalse(
+            self.helper["claude_refusal_fallback_detected"](
+                json.dumps([{"type": "result", "subtype": "success"}])
+            )
+        )
+
     def test_parallel_test_finish_does_not_wait_for_inherited_stderr_pipe(
         self,
     ) -> None:

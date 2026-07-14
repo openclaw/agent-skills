@@ -807,6 +807,30 @@ SAFE_CODEX_PROFILE_SCALAR_KEYS = {
     "model_reasoning_effort",
     "service_tier",
 }
+CLAUDE_SUBSCRIPTION_ENV_EXCLUDES = {
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_AWS_API_KEY",
+    "ANTHROPIC_AWS_BASE_URL",
+    "ANTHROPIC_AWS_WORKSPACE_ID",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_VERTEX",
+}
 CLAUDE_SAFE_MODE_MIN_VERSION = (2, 1, 169)
 CLAUDE_FABLE_MIN_VERSION = (2, 1, 170)
 CLAUDE_ISOLATION_PROBE_CONTROL_FLAG = "--autoreview-invalid-control"
@@ -9624,12 +9648,38 @@ def parse_cli_version(text: str) -> tuple[int, int, int] | None:
     return tuple(int(part) for part in match.groups())
 
 
+def claude_auth_mode(args: argparse.Namespace) -> str:
+    mode = (getattr(args, "claude_auth", None) or "default").strip().lower()
+    if mode not in {"default", "subscription"}:
+        raise SystemExit(
+            f"invalid Claude auth mode: {mode!r} (valid: default, subscription)"
+        )
+    return mode
+
+
+def claude_engine_env(
+    args: argparse.Namespace,
+    repo: Path,
+    extra_paths: list[Path] | None = None,
+) -> dict[str, str]:
+    env = safe_engine_env(
+        repo,
+        extra_paths,
+        engine="claude",
+        extra={"CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1"},
+    )
+    if claude_auth_mode(args) == "subscription":
+        for key in CLAUDE_SUBSCRIPTION_ENV_EXCLUDES:
+            env.pop(key, None)
+    return env
+
+
 def ensure_claude_isolation_supported(args: argparse.Namespace, repo: Path) -> None:
     claude_bin = resolve_command(args.claude_bin, repo)
-    engine_env = safe_engine_env(
+    engine_env = claude_engine_env(
+        args,
         repo,
         [Path(claude_bin).parent],
-        engine="claude",
     )
     temp_root = safe_temp_root(repo)
     result = run([claude_bin, "--version"], temp_root, check=False, env=engine_env)
@@ -10033,6 +10083,35 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     raise AssertionError("unreachable")
 
 
+def claude_refusal_fallback_detected(output: str) -> bool:
+    try:
+        parsed = json.loads(output)
+        events = parsed if isinstance(parsed, list) else [parsed]
+    except json.JSONDecodeError:
+        events = []
+        for line in output.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            events.extend(event if isinstance(event, list) else [event])
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("subtype") == "model_refusal_fallback":
+            return True
+        message = event.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(item, dict) and item.get("type") == "fallback"
+            for item in content
+        ):
+            return True
+    return False
+
+
 def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     ensure_claude_isolation_supported(args, repo)
     cmd = [
@@ -10069,15 +10148,20 @@ def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             label="claude",
             stream_output=args.stream_engine_output,
             stream_display=ClaudeStreamDisplay() if args.stream_engine_output else None,
-            env=safe_engine_env(
+            env=claude_engine_env(
+                args,
                 repo,
                 [Path(cmd[0]).parent],
-                engine="claude",
             ),
             resolve_root=repo,
         )
     if result.returncode != 0:
         raise SystemExit(f"claude engine failed ({result.returncode})\n{result.stderr or result.stdout}")
+    if claude_refusal_fallback_detected(result.stdout):
+        raise SystemExit(
+            "claude engine refused the requested model and switched models; "
+            "autoreview requires the selected reviewer model to answer"
+        )
     return result.stdout
 
 
@@ -11842,6 +11926,12 @@ def parse_args() -> argparse.Namespace:
         help="Do not pass --output-schema to codex exec; rely on the prompt-embedded schema and parse JSON from the final message. Auto-enabled for non-OpenAI providers (e.g. model_provider=amazon-bedrock), which hang when a strict schema runs with tool calls (openai/codex#15451). Env default: AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA.",
     )
     parser.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
+    parser.add_argument(
+        "--claude-auth",
+        choices=["default", "subscription"],
+        default=os.environ.get("AUTOREVIEW_CLAUDE_AUTH", "default"),
+        help="Claude authentication source: default preserves provider env; subscription ignores API/provider routing env and uses Claude Code login. Env default: AUTOREVIEW_CLAUDE_AUTH.",
+    )
     parser.add_argument("--droid-bin", default=os.environ.get("DROID_BIN", "droid"))
     parser.add_argument("--copilot-bin", default=os.environ.get("COPILOT_BIN", "copilot"))
     parser.add_argument(
@@ -12025,6 +12115,7 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
 
     selected_engines = {engine for engine, _, _ in reviewers}
     codex_profile = codex_profile_name(args)
+    claude_auth = claude_auth_mode(args)
     fallback_engines = set(fallback_by_engine) | set(env_fallback_by_engine)
     unused_fallback_engines = fallback_engines - selected_engines
     if unused_fallback_engines:
@@ -12042,6 +12133,8 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
         raise SystemExit("--codex-speed is only supported for codex; no codex reviewer selected")
     if codex_profile is not None and "codex" not in selected_engines:
         raise SystemExit("--codex-profile is only supported for codex; no codex reviewer selected")
+    if claude_auth != "default" and "claude" not in selected_engines:
+        raise SystemExit("--claude-auth is only supported for claude; no claude reviewer selected")
 
     seen: set[str] = set()
     result: list[argparse.Namespace] = []
@@ -12243,6 +12336,7 @@ def reviewer_test_args(**overrides: Any) -> argparse.Namespace:
         "codex_speed": None,
         "codex_profile": None,
         "codex_no_output_schema": False,
+        "claude_auth": "default",
         "tools": True,
     }
     defaults.update(overrides)
@@ -12276,6 +12370,7 @@ def self_test_config_defaults() -> None:
         "AUTOREVIEW_CODEX_CONFIG",
         "AUTOREVIEW_CODEX_SPEED",
         "AUTOREVIEW_CODEX_PROFILE",
+        "AUTOREVIEW_CLAUDE_AUTH",
         *(
             f"AUTOREVIEW_{engine.upper()}_{suffix}"
             for engine in ENGINES
@@ -12307,6 +12402,17 @@ def self_test_config_defaults() -> None:
             raise SystemExit(f"self-test config defaults failed: default claude model={default_claude.model!r}")
         if default_claude.thinking != "max":
             raise SystemExit(f"self-test config defaults failed: default claude thinking={default_claude.thinking!r}")
+        subscription_claude = reviewer_args(
+            reviewer_test_args(engine="claude", claude_auth="subscription")
+        )[0]
+        if subscription_claude.claude_auth != "subscription":
+            raise SystemExit("self-test config defaults failed: Claude subscription auth was not preserved")
+        try:
+            reviewer_args(reviewer_test_args(engine="codex", claude_auth="subscription"))
+            raise SystemExit("self-test config defaults failed: --claude-auth accepted without Claude reviewer")
+        except SystemExit as error:
+            if "only supported for claude" not in str(error):
+                raise
         bedrock = reviewer_args(reviewer_test_args(engine="codex", codex_profile="bedrock"))[0]
         if bedrock.model is not None or bedrock.thinking is not None or bedrock.fallback_model is not None:
             raise SystemExit("self-test config defaults failed: Codex profile should own model defaults")
