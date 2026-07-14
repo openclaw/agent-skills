@@ -9655,6 +9655,27 @@ def codex_exec_isolation_flags(*, load_runtime_profile: bool = False) -> list[st
     return flags
 
 
+def codex_profile_tool_isolation_flags(profile: str | None) -> list[str]:
+    if profile is None:
+        return []
+    # Bedrock credentials must remain available to Codex's provider client but
+    # inaccessible to model-controlled process tools. Disable every execution
+    # path that could inspect the reviewer process environment; the validated
+    # review bundle and server-side web search remain available to the model.
+    return [
+        "-c",
+        "features.shell_tool=false",
+        "-c",
+        "features.code_mode=false",
+        "-c",
+        "features.code_mode_only=false",
+        "-c",
+        "features.multi_agent=false",
+        "-c",
+        "features.enable_fanout=false",
+    ]
+
+
 def claude_review_isolation_flags(
     args: argparse.Namespace | None = None,
 ) -> list[str]:
@@ -9981,6 +10002,7 @@ def codex_command(
     cmd.extend(codex_auth_config_flags(source_repo, force_file=force_file_auth))
     profile = codex_profile_name(args)
     if profile is not None:
+        cmd.extend(codex_profile_tool_isolation_flags(profile))
         cmd.extend(["--profile", profile])
     cmd.append("exec")
     if args.stream_engine_output:
@@ -12325,7 +12347,7 @@ def reviewer_label(args: argparse.Namespace) -> str:
         parts.append(f"model={model}")
     if actual_model:
         parts.append(f"refusal-fallback-from={args.model}")
-    if getattr(args, "fallback_model", None):
+    if not actual_model and getattr(args, "fallback_model", None):
         parts.append(f"fallback={args.fallback_model}")
     thinking = getattr(args, "actual_thinking", None) or args.thinking
     if thinking:

@@ -880,6 +880,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertLess(profile_index, command.index("exec"))
         self.assertNotIn("--ignore-user-config", command)
         self.assertIn("--ignore-rules", command)
+        for override in (
+            "features.shell_tool=false",
+            "features.code_mode=false",
+            "features.code_mode_only=false",
+            "features.multi_agent=false",
+            "features.enable_fanout=false",
+        ):
+            self.assertIn(override, command)
         self.assertNotIn("--output-schema", command)
 
     def test_codex_command_ignores_user_config_without_profile(self) -> None:
@@ -910,6 +918,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 )
 
         self.assertIn("--ignore-user-config", command)
+        self.assertNotIn("features.shell_tool=false", command)
 
     def test_codex_bedrock_credentials_require_a_profile(self) -> None:
         old = os.environ.copy()
@@ -5209,6 +5218,58 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertEqual(invoked_thinking, ["max", "max", "max"])
         self.assertEqual(args.actual_model, "claude-opus-4-8")
         self.assertEqual(args.actual_thinking, "max")
+
+    def test_claude_retries_fable_once_without_opus_when_retry_succeeds(self) -> None:
+        refusal = subprocess.CompletedProcess(
+            args=["claude"],
+            returncode=1,
+            stdout=json.dumps(
+                [{"type": "system", "subtype": "model_refusal_no_fallback"}]
+            ),
+            stderr="",
+        )
+        success = subprocess.CompletedProcess(
+            args=["claude"],
+            returncode=0,
+            stdout=json.dumps([{"type": "result", "subtype": "success"}]),
+            stderr="",
+        )
+        args = argparse.Namespace(model="claude-fable-5", thinking="max")
+        run_once = mock.Mock(side_effect=[refusal, success])
+
+        with mock.patch.dict(
+            self.helper["run_claude"].__globals__,
+            {
+                "ensure_claude_isolation_supported": lambda *_args: None,
+                "run_claude_once": run_once,
+            },
+        ):
+            output = self.helper["run_claude"](args, Path("/repo"), "review")
+
+        self.assertEqual(output, success.stdout)
+        self.assertEqual(run_once.call_count, 2)
+        self.assertEqual(
+            [call.args[0].model for call in run_once.call_args_list],
+            ["claude-fable-5", "claude-fable-5"],
+        )
+        self.assertIsNone(args.actual_model)
+        self.assertIsNone(args.actual_thinking)
+
+    def test_reviewer_label_reports_only_effective_refusal_fallback(self) -> None:
+        args = argparse.Namespace(
+            engine="claude",
+            model="claude-fable-5",
+            thinking="max",
+            fallback_model="claude-opus-4-8,claude-sonnet-4-6",
+            actual_model="claude-opus-4-8",
+            actual_thinking="max",
+        )
+
+        label = self.helper["reviewer_label"](args)
+
+        self.assertIn("model=claude-opus-4-8", label)
+        self.assertIn("refusal-fallback-from=claude-fable-5", label)
+        self.assertNotIn("fallback=", label)
 
     def test_parallel_test_finish_does_not_wait_for_inherited_stderr_pipe(
         self,
