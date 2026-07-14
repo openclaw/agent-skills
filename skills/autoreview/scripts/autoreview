@@ -789,6 +789,7 @@ DEFAULT_MODEL_BY_ENGINE = {
 DEFAULT_CODEX_ACCESS_FALLBACK_MODEL = "gpt-5.6-terra"
 DEFAULT_THINKING_BY_ENGINE = {
     "codex": "high",
+    "claude": "max",
 }
 THINKING_LEVELS_BY_ENGINE = {
     "codex": {"none", "minimal", "low", "medium", "high", "xhigh", "max"},
@@ -798,6 +799,13 @@ THINKING_LEVELS_BY_ENGINE = {
     "pi": {"off", "minimal", "low", "medium", "high", "xhigh"},
     "opencode": {"minimal", "low", "medium", "high", "max"},
     "cursor": set(),
+}
+CODEX_PROFILE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+SAFE_CODEX_PROFILE_SCALAR_KEYS = {
+    "model",
+    "model_provider",
+    "model_reasoning_effort",
+    "service_tier",
 }
 CLAUDE_SAFE_MODE_MIN_VERSION = (2, 1, 169)
 CLAUDE_FABLE_MIN_VERSION = (2, 1, 170)
@@ -1134,6 +1142,13 @@ def safe_engine_env(
         "no_proxy",
     }
     codex_allowed_exact = {
+        "AWS_ACCESS_KEY_ID",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_DEFAULT_REGION",
+        "AWS_PROFILE",
+        "AWS_REGION",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
         "AZURE_OPENAI_API_KEY",
         "AZURE_OPENAI_ENDPOINT",
         "CODEX_API_KEY",
@@ -9400,6 +9415,105 @@ def codex_source_home(repo: Path) -> Path | None:
     )
 
 
+def codex_profile_name(args: argparse.Namespace) -> str | None:
+    raw = (getattr(args, "codex_profile", None) or "").strip()
+    if not raw:
+        return None
+    if not CODEX_PROFILE_NAME_PATTERN.fullmatch(raw):
+        raise SystemExit(
+            f"invalid Codex profile: {raw!r}; use letters, numbers, hyphens, or underscores"
+        )
+    return raw
+
+
+def prepare_codex_runtime_profile(
+    args: argparse.Namespace,
+    repo: Path,
+    runtime_codex_home: Path,
+) -> bool:
+    """Stage a capability-free Bedrock profile into the isolated Codex home."""
+    profile = codex_profile_name(args)
+    if profile is None:
+        return False
+    source_home = codex_source_home(repo)
+    if source_home is None:
+        raise SystemExit(f"Codex profile {profile!r} requires an external CODEX_HOME")
+    source_path = source_home / f"{profile}.config.toml"
+    try:
+        resolved_source = source_path.resolve(strict=True)
+    except OSError as exc:
+        raise SystemExit(f"Codex profile not found: {source_path}") from exc
+    if not resolved_source.is_file() or not external_env_path(
+        repo,
+        str(resolved_source),
+    ):
+        raise SystemExit(
+            "Codex profile must be a file outside the reviewed repository: "
+            f"{source_path}"
+        )
+    config = load_codex_auth_config(resolved_source)
+    provider = config.get("model_provider")
+    if provider != "amazon-bedrock":
+        raise SystemExit(
+            f"Codex profile {profile!r} uses unsupported model_provider={provider!r}; "
+            "autoreview profiles currently support amazon-bedrock only"
+        )
+
+    safe_scalars: dict[str, str] = {}
+    for key in SAFE_CODEX_PROFILE_SCALAR_KEYS:
+        value = config.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise SystemExit(f"Codex profile {profile!r} has invalid {key}")
+        safe_scalars[key] = value.strip()
+    if "model" not in safe_scalars:
+        raise SystemExit(f"Codex profile {profile!r} must select a model")
+    effort = safe_scalars.get("model_reasoning_effort")
+    if effort is not None and effort not in THINKING_LEVELS_BY_ENGINE["codex"]:
+        raise SystemExit(
+            f"Codex profile {profile!r} has invalid "
+            f"model_reasoning_effort={effort!r}"
+        )
+    service_tier = safe_scalars.get("service_tier")
+    if service_tier is not None and service_tier not in {"fast", "flex", "default"}:
+        raise SystemExit(f"Codex profile {profile!r} has invalid service_tier={service_tier!r}")
+
+    aws: dict[str, str] = {}
+    providers = config.get("model_providers")
+    if isinstance(providers, dict):
+        bedrock = providers.get("amazon-bedrock")
+        if isinstance(bedrock, dict) and isinstance(bedrock.get("aws"), dict):
+            for key in ("profile", "region"):
+                value = bedrock["aws"].get(key)
+                if value is None:
+                    continue
+                if not isinstance(value, str) or not value.strip():
+                    raise SystemExit(
+                        f"Codex profile {profile!r} has invalid "
+                        f"amazon-bedrock.aws.{key}"
+                    )
+                aws[key] = value.strip()
+
+    lines = [
+        f"{key} = {json.dumps(safe_scalars[key])}"
+        for key in ("model", "model_provider", "model_reasoning_effort", "service_tier")
+        if key in safe_scalars
+    ]
+    if aws:
+        lines.extend(["", "[model_providers.amazon-bedrock.aws]"])
+        lines.extend(
+            f"{key} = {json.dumps(aws[key])}"
+            for key in ("profile", "region")
+            if key in aws
+        )
+    runtime_codex_home.mkdir(parents=True, exist_ok=True)
+    runtime_profile = runtime_codex_home / f"{profile}.config.toml"
+    runtime_profile.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    runtime_profile.chmod(0o600)
+    return True
+
+
 def codex_auth_config_flags(repo: Path, *, force_file: bool = False) -> list[str]:
     codex_home = codex_source_home(repo)
     if codex_home is None:
@@ -9674,17 +9788,7 @@ def codex_speed_override(args: argparse.Namespace) -> str | None:
 
 def codex_uses_non_openai_provider(args: argparse.Namespace) -> bool:
     """Return whether Codex is routed through a known non-OpenAI provider."""
-    profile = (getattr(args, "codex_profile", None) or "").strip().lower()
-    if profile == "bedrock":
-        return True
-    for override in codex_config_overrides(args):
-        key, _, value = override.partition("=")
-        if key.strip() != "model_provider":
-            continue
-        provider = value.strip().strip('"').strip("'").lower()
-        if provider and provider != "openai":
-            return True
-    return False
+    return codex_profile_name(args) is not None
 
 
 def codex_use_output_schema(args: argparse.Namespace) -> bool:
@@ -9778,6 +9882,9 @@ def codex_command(
         cmd.extend(["-c", speed_override])
     cmd.extend(codex_config_isolation_flags(review_root, runtime_root))
     cmd.extend(codex_auth_config_flags(source_repo, force_file=force_file_auth))
+    profile = codex_profile_name(args)
+    if profile is not None:
+        cmd.extend(["--profile", profile])
     cmd.append("exec")
     if args.stream_engine_output:
         cmd.append("--json")
@@ -9852,10 +9959,11 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             ):
                 path.mkdir(parents=True, exist_ok=True)
             file_auth_linked = prepare_codex_runtime_auth(repo, runtime_codex_home)
+            profile_staged = prepare_codex_runtime_profile(args, repo, runtime_codex_home)
             source_codex_home = codex_source_home(repo)
             active_codex_home = (
                 runtime_codex_home
-                if file_auth_linked or source_codex_home is None
+                if file_auth_linked or profile_staged or source_codex_home is None
                 else source_codex_home
             )
             for index, model in enumerate(models):
@@ -11694,12 +11802,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base")
     parser.add_argument("--commit", default="HEAD")
     parser.add_argument("--engine", choices=ENGINE_CHOICES, default=os.environ.get("AUTOREVIEW_ENGINE", "codex"))
-    parser.add_argument("--reviewers", help="Comma-separated review panel, e.g. codex,claude,pi or codex:gpt-5.6-sol:high.")
+    parser.add_argument(
+        "--reviewers",
+        default=os.environ.get("AUTOREVIEW_REVIEWERS", "").strip() or None,
+        help="Comma-separated review panel, e.g. codex,claude,pi or codex:gpt-5.6-sol:high. Env default: AUTOREVIEW_REVIEWERS.",
+    )
     parser.add_argument("--panel", action="store_true", help="Run a Codex/Claude review panel unless --engine changes the first reviewer.")
     parser.add_argument(
         "--model",
         action="append",
-        help="Model for all reviewers or engine=model. Repeatable. Defaults: codex=gpt-5.6-sol with an access-only gpt-5.6-terra retry, claude=claude-fable-5.",
+        help="Model for all reviewers or engine=model. Repeatable. Defaults: codex=gpt-5.6-sol/high with an access-only gpt-5.6-terra retry, claude=claude-fable-5/max.",
     )
     parser.add_argument("--thinking", action="append", help="Thinking/effort for all reviewers or engine=level. Repeatable. Codex: none, minimal, low, medium, high, xhigh, max. Claude: low, medium, high, xhigh, max. Droid: off, none, low, medium, high. Pi: off, minimal, low, medium, high, xhigh. OpenCode: minimal, low, medium, high, max. Cursor: none.")
     parser.add_argument(
@@ -11718,6 +11830,11 @@ def parse_args() -> argparse.Namespace:
         "--codex-speed",
         choices=["fast", "flex", "default"],
         help="Codex service tier: fast (priority processing), flex, or default. Env default: AUTOREVIEW_CODEX_SPEED. Silently standard when the model catalog does not list the tier.",
+    )
+    parser.add_argument(
+        "--codex-profile",
+        default=os.environ.get("AUTOREVIEW_CODEX_PROFILE", "").strip() or None,
+        help="Codex profile to stage into the isolated reviewer runtime. Currently supports amazon-bedrock profiles. Env default: AUTOREVIEW_CODEX_PROFILE.",
     )
     parser.add_argument(
         "--codex-no-output-schema",
@@ -11907,6 +12024,7 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
         reviewers = [(args.engine, None, None)]
 
     selected_engines = {engine for engine, _, _ in reviewers}
+    codex_profile = codex_profile_name(args)
     fallback_engines = set(fallback_by_engine) | set(env_fallback_by_engine)
     unused_fallback_engines = fallback_engines - selected_engines
     if unused_fallback_engines:
@@ -11922,6 +12040,8 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
         raise SystemExit("--codex-config is only supported for codex; no codex reviewer selected")
     if getattr(args, "codex_speed", None) and "codex" not in selected_engines:
         raise SystemExit("--codex-speed is only supported for codex; no codex reviewer selected")
+    if codex_profile is not None and "codex" not in selected_engines:
+        raise SystemExit("--codex-profile is only supported for codex; no codex reviewer selected")
 
     seen: set[str] = set()
     result: list[argparse.Namespace] = []
@@ -11935,7 +12055,11 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
             or global_model
             or env_model_by_engine.get(engine)
             or env_global_model
-            or DEFAULT_MODEL_BY_ENGINE.get(engine)
+            or (
+                None
+                if engine == "codex" and codex_profile is not None
+                else DEFAULT_MODEL_BY_ENGINE.get(engine)
+            )
         )
         thinking = (
             inline_thinking
@@ -11943,7 +12067,11 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
             or global_thinking
             or env_thinking_by_engine.get(engine)
             or env_global_thinking
-            or DEFAULT_THINKING_BY_ENGINE.get(engine)
+            or (
+                None
+                if engine == "codex" and codex_profile is not None
+                else DEFAULT_THINKING_BY_ENGINE.get(engine)
+            )
         )
         if engine == "claude":
             fallback_model = (
@@ -11952,7 +12080,7 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
                 or env_fallback_by_engine.get(engine)
                 or env_global_fallback
             )
-        elif engine == "codex" and model == DEFAULT_MODEL_BY_ENGINE["codex"]:
+        elif engine == "codex" and codex_profile is None and model == DEFAULT_MODEL_BY_ENGINE["codex"]:
             fallback_model = DEFAULT_CODEX_ACCESS_FALLBACK_MODEL
         else:
             fallback_model = None
@@ -11971,6 +12099,9 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
 
 def reviewer_label(args: argparse.Namespace) -> str:
     parts = [args.engine]
+    profile = codex_profile_name(args) if args.engine == "codex" else None
+    if profile is not None:
+        parts.append(f"profile={profile}")
     if args.model:
         parts.append(f"model={args.model}")
     if getattr(args, "fallback_model", None):
@@ -12110,6 +12241,7 @@ def reviewer_test_args(**overrides: Any) -> argparse.Namespace:
         "fallback_model": None,
         "codex_config": None,
         "codex_speed": None,
+        "codex_profile": None,
         "codex_no_output_schema": False,
         "tools": True,
     }
@@ -12143,6 +12275,7 @@ def self_test_config_defaults() -> None:
         "AUTOREVIEW_FALLBACK_MODEL",
         "AUTOREVIEW_CODEX_CONFIG",
         "AUTOREVIEW_CODEX_SPEED",
+        "AUTOREVIEW_CODEX_PROFILE",
         *(
             f"AUTOREVIEW_{engine.upper()}_{suffix}"
             for engine in ENGINES
@@ -12172,6 +12305,21 @@ def self_test_config_defaults() -> None:
         default_claude = reviewer_args(reviewer_test_args(engine="claude"))[0]
         if default_claude.model != "claude-fable-5":
             raise SystemExit(f"self-test config defaults failed: default claude model={default_claude.model!r}")
+        if default_claude.thinking != "max":
+            raise SystemExit(f"self-test config defaults failed: default claude thinking={default_claude.thinking!r}")
+        bedrock = reviewer_args(reviewer_test_args(engine="codex", codex_profile="bedrock"))[0]
+        if bedrock.model is not None or bedrock.thinking is not None or bedrock.fallback_model is not None:
+            raise SystemExit("self-test config defaults failed: Codex profile should own model defaults")
+        bedrock_override = reviewer_args(
+            reviewer_test_args(
+                engine="codex",
+                codex_profile="bedrock",
+                model=["explicit-model"],
+                thinking=["xhigh"],
+            )
+        )[0]
+        if bedrock_override.model != "explicit-model" or bedrock_override.thinking != "xhigh":
+            raise SystemExit("self-test config defaults failed: CLI should override Codex profile defaults")
         os.environ["AUTOREVIEW_MODEL"] = "env-global-model"
         os.environ["AUTOREVIEW_CODEX_MODEL"] = "env-codex-model"
         os.environ["AUTOREVIEW_THINKING"] = "low"
@@ -12259,23 +12407,16 @@ def self_test_config_defaults() -> None:
             if "only supported for codex" not in str(error):
                 raise
     # codex --output-schema opt-out: on by default; explicit flag / env / a
-    # non-OpenAI model_provider (e.g. amazon-bedrock, which deadlocks on
+    # non-OpenAI profile (e.g. amazon-bedrock, which deadlocks on
     # schema+tools per openai/codex#15451) all disable it.
     with preserve_env(["AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA"]):
         if not codex_use_output_schema(reviewer_test_args(engine="codex")):
             raise SystemExit("self-test config defaults failed: output-schema should default ON for codex")
         if codex_use_output_schema(reviewer_test_args(engine="codex", codex_no_output_schema=True)):
             raise SystemExit("self-test config defaults failed: --codex-no-output-schema should disable output-schema")
-        bedrock = reviewer_test_args(
-            engine="codex", codex_config=['model_provider="amazon-bedrock"']
-        )
+        bedrock = reviewer_test_args(engine="codex", codex_profile="bedrock")
         if codex_use_output_schema(bedrock):
             raise SystemExit("self-test config defaults failed: non-OpenAI provider should auto-disable output-schema")
-        openai_provider = reviewer_test_args(
-            engine="codex", codex_config=['model_provider="openai"']
-        )
-        if not codex_use_output_schema(openai_provider):
-            raise SystemExit("self-test config defaults failed: explicit openai provider should keep output-schema ON")
         os.environ["AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA"] = "1"
         if codex_use_output_schema(reviewer_test_args(engine="codex")):
             raise SystemExit("self-test config defaults failed: AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA=1 should disable output-schema")

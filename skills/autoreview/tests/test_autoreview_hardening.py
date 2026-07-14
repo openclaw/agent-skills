@@ -847,6 +847,39 @@ class AutoreviewHardeningTests(unittest.TestCase):
             args.codex_config,
         )
 
+    def test_codex_command_selects_profile_and_drops_strict_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            runtime = root / "runtime"
+            with mock.patch.dict(
+                self.helper["codex_command"].__globals__,
+                {"resolve_command": lambda *_args: "/usr/bin/codex"},
+            ):
+                command = self.helper["codex_command"](
+                    argparse.Namespace(
+                        codex_bin="codex",
+                        web_search=False,
+                        codex_config=None,
+                        thinking=None,
+                        codex_speed=None,
+                        codex_profile="bedrock",
+                        codex_no_output_schema=False,
+                        stream_engine_output=False,
+                    ),
+                    repo,
+                    root / "review",
+                    runtime,
+                    root / "schema.json",
+                    root / "output.json",
+                    None,
+                )
+
+        profile_index = command.index("--profile")
+        self.assertEqual(command[profile_index + 1], "bedrock")
+        self.assertLess(profile_index, command.index("exec"))
+        self.assertNotIn("--output-schema", command)
+
     def test_untracked_files_respect_trusted_global_excludes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
@@ -4833,6 +4866,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     "test-token-placeholder",
                 )
                 self.assertEqual(
+                    env["AWS_BEARER_TOKEN_BEDROCK"],
+                    "test-token-placeholder",
+                )
+                self.assertEqual(
                     claude_env["ANTHROPIC_BEDROCK_BASE_URL"],
                     "https://bedrock.example.invalid",
                 )
@@ -4841,6 +4878,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     "https://vertex.example.invalid",
                 )
                 self.assertEqual(claude_env["AWS_PROFILE"], "review-profile")
+                self.assertEqual(env["AWS_PROFILE"], "review-profile")
                 self.assertNotIn("AWS_CONFIG_FILE", env)
                 self.assertNotIn("GOOGLE_APPLICATION_CREDENTIALS", env)
                 self.assertNotIn(
@@ -6254,6 +6292,72 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     json.loads(source_auth.read_text(encoding="utf-8"))["token"],
                     "test-auth-token",
                 )
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
+    def test_codex_runtime_profile_stages_only_safe_bedrock_settings(self) -> None:
+        old = os.environ.copy()
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source_home = root / "host-home" / ".codex"
+            runtime_home = root / "runtime" / "codex-home"
+            source_home.mkdir(parents=True)
+            (source_home / "bedrock.config.toml").write_text(
+                'model = "openai.gpt-5.5"\n'
+                'model_provider = "amazon-bedrock"\n'
+                'model_reasoning_effort = "xhigh"\n'
+                'approvals_reviewer = "user"\n'
+                '[mcp_servers.hostile]\ncommand = "touch"\n'
+                '[model_providers.amazon-bedrock.aws]\n'
+                'profile = "review"\nregion = "us-east-2"\n',
+                encoding="utf-8",
+            )
+            try:
+                os.environ["CODEX_HOME"] = str(source_home)
+                staged = self.helper["prepare_codex_runtime_profile"](
+                    argparse.Namespace(codex_profile="bedrock"),
+                    repo,
+                    runtime_home,
+                )
+                self.assertTrue(staged)
+                runtime_profile = runtime_home / "bedrock.config.toml"
+                text = runtime_profile.read_text(encoding="utf-8")
+                self.assertIn('model = "openai.gpt-5.5"', text)
+                self.assertIn('model_provider = "amazon-bedrock"', text)
+                self.assertIn('model_reasoning_effort = "xhigh"', text)
+                self.assertIn('profile = "review"', text)
+                self.assertIn('region = "us-east-2"', text)
+                self.assertNotIn("approvals_reviewer", text)
+                self.assertNotIn("mcp_servers", text)
+                self.assertEqual(
+                    stat.S_IMODE(runtime_profile.stat().st_mode),
+                    0o600,
+                )
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
+    def test_codex_runtime_profile_rejects_unsupported_provider(self) -> None:
+        old = os.environ.copy()
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source_home = root / "host-home" / ".codex"
+            source_home.mkdir(parents=True)
+            (source_home / "custom.config.toml").write_text(
+                'model = "custom-model"\nmodel_provider = "credential-sink"\n',
+                encoding="utf-8",
+            )
+            try:
+                os.environ["CODEX_HOME"] = str(source_home)
+                with self.assertRaisesRegex(SystemExit, "unsupported model_provider"):
+                    self.helper["prepare_codex_runtime_profile"](
+                        argparse.Namespace(codex_profile="custom"),
+                        repo,
+                        root / "runtime" / "codex-home",
+                    )
             finally:
                 os.environ.clear()
                 os.environ.update(old)
