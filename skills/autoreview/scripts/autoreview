@@ -12006,6 +12006,10 @@ def parse_args() -> argparse.Namespace:
         )
         for argument in sys.argv[1:]
     )
+    claude_auth_explicit = any(
+        argument == "--claude-auth" or argument.startswith("--claude-auth=")
+        for argument in sys.argv[1:]
+    )
     parser = argparse.ArgumentParser(
         description="Bundle-driven AI code review.",
         allow_abbrev=False,
@@ -12132,6 +12136,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--self-test-heartbeat-metrics", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.reviewer_selection_explicit = reviewer_selection_explicit
+    args.claude_auth_explicit = claude_auth_explicit
     args.engine = normalize_engine(args.engine)
     if args.cursor_allow_workspace_instructions is None:
         args.cursor_allow_workspace_instructions = env_truthy("AUTOREVIEW_CURSOR_ALLOW_WORKSPACE_INSTRUCTIONS")
@@ -12279,7 +12284,11 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
             "--codex-no-output-schema is only supported for codex; "
             "no codex reviewer selected"
         )
-    if claude_auth != "default" and "claude" not in selected_engines:
+    if (
+        claude_auth != "default"
+        and "claude" not in selected_engines
+        and getattr(args, "claude_auth_explicit", False)
+    ):
         raise SystemExit("--claude-auth is only supported for claude; no claude reviewer selected")
 
     seen: set[str] = set()
@@ -12490,6 +12499,7 @@ def reviewer_test_args(**overrides: Any) -> argparse.Namespace:
         "codex_profile": None,
         "codex_no_output_schema": False,
         "claude_auth": "default",
+        "claude_auth_explicit": False,
         "tools": True,
     }
     defaults.update(overrides)
@@ -12592,11 +12602,25 @@ def self_test_config_defaults() -> None:
         if subscription_claude.claude_auth != "subscription":
             raise SystemExit("self-test config defaults failed: Claude subscription auth was not preserved")
         try:
-            reviewer_args(reviewer_test_args(engine="codex", claude_auth="subscription"))
+            reviewer_args(
+                reviewer_test_args(
+                    engine="codex",
+                    claude_auth="subscription",
+                    claude_auth_explicit=True,
+                )
+            )
             raise SystemExit("self-test config defaults failed: --claude-auth accepted without Claude reviewer")
         except SystemExit as error:
             if "only supported for claude" not in str(error):
                 raise
+        env_subscription_without_claude = reviewer_args(
+            reviewer_test_args(engine="codex", claude_auth="subscription")
+        )
+        if [reviewer.engine for reviewer in env_subscription_without_claude] != ["codex"]:
+            raise SystemExit(
+                "self-test config defaults failed: Claude auth env default "
+                "affected non-Claude reviewer selection"
+            )
         bedrock = reviewer_args(reviewer_test_args(engine="codex", codex_profile="bedrock"))[0]
         if bedrock.model is not None or bedrock.thinking is not None or bedrock.fallback_model is not None:
             raise SystemExit("self-test config defaults failed: Codex profile should own model defaults")
@@ -12699,7 +12723,9 @@ def self_test_config_defaults() -> None:
     # codex --output-schema opt-out: on by default; explicit flag / env / a
     # non-OpenAI profile (e.g. amazon-bedrock, which deadlocks on
     # schema+tools per openai/codex#15451) all disable it.
-    with preserve_env(["AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA"]):
+    with preserve_env(
+        ["AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA", "AUTOREVIEW_REVIEWERS"]
+    ):
         if not codex_use_output_schema(reviewer_test_args(engine="codex")):
             raise SystemExit("self-test config defaults failed: output-schema should default ON for codex")
         if codex_use_output_schema(reviewer_test_args(engine="codex", codex_no_output_schema=True)):
@@ -12734,6 +12760,7 @@ def self_test_fallback_scope() -> None:
         "AUTOREVIEW_CODEX_MODEL",
         "AUTOREVIEW_CLAUDE_FALLBACK_MODEL",
         "AUTOREVIEW_CODEX_FALLBACK_MODEL",
+        "AUTOREVIEW_REVIEWERS",
     ]
     with preserve_env(keys):
         for key in keys:
