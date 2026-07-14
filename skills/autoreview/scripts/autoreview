@@ -467,6 +467,7 @@ SOURCE_CODE_REFERENCE_VALUES = {
     "context.observerAccessToken",
     "context.observerPassword",
     "context.sutAccessToken",
+    "context.sutPassword",
     "driverAccount.accessToken",
     "driverAccount.password",
     "driverPassword",

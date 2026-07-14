@@ -1884,6 +1884,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
         yaml_flow_reference = (
             "{ pass" + "word: context.driverPass" + "word, enabled: true }"
         )
+        sut_reference = (
+            "const pass"
+            + "word = context.sutPass"
+            + "word;"
+        )
         literal_value = "actual-production-" + "secret"
         source_literal = (
             "function configure() { return { pass"
@@ -1955,6 +1960,13 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertFalse(
             self.helper["secret_text_risk"](content, source_code=True)
         )
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                sut_reference,
+                source_code=True,
+            )
+        )
+        self.assertTrue(self.helper["secret_text_risk"](sut_reference))
         self.assertFalse(
             self.helper["secret_text_risk"](
                 final_property,
