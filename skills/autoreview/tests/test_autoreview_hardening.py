@@ -4986,7 +4986,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 os.environ.clear()
                 os.environ.update(old)
 
-    def test_claude_refusal_fallback_is_detected(self) -> None:
+    def test_claude_refusal_is_detected(self) -> None:
         output = json.dumps(
             [
                 {
@@ -5005,12 +5005,54 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ]
         )
 
-        self.assertTrue(self.helper["claude_refusal_fallback_detected"](output))
+        self.assertTrue(self.helper["claude_refusal_detected"](output))
         self.assertFalse(
-            self.helper["claude_refusal_fallback_detected"](
+            self.helper["claude_refusal_detected"](
                 json.dumps([{"type": "result", "subtype": "success"}])
             )
         )
+
+    def test_claude_retries_fable_twice_then_uses_opus_max(self) -> None:
+        refusal = subprocess.CompletedProcess(
+            args=["claude"],
+            returncode=1,
+            stdout=json.dumps(
+                [{"type": "system", "subtype": "model_refusal_no_fallback"}]
+            ),
+            stderr="",
+        )
+        success = subprocess.CompletedProcess(
+            args=["claude"],
+            returncode=0,
+            stdout=json.dumps([{"type": "result", "subtype": "success"}]),
+            stderr="",
+        )
+        args = argparse.Namespace(
+            model="claude-fable-5",
+            thinking="max",
+        )
+        run_once = mock.Mock(side_effect=[refusal, refusal, success])
+
+        with mock.patch.dict(
+            self.helper["run_claude"].__globals__,
+            {
+                "ensure_claude_isolation_supported": lambda *_args: None,
+                "run_claude_once": run_once,
+            },
+        ):
+            output = self.helper["run_claude"](args, Path("/repo"), "review")
+
+        self.assertEqual(output, success.stdout)
+        self.assertEqual(run_once.call_count, 3)
+        invoked_models = [call.args[0].model for call in run_once.call_args_list]
+        invoked_thinking = [call.args[0].thinking for call in run_once.call_args_list]
+        self.assertEqual(
+            invoked_models,
+            ["claude-fable-5", "claude-fable-5", "claude-opus-4-8"],
+        )
+        self.assertEqual(invoked_thinking, ["max", "max", "max"])
+        self.assertEqual(args.actual_model, "claude-opus-4-8")
+        self.assertEqual(args.actual_thinking, "max")
 
     def test_parallel_test_finish_does_not_wait_for_inherited_stderr_pipe(
         self,

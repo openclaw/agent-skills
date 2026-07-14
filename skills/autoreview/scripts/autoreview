@@ -10083,7 +10083,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     raise AssertionError("unreachable")
 
 
-def claude_refusal_fallback_detected(output: str) -> bool:
+def claude_refusal_detected(output: str) -> bool:
     try:
         parsed = json.loads(output)
         events = parsed if isinstance(parsed, list) else [parsed]
@@ -10098,22 +10098,21 @@ def claude_refusal_fallback_detected(output: str) -> bool:
     for event in events:
         if not isinstance(event, dict):
             continue
-        if event.get("subtype") == "model_refusal_fallback":
+        if event.get("subtype") in {
+            "model_refusal_fallback",
+            "model_refusal_no_fallback",
+        }:
             return True
-        message = event.get("message")
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        if isinstance(content, list) and any(
-            isinstance(item, dict) and item.get("type") == "fallback"
-            for item in content
-        ):
+        if event.get("terminal_reason") == "model_refusal":
             return True
     return False
 
 
-def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
-    ensure_claude_isolation_supported(args, repo)
+def run_claude_once(
+    args: argparse.Namespace,
+    repo: Path,
+    prompt: str,
+) -> subprocess.CompletedProcess[str]:
     cmd = [
         resolve_command(args.claude_bin, repo),
         *claude_review_isolation_flags(),
@@ -10155,14 +10154,63 @@ def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             ),
             resolve_root=repo,
         )
-    if result.returncode != 0:
-        raise SystemExit(f"claude engine failed ({result.returncode})\n{result.stderr or result.stdout}")
-    if claude_refusal_fallback_detected(result.stdout):
+    return result
+
+
+def claude_uses_fable_model(model: str | None) -> bool:
+    return model == "fable" or bool(model and model.startswith("claude-fable-5"))
+
+
+def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
+    ensure_claude_isolation_supported(args, repo)
+    args.actual_model = None
+    args.actual_thinking = None
+    for attempt in (1, 2):
+        result = run_claude_once(args, repo, prompt)
+        output = f"{result.stdout}\n{result.stderr}"
+        if claude_refusal_detected(output):
+            if not claude_uses_fable_model(args.model):
+                raise SystemExit(
+                    f"claude engine refused the requested model {args.model!r}"
+                )
+            if attempt == 1:
+                print(
+                    f"claude model {args.model} refused the review; "
+                    "retrying Fable once in a fresh session",
+                    file=sys.stderr,
+                )
+                continue
+            break
+        if result.returncode != 0:
+            raise SystemExit(
+                f"claude engine failed ({result.returncode})\n"
+                f"{result.stderr or result.stdout}"
+            )
+        return result.stdout
+
+    fallback_args = copy.copy(args)
+    fallback_args.model = "claude-opus-4-8"
+    fallback_args.thinking = "max"
+    fallback_args.fallback_model = None
+    print(
+        f"claude model {args.model} refused the review twice; "
+        "retrying with allowed fallback claude-opus-4-8 at max effort",
+        file=sys.stderr,
+    )
+    fallback_result = run_claude_once(fallback_args, repo, prompt)
+    fallback_output = f"{fallback_result.stdout}\n{fallback_result.stderr}"
+    if claude_refusal_detected(fallback_output):
         raise SystemExit(
-            "claude engine refused the requested model and switched models; "
-            "autoreview requires the selected reviewer model to answer"
+            "claude engine fallback claude-opus-4-8 also refused the review"
         )
-    return result.stdout
+    if fallback_result.returncode != 0:
+        raise SystemExit(
+            f"claude engine fallback failed ({fallback_result.returncode})\n"
+            f"{fallback_result.stderr or fallback_result.stdout}"
+        )
+    args.actual_model = fallback_args.model
+    args.actual_thinking = fallback_args.thinking
+    return fallback_result.stdout
 
 
 def run_droid(args: argparse.Namespace, repo: Path, prompt: str) -> str:
@@ -12195,12 +12243,17 @@ def reviewer_label(args: argparse.Namespace) -> str:
     profile = codex_profile_name(args) if args.engine == "codex" else None
     if profile is not None:
         parts.append(f"profile={profile}")
-    if args.model:
-        parts.append(f"model={args.model}")
+    actual_model = getattr(args, "actual_model", None)
+    model = actual_model or args.model
+    if model:
+        parts.append(f"model={model}")
+    if actual_model:
+        parts.append(f"refusal-fallback-from={args.model}")
     if getattr(args, "fallback_model", None):
         parts.append(f"fallback={args.fallback_model}")
-    if args.thinking:
-        parts.append(f"thinking={args.thinking}")
+    thinking = getattr(args, "actual_thinking", None) or args.thinking
+    if thinking:
+        parts.append(f"thinking={thinking}")
     return " ".join(parts)
 
 
@@ -12286,12 +12339,13 @@ def run_panel(
     reports: list[tuple[str, dict[str, Any]]] = []
     failures: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(reviewers)) as executor:
-        future_by_label = {
-            executor.submit(run_reviewer, reviewer, repo, prompt, changed_paths, [], input_truncated): reviewer_label(reviewer)
+        reviewer_by_future = {
+            executor.submit(run_reviewer, reviewer, repo, prompt, changed_paths, [], input_truncated): reviewer
             for reviewer in reviewers
         }
-        for future in concurrent.futures.as_completed(future_by_label):
-            label = future_by_label[future]
+        for future in concurrent.futures.as_completed(reviewer_by_future):
+            reviewer = reviewer_by_future[future]
+            label = reviewer_label(reviewer)
             try:
                 reports.append((label, future.result()))
             except SystemExit as exc:

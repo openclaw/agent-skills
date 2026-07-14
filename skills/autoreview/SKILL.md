@@ -36,7 +36,7 @@ Do not require autoreview for a change whose entire diff is prose-only internal 
 - If a review-triggered fix changes code, rerun focused tests and rerun the structured review helper.
 - For security-audit suppression changes, verify accepted findings remain auditable: suppressed findings stay in structured output, active output keeps an unsuppressible suppression notice, and aggregate findings cannot hide unrelated active risk.
 - Never switch or override the requested review engine/model except for the documented Codex Sol-to-Terra account-access fallback. Capacity, rate-limit, and unrelated failures keep the same engine/model.
-- Claude refusal-based model switching is disabled for review. If Fable or another selected Claude model refuses the bundle, fail the review instead of silently accepting output from a fallback model.
+- Claude's implicit refusal-based model switching is disabled for review. If Fable refuses the bundle, retry Fable once in a fresh session, then explicitly retry with `claude-opus-4-8` at `max` effort after the second refusal. Other selected Claude models fail on refusal.
 - Be patient with large bundles. Structured review can take up to 30 minutes while the model call is active, especially with Codex tools or web search.
 - Treat heartbeat lines like `review still running: ... elapsed=... pid=...` as healthy progress, not a hang. Let the helper continue while heartbeats are advancing. Pass `--stream-engine-output` when live engine text is useful; Codex and Claude filter tool/file chatter, other runnable engines pass raw output through.
 - Do not kill a review just because it has been quiet for 2-5 minutes, or because it is still running under the 30-minute window. Inspect the process only after missing multiple expected heartbeats, after 30 minutes, or after an obviously failed subprocess; prefer letting the same helper command finish.
@@ -318,7 +318,7 @@ Claude also supports `--fallback-model a,b` for availability-based fallback chai
 
 Claude's CLI reference warns that `--help` does not list every supported flag. The helper capability-checks isolation through empty-print validation with the exact review flags, and verifies the same parser rejects an unknown control flag; it does not infer support from help text or early-exit version behavior.
 
-[Anthropic's Fable model-switching guidance](https://support.claude.com/en/articles/15363606-why-claude-switched-models-in-your-conversation-with-fable-5) explains that flagged Fable requests normally rerun on Opus. Autoreview disables that switch and rejects any fallback event so its reviewer label always matches the model that actually answered.
+[Anthropic's Fable model-switching guidance](https://support.claude.com/en/articles/15363606-why-claude-switched-models-in-your-conversation-with-fable-5) explains that flagged Fable requests normally rerun on Opus. Autoreview disables the implicit switch so it can retry Fable once first; only a second refusal triggers the explicit `claude-opus-4-8`/`max` fallback, which is reported in the reviewer label.
 
 [OpenAI's model guidance](https://developers.openai.com/api/docs/guides/latest-model) identifies Sol as the GPT-5.6 frontier-capability route and documents `max` support. Autoreview keeps `high` as its default; use `max` only for the hardest quality-first reviews after comparing its latency and cost with `xhigh` on representative changes.
 
@@ -442,7 +442,7 @@ The helper:
 - supports opt-in review panels with `--panel` / `--reviewers`, an `AUTOREVIEW_REVIEWERS` personal default, per-engine `--model` / `--thinking`, and Claude `--fallback-model`
 - uses built-in defaults `codex=gpt-5.6-sol` with `high` reasoning and an access-only `gpt-5.6-terra` retry, plus `claude=claude-fable-5` with `max` effort; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
 - supports isolated `--codex-profile` / `AUTOREVIEW_CODEX_PROFILE` routing for sanitized built-in Amazon Bedrock profiles and automatically drops Codex CLI schema enforcement for those non-OpenAI runs
-- supports `--claude-auth subscription` / `AUTOREVIEW_CLAUDE_AUTH=subscription` to prefer Claude Code login over ambient API/provider env and disables refusal-based model switching so the selected Claude model must answer
+- supports `--claude-auth subscription` / `AUTOREVIEW_CLAUDE_AUTH=subscription` to prefer Claude Code login over ambient API/provider env; Fable refusal handling is a transparent Fable retry followed by an explicit `claude-opus-4-8`/`max` fallback after the second refusal
 - gives Codex the bundle in an empty workspace with web search available; Claude receives the bundle plus WebSearch by default and optional domain-constrained WebFetch, and Pi receives the bundle with no tools
 - runs Claude with `--safe-mode` (`v2.1.169+`), `--setting-sources user`, MCP and auto-memory disabled, no filesystem/shell tools, an empty external workspace, and `--fallback-model` when set
 - refuses Droid, Copilot, Cursor, and OpenCode reviews until their CLIs expose the required project, filesystem, and network isolation
