@@ -807,6 +807,15 @@ SAFE_CODEX_PROFILE_SCALAR_KEYS = {
     "model_reasoning_effort",
     "service_tier",
 }
+CODEX_BEDROCK_ENV_KEYS = {
+    "AWS_ACCESS_KEY_ID",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_DEFAULT_REGION",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+}
 CLAUDE_SUBSCRIPTION_ENV_EXCLUDES = {
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -1166,13 +1175,6 @@ def safe_engine_env(
         "no_proxy",
     }
     codex_allowed_exact = {
-        "AWS_ACCESS_KEY_ID",
-        "AWS_BEARER_TOKEN_BEDROCK",
-        "AWS_DEFAULT_REGION",
-        "AWS_PROFILE",
-        "AWS_REGION",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
         "AZURE_OPENAI_API_KEY",
         "AZURE_OPENAI_ENDPOINT",
         "CODEX_API_KEY",
@@ -9450,6 +9452,26 @@ def codex_profile_name(args: argparse.Namespace) -> str | None:
     return raw
 
 
+def codex_engine_env(
+    args: argparse.Namespace,
+    repo: Path,
+    extra_paths: list[Path] | None = None,
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    env = safe_engine_env(
+        repo,
+        extra_paths,
+        extra,
+        engine="codex",
+    )
+    if codex_profile_name(args) is not None:
+        for key in CODEX_BEDROCK_ENV_KEYS:
+            value = os.environ.get(key)
+            if value is not None:
+                env[key] = value
+    return env
+
+
 def prepare_codex_runtime_profile(
     args: argparse.Namespace,
     repo: Path,
@@ -9841,12 +9863,15 @@ def codex_uses_non_openai_provider(args: argparse.Namespace) -> bool:
     return codex_profile_name(args) is not None
 
 
+def codex_no_output_schema_requested(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "codex_no_output_schema", False)) or env_truthy(
+        "AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA"
+    )
+
+
 def codex_use_output_schema(args: argparse.Namespace) -> bool:
     """Return whether to enforce Codex structured output at the CLI layer."""
-    if getattr(args, "codex_no_output_schema", False):
-        return False
-    env_opt = os.environ.get("AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA", "").strip().lower()
-    if env_opt in {"1", "true", "yes", "on"}:
+    if codex_no_output_schema_requested(args):
         return False
     return not codex_uses_non_openai_provider(args)
 
@@ -10035,10 +10060,10 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                     label="codex",
                     stream_output=args.stream_engine_output,
                     stream_display=CodexStreamDisplay() if args.stream_engine_output else None,
-                    env=safe_engine_env(
+                    env=codex_engine_env(
+                        args,
                         repo,
                         [Path(cmd[0]).parent],
-                        engine="codex",
                         extra={
                             "HOME": str(runtime_home),
                             "USERPROFILE": str(runtime_home),
@@ -11929,6 +11954,14 @@ def env_truthy(name: str) -> bool:
 
 
 def parse_args() -> argparse.Namespace:
+    reviewer_selection_explicit = any(
+        argument in {"--engine", "--panel", "--reviewers"}
+        or any(
+            argument.startswith(f"{option}=")
+            for option in ("--engine", "--reviewers")
+        )
+        for argument in sys.argv[1:]
+    )
     parser = argparse.ArgumentParser(description="Bundle-driven AI code review.")
     parser.add_argument("--mode", choices=["auto", "local", "uncommitted", "branch", "commit"], default="auto")
     parser.add_argument("--base")
@@ -11936,7 +11969,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--engine", choices=ENGINE_CHOICES, default=os.environ.get("AUTOREVIEW_ENGINE", "codex"))
     parser.add_argument(
         "--reviewers",
-        default=os.environ.get("AUTOREVIEW_REVIEWERS", "").strip() or None,
         help="Comma-separated review panel, e.g. codex,claude,pi or codex:gpt-5.6-sol:high. Env default: AUTOREVIEW_REVIEWERS.",
     )
     parser.add_argument("--panel", action="store_true", help="Run a Codex/Claude review panel unless --engine changes the first reviewer.")
@@ -12052,6 +12084,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--self-test-json-array-parser", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--self-test-heartbeat-metrics", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    args.reviewer_selection_explicit = reviewer_selection_explicit
     args.engine = normalize_engine(args.engine)
     if args.cursor_allow_workspace_instructions is None:
         args.cursor_allow_workspace_instructions = env_truthy("AUTOREVIEW_CURSOR_ALLOW_WORKSPACE_INSTRUCTIONS")
@@ -12158,6 +12191,13 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
             if engine not in engines:
                 engines.append(engine)
         reviewers = [(engine, None, None) for engine in engines]
+    elif not getattr(args, "reviewer_selection_explicit", False) and (
+        env_reviewers := os.environ.get("AUTOREVIEW_REVIEWERS", "").strip()
+    ):
+        tokens = [token.strip() for token in env_reviewers.split(",") if token.strip()]
+        if len(tokens) == 1 and tokens[0] == "all":
+            tokens = list(ALL_REVIEWERS)
+        reviewers = [parse_reviewer_token(token) for token in tokens]
     else:
         reviewers = [(args.engine, None, None)]
 
@@ -12181,6 +12221,11 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
         raise SystemExit("--codex-speed is only supported for codex; no codex reviewer selected")
     if codex_profile is not None and "codex" not in selected_engines:
         raise SystemExit("--codex-profile is only supported for codex; no codex reviewer selected")
+    if codex_no_output_schema_requested(args) and "codex" not in selected_engines:
+        raise SystemExit(
+            "--codex-no-output-schema is only supported for codex; "
+            "no codex reviewer selected"
+        )
     if claude_auth != "default" and "claude" not in selected_engines:
         raise SystemExit("--claude-auth is only supported for claude; no claude reviewer selected")
 
@@ -12381,6 +12426,7 @@ def run_panel(
 def reviewer_test_args(**overrides: Any) -> argparse.Namespace:
     defaults = {
         "reviewers": None,
+        "reviewer_selection_explicit": False,
         "panel": False,
         "engine": "codex",
         "model": None,
@@ -12424,7 +12470,9 @@ def self_test_config_defaults() -> None:
         "AUTOREVIEW_CODEX_CONFIG",
         "AUTOREVIEW_CODEX_SPEED",
         "AUTOREVIEW_CODEX_PROFILE",
+        "AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA",
         "AUTOREVIEW_CLAUDE_AUTH",
+        "AUTOREVIEW_REVIEWERS",
         *(
             f"AUTOREVIEW_{engine.upper()}_{suffix}"
             for engine in ENGINES
@@ -12456,6 +12504,23 @@ def self_test_config_defaults() -> None:
             raise SystemExit(f"self-test config defaults failed: default claude model={default_claude.model!r}")
         if default_claude.thinking != "max":
             raise SystemExit(f"self-test config defaults failed: default claude thinking={default_claude.thinking!r}")
+        os.environ["AUTOREVIEW_REVIEWERS"] = "codex,claude"
+        env_panel = reviewer_args(reviewer_test_args(engine="pi"))
+        if [reviewer.engine for reviewer in env_panel] != ["codex", "claude"]:
+            raise SystemExit("self-test config defaults failed: AUTOREVIEW_REVIEWERS was not applied")
+        explicit_engine = reviewer_args(
+            reviewer_test_args(
+                engine="claude",
+                reviewer_selection_explicit=True,
+            )
+        )
+        if [reviewer.engine for reviewer in explicit_engine] != ["claude"]:
+            raise SystemExit("self-test config defaults failed: explicit --engine did not override env reviewers")
+        os.environ["AUTOREVIEW_REVIEWERS"] = "pi"
+        explicit_panel = reviewer_args(reviewer_test_args(panel=True))
+        if [reviewer.engine for reviewer in explicit_panel] != ["codex", "claude"]:
+            raise SystemExit("self-test config defaults failed: explicit --panel did not override env reviewers")
+        os.environ.pop("AUTOREVIEW_REVIEWERS")
         subscription_claude = reviewer_args(
             reviewer_test_args(engine="claude", claude_auth="subscription")
         )[0]
@@ -12577,6 +12642,20 @@ def self_test_config_defaults() -> None:
         bedrock = reviewer_test_args(engine="codex", codex_profile="bedrock")
         if codex_use_output_schema(bedrock):
             raise SystemExit("self-test config defaults failed: non-OpenAI provider should auto-disable output-schema")
+        try:
+            reviewer_args(
+                reviewer_test_args(
+                    engine="claude",
+                    codex_no_output_schema=True,
+                )
+            )
+            raise SystemExit(
+                "self-test config defaults failed: --codex-no-output-schema "
+                "accepted without Codex reviewer"
+            )
+        except SystemExit as error:
+            if "only supported for codex" not in str(error):
+                raise
         os.environ["AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA"] = "1"
         if codex_use_output_schema(reviewer_test_args(engine="codex")):
             raise SystemExit("self-test config defaults failed: AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA=1 should disable output-schema")

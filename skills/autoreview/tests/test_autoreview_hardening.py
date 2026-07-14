@@ -880,6 +880,47 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertLess(profile_index, command.index("exec"))
         self.assertNotIn("--output-schema", command)
 
+    def test_codex_bedrock_credentials_require_a_profile(self) -> None:
+        old = os.environ.copy()
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            try:
+                os.environ["AWS_BEARER_TOKEN_BEDROCK"] = "test-token"
+                os.environ["AWS_PROFILE"] = "review-profile"
+                standard = self.helper["codex_engine_env"](
+                    argparse.Namespace(codex_profile=None),
+                    repo,
+                )
+                bedrock = self.helper["codex_engine_env"](
+                    argparse.Namespace(codex_profile="bedrock"),
+                    repo,
+                )
+
+                self.assertNotIn("AWS_BEARER_TOKEN_BEDROCK", standard)
+                self.assertNotIn("AWS_PROFILE", standard)
+                self.assertEqual(
+                    bedrock["AWS_BEARER_TOKEN_BEDROCK"],
+                    "test-token",
+                )
+                self.assertEqual(bedrock["AWS_PROFILE"], "review-profile")
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
+    def test_explicit_reviewer_selection_overrides_environment_panel(self) -> None:
+        args = self.helper["reviewer_test_args"](
+            engine="claude",
+            reviewer_selection_explicit=True,
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"AUTOREVIEW_REVIEWERS": "pi"},
+            clear=False,
+        ):
+            reviewers = self.helper["reviewer_args"](args)
+
+        self.assertEqual([reviewer.engine for reviewer in reviewers], ["claude"])
+
     def test_untracked_files_respect_trusted_global_excludes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
@@ -4865,10 +4906,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     claude_env["AWS_BEARER_TOKEN_BEDROCK"],
                     "test-token-placeholder",
                 )
-                self.assertEqual(
-                    env["AWS_BEARER_TOKEN_BEDROCK"],
-                    "test-token-placeholder",
-                )
+                self.assertNotIn("AWS_BEARER_TOKEN_BEDROCK", env)
                 self.assertEqual(
                     claude_env["ANTHROPIC_BEDROCK_BASE_URL"],
                     "https://bedrock.example.invalid",
@@ -4878,7 +4916,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     "https://vertex.example.invalid",
                 )
                 self.assertEqual(claude_env["AWS_PROFILE"], "review-profile")
-                self.assertEqual(env["AWS_PROFILE"], "review-profile")
+                self.assertNotIn("AWS_PROFILE", env)
                 self.assertNotIn("AWS_CONFIG_FILE", env)
                 self.assertNotIn("GOOGLE_APPLICATION_CREDENTIALS", env)
                 self.assertNotIn(
