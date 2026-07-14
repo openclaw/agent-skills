@@ -811,7 +811,6 @@ CODEX_BEDROCK_ENV_KEYS = {
     "AWS_ACCESS_KEY_ID",
     "AWS_BEARER_TOKEN_BEDROCK",
     "AWS_DEFAULT_REGION",
-    "AWS_PROFILE",
     "AWS_REGION",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
@@ -9530,7 +9529,14 @@ def prepare_codex_runtime_profile(
     if isinstance(providers, dict):
         bedrock = providers.get("amazon-bedrock")
         if isinstance(bedrock, dict) and isinstance(bedrock.get("aws"), dict):
-            for key in ("profile", "region"):
+            profile_value = bedrock["aws"].get("profile")
+            if profile_value is not None:
+                raise SystemExit(
+                    f"Codex profile {profile!r} uses unsupported file-backed "
+                    "amazon-bedrock.aws.profile authentication; use "
+                    "AWS_BEARER_TOKEN_BEDROCK or static AWS credential environment variables"
+                )
+            for key in ("region",):
                 value = bedrock["aws"].get(key)
                 if value is None:
                     continue
@@ -9550,7 +9556,7 @@ def prepare_codex_runtime_profile(
         lines.extend(["", "[model_providers.amazon-bedrock.aws]"])
         lines.extend(
             f"{key} = {json.dumps(aws[key])}"
-            for key in ("profile", "region")
+            for key in ("region",)
             if key in aws
         )
     runtime_codex_home.mkdir(parents=True, exist_ok=True)
@@ -11962,7 +11968,10 @@ def parse_args() -> argparse.Namespace:
         )
         for argument in sys.argv[1:]
     )
-    parser = argparse.ArgumentParser(description="Bundle-driven AI code review.")
+    parser = argparse.ArgumentParser(
+        description="Bundle-driven AI code review.",
+        allow_abbrev=False,
+    )
     parser.add_argument("--mode", choices=["auto", "local", "uncommitted", "branch", "commit"], default="auto")
     parser.add_argument("--base")
     parser.add_argument("--commit", default="HEAD")
