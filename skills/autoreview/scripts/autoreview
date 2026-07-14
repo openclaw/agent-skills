@@ -9644,8 +9644,15 @@ def prepare_codex_runtime_auth(
     return True
 
 
-def codex_exec_isolation_flags() -> list[str]:
-    return ["--ignore-user-config", "--ignore-rules", "--skip-git-repo-check"]
+def codex_exec_isolation_flags(*, load_runtime_profile: bool = False) -> list[str]:
+    flags = ["--ignore-rules", "--skip-git-repo-check"]
+    # Codex applies --ignore-user-config to both config.toml and a selected
+    # NAME.config.toml profile. Profile runs already use a fresh CODEX_HOME
+    # containing only the sanitized profile staged by autoreview, so keep that
+    # layer enabled while continuing to ignore rules and repository config.
+    if not load_runtime_profile:
+        flags.insert(0, "--ignore-user-config")
+    return flags
 
 
 def claude_review_isolation_flags(
@@ -9981,7 +9988,7 @@ def codex_command(
     use_output_schema = codex_use_output_schema(args)
     cmd.extend(
         [
-            *codex_exec_isolation_flags(),
+            *codex_exec_isolation_flags(load_runtime_profile=profile is not None),
             "--ephemeral",
             "-C",
             str(review_root),

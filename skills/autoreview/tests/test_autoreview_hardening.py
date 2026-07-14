@@ -878,7 +878,38 @@ class AutoreviewHardeningTests(unittest.TestCase):
         profile_index = command.index("--profile")
         self.assertEqual(command[profile_index + 1], "bedrock")
         self.assertLess(profile_index, command.index("exec"))
+        self.assertNotIn("--ignore-user-config", command)
+        self.assertIn("--ignore-rules", command)
         self.assertNotIn("--output-schema", command)
+
+    def test_codex_command_ignores_user_config_without_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            with mock.patch.dict(
+                self.helper["codex_command"].__globals__,
+                {"resolve_command": lambda *_args: "/usr/bin/codex"},
+            ):
+                command = self.helper["codex_command"](
+                    argparse.Namespace(
+                        codex_bin="codex",
+                        web_search=False,
+                        codex_config=None,
+                        thinking=None,
+                        codex_speed=None,
+                        codex_profile=None,
+                        codex_no_output_schema=False,
+                        stream_engine_output=False,
+                    ),
+                    repo,
+                    root / "review",
+                    root / "runtime",
+                    root / "schema.json",
+                    root / "output.json",
+                    "gpt-5.6-sol",
+                )
+
+        self.assertIn("--ignore-user-config", command)
 
     def test_codex_bedrock_credentials_require_a_profile(self) -> None:
         old = os.environ.copy()
