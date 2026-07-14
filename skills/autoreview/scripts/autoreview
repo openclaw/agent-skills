@@ -9540,7 +9540,12 @@ def ensure_claude_isolation_supported(args: argparse.Namespace, repo: Path) -> N
         "",
     ]
     control_probe = run(
-        [*probe_command, CLAUDE_ISOLATION_PROBE_CONTROL_FLAG, "--print"],
+        [
+            claude_bin,
+            CLAUDE_ISOLATION_PROBE_CONTROL_FLAG,
+            *probe_command[1:],
+            "--print",
+        ],
         temp_root,
         input_text="",
         check=False,

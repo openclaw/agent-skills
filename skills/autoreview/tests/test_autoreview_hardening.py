@@ -5735,7 +5735,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertEqual(commands[0], ["/usr/bin/claude", "--version"])
         self.assertNotIn("--help", commands[1])
-        self.assertIn("--autoreview-invalid-control", commands[1])
+        self.assertEqual(commands[1][1], "--autoreview-invalid-control")
         self.assertEqual(commands[1][-1], "--print")
         self.assertNotIn("--autoreview-invalid-control", commands[2])
         for required in (
