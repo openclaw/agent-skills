@@ -5812,6 +5812,44 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ):
                 self.helper["ensure_claude_isolation_supported"](args, repo)
 
+    def test_claude_isolation_probe_rejects_warn_and_continue_parser(self) -> None:
+        args = argparse.Namespace(
+            claude_bin="claude",
+            fallback_model=None,
+            model="claude-fable-5",
+        )
+        results = iter(
+            [
+                subprocess.CompletedProcess([], 0, "2.1.207 (Claude Code)", ""),
+                subprocess.CompletedProcess(
+                    [],
+                    1,
+                    "",
+                    (
+                        "warning: unknown option '--autoreview-invalid-control'\n"
+                        "Error: Input must be provided either through stdin or as a "
+                        "prompt argument when using --print"
+                    ),
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            with mock.patch.dict(
+                self.helper["ensure_claude_isolation_supported"].__globals__,
+                {
+                    "resolve_command": lambda *_args: "/usr/bin/claude",
+                    "safe_engine_env": lambda *_args, **_kwargs: {},
+                    "safe_temp_root": lambda _repo: Path(tempdir),
+                    "run": lambda *_args, **_kwargs: next(results),
+                },
+            ), self.assertRaisesRegex(
+                SystemExit,
+                "capability probe rejects unknown flags",
+            ):
+                self.helper["ensure_claude_isolation_supported"](args, repo)
+
     def test_claude_runs_outside_repo_with_auto_memory_disabled(self) -> None:
         args = argparse.Namespace(
             claude_allowed_tools=None,

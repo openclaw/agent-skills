@@ -9556,6 +9556,7 @@ def ensure_claude_isolation_supported(args: argparse.Namespace, repo: Path) -> N
         control_probe.returncode == 0
         or CLAUDE_ISOLATION_PROBE_CONTROL_FLAG not in control_detail
         or "unknown option" not in control_detail.lower()
+        or CLAUDE_EMPTY_PRINT_DIAGNOSTIC in control_detail
     ):
         suffix = f": {control_detail}" if control_detail else ""
         raise SystemExit(
