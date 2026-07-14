@@ -1859,6 +1859,333 @@ class AutoreviewHardeningTests(unittest.TestCase):
             )
         )
 
+    def test_secret_detector_allows_typescript_object_secret_references(self) -> None:
+        content = (
+            "async function configure(context: RuntimeContext) {\n"
+            "  const cliDevice = await login();\n"
+            "  const driverPassword = readPassword();\n"
+            "  return {\n"
+            "    access"
+            + "Token"
+            + ": cliDevice.access"
+            + "Token,\n"
+            + "    pass"
+            + "word: driverPass"
+            + "word,\n"
+            + "    ...(context.driverPass"
+            + "word ? { pass"
+            + "word: context.driverPass"
+            + "word } : {}),\n"
+            + "  };\n"
+            + "}"
+        )
+        yaml_literal = "pass" + "word: actualProductionSecret,"
+        yaml_reference = "pass" + "word: context.driverPass" + "word"
+        yaml_flow_reference = (
+            "{ pass" + "word: context.driverPass" + "word, enabled: true }"
+        )
+        literal_value = "actual-production-" + "secret"
+        source_literal = (
+            "function configure() { return { pass"
+            + 'word: "'
+            + literal_value
+            + '" }; }'
+        )
+        jwt_like = "eyJhbGciOiJIUzI1NiJ9" + ".payload." + "signature"
+        undeclared_member = (
+            "const config = { pass"
+            + "word: "
+            + jwt_like
+            + " };"
+        )
+        jwt_root = jwt_like.split(".", 1)[0]
+        declared_member = (
+            f"const {jwt_root} = {{}};\n"
+            + "const config = { pass"
+            + "word: "
+            + jwt_like
+            + " };"
+        )
+        prefixed_member = (
+            "const session = {};\n"
+            + "const config = { pass"
+            + "word: session."
+            + jwt_like
+            + " };"
+        )
+        declared_identifier = "CorrectHorseBattery" + "Staple123"
+        declared_identifier_value = (
+            f"const {declared_identifier} = 0;\n"
+            + "const config = { pass"
+            + "word: "
+            + declared_identifier
+            + " };"
+        )
+        suffixed_reference = (
+            "const config = { pass"
+            + "word: context.driverPass"
+            + "wordExtra };"
+        )
+        prefixed_reference = (
+            "const config = { pass"
+            + "word: xcontext.driverPass"
+            + "word };"
+        )
+        final_property = (
+            "function configure(context: RuntimeContext) { return { pass"
+            + "word: context.driverPass"
+            + "word }; }"
+        )
+        inline_property = (
+            "function configure(context: RuntimeContext) { return { pass"
+            + "word: context.driverPass"
+            + "word, enabled: true }; }"
+        )
+        asserted_property = (
+            "function configure(context: RuntimeContext) { return { pass"
+            + "word: context.driverPass"
+            + "word! }; }"
+        )
+        cast_property = (
+            "function configure(context: RuntimeContext) { return { pass"
+            + "word: context.driverPass"
+            + "word as string }; }"
+        )
+
+        self.assertFalse(
+            self.helper["secret_text_risk"](content, source_code=True)
+        )
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                final_property,
+                source_code=True,
+            )
+        )
+        for source_reference in (
+            inline_property,
+            asserted_property,
+            cast_property,
+        ):
+            with self.subTest(source_reference=source_reference):
+                self.assertFalse(
+                    self.helper["secret_text_risk"](
+                        source_reference,
+                        source_code=True,
+                    )
+                )
+        self.assertTrue(self.helper["secret_text_risk"](yaml_literal))
+        self.assertTrue(self.helper["secret_text_risk"](yaml_reference))
+        self.assertTrue(self.helper["secret_text_risk"](yaml_flow_reference))
+        self.assertTrue(self.helper["secret_text_risk"](source_literal))
+        self.assertTrue(self.helper["secret_text_risk"](undeclared_member))
+        self.assertTrue(self.helper["secret_text_risk"](declared_member))
+        self.assertTrue(self.helper["secret_text_risk"](prefixed_member))
+        self.assertTrue(
+            self.helper["secret_text_risk"](declared_identifier_value)
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                suffixed_reference,
+                source_code=True,
+            )
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                prefixed_reference,
+                source_code=True,
+            )
+        )
+
+    def test_review_patch_scopes_source_references_to_typescript_files(self) -> None:
+        property_name = "pass" + "word"
+        reference = "context.driverPass" + "word"
+        source_patch = (
+            "diff --git a/src/runtime.ts b/src/runtime.ts\n"
+            "--- a/src/runtime.ts\n"
+            "+++ b/src/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            "+function configure(context: RuntimeContext) { return { "
+            + property_name
+            + ": "
+            + reference
+            + " }; }\n"
+        )
+        narrow_source_patch = (
+            "diff --git a/src/runtime.ts b/src/runtime.ts\n"
+            "--- a/src/runtime.ts\n"
+            "+++ b/src/runtime.ts\n"
+            "@@ -40,2 +40,3 @@ function configure(context: RuntimeContext) {\n"
+            "   return {\n"
+            "+    "
+            + property_name
+            + ": "
+            + reference
+            + ",\n"
+            "   };\n"
+        )
+        config_patch = (
+            "diff --git a/config.yml b/config.yml\n"
+            "--- a/config.yml\n"
+            "+++ b/config.yml\n"
+            "@@ -0,0 +1 @@\n"
+            "+"
+            + property_name
+            + ": "
+            + reference
+            + "\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local staged diff",
+                ["src/runtime.ts"],
+                source_patch,
+            ),
+            source_patch,
+        )
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local staged diff",
+                ["src/runtime.ts"],
+                narrow_source_patch,
+            ),
+            narrow_source_patch,
+        )
+        with self.assertRaisesRegex(SystemExit, "secret-like content"):
+            self.helper["validate_review_patch"](
+                "local staged diff",
+                ["src/runtime.ts", "config.yml"],
+                source_patch + config_patch,
+            )
+        with self.assertRaisesRegex(SystemExit, "secret-like content"):
+            self.helper["validate_review_patch"](
+                "local staged diff",
+                ["config.yml", "src/runtime.ts"],
+                source_patch + config_patch,
+            )
+
+    def test_review_patch_scans_rename_sides_with_their_own_file_types(self) -> None:
+        property_name = "pass" + "word"
+        reference = "context.driverPass" + "word"
+        patch = (
+            "diff --git a/src/runtime.ts b/config.yml\n"
+            "similarity index 80%\n"
+            "rename from src/runtime.ts\n"
+            "rename to config.yml\n"
+            "--- a/src/runtime.ts\n"
+            "+++ b/config.yml\n"
+            "@@ -1 +1 @@\n"
+            "-function configure(context: RuntimeContext) { return { "
+            + property_name
+            + ": "
+            + reference
+            + " }; }\n"
+            "+"
+            + property_name
+            + ": "
+            + reference
+            + "\n"
+        )
+
+        with self.assertRaisesRegex(SystemExit, "secret-like content"):
+            self.helper["validate_review_patch"](
+                "branch diff",
+                ["src/runtime.ts", "config.yml"],
+                patch,
+            )
+
+    def test_review_patch_decodes_git_quoted_source_paths(self) -> None:
+        property_name = "pass" + "word"
+        reference = "context.driverPass" + "word"
+        patch = (
+            'diff --git "a/\\303\\251.ts" "b/\\303\\251.ts"\n'
+            '--- "a/\\303\\251.ts"\n'
+            '+++ "b/\\303\\251.ts"\n'
+            "@@ -40,2 +40,3 @@ function configure(context: RuntimeContext) {\n"
+            "   return {\n"
+            "+    "
+            + property_name
+            + ": "
+            + reference
+            + ",\n"
+            "   };\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "local staged diff",
+                ["é.ts"],
+                patch,
+            ),
+            patch,
+        )
+        self.assertTrue(self.helper["source_code_review_path"]("module.mts"))
+        self.assertTrue(self.helper["source_code_review_path"]("module.cts"))
+
+    def test_secret_detector_allows_generated_fixture_credentials(self) -> None:
+        property_name = "pass" + "word"
+        variable_name = "to" + "ken"
+        access_property = "access" + "Token"
+        generated_fixture = (
+            f"function register() {{ return {{ {property_name}: "
+            + "`matrix-qa-${randomUUID()}` }; }"
+        )
+        generated_marker = (
+            f"const {variable_name} = "
+            + 'buildMatrixQaToken("MATRIX_QA_E2EE_THREAD");'
+        )
+        decoy_fixture = (
+            f"const config = {{ {access_property}: "
+            + 'decoy-'
+            + 'token" };'
+        )
+        literal_value = "actual-production-" + "secret"
+        fixture_shaped_literal = "PROD_TEST_ACTUAL_" + "SECRET_0123456789"
+        adversarial_label = "TEST_Q7WX9M2NK4PV8R6DH3JC"
+        unsafe_template = (
+            f"const {property_name} = "
+            + "`prod-live-secret-${randomUUID()}`;"
+        )
+        unsafe_string_template = (
+            f"const {property_name} = "
+            + "`prod-test-live-secret-${String()}`;"
+        )
+        unsafe_suffix_template = (
+            f"const {property_name} = "
+            + "`prod-live-secret-test-${randomUUID()}`;"
+        )
+        unsafe_call = (
+            f"const {variable_name} = "
+            + f'buildToken("{literal_value}");'
+        )
+        unsafe_fixture_label = (
+            f"const {property_name} = "
+            + f'"{fixture_shaped_literal}";'
+        )
+        unsafe_generator_label = (
+            f"const {variable_name} = "
+            + f'buildMatrixQaToken("{fixture_shaped_literal}");'
+        )
+        unsafe_identity_call = (
+            f"const {variable_name} = "
+            + f'buildTestToken("{adversarial_label}");'
+        )
+
+        for content in (generated_fixture, generated_marker, decoy_fixture):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+        for content in (
+            unsafe_template,
+            unsafe_string_template,
+            unsafe_suffix_template,
+            unsafe_call,
+            unsafe_fixture_label,
+            unsafe_generator_label,
+            unsafe_identity_call,
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
     def test_fallback_self_test_ignores_ambient_model_overrides(self) -> None:
         with mock.patch.dict(
             os.environ,

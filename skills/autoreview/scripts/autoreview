@@ -278,10 +278,14 @@ class ReviewChunk(NamedTuple):
     context: str = ""
 SECRET_PLACEHOLDER_VALUES = {
     "changeme",
+    "decoy-token",
     "dummy",
     "example",
     "fake",
     "gateway-token",
+    "matrix_qa_e2ee_cli_gateway",
+    "matrix_qa_e2ee_thread",
+    "matrix_qa_e2ee_verify_notice",
     "not-a-real",
     "placeholder",
     "redacted",
@@ -454,6 +458,26 @@ BACKTICK_SECRET_REFERENCE_PATTERNS = (
 BACKTICK_TEMPLATE_INTERPOLATION_PATTERN = re.compile(r"\$\{([^{}\r\n]+)\}")
 BACKTICK_TEMPLATE_SAFE_LITERAL_PATTERN = re.compile(
     r"(?i)(?:(?:Bearer|Basic)[ \t]+|[ \t:./,_-]*)"
+)
+BACKTICK_TEMPLATE_FIXTURE_PREFIX_VALUES = {"matrix-qa-"}
+SOURCE_CODE_REFERENCE_VALUES = {
+    "cliDevice.accessToken",
+    "context.driverAccessToken",
+    "context.driverPassword",
+    "context.observerAccessToken",
+    "context.observerPassword",
+    "context.sutAccessToken",
+    "driverAccount.accessToken",
+    "driverAccount.password",
+    "driverPassword",
+    "recoveryDevice.accessToken",
+    "recoveryDevice.password",
+}
+SOURCE_CODE_REFERENCE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_$?.])(?:" + "|".join(
+        re.escape(value)
+        for value in sorted(SOURCE_CODE_REFERENCE_VALUES, key=len, reverse=True)
+    ) + r")(?![A-Za-z0-9_$])"
 )
 DEFAULT_ENGINE_PATHS = ("/usr/local/bin", "/usr/bin", "/bin")
 # Keep this explicit: suffix matching leaks unrelated process credentials such
@@ -4610,27 +4634,37 @@ def safe_secret_call_suffix(text: str, end: int, call_target: str) -> bool:
         return safe_secret_assignment_suffix(text, cursor)
 
 
+def safe_backtick_literal_segment(value: str) -> bool:
+    return bool(
+        BACKTICK_TEMPLATE_SAFE_LITERAL_PATTERN.fullmatch(value)
+        or value.casefold() in BACKTICK_TEMPLATE_FIXTURE_PREFIX_VALUES
+    )
+
+
+def safe_backtick_interpolation_expression(expression: str) -> bool:
+    quoted_reference = "${" + expression + "}"
+    if any(
+        pattern.fullmatch(quoted_reference)
+        for pattern in QUOTED_SECRET_REFERENCE_PATTERNS
+    ):
+        return True
+    return re.fullmatch(r"(?:crypto\.)?randomUUID\(\)", expression) is not None
+
+
 def safe_backtick_secret_template(value: str) -> bool:
     cursor = 0
     found_interpolation = False
     for match in BACKTICK_TEMPLATE_INTERPOLATION_PATTERN.finditer(value):
         literal = value[cursor : match.start()]
-        if BACKTICK_TEMPLATE_SAFE_LITERAL_PATTERN.fullmatch(literal) is None:
+        if not safe_backtick_literal_segment(literal):
             return False
         expression = match.group(1).strip()
-        quoted_reference = "${" + expression + "}"
-        if not any(
-            pattern.fullmatch(quoted_reference)
-            for pattern in QUOTED_SECRET_REFERENCE_PATTERNS
-        ):
+        if not safe_backtick_interpolation_expression(expression):
             return False
         found_interpolation = True
         cursor = match.end()
     literal = value[cursor:]
-    return (
-        found_interpolation
-        and BACKTICK_TEMPLATE_SAFE_LITERAL_PATTERN.fullmatch(literal) is not None
-    )
+    return found_interpolation and safe_backtick_literal_segment(literal)
 
 
 def javascript_template_literal_end(
@@ -4764,6 +4798,14 @@ def mask_reference_declaration_evidence(text: str) -> str:
     return mask_csharp_evidence_prefix("".join(masked))
 
 
+@functools.lru_cache(maxsize=8)
+def source_code_reference_spans(text: str) -> frozenset[tuple[int, int]]:
+    return frozenset(
+        (match.start(), match.end())
+        for match in SOURCE_CODE_REFERENCE_PATTERN.finditer(text)
+    )
+
+
 def bare_code_reference(
     text: str,
     start: int,
@@ -4848,7 +4890,7 @@ def basic_authorization_risk(text: str) -> bool:
     return False
 
 
-def secret_text_risk(text: str) -> bool:
+def secret_text_risk(text: str, *, source_code: bool = False) -> bool:
     uri_authorities = uri_authority_ranges(text)
     if credentialed_uri_risk(text, uri_authorities) or basic_authorization_risk(text) or any(
         pattern.search(text) for pattern in SECRET_VALUE_PATTERNS
@@ -4868,6 +4910,9 @@ def secret_text_risk(text: str) -> bool:
     chained_assignment_positions = top_level_line_assignment_positions(
         text,
         {prefix.start() for prefix in assignment_prefixes},
+    )
+    source_reference_spans = (
+        source_code_reference_spans(text) if source_code else frozenset()
     )
     for prefix in assignment_prefixes:
         fallback = top_level_fallback_suffix(
@@ -4945,6 +4990,11 @@ def secret_text_risk(text: str) -> bool:
             and safe_secret_assignment_suffix(text, match.end())
         ):
             continue
+        if not quoted:
+            source_start = match.end() - len(value)
+            source_end = match.end() - (1 if value.endswith("!") else 0)
+            if (source_start, source_end) in source_reference_spans:
+                continue
         reference_patterns = (
             QUOTED_SECRET_REFERENCE_PATTERNS
             if quoted
@@ -4991,8 +5041,13 @@ def secret_text_risk(text: str) -> bool:
     return False
 
 
-def require_no_secret_values(label: str, text: str) -> None:
-    if secret_text_risk(text):
+def require_no_secret_values(
+    label: str,
+    text: str,
+    *,
+    source_code: bool = False,
+) -> None:
+    if secret_text_risk(text, source_code=source_code):
         raise SystemExit(
             "refusing to include secret-like content in review bundle; "
             f"clean or redact {label} before running autoreview"
@@ -5177,6 +5232,86 @@ def tracked_sensitive_repo_path_risk(rel: str) -> str | None:
     return None
 
 
+def source_code_review_path(rel: str) -> bool:
+    return Path(rel).suffix.lower() in {
+        ".cjs",
+        ".cts",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".mts",
+        ".ts",
+        ".tsx",
+    }
+
+
+def git_c_unquote(value: str) -> str | None:
+    if len(value) < 2 or value[0] != '"' or value[-1] != '"':
+        return None
+    escapes = {
+        "a": 7,
+        "b": 8,
+        "f": 12,
+        "n": 10,
+        "r": 13,
+        "t": 9,
+        "v": 11,
+        "\\": 92,
+        '"': 34,
+    }
+    decoded = bytearray()
+    cursor = 1
+    while cursor < len(value) - 1:
+        char = value[cursor]
+        if char != "\\":
+            decoded.extend(char.encode("utf-8"))
+            cursor += 1
+            continue
+        cursor += 1
+        if cursor >= len(value) - 1:
+            return None
+        escape = value[cursor]
+        if escape in escapes:
+            decoded.append(escapes[escape])
+            cursor += 1
+            continue
+        octal = re.match(r"[0-7]{1,3}", value[cursor:-1])
+        if octal is None:
+            return None
+        decoded.append(int(octal.group(0), 8))
+        cursor += octal.end()
+    try:
+        return decoded.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def diff_marker_path(value: str) -> str | None:
+    if value == "/dev/null":
+        return None
+    if value.startswith('"'):
+        decoded = git_c_unquote(value)
+        if decoded is None:
+            return None
+        value = decoded
+    if not value.startswith(("a/", "b/")):
+        return None
+    return value[2:]
+
+
+def diff_section_paths(section: str) -> tuple[str | None, str | None]:
+    old_path: str | None = None
+    new_path: str | None = None
+    for line in section.splitlines():
+        if line.startswith("@@"):
+            break
+        if line.startswith("--- "):
+            old_path = diff_marker_path(line[4:])
+        elif line.startswith("+++ "):
+            new_path = diff_marker_path(line[4:])
+    return old_path, new_path
+
+
 def validate_review_patch(
     label: str,
     paths: list[str],
@@ -5202,8 +5337,33 @@ def validate_review_patch(
             f"({patch_bytes} bytes; limit {limit}); split the change into smaller review targets"
         )
     require_no_secret_values(label, unified_diff_metadata(patch))
-    for content in unified_diff_contents(patch):
-        require_no_secret_values(label, content)
+    sections = [
+        unit
+        for unit in review_bundle_units(patch)
+        if unit.startswith("diff --git ")
+    ]
+    if sections:
+        expected_paths = set(paths)
+        for section in sections:
+            old_path, new_path = diff_section_paths(section)
+            old_content, new_content = unified_diff_contents(section)
+            for rel, content in (
+                (old_path, old_content),
+                (new_path, new_content),
+            ):
+                source_code = (
+                    rel is not None
+                    and rel in expected_paths
+                    and source_code_review_path(rel)
+                )
+                require_no_secret_values(
+                    f"{label} {rel or '<unknown>'}",
+                    content,
+                    source_code=source_code,
+                )
+    else:
+        for content in unified_diff_contents(patch):
+            require_no_secret_values(label, content)
     return patch
 
 
@@ -5312,7 +5472,7 @@ def file_bundle_snapshot(
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return "", True, "non-UTF-8 file"
-    if secret_text_risk(text):
+    if secret_text_risk(text, source_code=source_code_review_path(rel)):
         return "", True, "secret-like content"
     return text, False, None
 
