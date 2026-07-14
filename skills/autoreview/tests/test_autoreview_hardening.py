@@ -921,6 +921,27 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertEqual([reviewer.engine for reviewer in reviewers], ["claude"])
 
+    def test_environment_reviewer_list_rejects_empty_and_expands_all(self) -> None:
+        args = self.helper["reviewer_test_args"]()
+        with mock.patch.dict(
+            os.environ,
+            {"AUTOREVIEW_REVIEWERS": ","},
+            clear=False,
+        ), self.assertRaisesRegex(SystemExit, "must select at least one reviewer"):
+            self.helper["reviewer_args"](args)
+
+        with mock.patch.dict(
+            os.environ,
+            {"AUTOREVIEW_REVIEWERS": "all"},
+            clear=False,
+        ):
+            reviewers = self.helper["reviewer_args"](args)
+
+        self.assertEqual(
+            [reviewer.engine for reviewer in reviewers],
+            list(self.helper["ALL_REVIEWERS"]),
+        )
+
     def test_reviewer_selection_flags_reject_prefix_abbreviations(self) -> None:
         result = subprocess.run(
             [sys.executable, str(SCRIPT), "--engi", "claude"],
@@ -5081,6 +5102,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     "1",
                 )
                 self.assertEqual(default["ANTHROPIC_API_KEY"], "test-api-key")
+                subscription_flags = self.helper["claude_review_isolation_flags"](
+                    argparse.Namespace(claude_auth="subscription")
+                )
+                sources_index = subscription_flags.index("--setting-sources")
+                self.assertEqual(subscription_flags[sources_index + 1], "")
             finally:
                 os.environ.clear()
                 os.environ.update(old)

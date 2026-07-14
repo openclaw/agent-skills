@@ -9560,6 +9560,8 @@ def prepare_codex_runtime_profile(
             if key in aws
         )
     runtime_codex_home.mkdir(parents=True, exist_ok=True)
+    # Codex >= 0.134 loads --profile NAME from NAME.config.toml. The legacy
+    # [profiles.NAME] table in config.toml is no longer read.
     runtime_profile = runtime_codex_home / f"{profile}.config.toml"
     runtime_profile.write_text("\n".join(lines) + "\n", encoding="utf-8")
     runtime_profile.chmod(0o600)
@@ -9646,11 +9648,18 @@ def codex_exec_isolation_flags() -> list[str]:
     return ["--ignore-user-config", "--ignore-rules", "--skip-git-repo-check"]
 
 
-def claude_review_isolation_flags() -> list[str]:
+def claude_review_isolation_flags(
+    args: argparse.Namespace | None = None,
+) -> list[str]:
+    setting_sources = (
+        ""
+        if args is not None and claude_auth_mode(args) == "subscription"
+        else "user"
+    )
     return [
         "--safe-mode",
         "--setting-sources",
-        "user",
+        setting_sources,
         "--strict-mcp-config",
         "--disallowedTools",
         "mcp__*",
@@ -9727,7 +9736,7 @@ def ensure_claude_isolation_supported(args: argparse.Namespace, repo: Path) -> N
         )
     probe_command = [
         claude_bin,
-        *claude_review_isolation_flags(),
+        *claude_review_isolation_flags(args),
         "--tools",
         "",
     ]
@@ -10146,7 +10155,7 @@ def run_claude_once(
 ) -> subprocess.CompletedProcess[str]:
     cmd = [
         resolve_command(args.claude_bin, repo),
-        *claude_review_isolation_flags(),
+        *claude_review_isolation_flags(args),
         "--print",
         "--no-session-persistence",
         "--output-format",
@@ -12181,6 +12190,18 @@ def parse_reviewer_token(token: str) -> tuple[str, str | None, str | None]:
     return engine, model, thinking
 
 
+def parse_reviewer_list(
+    value: str,
+    source: str,
+) -> list[tuple[str, str | None, str | None]]:
+    tokens = [token.strip() for token in value.split(",") if token.strip()]
+    if not tokens:
+        raise SystemExit(f"{source} must select at least one reviewer")
+    if len(tokens) == 1 and tokens[0] == "all":
+        tokens = list(ALL_REVIEWERS)
+    return [parse_reviewer_token(token) for token in tokens]
+
+
 def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
     global_model, model_by_engine = parse_keyed_options(args.model, "model")
     global_thinking, thinking_by_engine = parse_keyed_options(args.thinking, "thinking")
@@ -12189,11 +12210,8 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
     env_global_thinking, env_thinking_by_engine = env_defaults_for("thinking")
     env_global_fallback, env_fallback_by_engine = env_defaults_for("fallback-model")
     reviewers: list[tuple[str, str | None, str | None]] = []
-    if args.reviewers:
-        tokens = [token.strip() for token in args.reviewers.split(",") if token.strip()]
-        if len(tokens) == 1 and tokens[0] == "all":
-            tokens = list(ALL_REVIEWERS)
-        reviewers = [parse_reviewer_token(token) for token in tokens]
+    if args.reviewers is not None:
+        reviewers = parse_reviewer_list(args.reviewers, "--reviewers")
     elif args.panel:
         engines = [args.engine]
         for engine in ("codex", "claude"):
@@ -12203,10 +12221,7 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
     elif not getattr(args, "reviewer_selection_explicit", False) and (
         env_reviewers := os.environ.get("AUTOREVIEW_REVIEWERS", "").strip()
     ):
-        tokens = [token.strip() for token in env_reviewers.split(",") if token.strip()]
-        if len(tokens) == 1 and tokens[0] == "all":
-            tokens = list(ALL_REVIEWERS)
-        reviewers = [parse_reviewer_token(token) for token in tokens]
+        reviewers = parse_reviewer_list(env_reviewers, "AUTOREVIEW_REVIEWERS")
     else:
         reviewers = [(args.engine, None, None)]
 
@@ -12517,6 +12532,18 @@ def self_test_config_defaults() -> None:
         env_panel = reviewer_args(reviewer_test_args(engine="pi"))
         if [reviewer.engine for reviewer in env_panel] != ["codex", "claude"]:
             raise SystemExit("self-test config defaults failed: AUTOREVIEW_REVIEWERS was not applied")
+        os.environ["AUTOREVIEW_REVIEWERS"] = "all"
+        env_all = reviewer_args(reviewer_test_args())
+        if [reviewer.engine for reviewer in env_all] != list(ALL_REVIEWERS):
+            raise SystemExit("self-test config defaults failed: AUTOREVIEW_REVIEWERS=all was not expanded")
+        os.environ["AUTOREVIEW_REVIEWERS"] = ","
+        try:
+            reviewer_args(reviewer_test_args())
+            raise SystemExit("self-test config defaults failed: empty env reviewer panel accepted")
+        except SystemExit as error:
+            if "must select at least one reviewer" not in str(error):
+                raise
+        os.environ["AUTOREVIEW_REVIEWERS"] = "codex,claude"
         explicit_engine = reviewer_args(
             reviewer_test_args(
                 engine="claude",
