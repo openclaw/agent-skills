@@ -7,7 +7,7 @@ description: "Pre-commit/ship code review: Codex default; optional Claude or Pi.
 
 Run the bundled structured review helper as a closeout check. This is code review, not Guardian `auto_review` approval routing.
 
-Codex review is the default when no engine is set. It uses `gpt-5.6-sol` with `high` reasoning by default, then retries once with `gpt-5.6-terra` only when the account cannot access Sol. Claude review is optional and uses `claude-fable-5` with `high` effort by default.
+Codex review is the default when no engine is set. It uses `gpt-5.6-sol` with `high` reasoning by default, then retries once with `gpt-5.6-terra` only when the account cannot access Sol. Claude review is optional. Subscription/default auth uses `claude-fable-5` with `high` effort; Bedrock auth uses `global.anthropic.claude-opus-4-8` with `xhigh` effort.
 
 For user-visible behavior, pair autoreview with `behavior-validator`. Autoreview is source-aware and judges the change bundle; behavior validation is source-blind and judges the running product or tool against a behavior contract. A clean autoreview is not proof that a UI, CLI, API, or generated artifact works from the user's perspective.
 
@@ -44,6 +44,7 @@ Do not require autoreview for a change whose entire diff is prose-only internal 
 - Security perspective is always included, but it should not cripple legitimate functionality. Report security findings only when the change creates a concrete, actionable risk or removes an important safety check.
 - Reviewer subprocesses preserve engine authentication and non-credentialed proxy variables needed by headless or restricted-network environments while stripping process-injection, Git override, and credentialed proxy values.
 - Before engine invocation, autoreview runs TruffleHog over temporary snapshots of the exact added, modified, or deleted content under review. It intentionally matches TruffleHog's low-false-positive pre-commit policy (`verified,unknown`); it does not classify arbitrary password-like strings or rescan unchanged history. After that scan passes, locally recognized secret-like values are redacted in place only when they occur exclusively on deleted lines of an entirely removed file; if one of those deleted values also occurs in added, context, or mixed staged/unstaged content, the review fails closed. Install TruffleHog using its official platform-neutral instructions; autoreview fails with that link when the binary is unavailable and never auto-installs it. Repositories should also run TruffleHog in pull-request CI as a backup outside autoreview; repository-local Git hooks are optional. Review bundles still omit security-sensitive paths or files, and explicit prompt and dataset inputs remain checked before engine invocation. Safe large diffs are sent as one pass while they fit the aggregate prompt limit, then partitioned into complete bounded passes without truncation.
+- Review bundles fail closed before engine invocation when tracked or untracked paths look sensitive or patch text looks secret-like. Sensitive field names and file-backed configuration remain reviewable only when the scanner can classify them as references rather than embedded values; there is no scanner bypass. Safe large diffs are scanned in full, sent as one pass while they fit the aggregate prompt limit, then partitioned into complete bounded passes without truncation.
 - For regression provenance, keep roles separate: blamed code author, blamed PR author, PR merger/committer, current PR author, and PR/date. If no blamed PR is traceable, use the blamed commit as the provenance: commit SHA, date, and author username. Do not guess a merger or frame missing PR metadata as a separate finding.
 - If the blamed PR was merged by `clawsweeper[bot]` or another automation, identify the human trigger when practical. Check timeline/comments first; if rate-limited, use gitcrawl/cache or public PR HTML. Look for maintainer commands such as `@clawsweeper automerge`, `/landpr`, or labels/status comments that armed automerge. Report `automerge triggered by @login`; if not found, say trigger unknown.
 - Do not invoke built-in `codex review`, nested reviewers, or reviewer panels from inside the review. The helper builds one validated bundle, calls the selected engine once for normal inputs or once per complete bounded chunk for oversized inputs, validates the structured results, and stops.
@@ -300,7 +301,7 @@ Recommended model defaults:
 | Engine              | Default model                                      | Source note                                           |
 | ------------------- | -------------------------------------------------- | ----------------------------------------------------- |
 | **codex** (default) | `gpt-5.6-sol` -> `gpt-5.6-terra` on access failure | OpenClaw org review default                           |
-| **claude**          | `claude-fable-5`                                   | Anthropic's most capable widely released Claude model |
+| **claude**          | `claude-fable-5`; Bedrock: `global.anthropic.claude-opus-4-8` | Auth-aware defaults: Fable/high for subscription, Opus/xhigh for Bedrock |
 
 CLI flags and environment variables override these defaults. Pi does not get a built-in model default because its provider catalog may vary by installation. Droid, Copilot, Cursor, and OpenCode are currently refused.
 
@@ -339,8 +340,8 @@ Examples matching current `main` behavior:
 "$AUTOREVIEW" --engine claude --model claude-fable-5 --fallback-model claude-opus-4-8,claude-sonnet-4-6
 
 # Mixed auth: Codex uses its stored ChatGPT login while Claude uses Amazon Bedrock.
-# The built-in Fable default maps to global.anthropic.claude-fable-5 on Bedrock;
-# pass --model claude=<geo-or-application-inference-profile> to override it.
+# Bedrock defaults to global.anthropic.claude-opus-4-8 at xhigh effort;
+# explicit --model and --thinking values still win (including Fable when requested).
 "$AUTOREVIEW" --panel --codex-auth chatgpt --claude-auth bedrock --claude-bedrock-region us-east-1
 
 # Bedrock panel: the isolated Codex reviewer stages the named amazon-bedrock profile;
@@ -449,7 +450,7 @@ The helper:
 - supports `--dry-run`, `--parallel-tests`, `--parallel-tests-shell`, `--prompt`, repo-relative `--prompt-file`, repo-relative `--dataset`, `--no-tools`, `--no-web-search`, repeatable Codex-only safe model/response tuning with `--codex-config key=value`, Codex-only `--codex-speed fast|flex|default`, and commit refs
 - supports `--stream-engine-output` or `AUTOREVIEW_STREAM_ENGINE_OUTPUT=1` for live engine text while preserving structured validation; Codex and Claude hide tool/file event details, emit compact activity summaries, and report usage at turn completion
 - supports opt-in review panels with `--panel` / `--reviewers`, an `AUTOREVIEW_REVIEWERS` personal default, per-engine `--model` / `--thinking`, and Claude `--fallback-model`
-- uses built-in defaults `codex=gpt-5.6-sol` with `high` reasoning and an access-only `gpt-5.6-terra` retry, plus `claude=claude-fable-5` with `high` effort; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
+- uses built-in defaults `codex=gpt-5.6-sol` with `high` reasoning and an access-only `gpt-5.6-terra` retry, plus auth-aware Claude defaults: `claude-fable-5`/`high` for subscription or default auth and `global.anthropic.claude-opus-4-8`/`xhigh` for Bedrock; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
 - supports isolated `--codex-profile` / `AUTOREVIEW_CODEX_PROFILE` routing for sanitized built-in Amazon Bedrock profiles, automatically drops Codex CLI schema enforcement for those non-OpenAI runs, and disables model-controlled process tools so provider credentials remain outside the model-visible tool boundary
 - supports `--codex-auth chatgpt` to force stored ChatGPT auth independently of Claude, plus `--claude-auth subscription|bedrock` to force Claude Code login or AWS Bedrock routing independently of Codex; Fable refusal handling is a transparent Fable retry followed by an explicit `claude-opus-4-8`/`max` fallback after the second refusal
 - gives Codex the bundle in an empty workspace with web search available; Claude receives the bundle plus WebSearch by default and optional domain-constrained WebFetch, and Pi receives the bundle with no tools

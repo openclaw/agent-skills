@@ -2710,6 +2710,83 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.subTest(content=content):
                 self.assertTrue(self.helper["secret_text_risk"](content))
 
+    def test_secret_detector_allows_file_backed_secret_configuration(self) -> None:
+        for content in (
+            "private_" + "key:\n  filename: /certs/current/key.pem",
+            "private_"
+            + "key:\n  filename: /certs/current/key.pem # current certificate path",
+            "private_"
+            + "key:\n  filename: /var/run/app2/client-secret.txt",
+            "private_"
+            + "key:\n  filename: /certs/current/key.pem\n"
+            + "  # rotated certificate path",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_non_file_nested_secret_values(self) -> None:
+        for content in (
+            "private_" + "key:\n  inline_string: CorrectHorseBatteryStaple",
+            "private_" + "key:\n  filename: CorrectHorseBatteryStaple",
+            "private_" + "key:\n  filename: CorrectHorseBatteryStaple.txt",
+            "private_" + "key:\n  filename: Correct-Horse-Battery-Staple.txt",
+            "private_" + "key:\n  filename: correct-horse-battery-staple.txt",
+            "private_" + "key:\n  filename: abcdefghijklmnopqrstuvwx.abcdef",
+            "private_"
+            + "key:\n  filename: /run/a1b2c3d4-e5f6g7h8-i9j0k1l2.pem",
+            "private_"
+            + "key:\n  filename: /run/CorrectHorseBatteryStaple/key.pem",
+            "private_"
+            + "key:\n  filename: /Correct/Horse/Battery/Staple/key.pem",
+            "private_" + "key:\n  filename: ./CorrectHorseBatteryStaple",
+            "private_"
+            + "key:\n  filename: ./Correct/Horse/Battery/Staple.txt",
+            "private_"
+            + "key:\n  filename: /certs/current/key.pem\n"
+            + "  value: CorrectHorseBatteryStaple",
+            "private_"
+            + "key:\n  filename: /certs/current/key.pem # actual value "
+            + "CorrectHorseBatteryStaple",
+            "private_"
+            + "key:\n  filename: /certs/current/key.pem\n"
+            + "  # actual value CorrectHorseBatteryStaple",
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_allows_secret_named_file_reads(self) -> None:
+        identity_name = "identity" + "Secret"
+        validation_name = "validation" + "Secret"
+        for content in (
+            f"const {identity_name} = readFileSync("
+            + 'path.join(workDir, "mesh-identity-secret.yaml"), "utf8");',
+            f"const {validation_name} = "
+            + "fs.readFileSync('/run/mesh-validation-secret.yaml');",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_opaque_secret_named_file_reads(self) -> None:
+        identity_name = "identity" + "Secret"
+        validation_name = "validation" + "Secret"
+        opaque_value = "CorrectHorse" + "BatteryStaple"
+        for content in (
+            f"const {identity_name} = readFileSync('{opaque_value}');",
+            f"const {identity_name} = readFileSync('{opaque_value}.txt');",
+            f"const {identity_name} = readFileSync('./{opaque_value}');",
+            f"const {identity_name} = readFileSync('abcdefghijklmnop.txt');",
+            f"const {validation_name} = readFileSync("
+            + 'path.join(workDir, "actual-production-secret"));',
+            f"const {validation_name} = readFileSync("
+            + 'path.join("Correct", "Horse", "Battery", "Staple"));',
+            f"const {identity_name} = vault.readFile("
+            + "'/k.pem', 'actual-production-secret');",
+            f"const {identity_name} = readFileSync("
+            + "'/safe/key.pem', 'actual-production-secret');",
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
     def test_secret_detector_allows_dotted_config_keys(self) -> None:
         self.assertFalse(
             self.helper["secret_text_risk"](

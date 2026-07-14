@@ -310,9 +310,9 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         self.assertEqual(reviewers[1].claude_bedrock_region, "us-east-1")
         self.assertEqual(
             reviewers[1].model,
-            "global.anthropic.claude-fable-5",
+            "global.anthropic.claude-opus-4-8",
         )
-        self.assertEqual(reviewers[1].thinking, "high")
+        self.assertEqual(reviewers[1].thinking, "xhigh")
 
     def test_cursor_agent_keyed_option_normalizes_to_cursor(self) -> None:
         self.assertEqual(

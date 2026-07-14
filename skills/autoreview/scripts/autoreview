@@ -787,7 +787,8 @@ DEFAULT_MODEL_BY_ENGINE = {
     "claude": "claude-fable-5",
 }
 DEFAULT_CODEX_ACCESS_FALLBACK_MODEL = "gpt-5.6-terra"
-DEFAULT_CLAUDE_BEDROCK_MODEL = "global.anthropic.claude-fable-5"
+DEFAULT_CLAUDE_BEDROCK_MODEL = "global.anthropic.claude-opus-4-8"
+DEFAULT_CLAUDE_BEDROCK_THINKING = "xhigh"
 DEFAULT_THINKING_BY_ENGINE = {
     "codex": "high",
     "claude": "high",
@@ -5560,6 +5561,120 @@ def public_call_argument_risk(
     return False if generic_credential_prompt_is_safe(value) else None
 
 
+def opaque_secret_token_risk(text: str) -> bool:
+    return any(
+        len(token) >= 20
+        and token.casefold() not in SECRET_PLACEHOLDER_VALUES
+        for token in re.findall(r"[A-Za-z0-9_]{20,}", text)
+    )
+
+
+def file_reference_value_is_safe(
+    value: str,
+    *,
+    allow_bare_filename: bool = False,
+) -> bool:
+    if (
+        not value
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        or credentialed_uri_risk(value)
+        or any(pattern.search(value) for pattern in SECRET_VALUE_PATTERNS)
+    ):
+        return False
+    if not allow_bare_filename and "/" not in value and "\\" not in value:
+        return False
+    normalized_path = value.replace("\\", "/")
+    path_components = [
+        component
+        for component in normalized_path.split("/")
+        if component not in {"", ".", "..", "~"}
+    ]
+    if any(
+        opaque_secret_token_risk(component)
+        for component in path_components
+    ):
+        return False
+    title_components = [
+        component
+        for component in path_components[:-1]
+        if re.fullmatch(r"[A-Z][A-Za-z0-9]*", component) is not None
+    ]
+    if len(title_components) >= 3 and opaque_secret_token_risk(
+        "".join(title_components)
+    ):
+        return False
+    basename = normalized_path.rsplit("/", 1)[-1]
+    filename_match = re.fullmatch(
+        r"[a-z0-9][a-z0-9._-]{0,127}\.[a-z0-9][a-z0-9_-]{0,15}",
+        basename,
+    )
+    if filename_match is None:
+        return False
+    stem = basename.rsplit(".", 1)[0]
+    compact_stem = "".join(re.findall(r"[a-z0-9]", stem))
+    return len(compact_stem) <= 20
+
+
+def safe_file_reference_expression(expression: str) -> bool:
+    expression = expression.strip()
+    literal = re.fullmatch(r"([\"'])([^\"'\r\n]+)\1", expression)
+    if literal is not None:
+        return file_reference_value_is_safe(literal.group(2))
+    if URI_CREDENTIAL_REFERENCE_PATTERN.fullmatch(expression) is not None:
+        return True
+    path_call = re.fullmatch(
+        r"(?:path|posixpath|ntpath|os\.path)\.(?:join|resolve)\s*\((.*)\)",
+        expression,
+        re.DOTALL,
+    )
+    if path_call is None:
+        return False
+    components = split_top_level_call_arguments(path_call.group(1))
+    if not components:
+        return False
+    path_evidence = False
+    opaque_literal_components: list[str] = []
+    for component in components:
+        component = component.strip()
+        literal = re.fullmatch(r"([\"'])([^\"'\r\n]+)\1", component)
+        if literal is not None:
+            value = literal.group(2)
+            if file_reference_value_is_safe(value, allow_bare_filename=True):
+                path_evidence = True
+                continue
+            if len(value) >= 12:
+                return False
+            opaque_literal_components.append(value)
+            continue
+        if URI_CREDENTIAL_REFERENCE_PATTERN.fullmatch(component) is None:
+            return False
+    if (
+        len(opaque_literal_components) > 1
+        and sensitive_mapping_comment_risk("".join(opaque_literal_components))
+    ):
+        return False
+    return path_evidence
+
+
+def file_read_argument_safety(
+    call_target: str,
+    argument: str,
+    argument_index: int,
+) -> bool | None:
+    if argument_index != 0:
+        return None
+    normalized_target = call_target.replace("?.", ".")
+    if normalized_target not in {
+        "readFile",
+        "readFileSync",
+        "fs.readFile",
+        "fs.readFileSync",
+        "fs.promises.readFile",
+    }:
+        return None
+    return safe_file_reference_expression(argument)
+
+
 def call_arguments_risk(
     arguments: str,
     call_target: str,
@@ -5578,6 +5693,11 @@ def call_arguments_risk(
             argument_index=index,
             javascript_dialect=javascript_dialect,
         )
+        file_read_safety = file_read_argument_safety(call_target, argument, index)
+        if file_read_safety is not None:
+            if file_read_safety:
+                continue
+            return True
         if not safe_credential_lookup_argument(
             call_target, scanned_argument, index
         ) and fallback_secret_risk(
@@ -6259,6 +6379,86 @@ def secret_text_risk(
             secret_text_risk(segment, javascript_dialect=javascript_dialect)
             for segment in text.split(DIFF_HUNK_CONTENT_BOUNDARY)
         )
+def sensitive_mapping_comment_risk(comment: str) -> bool:
+    if secret_literal_risk(comment, minimum_length=12):
+        return True
+    return opaque_secret_token_risk(comment)
+
+
+def nested_file_reference_mapping_safety(
+    text: str,
+    prefix: re.Match[str],
+) -> bool | None:
+    separator = re.search(r":(?![:=])", prefix.group(0))
+    if separator is None or "\n" not in prefix.group(0)[separator.end() :]:
+        return None
+    parent_key = prefix.group(0)[: separator.start()].strip(" \t\"'").casefold()
+    if parent_key not in {"private_key", "privatekey"}:
+        return None
+    child_start = prefix.end()
+    child_assignment = re.match(
+        r"(?P<key>filename)[ \t]*:[ \t]*"
+        r"(?P<value>[^\r\n#]+)",
+        text[child_start:],
+        re.IGNORECASE,
+    )
+    if child_assignment is None:
+        return None
+    parent_line_start = max(
+        text.rfind("\n", 0, prefix.start()),
+        text.rfind("\r", 0, prefix.start()),
+    )
+    child_line_start = max(
+        text.rfind("\n", 0, child_start),
+        text.rfind("\r", 0, child_start),
+    )
+    parent_indent = prefix.start() - parent_line_start - 1
+    child_indent = child_start - child_line_start - 1
+    if child_indent <= parent_indent:
+        return False
+    raw_value = child_assignment.group("value").strip()
+    literal = re.fullmatch(r"([\"'])([^\"'\r\n]+)\1", raw_value)
+    value = literal.group(2) if literal is not None else raw_value
+    if not file_reference_value_is_safe(value):
+        return False
+
+    cursor = child_start + child_assignment.end()
+    line_end = len(text)
+    for separator_char in ("\n", "\r"):
+        candidate = text.find(separator_char, cursor)
+        if candidate >= 0:
+            line_end = min(line_end, candidate)
+    inline_comment = text[cursor:line_end].lstrip(" \t")
+    if inline_comment.startswith("#") and sensitive_mapping_comment_risk(
+        inline_comment[1:]
+    ):
+        return False
+    cursor = line_end
+    while cursor < len(text):
+        if text.startswith("\r\n", cursor):
+            cursor += 2
+        else:
+            cursor += 1
+        next_end = len(text)
+        for separator_char in ("\n", "\r"):
+            candidate = text.find(separator_char, cursor)
+            if candidate >= 0:
+                next_end = min(next_end, candidate)
+        line = text[cursor:next_end]
+        stripped = line.lstrip(" \t")
+        if stripped.startswith("#"):
+            if sensitive_mapping_comment_risk(stripped[1:]):
+                return False
+        elif stripped:
+            indent = len(line) - len(stripped)
+            if indent > parent_indent:
+                return False
+            return True
+        cursor = next_end
+    return True
+
+
+def secret_text_risk(text: str) -> bool:
     uri_authorities = uri_authority_ranges(text)
     if credentialed_uri_risk(text, uri_authorities) or basic_authorization_risk(text) or any(
         pattern.search(text) for pattern in SECRET_VALUE_PATTERNS
@@ -6297,6 +6497,7 @@ def secret_text_risk(
         if javascript_dialect is not None
         else frozenset()
     )
+    safe_nested_file_references: set[int] = set()
     for prefix in assignment_prefixes:
         if prefix.start() in boolean_declaration_positions:
             continue
@@ -6313,6 +6514,12 @@ def secret_text_risk(
             javascript_dialect=javascript_dialect,
         ):
             return True
+        nested_file_safety = nested_file_reference_mapping_safety(text, prefix)
+        if nested_file_safety is not None:
+            if not nested_file_safety:
+                return True
+            safe_nested_file_references.add(prefix.start())
+            continue
         fallback = top_level_fallback_suffix(
             text[prefix.end() :],
             allow_chained_assignment=(
@@ -6346,6 +6553,8 @@ def secret_text_risk(
             or match.group("bare_value")
         )
         if value is None:
+            continue
+        if match.start() in safe_nested_file_references:
             continue
         key = re.split(r"\s*[:=]\s*", match.group(0), maxsplit=1)[0]
         separator_match = re.search(r"[:=]", match.group(0))
@@ -12127,7 +12336,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         action="append",
-        help="Model for all reviewers or engine=model. Repeatable. Defaults: codex=gpt-5.6-sol/high with an access-only gpt-5.6-terra retry, claude=claude-fable-5/high.",
+        help="Model for all reviewers or engine=model. Repeatable. Defaults: codex=gpt-5.6-sol/high with an access-only gpt-5.6-terra retry; Claude subscription/default auth=claude-fable-5/high; Claude Bedrock auth=global.anthropic.claude-opus-4-8/xhigh.",
     )
     parser.add_argument("--thinking", action="append", help="Thinking/effort for all reviewers or engine=level. Repeatable. Codex: none, minimal, low, medium, high, xhigh, max. Claude: low, medium, high, xhigh, max. Droid: off, none, low, medium, high. Pi: off, minimal, low, medium, high, xhigh. OpenCode: minimal, low, medium, high, max. Cursor: none.")
     parser.add_argument(
@@ -12429,30 +12638,40 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
             or global_model
             or env_model_by_engine.get(engine)
             or env_global_model
-            or (
+        )
+        if model is None:
+            model = (
                 None
                 if engine == "codex" and codex_profile is not None
-                else DEFAULT_MODEL_BY_ENGINE.get(engine)
+                else (
+                    DEFAULT_CLAUDE_BEDROCK_MODEL
+                    if engine == "claude" and claude_auth == "bedrock"
+                    else DEFAULT_MODEL_BY_ENGINE.get(engine)
+                )
             )
-        )
         if (
             engine == "claude"
             and claude_auth == "bedrock"
-            and model == DEFAULT_MODEL_BY_ENGINE["claude"]
+            and model in {"claude-fable-5", "claude-opus-4-8"}
         ):
-            model = DEFAULT_CLAUDE_BEDROCK_MODEL
+            model = f"global.anthropic.{model}"
         thinking = (
             inline_thinking
             or thinking_by_engine.get(engine)
             or global_thinking
             or env_thinking_by_engine.get(engine)
             or env_global_thinking
-            or (
+        )
+        if thinking is None:
+            thinking = (
                 None
                 if engine == "codex" and codex_profile is not None
-                else DEFAULT_THINKING_BY_ENGINE.get(engine)
+                else (
+                    DEFAULT_CLAUDE_BEDROCK_THINKING
+                    if engine == "claude" and claude_auth == "bedrock"
+                    else DEFAULT_THINKING_BY_ENGINE.get(engine)
+                )
             )
-        )
         if engine == "claude":
             fallback_model = (
                 fallback_by_engine.get(engine)
@@ -12751,6 +12970,27 @@ def self_test_config_defaults() -> None:
         if bedrock_claude.model != DEFAULT_CLAUDE_BEDROCK_MODEL:
             raise SystemExit(
                 "self-test config defaults failed: Claude Bedrock model was not mapped"
+            )
+        if bedrock_claude.thinking != DEFAULT_CLAUDE_BEDROCK_THINKING:
+            raise SystemExit(
+                "self-test config defaults failed: Claude Bedrock thinking was not mapped"
+            )
+        bedrock_claude_override = reviewer_args(
+            reviewer_test_args(
+                engine="claude",
+                claude_auth="bedrock",
+                claude_bedrock_region="us-east-1",
+                model=["claude-fable-5"],
+                thinking=["max"],
+            )
+        )[0]
+        if (
+            bedrock_claude_override.model != "global.anthropic.claude-fable-5"
+            or bedrock_claude_override.thinking != "max"
+        ):
+            raise SystemExit(
+                "self-test config defaults failed: explicit Claude Bedrock "
+                "model/thinking did not override auth defaults"
             )
         chatgpt_codex = reviewer_args(
             reviewer_test_args(engine="codex", codex_auth="chatgpt")
