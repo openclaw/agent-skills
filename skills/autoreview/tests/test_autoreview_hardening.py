@@ -2363,6 +2363,29 @@ class AutoreviewHardeningTests(unittest.TestCase):
             'const recoveryKey = "not-'
             + 'a-valid-matrix-recovery-key";'
         )
+        habitat_org_fixture = 'personal_org_id="org-habitat-personal-recreated"'
+        devbox_secret_fixture = (
+            "secret = cloud_init_secret_manifest(\n"
+            + '    namespace="test-dev-user",\n'
+            + '    gateway_host="gateway.test.host",\n'
+            + '    config_json=json.dumps({"setup_complete": "pending"}),\n'
+            + '    github_token="test-github-token",\n'
+            + ")"
+        )
+        devbox_worker_fixture = (
+            "secret = worker._agent_bootstrap_cloud_init_secret_manifest(\n"
+            + '    github_token="github-token",\n'
+            + ")\n"
+            + "secret = worker.agent_claim_cloud_init_secret_manifest(\n"
+            + '    github_token="github-token",\n'
+            + ")\n"
+            + 'assert "github_token=github-token" in user_data'
+        )
+        devbox_diff_fragment = (
+            "secret = worker._agent_bootstrap_cloud_init_secret_manifest(\n"
+            + "    vm_init=_vm_init_context(),\n"
+            + ";\n"
+        )
         literal_value = "actual-production-" + "secret"
         fixture_shaped_literal = "PROD_TEST_ACTUAL_" + "SECRET_0123456789"
         adversarial_label = "TEST_Q7WX9M2NK4PV8R6DH3JC"
@@ -2394,12 +2417,24 @@ class AutoreviewHardeningTests(unittest.TestCase):
             f"const {variable_name} = "
             + f'buildTestToken("{adversarial_label}");'
         )
+        unsafe_org_fixture_suffix = (
+            'personal_org_id="org-habitat-personal-recreated-prod"'
+        )
+        unsafe_devbox_secret_fixture = (
+            "secret = cloud_init_secret_manifest(\n"
+            + f'    github_token="{literal_value}",\n'
+            + ")"
+        )
 
         for content in (
             generated_fixture,
             generated_marker,
             decoy_fixture,
             invalid_recovery_fixture,
+            habitat_org_fixture,
+            devbox_secret_fixture,
+            devbox_worker_fixture,
+            devbox_diff_fragment,
         ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
@@ -2411,6 +2446,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             unsafe_fixture_label,
             unsafe_generator_label,
             unsafe_identity_call,
+            unsafe_org_fixture_suffix,
+            unsafe_devbox_secret_fixture,
         ):
             with self.subTest(content=content):
                 self.assertTrue(self.helper["secret_text_risk"](content))

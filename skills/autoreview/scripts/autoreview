@@ -215,7 +215,11 @@ SECRET_VALUE_PATTERNS = [
         r"PRIVATE KEY(?: BLOCK)?-----"
     ),
     re.compile(r"(?i)bearer\s+[A-Za-z0-9._-]{20,}"),
-    re.compile(r"\b(?:sk|rk|pk|org|proj)-[A-Za-z0-9_-]{20,}\b"),
+    re.compile(
+        r"\b(?:sk|rk|pk|proj)-[A-Za-z0-9_-]{20,}\b"
+        r"|\borg-(?!habitat-personal-recreated(?![A-Za-z0-9_-]))"
+        r"[A-Za-z0-9_-]{20,}\b"
+    ),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b"),
@@ -283,6 +287,7 @@ SECRET_PLACEHOLDER_VALUES = {
     "example",
     "fake",
     "gateway-token",
+    "github-token",
     "matrix_qa_e2ee_cli_gateway",
     "matrix_qa_e2ee_thread",
     "matrix_qa_e2ee_verify_notice",
@@ -293,6 +298,7 @@ SECRET_PLACEHOLDER_VALUES = {
     "sample",
     "secret-token",
     "test-auth-token",
+    "test-github-token",
     "test-token-placeholder",
     "token-oversized",
     "clawrouter-e2e-secret",
@@ -353,7 +359,16 @@ NON_SHELL_COMMAND_WORDS = {
     "with",
     "yield",
 }
-PUBLIC_PROMPT_TARGETS = {"getpass.getpass", "input", "prompt"}
+SECRET_FIXTURE_FACTORY_TARGETS = {
+    "cloud_init_secret_manifest",
+    "worker._agent_bootstrap_cloud_init_secret_manifest",
+    "worker.agent_claim_cloud_init_secret_manifest",
+}
+PUBLIC_PROMPT_TARGETS = {
+    "getpass.getpass",
+    "input",
+    "prompt",
+} | SECRET_FIXTURE_FACTORY_TARGETS
 GENERIC_CREDENTIAL_PROMPT_PATTERN = re.compile(
     r"(?i)\s*(?:(?:enter|type|provide)\s+(?:(?:your|the)\s+)?)?"
     r"(?:password|passphrase|api[\s_-]*(?:key|token))"
@@ -4562,6 +4577,14 @@ def public_call_argument_risk(
 
 
 def call_arguments_risk(arguments: str, call_target: str) -> bool:
+    if call_target in SECRET_FIXTURE_FACTORY_TARGETS:
+        for argument in split_top_level_call_arguments(arguments):
+            if re.match(r"\s*[A-Za-z_][A-Za-z0-9_]*\s*=", argument):
+                if secret_text_risk(argument):
+                    return True
+            elif fallback_secret_risk(argument, minimum_length=12):
+                return True
+        return False
     for index, argument in enumerate(split_top_level_call_arguments(arguments)):
         public_risk = public_call_argument_risk(call_target, argument, index)
         if public_risk is not None:
@@ -4644,9 +4667,14 @@ def safe_secret_call_suffix(text: str, end: int, call_target: str) -> bool:
 
     def safe_call_end(start: int, target: str) -> int | None:
         cursor = balanced_end(start, "(", ")")
+        if cursor is None and target in SECRET_FIXTURE_FACTORY_TARGETS:
+            fragment_end = re.search(r"(?m)^[ \t]*;", text[start:])
+            if fragment_end is not None:
+                cursor = start + fragment_end.start()
         if cursor is None:
             return None
-        arguments = text[start + 1 : cursor - 1]
+        arguments_end = cursor - 1 if text[cursor - 1 : cursor] == ")" else cursor
+        arguments = text[start + 1 : arguments_end]
         return None if call_arguments_risk(arguments, target) else cursor
 
     cursor = safe_call_end(end, call_target)
