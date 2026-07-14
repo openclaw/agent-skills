@@ -787,9 +787,10 @@ DEFAULT_MODEL_BY_ENGINE = {
     "claude": "claude-fable-5",
 }
 DEFAULT_CODEX_ACCESS_FALLBACK_MODEL = "gpt-5.6-terra"
+DEFAULT_CLAUDE_BEDROCK_MODEL = "global.anthropic.claude-fable-5"
 DEFAULT_THINKING_BY_ENGINE = {
     "codex": "high",
-    "claude": "max",
+    "claude": "high",
 }
 THINKING_LEVELS_BY_ENGINE = {
     "codex": {"none", "minimal", "low", "medium", "high", "xhigh", "max"},
@@ -815,6 +816,15 @@ CODEX_BEDROCK_ENV_KEYS = {
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
 }
+CODEX_CHATGPT_ENV_EXCLUDES = {
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_ENDPOINT",
+    "CODEX_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_ORGANIZATION",
+    "OPENAI_PROJECT",
+}
 CLAUDE_SUBSCRIPTION_ENV_EXCLUDES = {
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -835,6 +845,29 @@ CLAUDE_SUBSCRIPTION_ENV_EXCLUDES = {
     "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
     "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_VERTEX",
+}
+CLAUDE_BEDROCK_ENV_EXCLUDES = {
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_AWS_API_KEY",
+    "ANTHROPIC_AWS_BASE_URL",
+    "ANTHROPIC_AWS_WORKSPACE_ID",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_OAUTH_SCOPES",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
     "CLAUDE_CODE_USE_FOUNDRY",
     "CLAUDE_CODE_USE_MANTLE",
     "CLAUDE_CODE_USE_VERTEX",
@@ -9463,6 +9496,9 @@ def codex_engine_env(
         extra,
         engine="codex",
     )
+    if codex_auth_mode(args) == "chatgpt":
+        for key in CODEX_CHATGPT_ENV_EXCLUDES:
+            env.pop(key, None)
     if codex_profile_name(args) is not None:
         for key in CODEX_BEDROCK_ENV_KEYS:
             value = os.environ.get(key)
@@ -9568,7 +9604,21 @@ def prepare_codex_runtime_profile(
     return True
 
 
-def codex_auth_config_flags(repo: Path, *, force_file: bool = False) -> list[str]:
+def codex_auth_mode(args: argparse.Namespace) -> str:
+    mode = (getattr(args, "codex_auth", None) or "default").strip().lower()
+    if mode not in {"default", "chatgpt"}:
+        raise SystemExit(
+            f"invalid Codex auth mode: {mode!r} (valid: default, chatgpt)"
+        )
+    return mode
+
+
+def codex_auth_config_flags(
+    repo: Path,
+    *,
+    force_file: bool = False,
+    auth_mode: str = "default",
+) -> list[str]:
     codex_home = codex_source_home(repo)
     if codex_home is None:
         return ["-c", 'cli_auth_credentials_store="file"'] if force_file else []
@@ -9599,6 +9649,8 @@ def codex_auth_config_flags(repo: Path, *, force_file: bool = False) -> list[str
         ]
         if normalized_workspace_ids:
             flags.extend(["-c", f"forced_chatgpt_workspace_id={json.dumps(normalized_workspace_ids)}"])
+    if auth_mode == "chatgpt":
+        flags.extend(["-c", 'forced_login_method="chatgpt"'])
     return flags
 
 
@@ -9679,11 +9731,9 @@ def codex_profile_tool_isolation_flags(profile: str | None) -> list[str]:
 def claude_review_isolation_flags(
     args: argparse.Namespace | None = None,
 ) -> list[str]:
-    setting_sources = (
-        ""
-        if args is not None and claude_auth_mode(args) == "subscription"
-        else "user"
-    )
+    setting_sources = "user"
+    if args is not None and claude_auth_mode(args) in {"subscription", "bedrock"}:
+        setting_sources = ""
     return [
         "--safe-mode",
         "--setting-sources",
@@ -9715,11 +9765,28 @@ def parse_cli_version(text: str) -> tuple[int, int, int] | None:
 
 def claude_auth_mode(args: argparse.Namespace) -> str:
     mode = (getattr(args, "claude_auth", None) or "default").strip().lower()
-    if mode not in {"default", "subscription"}:
+    if mode not in {"default", "subscription", "bedrock"}:
         raise SystemExit(
-            f"invalid Claude auth mode: {mode!r} (valid: default, subscription)"
+            f"invalid Claude auth mode: {mode!r} (valid: default, subscription, bedrock)"
         )
     return mode
+
+
+def claude_bedrock_region(args: argparse.Namespace) -> str:
+    region = (
+        (getattr(args, "claude_bedrock_region", None) or "").strip()
+        or os.environ.get("AUTOREVIEW_CLAUDE_BEDROCK_REGION", "").strip()
+        or os.environ.get("AWS_REGION", "").strip()
+        or os.environ.get("AWS_DEFAULT_REGION", "").strip()
+    )
+    if not region:
+        raise SystemExit(
+            "Claude Bedrock auth requires --claude-bedrock-region, "
+            "AUTOREVIEW_CLAUDE_BEDROCK_REGION, or AWS_REGION"
+        )
+    if not re.fullmatch(r"[a-z0-9-]+", region):
+        raise SystemExit(f"invalid Claude Bedrock region: {region!r}")
+    return region
 
 
 def claude_engine_env(
@@ -9733,9 +9800,17 @@ def claude_engine_env(
         engine="claude",
         extra={"CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1"},
     )
-    if claude_auth_mode(args) == "subscription":
+    auth_mode = claude_auth_mode(args)
+    if auth_mode == "subscription":
         for key in CLAUDE_SUBSCRIPTION_ENV_EXCLUDES:
             env.pop(key, None)
+    elif auth_mode == "bedrock":
+        for key in CLAUDE_BEDROCK_ENV_EXCLUDES:
+            env.pop(key, None)
+        region = claude_bedrock_region(args)
+        env["CLAUDE_CODE_USE_BEDROCK"] = "1"
+        env["AWS_REGION"] = region
+        env["AWS_DEFAULT_REGION"] = region
     return env
 
 
@@ -9749,7 +9824,7 @@ def ensure_claude_isolation_supported(args: argparse.Namespace, repo: Path) -> N
     temp_root = safe_temp_root(repo)
     result = run([claude_bin, "--version"], temp_root, check=False, env=engine_env)
     selected_models = [args.model, *(getattr(args, "fallback_model", "") or "").split(",")]
-    uses_fable = any(model in {"claude-fable-5", "fable"} for model in selected_models)
+    uses_fable = any(claude_uses_fable_model(model) for model in selected_models)
     minimum_version = CLAUDE_FABLE_MIN_VERSION if uses_fable else CLAUDE_SAFE_MODE_MIN_VERSION
     version_reason = "for claude-fable-5" if uses_fable else "for --safe-mode"
     if result.returncode != 0:
@@ -9999,7 +10074,13 @@ def codex_command(
     if speed_override is not None:
         cmd.extend(["-c", speed_override])
     cmd.extend(codex_config_isolation_flags(review_root, runtime_root))
-    cmd.extend(codex_auth_config_flags(source_repo, force_file=force_file_auth))
+    cmd.extend(
+        codex_auth_config_flags(
+            source_repo,
+            force_file=force_file_auth,
+            auth_mode=codex_auth_mode(args),
+        )
+    )
     profile = codex_profile_name(args)
     if profile is not None:
         cmd.extend(codex_profile_tool_isolation_flags(profile))
@@ -10227,7 +10308,23 @@ def run_claude_once(
 
 
 def claude_uses_fable_model(model: str | None) -> bool:
-    return model == "fable" or bool(model and model.startswith("claude-fable-5"))
+    return model == "fable" or bool(
+        model
+        and (
+            model.startswith("claude-fable-5")
+            or model.endswith("anthropic.claude-fable-5")
+        )
+    )
+
+
+def claude_refusal_fallback_model(args: argparse.Namespace) -> str:
+    if claude_auth_mode(args) != "bedrock":
+        return "claude-opus-4-8"
+    model = args.model or ""
+    suffix = "anthropic.claude-fable-5"
+    if model.endswith(suffix):
+        return f"{model[:-len(suffix)]}anthropic.claude-opus-4-8"
+    return "global.anthropic.claude-opus-4-8"
 
 
 def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
@@ -10258,12 +10355,12 @@ def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         return result.stdout
 
     fallback_args = copy.copy(args)
-    fallback_args.model = "claude-opus-4-8"
+    fallback_args.model = claude_refusal_fallback_model(args)
     fallback_args.thinking = "max"
     fallback_args.fallback_model = None
     print(
         f"claude model {args.model} refused the review twice; "
-        "retrying with allowed fallback claude-opus-4-8 at max effort",
+        f"retrying with allowed fallback {fallback_args.model} at max effort",
         file=sys.stderr,
     )
     fallback_result = run_claude_once(fallback_args, repo, prompt)
@@ -12010,6 +12107,10 @@ def parse_args() -> argparse.Namespace:
         argument == "--claude-auth" or argument.startswith("--claude-auth=")
         for argument in sys.argv[1:]
     )
+    codex_auth_explicit = any(
+        argument == "--codex-auth" or argument.startswith("--codex-auth=")
+        for argument in sys.argv[1:]
+    )
     parser = argparse.ArgumentParser(
         description="Bundle-driven AI code review.",
         allow_abbrev=False,
@@ -12026,7 +12127,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         action="append",
-        help="Model for all reviewers or engine=model. Repeatable. Defaults: codex=gpt-5.6-sol/high with an access-only gpt-5.6-terra retry, claude=claude-fable-5/max.",
+        help="Model for all reviewers or engine=model. Repeatable. Defaults: codex=gpt-5.6-sol/high with an access-only gpt-5.6-terra retry, claude=claude-fable-5/high.",
     )
     parser.add_argument("--thinking", action="append", help="Thinking/effort for all reviewers or engine=level. Repeatable. Codex: none, minimal, low, medium, high, xhigh, max. Claude: low, medium, high, xhigh, max. Droid: off, none, low, medium, high. Pi: off, minimal, low, medium, high, xhigh. OpenCode: minimal, low, medium, high, max. Cursor: none.")
     parser.add_argument(
@@ -12052,6 +12153,12 @@ def parse_args() -> argparse.Namespace:
         help="Codex profile to stage into the isolated reviewer runtime. Currently supports amazon-bedrock profiles. Env default: AUTOREVIEW_CODEX_PROFILE.",
     )
     parser.add_argument(
+        "--codex-auth",
+        choices=["default", "chatgpt"],
+        default=os.environ.get("AUTOREVIEW_CODEX_AUTH", "default"),
+        help="Codex authentication source: default preserves API/provider env; chatgpt ignores API/provider routing env and forces the stored ChatGPT login. Env default: AUTOREVIEW_CODEX_AUTH.",
+    )
+    parser.add_argument(
         "--codex-no-output-schema",
         action="store_true",
         help="Do not pass --output-schema to codex exec; rely on the prompt-embedded schema and parse JSON from the final message. Auto-enabled for non-OpenAI providers (e.g. model_provider=amazon-bedrock), which hang when a strict schema runs with tool calls (openai/codex#15451). Env default: AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA.",
@@ -12059,9 +12166,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
     parser.add_argument(
         "--claude-auth",
-        choices=["default", "subscription"],
+        choices=["default", "subscription", "bedrock"],
         default=os.environ.get("AUTOREVIEW_CLAUDE_AUTH", "default"),
-        help="Claude authentication source: default preserves provider env; subscription ignores API/provider routing env and uses Claude Code login. Env default: AUTOREVIEW_CLAUDE_AUTH.",
+        help="Claude authentication source: default preserves provider env; subscription forces Claude Code login; bedrock forces AWS Bedrock routing with isolated settings. Env default: AUTOREVIEW_CLAUDE_AUTH.",
+    )
+    parser.add_argument(
+        "--claude-bedrock-region",
+        default=os.environ.get("AUTOREVIEW_CLAUDE_BEDROCK_REGION", "").strip() or None,
+        help="AWS region for --claude-auth bedrock. Env default: AUTOREVIEW_CLAUDE_BEDROCK_REGION; falls back to AWS_REGION/AWS_DEFAULT_REGION.",
     )
     parser.add_argument("--droid-bin", default=os.environ.get("DROID_BIN", "droid"))
     parser.add_argument("--copilot-bin", default=os.environ.get("COPILOT_BIN", "copilot"))
@@ -12137,6 +12249,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     args.reviewer_selection_explicit = reviewer_selection_explicit
     args.claude_auth_explicit = claude_auth_explicit
+    args.codex_auth_explicit = codex_auth_explicit
     args.engine = normalize_engine(args.engine)
     if args.cursor_allow_workspace_instructions is None:
         args.cursor_allow_workspace_instructions = env_truthy("AUTOREVIEW_CURSOR_ALLOW_WORKSPACE_INSTRUCTIONS")
@@ -12261,6 +12374,7 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
 
     selected_engines = {engine for engine, _, _ in reviewers}
     codex_profile = codex_profile_name(args)
+    codex_auth = codex_auth_mode(args)
     claude_auth = claude_auth_mode(args)
     fallback_engines = set(fallback_by_engine) | set(env_fallback_by_engine)
     unused_fallback_engines = fallback_engines - selected_engines
@@ -12279,6 +12393,18 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
         raise SystemExit("--codex-speed is only supported for codex; no codex reviewer selected")
     if codex_profile is not None and "codex" not in selected_engines:
         raise SystemExit("--codex-profile is only supported for codex; no codex reviewer selected")
+    if codex_auth != "default" and codex_profile is not None:
+        if getattr(args, "codex_auth_explicit", False):
+            raise SystemExit("--codex-auth chatgpt cannot be combined with --codex-profile")
+        # A profile is an explicit provider route. Let it override a personal
+        # AUTOREVIEW_CODEX_AUTH default without requiring callers to unset it.
+        codex_auth = "default"
+    if (
+        codex_auth != "default"
+        and "codex" not in selected_engines
+        and getattr(args, "codex_auth_explicit", False)
+    ):
+        raise SystemExit("--codex-auth is only supported for codex; no codex reviewer selected")
     if codex_no_output_schema_requested(args) and "codex" not in selected_engines:
         raise SystemExit(
             "--codex-no-output-schema is only supported for codex; "
@@ -12309,6 +12435,12 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
                 else DEFAULT_MODEL_BY_ENGINE.get(engine)
             )
         )
+        if (
+            engine == "claude"
+            and claude_auth == "bedrock"
+            and model == DEFAULT_MODEL_BY_ENGINE["claude"]
+        ):
+            model = DEFAULT_CLAUDE_BEDROCK_MODEL
         thinking = (
             inline_thinking
             or thinking_by_engine.get(engine)
@@ -12337,6 +12469,7 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
             raise SystemExit(f"invalid thinking level for {engine}: {thinking} (valid: {valid})")
         clone = copy.copy(args)
         clone.engine = engine
+        clone.codex_auth = codex_auth
         clone.model = model
         clone.thinking = thinking
         clone.fallback_model = fallback_model
@@ -12497,9 +12630,12 @@ def reviewer_test_args(**overrides: Any) -> argparse.Namespace:
         "codex_config": None,
         "codex_speed": None,
         "codex_profile": None,
+        "codex_auth": "default",
+        "codex_auth_explicit": False,
         "codex_no_output_schema": False,
         "claude_auth": "default",
         "claude_auth_explicit": False,
+        "claude_bedrock_region": None,
         "tools": True,
     }
     defaults.update(overrides)
@@ -12533,8 +12669,10 @@ def self_test_config_defaults() -> None:
         "AUTOREVIEW_CODEX_CONFIG",
         "AUTOREVIEW_CODEX_SPEED",
         "AUTOREVIEW_CODEX_PROFILE",
+        "AUTOREVIEW_CODEX_AUTH",
         "AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA",
         "AUTOREVIEW_CLAUDE_AUTH",
+        "AUTOREVIEW_CLAUDE_BEDROCK_REGION",
         "AUTOREVIEW_REVIEWERS",
         *(
             f"AUTOREVIEW_{engine.upper()}_{suffix}"
@@ -12565,7 +12703,7 @@ def self_test_config_defaults() -> None:
         default_claude = reviewer_args(reviewer_test_args(engine="claude"))[0]
         if default_claude.model != "claude-fable-5":
             raise SystemExit(f"self-test config defaults failed: default claude model={default_claude.model!r}")
-        if default_claude.thinking != "max":
+        if default_claude.thinking != "high":
             raise SystemExit(f"self-test config defaults failed: default claude thinking={default_claude.thinking!r}")
         os.environ["AUTOREVIEW_REVIEWERS"] = "codex,claude"
         env_panel = reviewer_args(reviewer_test_args(engine="pi"))
@@ -12601,6 +12739,24 @@ def self_test_config_defaults() -> None:
         )[0]
         if subscription_claude.claude_auth != "subscription":
             raise SystemExit("self-test config defaults failed: Claude subscription auth was not preserved")
+        bedrock_claude = reviewer_args(
+            reviewer_test_args(
+                engine="claude",
+                claude_auth="bedrock",
+                claude_bedrock_region="us-east-1",
+            )
+        )[0]
+        if bedrock_claude.claude_auth != "bedrock":
+            raise SystemExit("self-test config defaults failed: Claude Bedrock auth was not preserved")
+        if bedrock_claude.model != DEFAULT_CLAUDE_BEDROCK_MODEL:
+            raise SystemExit(
+                "self-test config defaults failed: Claude Bedrock model was not mapped"
+            )
+        chatgpt_codex = reviewer_args(
+            reviewer_test_args(engine="codex", codex_auth="chatgpt")
+        )[0]
+        if chatgpt_codex.codex_auth != "chatgpt":
+            raise SystemExit("self-test config defaults failed: Codex ChatGPT auth was not preserved")
         try:
             reviewer_args(
                 reviewer_test_args(
@@ -12613,6 +12769,18 @@ def self_test_config_defaults() -> None:
         except SystemExit as error:
             if "only supported for claude" not in str(error):
                 raise
+        try:
+            reviewer_args(
+                reviewer_test_args(
+                    engine="claude",
+                    codex_auth="chatgpt",
+                    codex_auth_explicit=True,
+                )
+            )
+            raise SystemExit("self-test config defaults failed: --codex-auth accepted without Codex reviewer")
+        except SystemExit as error:
+            if "only supported for codex" not in str(error):
+                raise
         env_subscription_without_claude = reviewer_args(
             reviewer_test_args(engine="codex", claude_auth="subscription")
         )
@@ -12624,6 +12792,30 @@ def self_test_config_defaults() -> None:
         bedrock = reviewer_args(reviewer_test_args(engine="codex", codex_profile="bedrock"))[0]
         if bedrock.model is not None or bedrock.thinking is not None or bedrock.fallback_model is not None:
             raise SystemExit("self-test config defaults failed: Codex profile should own model defaults")
+        env_chatgpt_bedrock = reviewer_args(
+            reviewer_test_args(
+                engine="codex",
+                codex_profile="bedrock",
+                codex_auth="chatgpt",
+            )
+        )[0]
+        if env_chatgpt_bedrock.codex_auth != "default":
+            raise SystemExit(
+                "self-test config defaults failed: Codex profile did not override auth env default"
+            )
+        try:
+            reviewer_args(
+                reviewer_test_args(
+                    engine="codex",
+                    codex_profile="bedrock",
+                    codex_auth="chatgpt",
+                    codex_auth_explicit=True,
+                )
+            )
+            raise SystemExit("self-test config defaults failed: ChatGPT auth accepted with Bedrock profile")
+        except SystemExit as error:
+            if "cannot be combined" not in str(error):
+                raise
         bedrock_override = reviewer_args(
             reviewer_test_args(
                 engine="codex",

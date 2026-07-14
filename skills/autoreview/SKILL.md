@@ -7,7 +7,7 @@ description: "Pre-commit/ship code review: Codex default; optional Claude or Pi.
 
 Run the bundled structured review helper as a closeout check. This is code review, not Guardian `auto_review` approval routing.
 
-Codex review is the default when no engine is set. It uses `gpt-5.6-sol` with `high` reasoning by default, then retries once with `gpt-5.6-terra` only when the account cannot access Sol. Claude review is optional and uses `claude-fable-5` with `max` effort by default.
+Codex review is the default when no engine is set. It uses `gpt-5.6-sol` with `high` reasoning by default, then retries once with `gpt-5.6-terra` only when the account cannot access Sol. Claude review is optional and uses `claude-fable-5` with `high` effort by default.
 
 For user-visible behavior, pair autoreview with `behavior-validator`. Autoreview is source-aware and judges the change bundle; behavior validation is source-blind and judges the running product or tool against a behavior contract. A clean autoreview is not proof that a UI, CLI, API, or generated artifact works from the user's perspective.
 
@@ -273,13 +273,13 @@ Run multiple reviewers against one frozen bundle:
 Set reviewer models and thinking/effort explicitly:
 
 ```bash
-"$AUTOREVIEW" --reviewers codex,claude --model codex=gpt-5.6-sol --thinking codex=high --model claude=claude-fable-5 --thinking claude=max
+"$AUTOREVIEW" --reviewers codex,claude --model codex=gpt-5.6-sol --thinking codex=high --model claude=claude-fable-5 --thinking claude=high
 ```
 
 Inline syntax is also supported for simple model IDs:
 
 ```bash
-"$AUTOREVIEW" --reviewers codex:gpt-5.6-sol:high,claude:claude-fable-5:max
+"$AUTOREVIEW" --reviewers codex:gpt-5.6-sol:high,claude:claude-fable-5:high
 ```
 
 For models with slashes or extra colons, prefer keyed form:
@@ -335,8 +335,13 @@ Examples matching current `main` behavior:
 "$AUTOREVIEW" --engine codex --codex-config 'service_tier="fast"'
 
 # Claude Code aliases or full model names, with optional availability fallback
-"$AUTOREVIEW" --engine claude --model claude-fable-5 --thinking max
+"$AUTOREVIEW" --engine claude --model claude-fable-5 --thinking high
 "$AUTOREVIEW" --engine claude --model claude-fable-5 --fallback-model claude-opus-4-8,claude-sonnet-4-6
+
+# Mixed auth: Codex uses its stored ChatGPT login while Claude uses Amazon Bedrock.
+# The built-in Fable default maps to global.anthropic.claude-fable-5 on Bedrock;
+# pass --model claude=<geo-or-application-inference-profile> to override it.
+"$AUTOREVIEW" --panel --codex-auth chatgpt --claude-auth bedrock --claude-bedrock-region us-east-1
 
 # Bedrock panel: the isolated Codex reviewer stages the named amazon-bedrock profile;
 # its model/effort defaults come from that profile, while Claude keeps its normal auth.
@@ -369,12 +374,14 @@ loader such as an untracked `.envrc`; the helper does not write a config file.
 | `AUTOREVIEW_CODEX_CONFIG`           | Safe Codex model/response tuning overrides, semicolon-separated, e.g. `service_tier="fast"`; capability-bearing keys fail closed |
 | `AUTOREVIEW_CODEX_SPEED`            | Codex service tier override: `fast` (priority), `flex`, or `default`; silently standard when the model does not list the tier    |
 | `AUTOREVIEW_CODEX_PROFILE`          | Named Codex config profile staged into the isolated runtime; currently supports `amazon-bedrock` with env credentials            |
+| `AUTOREVIEW_CODEX_AUTH`             | `default` preserves API/provider env; `chatgpt` removes it and forces the stored ChatGPT login                                   |
 | `AUTOREVIEW_CODEX_NO_OUTPUT_SCHEMA` | Disable Codex CLI strict schema enforcement; automatically disabled for non-OpenAI profiles                                      |
-| `AUTOREVIEW_CLAUDE_AUTH`            | `default` preserves API/provider env; `subscription` ignores it and uses the Claude Code login                                   |
+| `AUTOREVIEW_CLAUDE_AUTH`            | `default` preserves provider env; `subscription` forces Claude Code login; `bedrock` forces isolated AWS Bedrock routing         |
+| `AUTOREVIEW_CLAUDE_BEDROCK_REGION`  | Required AWS region for explicit Claude Bedrock auth unless `AWS_REGION` or `AWS_DEFAULT_REGION` is already set                  |
 | `AUTOREVIEW_CLAUDE_FALLBACK_MODEL`  | Claude-only fallback chain                                                                                                       |
 | `AUTOREVIEW_PROVIDER_ENV_ALLOW`     | Comma-separated custom Pi/OpenCode credential variable names; names must end in a recognized credential suffix                   |
 
-Codex maps thinking to `model_reasoning_effort`. Claude maps thinking to `--effort`. Pi maps thinking to `--thinking`. Only Claude accepts `--fallback-model`; global CLI/env fallback requires at least one Claude reviewer, and engine-specific fallback overrides require that reviewer to be selected. Non-Claude fallback overrides, including `AUTOREVIEW_<NONCLAUDE>_FALLBACK_MODEL`, fail closed instead of being silently ignored. Use `--claude-auth subscription` when ambient API or third-party provider variables would otherwise take precedence over the stored Claude Code login.
+Codex maps thinking to `model_reasoning_effort`. Claude maps thinking to `--effort`. Pi maps thinking to `--thinking`. Only Claude accepts `--fallback-model`; global CLI/env fallback requires at least one Claude reviewer, and engine-specific fallback overrides require that reviewer to be selected. Non-Claude fallback overrides, including `AUTOREVIEW_<NONCLAUDE>_FALLBACK_MODEL`, fail closed instead of being silently ignored. Use `--codex-auth chatgpt` to prevent ambient API keys or relays from overriding Codex's stored ChatGPT login. Use `--claude-auth subscription` for the Claude Code login, or `--claude-auth bedrock --claude-bedrock-region REGION` to route Claude through AWS credentials without loading user settings that can override the provider.
 
 ## Review engine isolation
 
@@ -382,15 +389,15 @@ When autoreview runs inside the repository under review, external reviewer CLIs 
 
 | Engine       | Isolation flags                                                                                                                                                                                                                                   | Reference                                                                   |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| **codex**    | Auth-only config overrides, isolated workspace, `exec --ignore-user-config --ignore-rules --skip-git-repo-check`, plus read-only sandbox; profiled runs load only the sanitized runtime profile and disable process tools                         | Codex CLI `exec --help`                                                     |
-| **claude**   | `--safe-mode --setting-sources user --strict-mcp-config --disallowedTools mcp__*`; subscription auth uses an empty settings source; auto-memory and filesystem/shell tools disabled; empty external workspace; WebSearch by default (`v2.1.169+`) | Claude Code [CLI reference](https://code.claude.com/docs/en/cli-reference)  |
+| **codex**    | Auth-only config overrides, isolated workspace, `exec --ignore-user-config --ignore-rules --skip-git-repo-check`, plus read-only sandbox; ChatGPT auth strips API/provider env; profiled runs load only the sanitized runtime profile and disable process tools | Codex CLI `exec --help`                                                    |
+| **claude**   | `--safe-mode --setting-sources user --strict-mcp-config --disallowedTools mcp__*`; explicit subscription or Bedrock auth uses an empty settings source; auto-memory and filesystem/shell tools disabled; empty external workspace; WebSearch by default (`v2.1.169+`) | Claude Code [CLI reference](https://code.claude.com/docs/en/cli-reference) |
 | **droid**    | Fails closed: current CLI cannot disable both project instructions and all tools                                                                                                                                                                  | Droid CLI `exec --help` and `--list-tools`                                  |
 | **copilot**  | Fails closed: repository read tools also expose ignored files outside the reviewed bundle                                                                                                                                                         | GitHub Copilot CLI command reference                                        |
 | **pi**       | `--no-approve --no-session --no-context-files --no-extensions --no-skills --no-prompt-templates --no-themes --no-tools`                                                                                                                           | Pi CLI `--help`; requires Pi `v0.79.0+`                                     |
 | **opencode** | Fails closed: project/global config isolation and private-network fetch denial are not both proven                                                                                                                                                | OpenCode CLI contract                                                       |
 | **cursor**   | Fails closed: documented read permissions can target absolute host paths and no proven repository-only filesystem sandbox is exposed                                                                                                              | Cursor CLI [permissions](https://cursor.com/docs/cli/reference/permissions) |
 
-Codex `--ignore-user-config` skips normal user config loading for the exec run. Autoreview reconstructs only the documented `cli_auth_credentials_store`, `forced_login_method`, and `forced_chatgpt_workspace_id` settings from `CODEX_HOME/config.toml`, keeping authentication usable without forwarding unrelated user configuration. When `--codex-profile` is selected, autoreview stages only model, reasoning, service-tier, and built-in Amazon Bedrock region fields into the isolated Codex home; hooks, MCP servers, commands, paths, and unrelated settings are dropped. Profile runs omit `--ignore-user-config` so Codex can load that isolated profile, and force shell, code-mode, and multi-agent execution tools off so Bedrock credentials remain unavailable to model-controlled processes. Bedrock reviews accept `AWS_BEARER_TOKEN_BEDROCK` or static AWS credential environment variables. File-backed AWS named profiles are rejected because the isolated reviewer home intentionally cannot expose `~/.aws`, SSO caches, or credential processes. Codex runs in an empty temporary workspace: the validated bundle is its sole repository input, ignored files and linked-worktree metadata remain unreadable, and the zero project-doc budget keeps workspace instructions out of the prompt. `--ignore-rules` skips user/project execpolicy rules. Claude `--safe-mode` disables project hooks, skills, plugins, MCP servers, and CLAUDE.md; subscription-auth reviews also disable user settings so a settings `env` block cannot restore API or provider routing. Autoreview supplies WebSearch by default, permits only explicitly domain-constrained WebFetch rules, and exposes no filesystem or shell tools. Pi runs from a neutral temporary directory with project resources disabled and `--no-tools`. Droid, Copilot, Cursor, and OpenCode fail closed because their current CLI contracts cannot isolate untrusted review input from host, project, or private-network trust surfaces.
+Codex `--ignore-user-config` skips normal user config loading for the exec run. Autoreview reconstructs only the documented `cli_auth_credentials_store`, `forced_login_method`, and `forced_chatgpt_workspace_id` settings from `CODEX_HOME/config.toml`, keeping authentication usable without forwarding unrelated user configuration. ChatGPT auth also removes ambient API-key and relay variables before forcing `forced_login_method="chatgpt"`. When `--codex-profile` is selected, autoreview stages only model, reasoning, service-tier, and built-in Amazon Bedrock region fields into the isolated Codex home; hooks, MCP servers, commands, paths, and unrelated settings are dropped. Profile runs omit `--ignore-user-config` so Codex can load that isolated profile, and force shell, code-mode, and multi-agent execution tools off so Bedrock credentials remain unavailable to model-controlled processes. Bedrock reviews accept `AWS_BEARER_TOKEN_BEDROCK` or static AWS credential environment variables. File-backed AWS named profiles are rejected because the isolated reviewer home intentionally cannot expose `~/.aws`, SSO caches, or credential processes. Codex runs in an empty temporary workspace: the validated bundle is its sole repository input, ignored files and linked-worktree metadata remain unreadable, and the zero project-doc budget keeps workspace instructions out of the prompt. `--ignore-rules` skips user/project execpolicy rules. Claude `--safe-mode` disables project hooks, skills, plugins, MCP servers, and CLAUDE.md; subscription and explicit Bedrock reviews also disable user settings so a settings `env` block cannot restore or replace the requested provider route. Bedrock mode removes subscription and competing cloud-provider variables, forces `CLAUDE_CODE_USE_BEDROCK=1`, and supplies the selected AWS region while preserving AWS credentials. Autoreview supplies WebSearch by default, permits only explicitly domain-constrained WebFetch rules, and exposes no filesystem or shell tools. Pi runs from a neutral temporary directory with project resources disabled and `--no-tools`. Droid, Copilot, Cursor, and OpenCode fail closed because their current CLI contracts cannot isolate untrusted review input from host, project, or private-network trust surfaces.
 
 Codex `0.134.0+` profiles use a separate `$CODEX_HOME/<name>.config.toml` file selected by `--profile <name>`; legacy `[profiles.<name>]` tables are no longer read. See [Codex advanced configuration](https://learn.chatgpt.com/docs/config-file/config-advanced#profiles).
 
@@ -442,11 +449,11 @@ The helper:
 - supports `--dry-run`, `--parallel-tests`, `--parallel-tests-shell`, `--prompt`, repo-relative `--prompt-file`, repo-relative `--dataset`, `--no-tools`, `--no-web-search`, repeatable Codex-only safe model/response tuning with `--codex-config key=value`, Codex-only `--codex-speed fast|flex|default`, and commit refs
 - supports `--stream-engine-output` or `AUTOREVIEW_STREAM_ENGINE_OUTPUT=1` for live engine text while preserving structured validation; Codex and Claude hide tool/file event details, emit compact activity summaries, and report usage at turn completion
 - supports opt-in review panels with `--panel` / `--reviewers`, an `AUTOREVIEW_REVIEWERS` personal default, per-engine `--model` / `--thinking`, and Claude `--fallback-model`
-- uses built-in defaults `codex=gpt-5.6-sol` with `high` reasoning and an access-only `gpt-5.6-terra` retry, plus `claude=claude-fable-5` with `max` effort; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
+- uses built-in defaults `codex=gpt-5.6-sol` with `high` reasoning and an access-only `gpt-5.6-terra` retry, plus `claude=claude-fable-5` with `high` effort; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
 - supports isolated `--codex-profile` / `AUTOREVIEW_CODEX_PROFILE` routing for sanitized built-in Amazon Bedrock profiles, automatically drops Codex CLI schema enforcement for those non-OpenAI runs, and disables model-controlled process tools so provider credentials remain outside the model-visible tool boundary
-- supports `--claude-auth subscription` / `AUTOREVIEW_CLAUDE_AUTH=subscription` to prefer Claude Code login over ambient API/provider env; Fable refusal handling is a transparent Fable retry followed by an explicit `claude-opus-4-8`/`max` fallback after the second refusal
+- supports `--codex-auth chatgpt` to force stored ChatGPT auth independently of Claude, plus `--claude-auth subscription|bedrock` to force Claude Code login or AWS Bedrock routing independently of Codex; Fable refusal handling is a transparent Fable retry followed by an explicit `claude-opus-4-8`/`max` fallback after the second refusal
 - gives Codex the bundle in an empty workspace with web search available; Claude receives the bundle plus WebSearch by default and optional domain-constrained WebFetch, and Pi receives the bundle with no tools
-- runs Claude with `--safe-mode` (`v2.1.169+`), `--setting-sources user`, MCP and auto-memory disabled, no filesystem/shell tools, an empty external workspace, and `--fallback-model` when set
+- runs Claude with `--safe-mode` (`v2.1.169+`), user-only settings for default auth or no settings for explicit subscription/Bedrock auth, MCP and auto-memory disabled, no filesystem/shell tools, an empty external workspace, and `--fallback-model` when set
 - refuses Droid, Copilot, Cursor, and OpenCode reviews until their CLIs expose the required project, filesystem, and network isolation
 - runs Pi `v0.79.0+` from neutral temporary directories with `--no-approve`, `--no-session`, disabled Pi context/resource loading, and `--no-tools` because its built-in read tools are not repository-confined
 - prints `review still running: <engine> elapsed=<seconds>s pid=<pid>` to stderr at long-running intervals while waiting for the selected review engine, unless streamed output or compact Codex activity has been visible recently

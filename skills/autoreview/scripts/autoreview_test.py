@@ -272,6 +272,48 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "only supported for claude"):
             AUTOREVIEW.reviewer_args(args)
 
+    def test_explicit_codex_auth_rejects_non_codex_engine(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "autoreview",
+                "--engine",
+                "claude",
+                "--codex-auth",
+                "chatgpt",
+            ],
+        ):
+            args = AUTOREVIEW.parse_args()
+        with self.assertRaisesRegex(SystemExit, "only supported for codex"):
+            AUTOREVIEW.reviewer_args(args)
+
+    def test_mixed_chatgpt_and_bedrock_auth_is_preserved(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "autoreview",
+                "--panel",
+                "--codex-auth",
+                "chatgpt",
+                "--claude-auth",
+                "bedrock",
+                "--claude-bedrock-region",
+                "us-east-1",
+            ],
+        ):
+            reviewers = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())
+        self.assertEqual([reviewer.engine for reviewer in reviewers], ["codex", "claude"])
+        self.assertEqual(reviewers[0].codex_auth, "chatgpt")
+        self.assertEqual(reviewers[1].claude_auth, "bedrock")
+        self.assertEqual(reviewers[1].claude_bedrock_region, "us-east-1")
+        self.assertEqual(
+            reviewers[1].model,
+            "global.anthropic.claude-fable-5",
+        )
+        self.assertEqual(reviewers[1].thinking, "high")
+
     def test_cursor_agent_keyed_option_normalizes_to_cursor(self) -> None:
         self.assertEqual(
             AUTOREVIEW.parse_keyed_options(["cursor-agent=auto"], "model"),

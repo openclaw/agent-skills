@@ -5151,6 +5151,89 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 os.environ.clear()
                 os.environ.update(old)
 
+    def test_claude_bedrock_auth_forces_aws_routing(self) -> None:
+        old = os.environ.copy()
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            try:
+                os.environ["ANTHROPIC_API_KEY"] = "test-api-key"
+                os.environ["ANTHROPIC_BASE_URL"] = "https://api.example.invalid"
+                os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "test-oauth-token"
+                os.environ["CLAUDE_CODE_USE_BEDROCK"] = "0"
+                os.environ["CLAUDE_CODE_USE_MANTLE"] = "1"
+                os.environ["AWS_BEARER_TOKEN_BEDROCK"] = "test-bedrock-token"
+
+                args = argparse.Namespace(
+                    claude_auth="bedrock",
+                    claude_bedrock_region="us-east-2",
+                )
+                bedrock = self.helper["claude_engine_env"](args, repo)
+
+                for key in (
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_BASE_URL",
+                    "CLAUDE_CODE_OAUTH_TOKEN",
+                    "CLAUDE_CODE_USE_MANTLE",
+                ):
+                    self.assertNotIn(key, bedrock)
+                self.assertEqual(bedrock["CLAUDE_CODE_USE_BEDROCK"], "1")
+                self.assertEqual(bedrock["AWS_REGION"], "us-east-2")
+                self.assertEqual(bedrock["AWS_DEFAULT_REGION"], "us-east-2")
+                self.assertEqual(
+                    bedrock["AWS_BEARER_TOKEN_BEDROCK"],
+                    "test-bedrock-token",
+                )
+                bedrock_flags = self.helper["claude_review_isolation_flags"](args)
+                sources_index = bedrock_flags.index("--setting-sources")
+                self.assertEqual(bedrock_flags[sources_index + 1], "")
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
+    def test_claude_bedrock_auth_requires_region(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(SystemExit, "requires.*region"):
+                self.helper["claude_bedrock_region"](
+                    argparse.Namespace(
+                        claude_auth="bedrock",
+                        claude_bedrock_region=None,
+                    )
+                )
+
+    def test_codex_chatgpt_auth_ignores_api_environment(self) -> None:
+        old = os.environ.copy()
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            try:
+                os.environ["OPENAI_API_KEY"] = "test-openai-key"
+                os.environ["OPENAI_BASE_URL"] = "https://api.example.invalid"
+                os.environ["CODEX_API_KEY"] = "test-codex-key"
+                args = argparse.Namespace(
+                    codex_auth="chatgpt",
+                    codex_profile=None,
+                )
+
+                chatgpt = self.helper["codex_engine_env"](args, repo)
+                default = self.helper["codex_engine_env"](
+                    argparse.Namespace(
+                        codex_auth="default",
+                        codex_profile=None,
+                    ),
+                    repo,
+                )
+
+                for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY"):
+                    self.assertNotIn(key, chatgpt)
+                self.assertEqual(default["OPENAI_API_KEY"], "test-openai-key")
+                flags = self.helper["codex_auth_config_flags"](
+                    repo,
+                    auth_mode="chatgpt",
+                )
+                self.assertIn('forced_login_method="chatgpt"', flags)
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
     def test_claude_refusal_is_detected(self) -> None:
         output = json.dumps(
             [
@@ -5254,6 +5337,28 @@ class AutoreviewHardeningTests(unittest.TestCase):
         )
         self.assertIsNone(args.actual_model)
         self.assertIsNone(args.actual_thinking)
+
+    def test_claude_bedrock_refusal_fallback_keeps_inference_scope(self) -> None:
+        fallback_model = self.helper["claude_refusal_fallback_model"]
+
+        self.assertEqual(
+            fallback_model(
+                argparse.Namespace(
+                    claude_auth="bedrock",
+                    model="global.anthropic.claude-fable-5",
+                )
+            ),
+            "global.anthropic.claude-opus-4-8",
+        )
+        self.assertEqual(
+            fallback_model(
+                argparse.Namespace(
+                    claude_auth="bedrock",
+                    model="us-gov.anthropic.claude-fable-5",
+                )
+            ),
+            "us-gov.anthropic.claude-opus-4-8",
+        )
 
     def test_reviewer_label_reports_only_effective_refusal_fallback(self) -> None:
         args = argparse.Namespace(
