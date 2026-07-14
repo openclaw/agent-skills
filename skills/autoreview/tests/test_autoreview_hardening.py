@@ -2359,6 +2359,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + 'decoy-'
             + 'token" };'
         )
+        invalid_recovery_fixture = (
+            'const recoveryKey = "not-'
+            + 'a-valid-matrix-recovery-key";'
+        )
         literal_value = "actual-production-" + "secret"
         fixture_shaped_literal = "PROD_TEST_ACTUAL_" + "SECRET_0123456789"
         adversarial_label = "TEST_Q7WX9M2NK4PV8R6DH3JC"
@@ -2391,7 +2395,12 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + f'buildTestToken("{adversarial_label}");'
         )
 
-        for content in (generated_fixture, generated_marker, decoy_fixture):
+        for content in (
+            generated_fixture,
+            generated_marker,
+            decoy_fixture,
+            invalid_recovery_fixture,
+        ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
         for content in (
