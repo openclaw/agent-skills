@@ -5919,6 +5919,17 @@ def review_chunk_context(
     lines = compact_review_chunk_context(context)
     if context and context[0] == "# Untracked File\n" and next_new_line is not None:
         lines.append(f"[Continuation begins at untracked source line {next_new_line}.]\n")
+    elif (
+        next_new_line is not None
+        and next_new_line >= 1
+        and next_old_line is not None
+        and next_old_line >= 1
+        and next_new_line != next_old_line
+    ):
+        lines.append(
+            f"[Continuation position: new-file line {next_new_line}; "
+            f"old-file line {next_old_line}.]\n"
+        )
     elif next_new_line is not None and next_new_line >= 1:
         lines.append(f"[Continuation begins at new-file line {next_new_line}.]\n")
     elif next_old_line is not None and next_old_line >= 1:
@@ -6024,7 +6035,7 @@ def split_oversized_review_unit(
                 limit,
                 first_limit=chunk_limit,
             )
-            for index, fragment in enumerate(fragments):
+            for index, fragment in enumerate(fragments[:-1]):
                 chunks.append(
                     ReviewChunk(
                         fragment,
@@ -6037,6 +6048,15 @@ def split_oversized_review_unit(
                         ),
                     )
                 )
+            current = [fragments[-1]]
+            current_bytes = utf8_size(fragments[-1])
+            current_context = review_chunk_context(
+                context,
+                untracked_source_line or next_new_line,
+                next_old_line,
+                continued_line=len(fragments) > 1,
+                diff_line_marker=diff_line_marker,
+            )
             next_new_line, next_old_line, in_hunk = update_review_chunk_context(
                 context,
                 line,

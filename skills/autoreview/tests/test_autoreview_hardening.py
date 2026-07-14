@@ -520,6 +520,54 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 )
                 self.assertEqual("".join(chunk.content for chunk in chunks), unit)
 
+    def test_modified_file_deletion_context_keeps_old_and_new_offsets(self) -> None:
+        context: list[str] = []
+        next_new_line = None
+        next_old_line = None
+        in_hunk = False
+        for line in (
+            "diff --git a/safe.txt b/safe.txt\n",
+            "--- a/safe.txt\n",
+            "+++ b/safe.txt\n",
+            "@@ -10,3 +10,2 @@\n",
+            "-first deleted line\n",
+        ):
+            next_new_line, next_old_line, in_hunk = self.helper[
+                "update_review_chunk_context"
+            ](
+                context,
+                line,
+                next_new_line,
+                next_old_line,
+                in_hunk,
+            )
+
+        rendered = self.helper["review_chunk_context"](
+            context,
+            next_new_line,
+            next_old_line,
+        )
+
+        self.assertIn("new-file line 10", rendered)
+        self.assertIn("old-file line 11", rendered)
+
+    def test_multiple_long_line_tails_pack_into_following_chunks(self) -> None:
+        limit = 200
+        unit = (
+            "diff --git a/large.txt b/large.txt\n"
+            "--- a/large.txt\n"
+            "+++ b/large.txt\n"
+            "@@ -1,5 +1,5 @@\n"
+            + ("+" + "x" * 205 + "\n") * 5
+        )
+
+        chunks = self.helper["split_oversized_review_unit"](unit, limit)
+        minimum_chunks = (len(unit.encode("utf-8")) + limit - 1) // limit
+
+        self.assertLessEqual(len(chunks), minimum_chunks + 1)
+        self.assertEqual("".join(chunk.content for chunk in chunks), unit)
+        self.assertTrue(all(len(chunk.content.encode("utf-8")) <= limit for chunk in chunks))
+
     def test_untracked_continuation_context_keeps_source_line(self) -> None:
         unit = (
             "# Untracked File\n"
