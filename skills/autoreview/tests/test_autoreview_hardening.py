@@ -1956,33 +1956,235 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + "word: context.driverPass"
             + "word as string }; }"
         )
+        union_cast_property = (
+            "function configure(context: RuntimeContext) { return { pass"
+            + "word: context.driverPass"
+            + "word as string | undefined }; }"
+        )
+        next_statement = (
+            "function configure(context: RuntimeContext) {\n"
+            + "  const pass"
+            + "word = context.driverPass"
+            + "word\n"
+            + "  return consume();\n"
+            + "}"
+        )
+        line_comment = (
+            "const pass"
+            + "word = context.driverPass"
+            + "word // supplied by CI\n"
+            + "consume();"
+        )
+        block_comment = (
+            "const pass"
+            + "word = context.driverPass"
+            + "word /* supplied by CI */;"
+        )
+        concatenated_literal = (
+            "function configure(context: RuntimeContext) { return { pass"
+            + "word: context.driverPass"
+            + 'word + "'
+            + literal_value
+            + '" }; }'
+        )
+        continued_literal = (
+            "function configure(context: RuntimeContext) { return { pass"
+            + "word: context.driverPass"
+            + "word\n"
+            + '  + "'
+            + literal_value
+            + '" }; }'
+        )
+        fallback_literal = (
+            "function configure(context: RuntimeContext) { return { pass"
+            + "word: context.driverPass"
+            + 'word ?? "'
+            + literal_value
+            + '" }; }'
+        )
+        assigned_literal = (
+            "const pass"
+            + "word = context.driverPass"
+            + "word\n"
+            + '  = "'
+            + literal_value
+            + '";'
+        )
+        newline_cast_literal = (
+            "const pass"
+            + "word = context.driverPass"
+            + "word\n"
+            + "  as string + \""
+            + literal_value
+            + '";'
+        )
+        commented_continuation = (
+            "const pass"
+            + "word = context.driverPass"
+            + "word // supplied by CI\n"
+            + '  + "'
+            + literal_value
+            + '";'
+        )
+        unicode_comment_continuation = (
+            "const pass"
+            + "word = context.driverPass"
+            + "word // supplied by CI"
+            + chr(0x2028)
+            + '  + "'
+            + literal_value
+            + '";'
+        )
+        unicode_space_continuation = (
+            "const pass"
+            + "word = context.driverPass"
+            + "word\n"
+            + chr(0x00A0)
+            + '+ "'
+            + literal_value
+            + '";'
+        )
+        multiline_cast_literal = (
+            "const pass"
+            + "word = context.driverPass"
+            + "word as string\n"
+            + '+ "'
+            + literal_value
+            + '";'
+        )
+        leading_comma_statement = (
+            "const pass"
+            + "word = context.driverPass"
+            + "word\n"
+            + ', username = "'
+            + literal_value
+            + '";'
+        )
+        unary_statement = (
+            "const pass"
+            + "word = context.driverPass"
+            + "word\n"
+            + '!audit("'
+            + literal_value
+            + '");'
+        )
+        inequality_literal = (
+            "const pass"
+            + "word = context.driverPass"
+            + "word\n"
+            + '!== "'
+            + literal_value
+            + '";'
+        )
+        member_call_literal = (
+            "const pass"
+            + "word = context.driverPass"
+            + 'word["concat"]("safe", "'
+            + literal_value
+            + '");'
+        )
+        continued_then_unary_statement = (
+            "const pass"
+            + "word = context.driverPass"
+            + "word + suffix\n"
+            + '!audit("'
+            + literal_value
+            + '");'
+        )
+        trailing_operator_literal = (
+            "const pass"
+            + "word = context.driverPass"
+            + "word + suffix +\n"
+            + '  "'
+            + literal_value
+            + '";'
+        )
+        plain_javascript_as_statement = (
+            "const pass"
+            + "word = context.driverPass"
+            + "word\n"
+            + 'as("'
+            + literal_value
+            + '");'
+        )
+        typescript_dollar_identifier = (
+            "const pass"
+            + "word = context.driverPass"
+            + "word\n"
+            + 'as$logger("'
+            + literal_value
+            + '");'
+        )
 
         self.assertFalse(
-            self.helper["secret_text_risk"](content, source_code=True)
+            self.helper["secret_text_risk"](
+                content,
+                javascript_dialect="typescript",
+            )
         )
         self.assertFalse(
             self.helper["secret_text_risk"](
                 sut_reference,
-                source_code=True,
+                javascript_dialect="typescript",
             )
         )
         self.assertTrue(self.helper["secret_text_risk"](sut_reference))
         self.assertFalse(
             self.helper["secret_text_risk"](
+                plain_javascript_as_statement,
+                javascript_dialect="javascript",
+            )
+        )
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                typescript_dollar_identifier,
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertFalse(
+            self.helper["secret_text_risk"](
                 final_property,
-                source_code=True,
+                javascript_dialect="typescript",
             )
         )
         for source_reference in (
             inline_property,
             asserted_property,
             cast_property,
+            union_cast_property,
+            next_statement,
+            line_comment,
+            block_comment,
+            leading_comma_statement,
+            unary_statement,
+            continued_then_unary_statement,
         ):
             with self.subTest(source_reference=source_reference):
                 self.assertFalse(
                     self.helper["secret_text_risk"](
                         source_reference,
-                        source_code=True,
+                        javascript_dialect="typescript",
+                    )
+                )
+        for unsafe_source_reference in (
+            concatenated_literal,
+            continued_literal,
+            fallback_literal,
+            assigned_literal,
+            newline_cast_literal,
+            commented_continuation,
+            unicode_comment_continuation,
+            unicode_space_continuation,
+            multiline_cast_literal,
+            inequality_literal,
+            member_call_literal,
+            trailing_operator_literal,
+        ):
+            with self.subTest(unsafe_source_reference=unsafe_source_reference):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        unsafe_source_reference,
+                        javascript_dialect="typescript",
                     )
                 )
         self.assertTrue(self.helper["secret_text_risk"](yaml_literal))
@@ -1998,13 +2200,13 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertTrue(
             self.helper["secret_text_risk"](
                 suffixed_reference,
-                source_code=True,
+                javascript_dialect="typescript",
             )
         )
         self.assertTrue(
             self.helper["secret_text_risk"](
                 prefixed_reference,
-                source_code=True,
+                javascript_dialect="typescript",
             )
         )
 
@@ -2131,8 +2333,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ),
             patch,
         )
-        self.assertTrue(self.helper["source_code_review_path"]("module.mts"))
-        self.assertTrue(self.helper["source_code_review_path"]("module.cts"))
+        self.assertEqual(
+            self.helper["javascript_review_dialect"]("module.mts"),
+            "typescript",
+        )
+        self.assertEqual(
+            self.helper["javascript_review_dialect"]("module.cts"),
+            "typescript",
+        )
 
     def test_secret_detector_allows_generated_fixture_credentials(self) -> None:
         property_name = "pass" + "word"
