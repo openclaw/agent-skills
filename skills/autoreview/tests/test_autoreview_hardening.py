@@ -2679,6 +2679,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
         key = "control_" + "fencing_" + "token"
         binding_key = "fencing_" + "token"
         environment_name = "HAVA_SYNC_CONTROL_" + "FENCING_TOKEN"
+        password_key = "pass" + "word"
+        unsafe_environment_name = "ACTUAL_PRODUCTION_" + "PASSWORD"
         safe_lines = (
             f"{key} = attempt.{binding_key}\n"
             f"{binding_key} = int(evidence[{key!r}])\n"
@@ -2767,7 +2769,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "+++ b/runtime.py\n"
             "@@ -0,0 +1,3 @@\n"
             "+_RUNTIME_ENV_BY_FIELD = {\n"
-            "+    'password': 'ACTUAL_PRODUCTION_PASSWORD',\n"
+            f"+    {password_key!r}: {unsafe_environment_name!r},\n"
             "+}\n"
         )
 
