@@ -5678,13 +5678,43 @@ def python_assignment_value_start(
     return line_start + annotated.end(), "="
 
 
+def python_comment_secret_risk(comment: str) -> bool:
+    if secret_literal_risk(comment, minimum_length=8):
+        return True
+    hinted = re.search(
+        r"(?i)\b(?:"
+        r"(?:default|fallback)\s+(?:is\s+)?"
+        r"|(?:credential|password|secret|token)\s*(?:is\b|[:=])\s*"
+        r")(?P<value>[^\s,;]+)",
+        comment,
+    )
+    if hinted is None:
+        return False
+    value = hinted.group("value").strip("\"'`()[]{}")
+    return bool(value) and value.casefold() not in {
+        "caller",
+        "environment",
+        "handling",
+        "none",
+        "placeholder",
+        "redacted",
+        "request",
+        "runtime",
+        "supplied",
+    }
+
+
 def python_assignment_comment(text: str, value_start: int) -> bool:
     line_end = value_start
     for _ in range(64):
         next_line = text.find("\n", line_end)
         line_end = len(text) if next_line < 0 else next_line
         expression = text[value_start:line_end]
-        if "#" in expression:
+        if any(
+            python_comment_secret_risk(line.split("#", 1)[1])
+            for line in expression.splitlines()
+            if "#" in line
+        ):
             return True
         try:
             ast.parse(expression.strip(), mode="eval")
@@ -5699,7 +5729,10 @@ def python_assignment_comment(text: str, value_start: int) -> bool:
                 adjacent_end = len(text) if adjacent_end < 0 else adjacent_end
                 adjacent = text[cursor:adjacent_end].strip()
                 if adjacent.startswith("#"):
-                    return True
+                    if python_comment_secret_risk(adjacent[1:]):
+                        return True
+                    cursor = adjacent_end + 1
+                    continue
                 if adjacent:
                     return False
                 cursor = adjacent_end + 1

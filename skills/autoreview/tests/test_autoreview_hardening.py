@@ -2817,6 +2817,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             f"+{password_key} = request.{password_key}\n"
             f"+# fallback is {comment_fallback}\n"
         )
+        benign_comment_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            f"+{password_key} = request.{password_key}  # supplied by caller\n"
+            "+# Validate before use\n"
+        )
         unsafe_annotation_source_patch = (
             "diff --git a/runtime.py b/runtime.py\n"
             "--- a/runtime.py\n"
@@ -2902,6 +2910,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 environment_source_patch,
             ),
             environment_source_patch,
+        )
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "branch diff",
+                ["runtime.py"],
+                benign_comment_source_patch,
+            ),
+            benign_comment_source_patch,
         )
         self.assertFalse(
             self.helper["python_runtime_expression_is_safe"](
