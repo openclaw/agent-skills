@@ -5683,7 +5683,7 @@ def python_comment_secret_risk(comment: str) -> bool:
         return True
     hinted = re.search(
         r"(?i)\b(?:"
-        r"(?:default|fallback)\s+(?:is\s+)?"
+        r"(?:default|fallback)(?:\s+is\b\s*|\s*[:=]\s*|\s+)"
         r"|(?:credential|password|secret|token)\s*(?:is\b|[:=])\s*"
         r")(?P<value>[^\s,;]+)",
         comment,
