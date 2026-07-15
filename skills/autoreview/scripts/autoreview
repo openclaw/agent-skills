@@ -5690,18 +5690,28 @@ def python_comment_secret_risk(comment: str) -> bool:
     )
     if hinted is None:
         return False
-    value = hinted.group("value").strip("\"'`()[]{}")
-    return bool(value) and value.casefold() not in {
-        "caller",
-        "environment",
-        "handling",
-        "none",
-        "placeholder",
-        "redacted",
-        "request",
-        "runtime",
-        "supplied",
-    }
+    raw_value = hinted.group("value")
+    quoted = (
+        len(raw_value) >= 2
+        and raw_value[0] in {"\"", "'", "`"}
+        and raw_value[-1] == raw_value[0]
+    )
+    value = raw_value.strip("\"'`()[]{}")
+    if not value or value.casefold() in SECRET_PLACEHOLDER_VALUES:
+        return False
+    return bool(
+        (quoted and len(value) >= 4)
+        or (
+            len(value) >= 6
+            and any(character.isalpha() for character in value)
+            and any(character.isdigit() for character in value)
+        )
+        or (
+            len(value) >= 6
+            and re.search(r"[^A-Za-z0-9_]", value) is not None
+        )
+        or secret_literal_risk(raw_value, minimum_length=8)
+    )
 
 
 def python_assignment_comment(text: str, value_start: int) -> bool:
