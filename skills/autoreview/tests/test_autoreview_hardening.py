@@ -2675,6 +2675,179 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     source_patch + config_patch,
                 )
 
+    def test_review_patch_scopes_runtime_references_to_python_files(self) -> None:
+        key = "control_" + "fencing_" + "token"
+        binding_key = "fencing_" + "token"
+        environment_name = "HAVA_SYNC_CONTROL_" + "FENCING_TOKEN"
+        safe_lines = (
+            f"{key} = attempt.{binding_key}\n"
+            f"{binding_key} = int(evidence[{key!r}])\n"
+            f"{binding_key} = int(evidence.get({key!r}) or 0)\n"
+        )
+        source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            + "".join(f"-{line}" for line in safe_lines.splitlines(keepends=True))
+            + "".join(f"+{line}" for line in safe_lines.splitlines(keepends=True))
+        )
+        config_patch = (
+            "diff --git a/runtime.yml b/runtime.yml\n"
+            "--- a/runtime.yml\n"
+            "+++ b/runtime.yml\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{key}: attempt.{key}\n"
+        )
+        literal = "actual-production-" + "secret"
+        hardcoded_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{key} = {literal!r}\n"
+        )
+        numeric_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{key} = 12345678901234567890\n"
+        )
+        fallback_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{key} = int(evidence.get({key!r}) or {literal!r})\n"
+        )
+        multiline_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,3 @@\n"
+            f"+{key!r}: int(\n"
+            f"+    evidence.get({key!r}) or 0\n"
+            "+),\n"
+        )
+        sql_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f'+    "UPDATE leases SET {binding_key}={binding_key}+1 '
+            'WHERE task_id=?",\n'
+        )
+        environment_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,3 @@\n"
+            "+_RUNTIME_ENV_BY_FIELD = {\n"
+            f"+    {key!r}: {environment_name!r},\n"
+            "+}\n"
+        )
+        standalone_environment_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{key!r}: {environment_name!r},\n"
+        )
+        ordinary_counter_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{binding_key} = {binding_key} + 1,\n"
+        )
+        unsafe_environment_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,3 @@\n"
+            "+_RUNTIME_ENV_BY_FIELD = {\n"
+            "+    'password': 'ACTUAL_PRODUCTION_PASSWORD',\n"
+            "+}\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "branch diff",
+                ["runtime.py"],
+                source_patch,
+            ),
+            source_patch,
+        )
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "branch diff",
+                ["runtime.py"],
+                multiline_source_patch,
+            ),
+            multiline_source_patch,
+        )
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "branch diff",
+                ["runtime.py"],
+                sql_source_patch,
+            ),
+            sql_source_patch,
+        )
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "branch diff",
+                ["runtime.py"],
+                environment_source_patch,
+            ),
+            environment_source_patch,
+        )
+        self.assertFalse(
+            self.helper["python_runtime_expression_is_safe"](
+                "chr(65) * 32",
+                key,
+                allow_environment_symbol=False,
+            )
+        )
+        self.assertFalse(
+            self.helper["python_runtime_expression_is_safe"](
+                "evidence['a7f9k2m4q8v6n3x5r1p0t9z8_token']",
+                "token",
+                allow_environment_symbol=False,
+            )
+        )
+        self.assertFalse(
+            self.helper["python_runtime_expression_is_safe"](
+                f"evidence[{literal + '_' + binding_key!r}]",
+                binding_key,
+                allow_environment_symbol=False,
+            )
+        )
+        with self.assertRaisesRegex(SystemExit, "secret-like content"):
+            self.helper["validate_review_patch"](
+                "branch diff",
+                ["runtime.py", "runtime.yml"],
+                source_patch + config_patch,
+            )
+        for patch in (
+            hardcoded_source_patch,
+            numeric_source_patch,
+            fallback_source_patch,
+            standalone_environment_source_patch,
+            ordinary_counter_source_patch,
+            unsafe_environment_source_patch,
+        ):
+            with self.subTest(patch=patch), self.assertRaisesRegex(
+                SystemExit,
+                "secret-like content",
+            ):
+                self.helper["validate_review_patch"](
+                    "branch diff",
+                    ["runtime.py"],
+                    patch,
+                )
+
     def test_review_patch_scans_rename_sides_with_their_own_file_types(self) -> None:
         property_name = "pass" + "word"
         reference = "context.driverPass" + "word"

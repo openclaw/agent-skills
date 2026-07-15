@@ -5365,6 +5365,207 @@ def bare_code_reference(
     )
 
 
+def python_runtime_expression_is_safe(
+    expression: str,
+    expected_key: str,
+    *,
+    allow_environment_symbol: bool,
+) -> bool:
+    try:
+        parsed = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return False
+    root = parsed.body
+    if isinstance(root, ast.Tuple) and len(root.elts) == 1:
+        root = root.elts[0]
+
+    unsafe_prefixes = {
+        "actual",
+        "credential",
+        "hardcoded",
+        "password",
+        "production",
+        "secret",
+    }
+    binding_prefixes = {
+        "attempt",
+        "automation",
+        "binding",
+        "claim",
+        "control",
+        "evidence",
+        "execution",
+        "lease",
+        "request",
+        "response",
+        "result",
+        "runtime",
+        "task",
+        "worker",
+    }
+
+    def binding_name_matches(value: str) -> bool:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) is None:
+            return False
+        normalized = value.casefold()
+        expected = expected_key.casefold()
+        if normalized == expected:
+            return True
+        for longer, shorter in ((normalized, expected), (expected, normalized)):
+            suffix = "_" + shorter
+            if not longer.endswith(suffix):
+                continue
+            prefix = longer[: -len(suffix)]
+            if prefix in binding_prefixes:
+                return True
+        return False
+
+    def environment_symbol_matches(value: str) -> bool:
+        expected = expected_key.upper()
+        suffix = "_" + expected
+        if not value.endswith(suffix):
+            return False
+        prefix = value[: -len(suffix)]
+        components = prefix.split("_")
+        return bool(components) and all(
+            re.fullmatch(r"[A-Z][A-Z0-9]{0,15}", component) is not None
+            and component.casefold() not in unsafe_prefixes
+            for component in components
+        )
+
+    def reference_chain(node: ast.AST) -> bool:
+        return isinstance(node, ast.Name) or (
+            isinstance(node, ast.Attribute) and reference_chain(node.value)
+        )
+
+    def lookup_expression(node: ast.AST) -> bool:
+        if isinstance(node, ast.Subscript):
+            return (
+                reference_chain(node.value)
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, str)
+                and binding_name_matches(node.slice.value)
+            )
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and reference_chain(node.func.value)
+            and len(node.args) == 1
+            and not node.keywords
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and binding_name_matches(node.args[0].value)
+        )
+
+    if (
+        allow_environment_symbol
+        and isinstance(root, ast.Constant)
+        and isinstance(root.value, str)
+        and re.fullmatch(r"[A-Z][A-Z0-9_]{2,}", root.value) is not None
+        and environment_symbol_matches(root.value)
+    ):
+        return True
+
+    if (
+        isinstance(root, ast.Attribute)
+        and reference_chain(root.value)
+        and binding_name_matches(root.attr)
+    ):
+        return True
+    if lookup_expression(root):
+        return True
+    if not (
+        isinstance(root, ast.Call)
+        and isinstance(root.func, ast.Name)
+        and root.func.id == "int"
+        and len(root.args) == 1
+        and not root.keywords
+    ):
+        return False
+    argument = root.args[0]
+    if lookup_expression(argument):
+        return True
+    return (
+        isinstance(argument, ast.BoolOp)
+        and isinstance(argument.op, ast.Or)
+        and len(argument.values) == 2
+        and lookup_expression(argument.values[0])
+        and isinstance(argument.values[1], ast.Constant)
+        and type(argument.values[1].value) is int
+        and argument.values[1].value == 0
+    )
+
+
+def safe_python_assignment_expression(
+    text: str,
+    value_start: int,
+    key: str,
+    separator: str,
+) -> bool:
+    cursor = value_start
+    while cursor < len(text) and text[cursor] in " \t":
+        cursor += 1
+    expected_key = key.strip("\"'")
+    line_start = max(
+        text.rfind("\n", 0, value_start),
+        text.rfind("\r", 0, value_start),
+    ) + 1
+    sql_prefix = text[line_start:cursor]
+    counter = re.match(
+        rf"(?i){re.escape(expected_key)}\s*\+\s*1\b",
+        text[cursor:],
+    )
+    if (
+        counter is not None
+        and re.search(
+            rf"[\"']\s*UPDATE\b[^\"']*\bSET\b[^\"']*"
+            rf"\b{re.escape(expected_key)}\s*=\s*$",
+            sql_prefix,
+            re.IGNORECASE,
+        )
+        is not None
+        and re.match(
+            r"\s+(?:WHERE\b|RETURNING\b)",
+            text[cursor + counter.end() :],
+            re.IGNORECASE,
+        )
+    ):
+        return True
+    line_end = cursor
+    for _ in range(64):
+        next_line = text.find("\n", line_end)
+        line_end = len(text) if next_line < 0 else next_line
+        if line_end - cursor > 32_768:
+            return False
+        expression = text[cursor:line_end].strip()
+        context = text[max(0, value_start - 8192) : value_start]
+        environment_mapping = (
+            separator == ":"
+            and re.search(
+                r"(?<![A-Za-z0-9_])_*[A-Z][A-Z0-9_]*ENV[A-Z0-9_]*"
+                r"\s*=\s*\{[^{}]*$",
+                context,
+                re.DOTALL,
+            )
+            is not None
+        )
+        if (
+            expression
+            and python_runtime_expression_is_safe(
+                expression,
+                expected_key,
+                allow_environment_symbol=environment_mapping,
+            )
+            and safe_secret_assignment_suffix(text, line_end)
+        ):
+            return True
+        if next_line < 0:
+            return False
+        line_end = next_line + 1
+    return False
+
+
 def basic_authorization_risk(text: str) -> bool:
     for match in BASIC_AUTHORIZATION_PATTERN.finditer(text):
         encoded = match.group("credential")
@@ -5521,6 +5722,7 @@ def secret_text_risk(
     text: str,
     *,
     javascript_dialect: str | None = None,
+    python_source: bool = False,
 ) -> bool:
     if DIFF_HUNK_CONTENT_BOUNDARY in text:
         return any(
@@ -5581,6 +5783,15 @@ def secret_text_risk(
             javascript_dialect=javascript_dialect,
         ):
             return True
+        separator_match = re.search(r"[:=]", prefix.group(0))
+        assert separator_match is not None
+        if python_source and safe_python_assignment_expression(
+            text,
+            prefix.start() + separator_match.end(),
+            re.split(r"\s*[:=]\s*", prefix.group(0), maxsplit=1)[0],
+            separator_match.group(0),
+        ):
+            continue
         fallback = top_level_fallback_suffix(
             text[prefix.end() :],
             allow_chained_assignment=(
@@ -5623,6 +5834,13 @@ def secret_text_risk(
             text,
             match,
             javascript_dialect=javascript_dialect,
+        ):
+            continue
+        if python_source and safe_python_assignment_expression(
+            text,
+            match.start() + separator_match.end(),
+            key,
+            separator,
         ):
             continue
         if (
@@ -5766,8 +5984,13 @@ def require_no_secret_values(
     text: str,
     *,
     javascript_dialect: str | None = None,
+    python_source: bool = False,
 ) -> None:
-    if secret_text_risk(text, javascript_dialect=javascript_dialect):
+    if secret_text_risk(
+        text,
+        javascript_dialect=javascript_dialect,
+        python_source=python_source,
+    ):
         raise SystemExit(
             "refusing to include secret-like content in review bundle; "
             f"clean or redact {label} before running autoreview"
@@ -7232,6 +7455,10 @@ def javascript_review_dialect(rel: str) -> str | None:
     return None
 
 
+def python_review_source(rel: str) -> bool:
+    return Path(rel).suffix.lower() in {".py", ".pyi", ".pyw"}
+
+
 def git_c_unquote(value: str) -> str | None:
     if len(value) < 2 or value[0] != '"' or value[-1] != '"':
         return None
@@ -7408,6 +7635,11 @@ def validate_review_patch(
                     f"{label} {rel or '<unknown>'}",
                     content,
                     javascript_dialect=javascript_dialect,
+                    python_source=(
+                        python_review_source(rel)
+                        if rel is not None and rel in expected_paths
+                        else False
+                    ),
                 )
     else:
         for content in unified_diff_contents(patch):
