@@ -24,6 +24,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import tokenize
 import unicodedata
 import urllib.parse
 from pathlib import Path, PurePosixPath
@@ -5541,16 +5542,9 @@ def safe_python_assignment_expression(
         if line_end - cursor > 32_768:
             return False
         expression = text[cursor:line_end].strip()
-        context = text[max(0, value_start - 8192) : value_start]
-        environment_mapping = (
-            separator == ":"
-            and re.search(
-                r"(?<![A-Za-z0-9_])_*[A-Z][A-Z0-9_]*ENV[A-Z0-9_]*"
-                r"\s*=\s*\{[^{}]*$",
-                context,
-                re.DOTALL,
-            )
-            is not None
+        environment_mapping = separator == ":" and python_environment_mapping_context(
+            text,
+            value_start,
         )
         if (
             expression
@@ -5565,6 +5559,56 @@ def safe_python_assignment_expression(
         if next_line < 0:
             return False
         line_end = next_line + 1
+    return False
+
+
+def python_environment_mapping_context(text: str, value_start: int) -> bool:
+    lower = max(0, value_start - 8192)
+    context = text[lower:value_start]
+    candidates = list(
+        re.finditer(
+            r"(?m)^[ \t]*(?P<name>_*[A-Z][A-Z0-9_]*ENV[A-Z0-9_]*)"
+            r"\s*=\s*\{",
+            context,
+        )
+    )
+    ignored = {
+        tokenize.COMMENT,
+        tokenize.DEDENT,
+        tokenize.ENCODING,
+        tokenize.ENDMARKER,
+        tokenize.INDENT,
+        tokenize.NL,
+        tokenize.NEWLINE,
+    }
+    for candidate in reversed(candidates):
+        snippet = textwrap.dedent(context[candidate.start() :])
+        tokens: list[tokenize.TokenInfo] = []
+        generator = tokenize.generate_tokens(io.StringIO(snippet).readline)
+        try:
+            while True:
+                token = next(generator)
+                if token.type not in ignored:
+                    tokens.append(token)
+        except (IndentationError, StopIteration, tokenize.TokenError):
+            pass
+        if len(tokens) < 3:
+            continue
+        brace_balance = sum(
+            1 if token.string == "{" else -1 if token.string == "}" else 0
+            for token in tokens
+            if token.type == tokenize.OP
+        )
+        if (
+            tokens[0].type == tokenize.NAME
+            and tokens[0].string == candidate.group("name")
+            and tokens[1].type == tokenize.OP
+            and tokens[1].string == "="
+            and tokens[2].type == tokenize.OP
+            and tokens[2].string == "{"
+            and brace_balance > 0
+        ):
+            return True
     return False
 
 

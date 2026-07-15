@@ -2683,6 +2683,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
         unsafe_environment_name = "ACTUAL_PRODUCTION_" + "PASSWORD"
         concatenated_environment_name = "ACTUAL" + "SECRET_PASSWORD"
         comment_fallback = "hunter" + "2"
+        opaque_environment_name = "Q7R9M2K4_" + "PASSWORD"
         safe_lines = (
             f"{key} = attempt.{binding_key}\n"
             f"{binding_key} = int(evidence[{key!r}])\n"
@@ -2791,6 +2792,22 @@ class AutoreviewHardeningTests(unittest.TestCase):
             f"+{password_key} = request.{password_key}  "
             f"# fallback is {comment_fallback}\n"
         )
+        comment_spoofed_environment_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+# _RUNTIME_ENV = {\n"
+            f"+{password_key}: {opaque_environment_name!r}\n"
+        )
+        string_spoofed_environment_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+mapping_hint = '_RUNTIME_ENV = {'\n"
+            f"+{password_key}: {opaque_environment_name!r}\n"
+        )
 
         self.assertEqual(
             self.helper["validate_review_patch"](
@@ -2860,6 +2877,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             unsafe_environment_source_patch,
             concatenated_marker_environment_patch,
             inline_comment_source_patch,
+            comment_spoofed_environment_patch,
+            string_spoofed_environment_patch,
         ):
             with self.subTest(patch=patch), self.assertRaisesRegex(
                 SystemExit,
