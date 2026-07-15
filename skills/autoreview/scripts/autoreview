@@ -5374,7 +5374,7 @@ def python_runtime_expression_is_safe(
 ) -> bool:
     try:
         parsed = ast.parse(expression, mode="eval")
-    except SyntaxError:
+    except (MemoryError, RecursionError, SyntaxError, ValueError):
         return False
     root = parsed.body
     if isinstance(root, ast.Tuple) and len(root.elts) == 1:
@@ -5690,7 +5690,7 @@ def python_annotated_placeholder_is_safe(text: str, value_start: int) -> bool:
         expression = text[value_start:line_end].strip()
         try:
             root = ast.parse(expression, mode="eval").body
-        except SyntaxError:
+        except (MemoryError, RecursionError, SyntaxError, ValueError):
             pass
         else:
             placeholder = (
@@ -5763,7 +5763,7 @@ def python_assignment_comment(text: str, value_start: int) -> bool:
             return True
         try:
             ast.parse(expression.strip(), mode="eval")
-        except SyntaxError:
+        except (MemoryError, RecursionError, SyntaxError, ValueError):
             pass
         else:
             cursor = line_end + (1 if next_line >= 0 else 0)

@@ -2990,6 +2990,20 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 allow_environment_symbol=False,
             )
         )
+        deep_unary = "+" * 5_000 + "1"
+        self.assertFalse(
+            self.helper["python_runtime_expression_is_safe"](
+                deep_unary,
+                password_key,
+                allow_environment_symbol=False,
+            )
+        )
+        self.assertFalse(
+            self.helper["python_assignment_comment"](
+                f"{password_key} = {deep_unary}\n",
+                len(password_key) + 3,
+            )
+        )
         self.assertFalse(
             self.helper["python_runtime_expression_is_safe"](
                 "evidence['a7f9k2m4q8v6n3x5r1p0t9z8_token']",
