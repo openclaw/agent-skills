@@ -2809,6 +2809,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             f"# fallback {comment_fallback}\n"
             "+)\n"
         )
+        adjacent_comment_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            f"+{password_key} = request.{password_key}\n"
+            f"+# fallback is {comment_fallback}\n"
+        )
         unsafe_annotation_source_patch = (
             "diff --git a/runtime.py b/runtime.py\n"
             "--- a/runtime.py\n"
@@ -2842,6 +2850,17 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "+_RUNTIME_ENV = {\n"
             '+"""\n'
             f"+{password_key}: {opaque_environment_name!r}\n"
+        )
+        nested_environment_mapping_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,5 @@\n"
+            "+_RUNTIME_ENV_BY_FIELD = {\n"
+            "+    'defaults': {\n"
+            f"+        {password_key!r}: {opaque_environment_name!r},\n"
+            "+    },\n"
+            "+}\n"
         )
 
         self.assertEqual(
@@ -2921,10 +2940,12 @@ class AutoreviewHardeningTests(unittest.TestCase):
             concatenated_marker_environment_patch,
             inline_comment_source_patch,
             multiline_comment_source_patch,
+            adjacent_comment_source_patch,
             unsafe_annotation_source_patch,
             comment_spoofed_environment_patch,
             string_spoofed_environment_patch,
             multiline_string_spoofed_environment_patch,
+            nested_environment_mapping_patch,
         ):
             with self.subTest(patch=patch), self.assertRaisesRegex(
                 SystemExit,

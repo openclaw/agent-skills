@@ -5545,6 +5545,7 @@ def safe_python_assignment_expression(
         environment_mapping = separator == ":" and python_environment_mapping_context(
             text,
             value_start,
+            expected_key,
         )
         if (
             expression
@@ -5562,7 +5563,11 @@ def safe_python_assignment_expression(
     return False
 
 
-def python_environment_mapping_context(text: str, value_start: int) -> bool:
+def python_environment_mapping_context(
+    text: str,
+    value_start: int,
+    expected_key: str,
+) -> bool:
     scan_text = text[:value_start] + "'SAFE_ENVIRONMENT_NAME'\n}\n"
     line_offsets = [0]
     for line in scan_text.splitlines(keepends=True):
@@ -5589,30 +5594,57 @@ def python_environment_mapping_context(text: str, value_start: int) -> bool:
         ]
     except (IndentationError, tokenize.TokenError):
         return False
-    for index in range(len(tokens) - 2):
-        name, assignment, opener = tokens[index : index + 3]
-        if not (
-            name.type == tokenize.NAME
-            and re.fullmatch(
-                r"_*[A-Z][A-Z0-9_]*ENV[A-Z0-9_]*",
-                name.string,
-            )
-            is not None
-            and assignment.type == tokenize.OP
-            and assignment.string == "="
-            and opener.type == tokenize.OP
-            and opener.string == "{"
-            and absolute(opener.end) <= value_start
-        ):
+    value_index = next(
+        (
+            index
+            for index, token in enumerate(tokens)
+            if absolute(token.start) >= value_start
+        ),
+        None,
+    )
+    if value_index is None or value_index < 2:
+        return False
+    key_token, colon, value_token = tokens[value_index - 2 : value_index + 1]
+    if not (
+        key_token.type == tokenize.STRING
+        and colon.type == tokenize.OP
+        and colon.string == ":"
+        and value_token.type == tokenize.STRING
+    ):
+        return False
+    try:
+        key_value = ast.literal_eval(key_token.string)
+    except (SyntaxError, ValueError):
+        return False
+    if key_value != expected_key:
+        return False
+
+    brace_stack: list[int] = []
+    for index, token in enumerate(tokens[: value_index - 1]):
+        if token.type != tokenize.OP:
             continue
-        depth = 0
-        for token in tokens[index + 2 :]:
-            if token.type != tokenize.OP or token.string not in {"{", "}"}:
-                continue
-            depth += 1 if token.string == "{" else -1
-            if depth == 0:
-                return value_start < absolute(token.start)
-    return False
+        if token.string == "{":
+            brace_stack.append(index)
+        elif token.string == "}" and brace_stack:
+            brace_stack.pop()
+    if not brace_stack:
+        return False
+    opener_index = brace_stack[-1]
+    if opener_index < 2:
+        return False
+    name, assignment, opener = tokens[opener_index - 2 : opener_index + 1]
+    return bool(
+        name.type == tokenize.NAME
+        and re.fullmatch(
+            r"_*[A-Z][A-Z0-9_]*(?:BINDING_ENV|ENV_BY_FIELD|FIELD_TO_ENV)",
+            name.string,
+        )
+        is not None
+        and assignment.type == tokenize.OP
+        and assignment.string == "="
+        and opener.type == tokenize.OP
+        and opener.string == "{"
+    )
 
 
 def python_assignment_value_start(
@@ -5659,6 +5691,18 @@ def python_assignment_comment(text: str, value_start: int) -> bool:
         except SyntaxError:
             pass
         else:
+            cursor = line_end + (1 if next_line >= 0 else 0)
+            for _ in range(8):
+                if cursor >= len(text):
+                    return False
+                adjacent_end = text.find("\n", cursor)
+                adjacent_end = len(text) if adjacent_end < 0 else adjacent_end
+                adjacent = text[cursor:adjacent_end].strip()
+                if adjacent.startswith("#"):
+                    return True
+                if adjacent:
+                    return False
+                cursor = adjacent_end + 1
             return False
         if next_line < 0 or line_end - value_start > 32_768:
             return False
