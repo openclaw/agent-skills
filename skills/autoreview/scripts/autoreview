@@ -201,7 +201,8 @@ SECRET_ASSIGNMENT_PATTERN = re.compile(
     r"(?:(?:\?\.|\.)[A-Za-z_$][A-Za-z0-9_$]*)*)(?=[ \t]*\()|"
     r"(?P<reference_value>[A-Za-z_$][A-Za-z0-9_$]*"
     r"(?:(?:\?\.|\.)[A-Za-z_$][A-Za-z0-9_$]*"
-    r"|\[(?:[\"'][A-Za-z_$][A-Za-z0-9_$]*[\"']|[0-9]+)\])+)"
+    r"|(?:\?\.)?\[(?:[A-Za-z_$][A-Za-z0-9_$]*"
+    r"|[\"'][A-Za-z_$][A-Za-z0-9_$]*[\"']|[0-9]+)\])+)"
     r"(?![A-Za-z0-9_./+=:@#$%&*!?-])|"
     r"(?P<bare_value>[A-Za-z0-9_./+=:@#$%&*!?-]{8,}))"
 )
@@ -415,12 +416,15 @@ SOURCE_CODE_REFERENCE_ROOT_VALUES = {
     "attemptAuthProfileStore",
 }
 SOURCE_CODE_REFERENCE_ROOT_PATTERN = re.compile(
-    r"^(?:"
+    r"(?<![A-Za-z0-9_$?.])(?:"
     + "|".join(
         re.escape(value)
         for value in sorted(SOURCE_CODE_REFERENCE_ROOT_VALUES, key=len, reverse=True)
     )
-    + r")(?:(?:\?\.|[.\[]).*)$"
+    + r")(?:(?:\?\.|\.)[A-Za-z_$][A-Za-z0-9_$]*"
+    r"|(?:\?\.)?\[(?:[A-Za-z_$][A-Za-z0-9_$]*"
+    r"|[\"'][A-Za-z_$][A-Za-z0-9_$]*[\"']|[0-9]+)\])+"
+    r"(?![A-Za-z0-9_$])"
 )
 QUOTED_SECRET_REFERENCE_PATTERNS = (
     re.compile(r"^\$[A-Za-z_][A-Za-z0-9_]*$"),
@@ -439,7 +443,6 @@ QUOTED_SECRET_REFERENCE_PATTERNS = (
 )
 UNQUOTED_SECRET_REFERENCE_PATTERNS = (
     *QUOTED_SECRET_REFERENCE_PATTERNS,
-    SOURCE_CODE_REFERENCE_ROOT_PATTERN,
     re.compile(
         r"^(?:process\.env|os\.environ|env|cfg|config|params|payload|provider|user|"
         r"request|response|result|input|runtime|account|client|options|auth|auth_response|oauth_response|"
@@ -3785,7 +3788,12 @@ def shell_command_prefix(text: str, position: int) -> bool:
     )
 
 
-def secret_literal_risk(expression: str, minimum_length: int = 12) -> bool:
+def secret_literal_risk(
+    expression: str,
+    minimum_length: int = 12,
+    *,
+    javascript_dialect: str | None = None,
+) -> bool:
     if credentialed_uri_risk(expression) or basic_authorization_risk(expression) or any(
         pattern.search(expression) for pattern in SECRET_VALUE_PATTERNS
     ):
@@ -3815,6 +3823,11 @@ def secret_literal_risk(expression: str, minimum_length: int = 12) -> bool:
         if match.group("bare") is not None:
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
                 continue
+            if (
+                javascript_dialect is not None
+                and SOURCE_CODE_REFERENCE_ROOT_PATTERN.fullmatch(value)
+            ):
+                continue
             suffix = expression[match.end() :].lstrip()
             if suffix.startswith("("):
                 continue
@@ -3834,6 +3847,7 @@ def fallback_secret_risk(
             typescript=javascript_dialect == "typescript",
         ),
         minimum_length=minimum_length,
+        javascript_dialect=javascript_dialect,
     )
 
 
@@ -4927,6 +4941,7 @@ def javascript_reference_spans(text: str) -> frozenset[tuple[int, int]]:
         (match.start(), match.end())
         for pattern in (
             SOURCE_CODE_REFERENCE_PATTERN,
+            SOURCE_CODE_REFERENCE_ROOT_PATTERN,
             SOURCE_CODE_LIFECYCLE_REFERENCE_PATTERN,
         )
         for match in pattern.finditer(text)
@@ -5218,7 +5233,13 @@ def secret_text_risk(
             source_start = match.end() - len(value)
             source_end = match.end() - (1 if value.endswith("!") else 0)
             if (
-                (source_start, source_end) in source_reference_spans
+                (
+                    (source_start, source_end) in source_reference_spans
+                    or (
+                        javascript_dialect is not None
+                        and SOURCE_CODE_REFERENCE_ROOT_PATTERN.fullmatch(value)
+                    )
+                )
                 and safe_javascript_reference_suffix(
                     text,
                     match.end(),

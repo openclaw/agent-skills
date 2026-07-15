@@ -2259,6 +2259,44 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     )
                 )
 
+        store_reference = (
+            "const cred"
+            + "ential = attemptAuthProfileStore.profiles[successfulProfileId];"
+        )
+        optional_store_reference = (
+            "const cred"
+            + "ential = attemptAuthProfileStore?.[successfulProfileId];"
+        )
+        quoted_store_reference = (
+            "const cred"
+            + 'ential = attemptAuthProfileStore["profiles"][successfulProfileId];'
+        )
+        yaml_store_literal = (
+            "pass"
+            + 'word: attemptAuthProfileStore["'
+            + literal_value
+            + '"]'
+        )
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                store_reference,
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                optional_store_reference,
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                quoted_store_reference,
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertTrue(self.helper["secret_text_risk"](yaml_store_literal))
+
     def test_lifecycle_reference_scan_is_bounded_for_non_matching_identifier(self) -> None:
         source = "const value = resolved" + "A" * 100_000 + "X;"
 
