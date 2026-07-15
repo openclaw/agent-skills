@@ -5549,6 +5549,9 @@ def safe_python_assignment_expression(
         )
         and "--" not in sql_suffix
         and "/*" not in sql_suffix
+        and "--" not in sql_prefix
+        and "/*" not in sql_prefix
+        and not python_comment_secret_risk(sql_prefix)
         and not python_comment_secret_risk(sql_suffix)
     ):
         return True
@@ -5733,7 +5736,7 @@ def python_comment_secret_risk(comment: str) -> bool:
         r"(?i)\b(?:"
         r"(?:default|fallback)(?:\s+is\b\s*|\s*[:=]\s*|\s+)"
         r"|(?:credential|password|secret|token)\s*(?:is\b|[:=])\s*"
-        r")(?P<value>[^\s,;]+)",
+        r")(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|`[^`\r\n]*`|[^\s,;]+)",
         comment,
     )
     for hinted in hints:

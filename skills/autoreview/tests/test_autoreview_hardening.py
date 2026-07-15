@@ -2758,6 +2758,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             f'+    "UPDATE leases SET {binding_key}={binding_key}+1 '
             f'WHERE task_id=? -- {password_key} is {comment_fallback}",\n'
         )
+        sql_prefix_comment_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f'+    "UPDATE leases /* {password_key} is {comment_fallback} */ '
+            f'SET {binding_key}={binding_key}+1 WHERE task_id=?",\n'
+        )
         environment_source_patch = (
             "diff --git a/runtime.py b/runtime.py\n"
             "--- a/runtime.py\n"
@@ -2841,6 +2849,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "@@ -0,0 +1 @@\n"
             f"+{password_key} = request.{password_key}  "
             f"# default is required; {password_key} is {comment_fallback}\n"
+        )
+        quoted_hint_comment_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{password_key} = request.{password_key}  "
+            f'# {password_key} is "ab 12"\n'
         )
         benign_comment_source_patch = (
             "diff --git a/runtime.py b/runtime.py\n"
@@ -3047,6 +3063,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             standalone_environment_source_patch,
             ordinary_counter_source_patch,
             sql_comment_source_patch,
+            sql_prefix_comment_source_patch,
             unsafe_environment_source_patch,
             concatenated_marker_environment_patch,
             inline_comment_source_patch,
@@ -3054,6 +3071,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             adjacent_comment_source_patch,
             delimited_comment_source_patches,
             multiple_hint_comment_source_patch,
+            quoted_hint_comment_source_patch,
             unsafe_annotation_source_patch,
             literal_annotation_source_patch,
             numeric_annotation_source_patch,
