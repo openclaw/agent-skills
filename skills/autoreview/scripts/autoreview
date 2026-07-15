@@ -5429,7 +5429,9 @@ def python_runtime_expression_is_safe(
         components = prefix.split("_")
         return bool(components) and all(
             re.fullmatch(r"[A-Z][A-Z0-9]{0,15}", component) is not None
-            and component.casefold() not in unsafe_prefixes
+            and not any(
+                marker in component.casefold() for marker in unsafe_prefixes
+            )
             for component in components
         )
 
@@ -5564,6 +5566,15 @@ def safe_python_assignment_expression(
             return False
         line_end = next_line + 1
     return False
+
+
+def python_inline_assignment_comment(text: str, start: int) -> bool:
+    line_end = len(text)
+    for terminator in ("\n", "\r"):
+        found = text.find(terminator, start)
+        if found >= 0:
+            line_end = min(line_end, found)
+    return "#" in text[start:line_end]
 
 
 def basic_authorization_risk(text: str) -> bool:
@@ -5836,6 +5847,11 @@ def secret_text_risk(
             javascript_dialect=javascript_dialect,
         ):
             continue
+        if python_source and python_inline_assignment_comment(
+            text,
+            match.end(),
+        ):
+            return True
         if python_source and safe_python_assignment_expression(
             text,
             match.start() + separator_match.end(),

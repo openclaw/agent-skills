@@ -2681,6 +2681,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
         environment_name = "HAVA_SYNC_CONTROL_" + "FENCING_TOKEN"
         password_key = "pass" + "word"
         unsafe_environment_name = "ACTUAL_PRODUCTION_" + "PASSWORD"
+        concatenated_environment_name = "ACTUAL" + "SECRET_PASSWORD"
+        comment_fallback = "hunter" + "2"
         safe_lines = (
             f"{key} = attempt.{binding_key}\n"
             f"{binding_key} = int(evidence[{key!r}])\n"
@@ -2772,6 +2774,23 @@ class AutoreviewHardeningTests(unittest.TestCase):
             f"+    {password_key!r}: {unsafe_environment_name!r},\n"
             "+}\n"
         )
+        concatenated_marker_environment_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,3 @@\n"
+            "+_RUNTIME_ENV_BY_FIELD = {\n"
+            f"+    {password_key!r}: {concatenated_environment_name!r},\n"
+            "+}\n"
+        )
+        inline_comment_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{password_key} = request.{password_key}  "
+            f"# fallback is {comment_fallback}\n"
+        )
 
         self.assertEqual(
             self.helper["validate_review_patch"](
@@ -2839,6 +2858,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             standalone_environment_source_patch,
             ordinary_counter_source_patch,
             unsafe_environment_source_patch,
+            concatenated_marker_environment_patch,
+            inline_comment_source_patch,
         ):
             with self.subTest(patch=patch), self.assertRaisesRegex(
                 SystemExit,
