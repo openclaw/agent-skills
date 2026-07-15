@@ -6552,6 +6552,40 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.helper["safe_temp_root"](repo)
 
     @unittest.skipIf(os.name == "nt", "POSIX Testbox temp-root behavior")
+    def test_testbox_temp_root_rejects_shared_write_without_sticky_bit(self) -> None:
+        for mode in (0o040770, 0o040707, 0o040777):
+            with self.subTest(mode=oct(mode)), self.assertRaisesRegex(
+                SystemExit,
+                "shared-writable.*sticky bit",
+            ):
+                self.helper["validate_testbox_temp_root"](
+                    Path("/tmp"),
+                    mock.Mock(st_mode=mode, st_uid=os.geteuid()),
+                )
+
+    @unittest.skipIf(os.name == "nt", "POSIX Testbox temp-root behavior")
+    def test_testbox_temp_root_rejects_untrusted_owner(self) -> None:
+        foreign_uid = 1 if os.geteuid() == 0 else os.geteuid() + 1
+
+        with self.assertRaisesRegex(
+            SystemExit,
+            "owned by root or the current user",
+        ):
+            self.helper["validate_testbox_temp_root"](
+                Path("/tmp"),
+                mock.Mock(st_mode=0o041777, st_uid=foreign_uid),
+            )
+
+    @unittest.skipIf(os.name == "nt", "POSIX Testbox temp-root behavior")
+    def test_testbox_temp_root_accepts_trusted_sticky_shared_root(self) -> None:
+        for owner_uid in {0, os.geteuid()}:
+            with self.subTest(owner_uid=owner_uid):
+                self.helper["validate_testbox_temp_root"](
+                    Path("/tmp"),
+                    mock.Mock(st_mode=0o041777, st_uid=owner_uid),
+                )
+
+    @unittest.skipIf(os.name == "nt", "POSIX Testbox temp-root behavior")
     def test_testbox_parallel_test_temp_root_stays_within_socket_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)

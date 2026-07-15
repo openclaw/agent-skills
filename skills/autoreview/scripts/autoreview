@@ -1048,6 +1048,21 @@ def safe_temp_root(repo: Path) -> Path:
     return root
 
 
+def validate_testbox_temp_root(root: Path, root_stat: os.stat_result) -> None:
+    """Require a trusted POSIX owner and sticky shared-write semantics."""
+
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise SystemExit("short Testbox temp root must be a directory")
+    trusted_uids = {0, os.geteuid()}
+    if root_stat.st_uid not in trusted_uids:
+        raise SystemExit(
+            "short Testbox temp root must be owned by root or the current user"
+        )
+    shared_write = root_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    if shared_write and not root_stat.st_mode & stat.S_ISVTX:
+        raise SystemExit("shared-writable Testbox temp root must have the sticky bit set")
+
+
 def parallel_test_temp_root(repo: Path) -> Path:
     root = safe_temp_root(repo)
     if os.name == "nt" or not env_truthy("OPENCLAW_TESTBOX"):
@@ -1060,14 +1075,9 @@ def parallel_test_temp_root(repo: Path) -> Path:
         short_root_stat = short_root.stat()
     except OSError as exc:
         raise SystemExit(f"unable to resolve short Testbox temp root: {exc}") from exc
-    if not stat.S_ISDIR(short_root_stat.st_mode):
-        raise SystemExit("short Testbox temp root must be a directory")
+    validate_testbox_temp_root(short_root, short_root_stat)
     if is_within(short_root, repo.resolve()):
         raise SystemExit("short Testbox temp root must be outside the reviewed repository")
-    if short_root_stat.st_mode & stat.S_IWOTH and not (
-        short_root_stat.st_mode & stat.S_ISVTX
-    ):
-        raise SystemExit("world-writable Testbox temp root must have the sticky bit set")
     return short_root
 
 
