@@ -5730,7 +5730,11 @@ def python_annotated_placeholder_is_safe(text: str, value_start: int) -> bool:
 
 
 def python_comment_secret_risk(comment: str) -> bool:
-    if secret_literal_risk(comment, minimum_length=8):
+    if (
+        credentialed_uri_risk(comment)
+        or basic_authorization_risk(comment)
+        or any(pattern.search(comment) for pattern in SECRET_VALUE_PATTERNS)
+    ):
         return True
     hints = re.finditer(
         r"(?i)\b(?:"
@@ -5802,6 +5806,21 @@ def python_assignment_comment(text: str, value_start: int) -> bool:
         if next_line < 0 or line_end - value_start > 32_768:
             return False
         line_end = next_line + 1
+    return False
+
+
+def python_source_comment_secret_risk(text: str) -> bool:
+    for line in text.splitlines(keepends=True):
+        try:
+            tokens = tokenize.generate_tokens(io.StringIO(line).readline)
+            for token in tokens:
+                if (
+                    token.type == tokenize.COMMENT
+                    and python_comment_secret_risk(token.string[1:])
+                ):
+                    return True
+        except (IndentationError, tokenize.TokenError):
+            continue
     return False
 
 
@@ -5965,9 +5984,15 @@ def secret_text_risk(
 ) -> bool:
     if DIFF_HUNK_CONTENT_BOUNDARY in text:
         return any(
-            secret_text_risk(segment, javascript_dialect=javascript_dialect)
+            secret_text_risk(
+                segment,
+                javascript_dialect=javascript_dialect,
+                python_source=python_source,
+            )
             for segment in text.split(DIFF_HUNK_CONTENT_BOUNDARY)
         )
+    if python_source and python_source_comment_secret_risk(text):
+        return True
     uri_authorities = uri_authority_ranges(text)
     if credentialed_uri_risk(text, uri_authorities) or basic_authorization_risk(text) or any(
         pattern.search(text) for pattern in SECRET_VALUE_PATTERNS

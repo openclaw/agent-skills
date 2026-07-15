@@ -2833,6 +2833,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             f"+{password_key} = request.{password_key}\n"
             f"+# fallback is {comment_fallback}\n"
         )
+        preceding_comment_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            f"+# fallback is {comment_fallback}\n"
+            f"+{password_key} = request.{password_key}\n"
+        )
         delimited_comment_source_patches = (
             "diff --git a/runtime.py b/runtime.py\n"
             "--- a/runtime.py\n"
@@ -3069,6 +3077,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             inline_comment_source_patch,
             multiline_comment_source_patch,
             adjacent_comment_source_patch,
+            preceding_comment_source_patch,
             delimited_comment_source_patches,
             multiple_hint_comment_source_patch,
             quoted_hint_comment_source_patch,
