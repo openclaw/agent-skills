@@ -5963,10 +5963,11 @@ def secret_text_risk(
         separator_match = re.search(r"[:=]", prefix.group(0))
         assert separator_match is not None
         key = re.split(r"\s*[:=]\s*", prefix.group(0), maxsplit=1)[0]
+        default_value_start = prefix.start() + separator_match.end()
         value_start, separator = python_assignment_value_start(
             text,
             prefix.start(),
-            prefix.start() + separator_match.end(),
+            default_value_start,
             key,
             separator_match.group(0),
         )
@@ -5977,6 +5978,8 @@ def secret_text_risk(
             separator,
         ):
             continue
+        if python_source and value_start != default_value_start:
+            return True
         fallback = top_level_fallback_suffix(
             text[prefix.end() :],
             allow_chained_assignment=(
@@ -6014,10 +6017,11 @@ def secret_text_risk(
         key = re.split(r"\s*[:=]\s*", match.group(0), maxsplit=1)[0]
         separator_match = re.search(r"[:=]", match.group(0))
         assert separator_match is not None
+        default_value_start = match.start() + separator_match.end()
         value_start, separator = python_assignment_value_start(
             text,
             match.start(),
-            match.start() + separator_match.end(),
+            default_value_start,
             key,
             separator_match.group(0),
         )
@@ -6039,6 +6043,8 @@ def secret_text_risk(
             separator,
         ):
             continue
+        if python_source and value_start != default_value_start:
+            return True
         if (
             key.strip("\"'").lower() == "credentials"
             and value.lower() in FETCH_CREDENTIAL_MODE_VALUES
