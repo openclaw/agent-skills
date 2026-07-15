@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import statistics
+import stat
+import sys
+import tempfile
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+
+def discover_repo_root(start: Path) -> Path | None:
+    current = start.resolve()
+    while True:
+        if (current / ".git").exists():
+            return current
+        if current.parent == current:
+            return None
+        current = current.parent
+
+
+def fallback_log_dir() -> Path:
+    identity = (
+        str(os.getuid())
+        if hasattr(os, "getuid")
+        else hashlib.sha256(str(Path.home()).encode("utf-8")).hexdigest()[:12]
+    )
+    return Path(tempfile.gettempdir()).resolve() / f"autoreview-state-{identity}"
+
+
+def private_directory_available(path: Path) -> bool:
+    try:
+        path_stat = path.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISDIR(path_stat.st_mode):
+        return False
+    if hasattr(os, "getuid") and path_stat.st_uid != os.getuid():
+        return False
+    if path_stat.st_mode & 0o022:
+        return False
+    return os.access(path, os.W_OK | os.X_OK)
+
+
+def implicit_log_candidates() -> tuple[Path, Path]:
+    state_home = os.environ.get("XDG_STATE_HOME", "").strip()
+    candidate = (
+        Path(state_home).expanduser()
+        if state_home
+        else Path.home() / ".local" / "state"
+    ) / "autoreview"
+    return candidate, fallback_log_dir()
+
+
+def private_history_root_available(path: Path) -> bool:
+    return private_directory_available(path) and private_directory_available(
+        path / "runs"
+    )
+
+
+def default_log_dirs() -> list[Path]:
+    configured = os.environ.get("AUTOREVIEW_RUN_LOG_DIR", "").strip()
+    if configured:
+        return [Path(configured).expanduser()]
+    candidate, fallback = implicit_log_candidates()
+    runs_root = (candidate.resolve() / "runs").resolve()
+    repos = {
+        repo
+        for repo in (
+            discover_repo_root(runs_root),
+            discover_repo_root(Path.cwd()),
+        )
+        if repo is not None
+    }
+    candidate_overlaps_repo = False
+    for repo in repos:
+        if runs_root.is_relative_to(repo) or repo.is_relative_to(runs_root):
+            candidate_overlaps_repo = True
+            break
+
+    roots: list[Path] = []
+    for root, eligible in (
+        (candidate.resolve(), not candidate_overlaps_repo),
+        (fallback, True),
+    ):
+        if not eligible:
+            continue
+        if private_history_root_available(root):
+            if root not in roots:
+                roots.append(root)
+            continue
+        if root.exists() or (root / "runs").exists():
+            print(
+                "ignoring unsafe or incomplete implicit autoreview history root",
+                file=sys.stderr,
+            )
+    return roots
+
+
+def default_log_dir() -> Path:
+    roots = default_log_dirs()
+    if roots:
+        return roots[0]
+    return implicit_log_candidates()[0]
+
+
+def percentile(values: list[float], percentage: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    index = max(0, min(len(ordered) - 1, int(len(ordered) * percentage + 0.999) - 1))
+    return ordered[index]
+
+
+def load_runs(root: Path) -> list[dict[str, Any]]:
+    runs_root = root / "runs"
+    if not runs_root.is_dir():
+        raise SystemExit(f"autoreview history not found: {runs_root}")
+    runs: list[tuple[int, str, dict[str, Any]]] = []
+    for path in sorted(runs_root.glob("*/metadata.json")):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"invalid history JSON at {path}: {exc}") from exc
+        if isinstance(value, dict):
+            started = value.get("started_at_unix_ns")
+            if not isinstance(started, int):
+                started = path.stat().st_mtime_ns
+            runs.append((started, str(value.get("run_id") or path.parent.name), value))
+    runs.sort(key=lambda item: (item[0], item[1]))
+    return [value for _, _, value in runs]
+
+
+def load_run_roots(roots: list[Path]) -> list[dict[str, Any]]:
+    runs: list[dict[str, Any]] = []
+    seen_run_ids: set[str] = set()
+    for root in roots:
+        for run in load_runs(root):
+            run_id = str(run.get("run_id") or "")
+            if run_id and run_id in seen_run_ids:
+                continue
+            if run_id:
+                seen_run_ids.add(run_id)
+            runs.append(run)
+    return sorted(
+        runs,
+        key=lambda run: (
+            int(run.get("started_at_unix_ns") or 0),
+            str(run.get("run_id") or ""),
+        ),
+    )
+
+
+def summarize(runs: list[dict[str, Any]], engine: str | None) -> dict[str, Any]:
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    review_groups: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+
+    def configuration_key(record: dict[str, Any]) -> tuple[Any, ...]:
+        speed_requested = record.get("speed_requested")
+        if speed_requested is None and "speed" in record:
+            speed_requested = record.get("speed")
+        if speed_requested is None:
+            speed_requested = (
+                "inherited" if record.get("engine") == "codex" else "n/a"
+            )
+        return (
+            record.get("engine"),
+            record.get("model"),
+            record.get("thinking"),
+            record.get("auth"),
+            record.get("profile"),
+            speed_requested,
+        )
+
+    for run in runs:
+        attempts = [
+            attempt
+            for attempt in run.get("attempts", [])
+            if isinstance(attempt, dict)
+        ]
+        reviewers = [
+            reviewer
+            for reviewer in run.get("reviewer_runs", [])
+            if isinstance(reviewer, dict)
+        ]
+        for reviewer in reviewers:
+            if reviewer.get("status") != "running" and (
+                not engine or reviewer.get("engine") == engine
+            ):
+                review_groups[configuration_key(reviewer)].append(reviewer)
+        for attempt in attempts:
+            if not isinstance(attempt, dict) or attempt.get("status") == "running":
+                continue
+            if engine and attempt.get("engine") != engine:
+                continue
+            groups[configuration_key(attempt)].append(attempt)
+
+    configurations: list[dict[str, Any]] = []
+    for key in groups.keys() | review_groups.keys():
+        attempts = groups.get(key, [])
+        reviews = review_groups.get(key, [])
+        durations = [
+            float(attempt["duration_seconds"])
+            for attempt in attempts
+            if isinstance(attempt.get("duration_seconds"), (int, float))
+        ]
+        configurations.append(
+            {
+                "engine": key[0],
+                "model": key[1],
+                "thinking": key[2],
+                "auth": key[3],
+                "profile": key[4],
+                "speed_requested": key[5],
+                "reviews": len(reviews),
+                "review_completed": sum(
+                    review.get("status") == "completed" for review in reviews
+                ),
+                "review_failures": sum(
+                    review.get("status") == "failed" for review in reviews
+                ),
+                "attempts": len(attempts),
+                "completed": sum(attempt.get("status") == "completed" for attempt in attempts),
+                "refusals": sum(bool(attempt.get("refusal")) for attempt in attempts),
+                "failures": sum(
+                    attempt.get("status") in {"failed", "model_unavailable"}
+                    for attempt in attempts
+                ),
+                "fallback_attempts": sum(attempt.get("reason") != "primary" for attempt in attempts),
+                "average_seconds": round(statistics.fmean(durations), 3) if durations else 0.0,
+                "p50_seconds": round(statistics.median(durations), 3) if durations else 0.0,
+                "p95_seconds": round(percentile(durations, 0.95), 3) if durations else 0.0,
+            }
+        )
+    configurations.sort(
+        key=lambda item: (
+            str(item["engine"]),
+            str(item["model"]),
+            str(item["thinking"]),
+            str(item["speed_requested"]),
+        )
+    )
+    return {
+        "runs": len(runs),
+        "clean_runs": sum(
+            (run.get("result") or {}).get("outcome") == "clean" for run in runs
+        ),
+        "error_runs": sum(run.get("status") == "error" for run in runs),
+        "configurations": configurations,
+    }
+
+
+def render(summary: dict[str, Any]) -> None:
+    print(
+        f"runs={summary['runs']} clean={summary['clean_runs']} "
+        f"errors={summary['error_runs']}"
+    )
+    rows = summary["configurations"]
+    if not rows:
+        print("no completed reviewer attempts")
+        return
+    headers = (
+        "engine",
+        "model",
+        "thinking",
+        "auth",
+        "speed_req",
+        "reviews",
+        "review_ok",
+        "review_fail",
+        "attempts",
+        "attempt_ok",
+        "refused",
+        "failed",
+        "fallback",
+        "avg_s",
+        "p50_s",
+        "p95_s",
+    )
+    values = [
+        (
+            row["engine"] or "-",
+            row["model"] or "-",
+            row["thinking"] or "-",
+            row["auth"] or "-",
+            row["speed_requested"] or "-",
+            str(row["reviews"]),
+            str(row["review_completed"]),
+            str(row["review_failures"]),
+            str(row["attempts"]),
+            str(row["completed"]),
+            str(row["refusals"]),
+            str(row["failures"]),
+            str(row["fallback_attempts"]),
+            str(row["average_seconds"]),
+            str(row["p50_seconds"]),
+            str(row["p95_seconds"]),
+        )
+        for row in rows
+    ]
+    widths = [
+        max(len(headers[index]), *(len(row[index]) for row in values))
+        for index in range(len(headers))
+    ]
+    print("  ".join(value.ljust(widths[index]) for index, value in enumerate(headers)))
+    print("  ".join("-" * width for width in widths))
+    for row in values:
+        print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Summarize persistent autoreview timing and fallback history."
+    )
+    parser.add_argument("--log-dir", type=Path)
+    parser.add_argument("--last", type=int, help="Use only the most recent N runs.")
+    parser.add_argument("--engine", help="Filter reviewer attempts by engine.")
+    parser.add_argument("--json", action="store_true", help="Print machine-readable summary JSON.")
+    args = parser.parse_args()
+    if args.last is not None and args.last <= 0:
+        raise SystemExit("--last must be greater than zero")
+    roots = (
+        [args.log_dir.expanduser().resolve()]
+        if args.log_dir is not None
+        else default_log_dirs()
+    )
+    if not roots:
+        raise SystemExit("autoreview history not found in private default roots")
+    runs = load_run_roots(roots)
+    if args.last is not None:
+        runs = runs[-args.last :]
+    summary = summarize(runs, args.engine)
+    if args.json:
+        print(json.dumps(summary, indent=2))
+    else:
+        render(summary)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

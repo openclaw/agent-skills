@@ -16,7 +16,9 @@ import math
 import os
 import queue
 import re
+import secrets
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -28,6 +30,9 @@ import unicodedata
 import urllib.parse
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, NamedTuple
+
+
+_ACTIVE_RUN_TELEMETRY: Any = None
 
 
 ENGINES = ("codex", "claude", "droid", "copilot", "pi", "opencode", "cursor")
@@ -787,6 +792,7 @@ DEFAULT_MODEL_BY_ENGINE = {
     "claude": "claude-fable-5",
 }
 DEFAULT_CODEX_ACCESS_FALLBACK_MODEL = "gpt-5.6-terra"
+DEFAULT_CODEX_SPEED = "fast"
 DEFAULT_CLAUDE_BEDROCK_MODEL = "global.anthropic.claude-opus-4-8"
 DEFAULT_CLAUDE_BEDROCK_THINKING = "xhigh"
 DEFAULT_THINKING_BY_ENGINE = {
@@ -10176,7 +10182,22 @@ def codex_config_keys(args: argparse.Namespace) -> list[str]:
 
 
 def codex_speed_override(args: argparse.Namespace) -> str | None:
-    speed = getattr(args, "codex_speed", None) or os.environ.get("AUTOREVIEW_CODEX_SPEED", "").strip() or None
+    explicit_speed = (
+        getattr(args, "codex_speed", None)
+        or os.environ.get("AUTOREVIEW_CODEX_SPEED", "").strip()
+        or None
+    )
+    speed = explicit_speed
+    # The default auth mode may resolve through API credentials or provider
+    # configuration that this isolated helper must not guess at. Apply the
+    # implicit tier only when ChatGPT auth was selected explicitly by CLI/env.
+    if (
+        speed is None
+        and "service_tier" not in codex_config_keys(args)
+        and codex_auth_mode(args) == "chatgpt"
+        and codex_profile_name(args) is None
+    ):
+        speed = DEFAULT_CODEX_SPEED
     if speed is None:
         return None
     speed = speed.strip().lower()
@@ -10376,45 +10397,66 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                 else source_codex_home
             )
             for index, model in enumerate(models):
-                output_path.write_text("")
-                cmd = codex_command(
-                    args,
-                    repo,
-                    review_root,
-                    runtime_root,
-                    schema_path,
-                    output_path,
-                    model,
-                    force_file_auth=file_auth_linked,
+                telemetry = telemetry_for(args)
+                attempt_id = (
+                    telemetry.start_attempt(
+                        args,
+                        model=model,
+                        reason="primary" if index == 0 else "access_fallback",
+                    )
+                    if telemetry
+                    else None
                 )
-                result = run_with_heartbeat(
-                    cmd,
-                    review_root,
-                    input_text=prompt,
-                    label="codex",
-                    stream_output=args.stream_engine_output,
-                    stream_display=CodexStreamDisplay() if args.stream_engine_output else None,
-                    env=codex_engine_env(
+                try:
+                    output_path.write_text("")
+                    cmd = codex_command(
                         args,
                         repo,
-                        [Path(cmd[0]).parent],
-                        extra={
-                            "HOME": str(runtime_home),
-                            "USERPROFILE": str(runtime_home),
-                            "XDG_CACHE_HOME": str(runtime_cache),
-                            "XDG_CONFIG_HOME": str(runtime_config),
-                            "XDG_DATA_HOME": str(runtime_data),
-                            "XDG_STATE_HOME": str(runtime_state),
-                            # Keyring namespaces are derived from canonical CODEX_HOME.
-                            # Linked file auth uses the isolated home; keyring/auto must
-                            # retain the source namespace until Codex supports an auth split.
-                            "CODEX_HOME": str(active_codex_home),
-                        },
-                    ),
-                    resolve_root=repo,
-                )
-                output = output_path.read_text()
+                        review_root,
+                        runtime_root,
+                        schema_path,
+                        output_path,
+                        model,
+                        force_file_auth=file_auth_linked,
+                    )
+                    result = run_with_heartbeat(
+                        cmd,
+                        review_root,
+                        input_text=prompt,
+                        label="codex",
+                        stream_output=args.stream_engine_output,
+                        stream_display=CodexStreamDisplay() if args.stream_engine_output else None,
+                        env=codex_engine_env(
+                            args,
+                            repo,
+                            [Path(cmd[0]).parent],
+                            extra={
+                                "HOME": str(runtime_home),
+                                "USERPROFILE": str(runtime_home),
+                                "XDG_CACHE_HOME": str(runtime_cache),
+                                "XDG_CONFIG_HOME": str(runtime_config),
+                                "XDG_DATA_HOME": str(runtime_data),
+                                "XDG_STATE_HOME": str(runtime_state),
+                                # Keyring namespaces are derived from canonical CODEX_HOME.
+                                # Linked file auth uses the isolated home; keyring/auto must
+                                # retain the source namespace until Codex supports an auth split.
+                                "CODEX_HOME": str(active_codex_home),
+                            },
+                        ),
+                        resolve_root=repo,
+                    )
+                    output = output_path.read_text()
+                except BaseException:
+                    if telemetry and attempt_id is not None:
+                        telemetry.finish_attempt(attempt_id, status="failed")
+                    raise
                 if result.returncode == 0:
+                    if telemetry and attempt_id is not None:
+                        telemetry.finish_attempt(
+                            attempt_id,
+                            status="completed",
+                            returncode=result.returncode,
+                        )
                     return output or result.stdout
                 if (
                     index == 0
@@ -10422,12 +10464,24 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                     and model
                     and codex_model_access_failure(result, model)
                 ):
+                    if telemetry and attempt_id is not None:
+                        telemetry.finish_attempt(
+                            attempt_id,
+                            status="model_unavailable",
+                            returncode=result.returncode,
+                        )
                     primary_failure = result
                     print(
                         f"codex model {model} is unavailable for this account; retrying with {models[1]}",
                         file=sys.stderr,
                     )
                     continue
+                if telemetry and attempt_id is not None:
+                    telemetry.finish_attempt(
+                        attempt_id,
+                        status="failed",
+                        returncode=result.returncode,
+                    )
                 detail = result.stderr or result.stdout
                 if primary_failure is not None:
                     primary_detail = primary_failure.stderr or primary_failure.stdout
@@ -10540,10 +10594,50 @@ def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     ensure_claude_isolation_supported(args, repo)
     args.actual_model = None
     args.actual_thinking = None
-    for attempt in (1, 2):
-        result = run_claude_once(args, repo, prompt)
+
+    def run_once(
+        run_args: argparse.Namespace,
+        *,
+        reason: str,
+    ) -> tuple[subprocess.CompletedProcess[str], str, bool]:
+        telemetry = telemetry_for(args)
+        attempt_id = (
+            telemetry.start_attempt(
+                args,
+                model=run_args.model,
+                thinking=run_args.thinking,
+                reason=reason,
+            )
+            if telemetry
+            else None
+        )
+        try:
+            result = run_claude_once(run_args, repo, prompt)
+        except BaseException:
+            if telemetry and attempt_id is not None:
+                telemetry.finish_attempt(attempt_id, status="failed")
+            raise
         output = f"{result.stdout}\n{result.stderr}"
-        if claude_refusal_detected(output):
+        refusal = claude_refusal_detected(output)
+        if telemetry and attempt_id is not None:
+            telemetry.finish_attempt(
+                attempt_id,
+                status=(
+                    "refused"
+                    if refusal
+                    else "completed" if result.returncode == 0 else "failed"
+                ),
+                returncode=result.returncode,
+                refusal=refusal,
+            )
+        return result, output, refusal
+
+    for attempt in (1, 2):
+        result, _output, refused = run_once(
+            args,
+            reason="primary" if attempt == 1 else "refusal_retry",
+        )
+        if refused:
             if not claude_uses_fable_model(args.model):
                 raise SystemExit(
                     f"claude engine refused the requested model {args.model!r}"
@@ -10572,9 +10666,11 @@ def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         f"retrying with allowed fallback {fallback_args.model} at max effort",
         file=sys.stderr,
     )
-    fallback_result = run_claude_once(fallback_args, repo, prompt)
-    fallback_output = f"{fallback_result.stdout}\n{fallback_result.stderr}"
-    if claude_refusal_detected(fallback_output):
+    fallback_result, _fallback_output, fallback_refused = run_once(
+        fallback_args,
+        reason="refusal_fallback",
+    )
+    if fallback_refused:
         raise SystemExit(
             "claude engine fallback claude-opus-4-8 also refused the review"
         )
@@ -10810,22 +10906,35 @@ def run_pi(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     # Pi's built-in read tools accept absolute paths and have no repository
     # confinement, so an untrusted review prompt must never receive them.
     cmd.append("--no-tools")
-    with tempfile.TemporaryDirectory(
-        prefix="autoreview-pi-run.",
-        dir=safe_temp_root(repo),
-    ) as tempdir:
-        result = run_with_heartbeat(
-            cmd,
-            Path(tempdir),
-            input_text=prompt,
-            label="pi",
-            stream_output=args.stream_engine_output,
-            resolve_root=repo,
-            env=safe_engine_env(
-                repo,
-                [Path(cmd[0]).parent],
-                engine="pi",
-            ),
+    telemetry = telemetry_for(args)
+    attempt_id = telemetry.start_attempt(args) if telemetry else None
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="autoreview-pi-run.",
+            dir=safe_temp_root(repo),
+        ) as tempdir:
+            result = run_with_heartbeat(
+                cmd,
+                Path(tempdir),
+                input_text=prompt,
+                label="pi",
+                stream_output=args.stream_engine_output,
+                resolve_root=repo,
+                env=safe_engine_env(
+                    repo,
+                    [Path(cmd[0]).parent],
+                    engine="pi",
+                ),
+            )
+    except BaseException:
+        if telemetry and attempt_id is not None:
+            telemetry.finish_attempt(attempt_id, status="failed")
+        raise
+    if telemetry and attempt_id is not None:
+        telemetry.finish_attempt(
+            attempt_id,
+            status="completed" if result.returncode == 0 else "failed",
+            returncode=result.returncode,
         )
     if result.returncode != 0:
         raise SystemExit(f"pi engine failed ({result.returncode})\n{result.stderr or result.stdout}")
@@ -12354,7 +12463,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--codex-speed",
         choices=["fast", "flex", "default"],
-        help="Codex service tier: fast (priority processing), flex, or default. Env default: AUTOREVIEW_CODEX_SPEED. Silently standard when the model catalog does not list the tier.",
+        help="Codex service tier: fast (priority processing), flex, or default. ChatGPT auth defaults to fast unless service_tier is explicitly configured; provider profiles do not. Env override: AUTOREVIEW_CODEX_SPEED. Silently standard when the model catalog does not list the tier.",
     )
     parser.add_argument(
         "--codex-profile",
@@ -12421,6 +12530,29 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", help="Write human output to a file as well as stdout.")
     parser.add_argument("--json-output", help="Write validated structured review JSON.")
+    parser.add_argument(
+        "--run-log-dir",
+        help="Private autoreview history root outside the reviewed repo. Default: $AUTOREVIEW_RUN_LOG_DIR, then $XDG_STATE_HOME/autoreview or ~/.local/state/autoreview.",
+    )
+    parser.add_argument(
+        "--no-run-log",
+        action="store_true",
+        help="Disable persistent run metadata and timing history. Env alternative: AUTOREVIEW_RUN_LOG=0.",
+    )
+    bundle_log_group = parser.add_mutually_exclusive_group()
+    bundle_log_group.add_argument(
+        "--log-bundle",
+        dest="log_bundle",
+        action="store_true",
+        default=None,
+        help="Persist the exact scanner-approved bundle and final report in the private run directory. Opt-in; env alternative: AUTOREVIEW_RUN_LOG_BUNDLE=1.",
+    )
+    bundle_log_group.add_argument(
+        "--no-log-bundle",
+        dest="log_bundle",
+        action="store_false",
+        help="Do not persist the bundle even when AUTOREVIEW_RUN_LOG_BUNDLE enables it.",
+    )
     parser.add_argument(
         "--stream-engine-output",
         action="store_true",
@@ -12697,6 +12829,512 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
     return result
 
 
+def run_log_enabled(args: argparse.Namespace) -> bool:
+    if getattr(args, "no_run_log", False):
+        return False
+    value = os.environ.get("AUTOREVIEW_RUN_LOG", "1").strip().casefold()
+    return value not in {"0", "false", "no", "off"}
+
+
+def run_log_bundle_enabled(args: argparse.Namespace) -> bool:
+    explicit = getattr(args, "log_bundle", None)
+    if explicit is not None:
+        return bool(explicit)
+    value = os.environ.get("AUTOREVIEW_RUN_LOG_BUNDLE", "0").strip().casefold()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"", "0", "false", "no", "off"}:
+        return False
+    raise SystemExit(
+        "invalid AUTOREVIEW_RUN_LOG_BUNDLE value; use 1/true/yes/on or "
+        "0/false/no/off"
+    )
+
+
+def fallback_run_log_root() -> Path:
+    identity = (
+        str(os.getuid())
+        if hasattr(os, "getuid")
+        else hashlib.sha256(str(Path.home()).encode("utf-8")).hexdigest()[:12]
+    )
+    return Path(tempfile.gettempdir()).resolve() / f"autoreview-state-{identity}"
+
+
+def run_log_root(args: argparse.Namespace, repo: Path) -> Path:
+    configured = (
+        (getattr(args, "run_log_dir", None) or "").strip()
+        or os.environ.get("AUTOREVIEW_RUN_LOG_DIR", "").strip()
+    )
+    explicitly_configured = bool(configured)
+    if configured:
+        root = Path(configured).expanduser()
+        if not root.is_absolute():
+            root = Path.cwd() / root
+    else:
+        state_home = os.environ.get("XDG_STATE_HOME", "").strip()
+        root = (
+            Path(state_home).expanduser()
+            if state_home
+            else Path.home() / ".local" / "state"
+        ) / "autoreview"
+    resolved = root.resolve()
+    repo_root_path = repo.resolve()
+    runs_root = (resolved / "runs").resolve()
+    overlaps_repo = runs_root.is_relative_to(
+        repo_root_path
+    ) or repo_root_path.is_relative_to(runs_root)
+    if overlaps_repo:
+        if explicitly_configured:
+            raise SystemExit(
+                "autoreview run logs must be outside the reviewed repository: "
+                f"{display_escape(str(root), 500)}"
+            )
+        resolved = fallback_run_log_root()
+        fallback_runs_root = (resolved / "runs").resolve()
+        if fallback_runs_root.is_relative_to(
+            repo_root_path
+        ) or repo_root_path.is_relative_to(fallback_runs_root):
+            raise SystemExit(
+                "autoreview could not find a history directory outside the "
+                "reviewed repository; set --run-log-dir or --no-run-log"
+            )
+    return resolved
+
+
+def utc_timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def codex_speed_value(args: argparse.Namespace) -> str | None:
+    override = codex_speed_override(args)
+    if override is not None:
+        _, _, value = override.partition("=")
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, str) else None
+    for configured in reversed(codex_config_overrides(args)):
+        key, _, value = configured.partition("=")
+        if key.strip() != "service_tier":
+            continue
+        try:
+            parsed = ast.literal_eval(value.strip())
+        except (SyntaxError, ValueError):
+            return "configured"
+        return parsed if parsed in {"fast", "flex", "default"} else "configured"
+    return None
+
+
+def reviewer_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "engine": args.engine,
+        "model": args.model,
+        "thinking": args.thinking,
+        "fallback_model": getattr(args, "fallback_model", None),
+        "tools": bool(args.tools),
+    }
+    if args.engine == "codex":
+        config.update(
+            {
+                "auth": codex_auth_mode(args),
+                "profile": codex_profile_name(args),
+                "speed_requested": codex_speed_value(args),
+                "config_keys": codex_config_keys(args),
+                "output_schema": codex_use_output_schema(args),
+            }
+        )
+    elif args.engine == "claude":
+        auth = claude_auth_mode(args)
+        config["auth"] = auth
+        if auth == "bedrock":
+            config["region"] = claude_bedrock_region(args)
+    return config
+
+
+def ensure_private_directory(path: Path, *, parents: bool = False) -> None:
+    try:
+        path.mkdir(parents=parents, mode=0o700)
+    except FileExistsError:
+        try:
+            path_stat = path.lstat()
+        except OSError as exc:
+            raise SystemExit(f"cannot inspect autoreview history directory: {path}") from exc
+        if not stat.S_ISDIR(path_stat.st_mode):
+            raise SystemExit(f"autoreview history path is not a directory: {path}")
+        if hasattr(os, "getuid") and path_stat.st_uid != os.getuid():
+            raise SystemExit(
+                f"autoreview history directory is not owned by the current user: {path}"
+            )
+        if path_stat.st_mode & 0o022:
+            raise SystemExit(
+                "autoreview history directory must not be group/world-writable: "
+                f"{path}"
+            )
+    else:
+        path.chmod(0o700)
+
+
+class RunTelemetry:
+    """Persist one review's safe configuration, artifacts, and timing history."""
+
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        repo: Path,
+        target: str,
+        target_ref: str | None,
+        reviewers: list[argparse.Namespace],
+        *,
+        root_override: Path | None = None,
+        strict: bool = False,
+    ) -> None:
+        self.strict = strict
+        self.logging_available = True
+        self.logging_warning_emitted = False
+        self.lock = threading.Lock()
+        self.started_monotonic = time.monotonic()
+        self.attempt_started: dict[int, float] = {}
+        self.reviewer_started: dict[int, float] = {}
+        self.next_attempt_id = 1
+        self.next_reviewer_id = 1
+        self.root = root_override if root_override is not None else run_log_root(args, repo)
+        ensure_private_directory(self.root, parents=True)
+        runs_root = self.root / "runs"
+        ensure_private_directory(runs_root)
+        started_unix_ns = time.time_ns()
+        run_id = (
+            time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            + "-"
+            + f"{started_unix_ns % 1_000_000_000:09d}"
+            + "-"
+            + secrets.token_hex(4)
+        )
+        self.run_dir = runs_root / run_id
+        self.run_dir.mkdir(mode=0o700)
+        self.run_dir.chmod(0o700)
+        self.metadata_path = self.run_dir / "metadata.json"
+        self.log_bundle = run_log_bundle_enabled(args)
+        self.data: dict[str, Any] = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "status": "running",
+            "started_at": utc_timestamp(),
+            "started_at_unix_ns": started_unix_ns,
+            "host": socket.gethostname(),
+            "repo": {
+                "root": str(repo),
+                "branch": current_branch(repo),
+                "commit": git(repo, "rev-parse", "HEAD", check=False).strip() or None,
+            },
+            "target": {"mode": target, "ref": target_ref},
+            "reviewers": [reviewer_configuration(reviewer) for reviewer in reviewers],
+            "run_config": {
+                "web_search": bool(args.web_search),
+                "stream_engine_output": bool(args.stream_engine_output),
+                "parallel_tests": bool(args.parallel_tests),
+            },
+            "bundle": None,
+            "reviewer_runs": [],
+            "attempts": [],
+            "result": None,
+            "artifacts": {"metadata": "metadata.json"},
+        }
+        self.persist()
+
+    def persist_locked(self) -> None:
+        if not self.logging_available:
+            return
+        try:
+            atomic_write_text(
+                self.metadata_path,
+                json.dumps(self.data, indent=2, sort_keys=True) + "\n",
+            )
+            self.metadata_path.chmod(0o600)
+        except OSError as exc:
+            self.handle_logging_error_locked(exc)
+
+    def handle_logging_error_locked(self, exc: OSError) -> None:
+        if self.strict:
+            raise exc
+        self.logging_available = False
+        if not self.logging_warning_emitted:
+            print(
+                "autoreview history disabled after write failure: "
+                f"{display_escape(type(exc).__name__, 200)}",
+                file=sys.stderr,
+            )
+            self.logging_warning_emitted = True
+
+    def persist(self) -> None:
+        with self.lock:
+            self.persist_locked()
+
+    def record_bundle(
+        self,
+        bundle: str,
+        *,
+        truncated: bool,
+        changed_paths: set[str],
+        prompts: list[str],
+    ) -> None:
+        encoded = bundle.encode("utf-8")
+        with self.lock:
+            artifact: str | None = None
+            if self.log_bundle and self.logging_available:
+                try:
+                    bundle_path = self.run_dir / "bundle.txt"
+                    atomic_write_text(bundle_path, bundle)
+                    bundle_path.chmod(0o600)
+                    artifact = bundle_path.name
+                    self.data["artifacts"]["bundle"] = artifact
+                except OSError as exc:
+                    self.handle_logging_error_locked(exc)
+            self.data["bundle"] = {
+                "artifact": artifact,
+                "bytes": len(encoded),
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+                "truncated": truncated,
+                "changed_paths": sorted(changed_paths),
+                "review_passes": len(prompts),
+                "prompt_bytes": [utf8_size(prompt) for prompt in prompts],
+            }
+            self.persist_locked()
+
+    def start_attempt(
+        self,
+        args: argparse.Namespace,
+        *,
+        model: str | None = None,
+        thinking: str | None = None,
+        reason: str = "primary",
+    ) -> int:
+        with self.lock:
+            attempt_id = self.next_attempt_id
+            self.next_attempt_id += 1
+            config = reviewer_configuration(args)
+            entry = {
+                "attempt_id": attempt_id,
+                "pass": getattr(args, "telemetry_pass", 1),
+                "structured_output_attempt": getattr(
+                    args, "telemetry_structured_attempt", 1
+                ),
+                "engine": args.engine,
+                "model": model if model is not None else config.get("model"),
+                "thinking": thinking if thinking is not None else config.get("thinking"),
+                "auth": config.get("auth"),
+                "profile": config.get("profile"),
+                "speed_requested": config.get("speed_requested"),
+                "reason": reason,
+                "started_at": utc_timestamp(),
+                "status": "running",
+            }
+            self.data["attempts"].append(entry)
+            self.attempt_started[attempt_id] = time.monotonic()
+            self.persist_locked()
+            return attempt_id
+
+    def finish_attempt(
+        self,
+        attempt_id: int,
+        *,
+        status: str,
+        returncode: int | None = None,
+        refusal: bool = False,
+    ) -> None:
+        with self.lock:
+            entry = next(
+                (
+                    item
+                    for item in self.data["attempts"]
+                    if item["attempt_id"] == attempt_id
+                ),
+                None,
+            )
+            if entry is None or entry["status"] != "running":
+                return
+            started = self.attempt_started.pop(attempt_id)
+            entry.update(
+                {
+                    "finished_at": utc_timestamp(),
+                    "duration_seconds": round(time.monotonic() - started, 3),
+                    "status": status,
+                    "returncode": returncode,
+                    "refusal": refusal,
+                }
+            )
+            self.persist_locked()
+
+    def start_reviewer(self, args: argparse.Namespace) -> int:
+        with self.lock:
+            reviewer_id = self.next_reviewer_id
+            self.next_reviewer_id += 1
+            entry = {
+                "reviewer_run_id": reviewer_id,
+                "pass": getattr(args, "telemetry_pass", 1),
+                **reviewer_configuration(args),
+                "started_at": utc_timestamp(),
+                "status": "running",
+            }
+            self.data["reviewer_runs"].append(entry)
+            self.reviewer_started[reviewer_id] = time.monotonic()
+            self.persist_locked()
+            return reviewer_id
+
+    def finish_reviewer(
+        self,
+        reviewer_id: int,
+        *,
+        status: str,
+        findings: int | None = None,
+        structured_output_attempts: int = 1,
+    ) -> None:
+        with self.lock:
+            entry = next(
+                (
+                    item
+                    for item in self.data["reviewer_runs"]
+                    if item["reviewer_run_id"] == reviewer_id
+                ),
+                None,
+            )
+            if entry is None or entry["status"] != "running":
+                return
+            started = self.reviewer_started.pop(reviewer_id)
+            entry.update(
+                {
+                    "finished_at": utc_timestamp(),
+                    "duration_seconds": round(time.monotonic() - started, 3),
+                    "status": status,
+                    "findings": findings,
+                    "structured_output_attempts": structured_output_attempts,
+                }
+            )
+            self.persist_locked()
+
+    def record_result(
+        self,
+        report: dict[str, Any],
+        *,
+        tests_status: int,
+        outcome: str,
+    ) -> None:
+        report_path: Path | None = None
+        with self.lock:
+            if self.log_bundle and self.logging_available:
+                try:
+                    report_path = self.run_dir / "report.json"
+                    atomic_write_text(
+                        report_path,
+                        json.dumps(report, indent=2) + "\n",
+                    )
+                    report_path.chmod(0o600)
+                except OSError as exc:
+                    report_path = None
+                    self.handle_logging_error_locked(exc)
+            if report_path is not None:
+                self.data["artifacts"]["report"] = report_path.name
+            self.data["result"] = {
+                "outcome": outcome,
+                "findings": len(report["findings"]),
+                "overall_correctness": report["overall_correctness"],
+                "overall_confidence": report["overall_confidence"],
+                "tests_status": tests_status,
+            }
+            self.persist_locked()
+
+    def mark_outcome(self, outcome: str) -> None:
+        with self.lock:
+            self.data["result"] = {"outcome": outcome}
+            self.persist_locked()
+
+    def finish(self, exit_code: int, *, error_type: str | None = None) -> None:
+        with self.lock:
+            if self.data["status"] != "running":
+                return
+            self.data.update(
+                {
+                    "status": "error" if error_type else "completed",
+                    "exit_code": exit_code,
+                    "error_type": error_type,
+                    "finished_at": utc_timestamp(),
+                    "duration_seconds": round(
+                        time.monotonic() - self.started_monotonic, 3
+                    ),
+                }
+            )
+            self.persist_locked()
+
+
+def create_run_telemetry(
+    args: argparse.Namespace,
+    repo: Path,
+    target: str,
+    target_ref: str | None,
+    reviewers: list[argparse.Namespace],
+) -> RunTelemetry | None:
+    strict = bool(
+        (getattr(args, "run_log_dir", None) or "").strip()
+        or os.environ.get("AUTOREVIEW_RUN_LOG_DIR", "").strip()
+    )
+    # Validate the sensitive artifact opt-in before entering best-effort setup.
+    args.log_bundle = run_log_bundle_enabled(args)
+    try:
+        telemetry = RunTelemetry(
+            args,
+            repo,
+            target,
+            target_ref,
+            reviewers,
+            strict=True,
+        )
+        telemetry.strict = strict
+        return telemetry
+    except (OSError, SystemExit) as exc:
+        if strict:
+            raise
+        print(
+            "autoreview history default unavailable; trying private temp root: "
+            f"{display_escape(type(exc).__name__, 200)}",
+            file=sys.stderr,
+        )
+    fallback_root = fallback_run_log_root()
+    fallback_runs_root = (fallback_root / "runs").absolute()
+    repo_root = repo.resolve()
+    if fallback_runs_root.is_relative_to(repo_root) or repo_root.is_relative_to(
+        fallback_runs_root
+    ):
+        print(
+            "autoreview history disabled; private temp root overlaps repository",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        telemetry = RunTelemetry(
+            args,
+            repo,
+            target,
+            target_ref,
+            reviewers,
+            root_override=fallback_root,
+            strict=True,
+        )
+        telemetry.strict = False
+        return telemetry
+    except (OSError, SystemExit) as exc:
+        print(
+            "autoreview history disabled; private temp root unavailable: "
+            f"{display_escape(type(exc).__name__, 200)}",
+            file=sys.stderr,
+        )
+        return None
+
+
+def telemetry_for(args: argparse.Namespace) -> RunTelemetry | None:
+    telemetry = getattr(args, "run_telemetry", None)
+    return telemetry if isinstance(telemetry, RunTelemetry) else None
+
+
 def reviewer_label(args: argparse.Namespace) -> str:
     parts = [args.engine]
     profile = codex_profile_name(args) if args.engine == "codex" else None
@@ -12723,25 +13361,48 @@ def run_reviewer(
     changed_paths: set[str],
     required: list[str],
     input_truncated: bool = False,
+    pass_index: int = 1,
 ) -> dict[str, Any]:
     ensure_reviewer_input_complete(args, input_truncated)
+    args.telemetry_pass = pass_index
+    telemetry = telemetry_for(args)
+    reviewer_run_id = telemetry.start_reviewer(args) if telemetry else None
     attempts = 3 if args.engine == "cursor" else 1
-    for attempt in range(1, attempts + 1):
-        raw = run_engine(args, repo, prompt)
-        try:
-            report = extract_json(raw)
-            validate_report(report, repo, changed_paths, required)
-            filter_findings_by_priority(report, args.max_priority)
-            return report
-        except SystemExit as exc:
-            if attempt >= attempts or not is_structured_output_failure(str(exc)):
-                raise
-            print(
-                "retrying "
-                f"{args.engine} structured output validation after attempt "
-                f"{attempt}: {display_escape(exc, 4000, multiline=True)}",
-                file=sys.stderr,
+    try:
+        for attempt in range(1, attempts + 1):
+            args.telemetry_structured_attempt = attempt
+            raw = run_engine(args, repo, prompt)
+            try:
+                report = extract_json(raw)
+                validate_report(report, repo, changed_paths, required)
+                filter_findings_by_priority(report, args.max_priority)
+                if telemetry and reviewer_run_id is not None:
+                    telemetry.finish_reviewer(
+                        reviewer_run_id,
+                        status="completed",
+                        findings=len(report["findings"]),
+                        structured_output_attempts=attempt,
+                    )
+                return report
+            except SystemExit as exc:
+                if attempt >= attempts or not is_structured_output_failure(str(exc)):
+                    raise
+                print(
+                    "retrying "
+                    f"{args.engine} structured output validation after attempt "
+                    f"{attempt}: {display_escape(exc, 4000, multiline=True)}",
+                    file=sys.stderr,
+                )
+    except BaseException:
+        if telemetry and reviewer_run_id is not None:
+            telemetry.finish_reviewer(
+                reviewer_run_id,
+                status="failed",
+                structured_output_attempts=getattr(
+                    args, "telemetry_structured_attempt", 1
+                ),
             )
+        raise
     raise SystemExit(f"{args.engine} structured output validation failed after {attempts} attempts")
 
 
@@ -12794,12 +13455,22 @@ def run_panel(
     changed_paths: set[str],
     input_truncated: bool,
     required: list[str] | None = None,
+    pass_index: int = 1,
 ) -> dict[str, Any]:
     reports: list[tuple[str, dict[str, Any]]] = []
     failures: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(reviewers)) as executor:
         reviewer_by_future = {
-            executor.submit(run_reviewer, reviewer, repo, prompt, changed_paths, [], input_truncated): reviewer
+            executor.submit(
+                run_reviewer,
+                reviewer,
+                repo,
+                prompt,
+                changed_paths,
+                [],
+                input_truncated,
+                pass_index,
+            ): reviewer
             for reviewer in reviewers
         }
         for future in concurrent.futures.as_completed(reviewer_by_future):
@@ -12856,6 +13527,12 @@ def reviewer_test_args(**overrides: Any) -> argparse.Namespace:
         "claude_auth_explicit": False,
         "claude_bedrock_region": None,
         "tools": True,
+        "web_search": True,
+        "stream_engine_output": False,
+        "parallel_tests": None,
+        "run_log_dir": None,
+        "no_run_log": False,
+        "log_bundle": None,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -12997,6 +13674,23 @@ def self_test_config_defaults() -> None:
         )[0]
         if chatgpt_codex.codex_auth != "chatgpt":
             raise SystemExit("self-test config defaults failed: Codex ChatGPT auth was not preserved")
+        if codex_speed_value(chatgpt_codex) != DEFAULT_CODEX_SPEED:
+            raise SystemExit(
+                "self-test config defaults failed: ChatGPT Codex did not default to fast"
+            )
+        explicit_service_tier = reviewer_test_args(
+            engine="codex",
+            codex_auth="chatgpt",
+            codex_config=['service_tier="flex"'],
+        )
+        if codex_speed_override(explicit_service_tier) is not None:
+            raise SystemExit(
+                "self-test config defaults failed: implicit fast overrode raw service_tier"
+            )
+        if codex_speed_value(explicit_service_tier) != "flex":
+            raise SystemExit(
+                "self-test config defaults failed: raw service_tier was not logged"
+            )
         try:
             reviewer_args(
                 reviewer_test_args(
@@ -13042,6 +13736,10 @@ def self_test_config_defaults() -> None:
         if env_chatgpt_bedrock.codex_auth != "default":
             raise SystemExit(
                 "self-test config defaults failed: Codex profile did not override auth env default"
+            )
+        if codex_speed_override(env_chatgpt_bedrock) is not None:
+            raise SystemExit(
+                "self-test config defaults failed: Codex profile inherited implicit fast"
             )
         try:
             reviewer_args(
@@ -13334,6 +14032,7 @@ def atomic_write_text(path: Path, content: str) -> None:
 
 
 def main() -> int:
+    global _ACTIVE_RUN_TELEMETRY
     args = parse_args()
     if args.self_test:
         return self_test()
@@ -13396,6 +14095,18 @@ def main() -> int:
     if args.dry_run:
         return 0
 
+    telemetry = (
+        create_run_telemetry(args, repo, target, target_ref, reviewers)
+        if run_log_enabled(args)
+        else None
+    )
+    _ACTIVE_RUN_TELEMETRY = telemetry
+    if telemetry:
+        for reviewer in reviewers:
+            reviewer.run_telemetry = telemetry
+        print(f"run_log_root: {telemetry.root}")
+        print(f"run_log: {telemetry.run_dir}")
+
     review_source_snapshot = source_tree_snapshot(repo)
     run_trufflehog_preflight(repo, target, target_ref, args.commit)
     known_secret_fragments: set[str] = set()
@@ -13450,6 +14161,13 @@ def main() -> int:
             known_secret_fragments,
         )
     changed_paths = review_paths(repo, target, target_ref, args.commit)
+    if telemetry:
+        telemetry.record_bundle(
+            bundle,
+            truncated=input_truncated,
+            changed_paths=changed_paths,
+            prompts=prompts,
+        )
     print(f"bundle: {utf8_size(bundle)} bytes; review passes: {len(prompts)}")
     if source_tree_snapshot(repo) != review_source_snapshot:
         raise SystemExit(
@@ -13477,6 +14195,7 @@ def main() -> int:
                     changed_paths,
                     required,
                     input_truncated,
+                    index,
                 )
             else:
                 chunk_report = run_panel(
@@ -13487,6 +14206,7 @@ def main() -> int:
                     changed_paths,
                     input_truncated,
                     required,
+                    index,
                 )
             chunk_reports.append((f"chunk {index}/{len(prompts)}", chunk_report))
         if len(chunk_reports) == 1:
@@ -13501,6 +14221,8 @@ def main() -> int:
         tests_status = finish_parallel_tests(*tests_proc) if tests_proc else 0
 
     if source_tree_snapshot(repo) != review_source_snapshot:
+        if telemetry:
+            telemetry.mark_outcome("source_changed")
         print(
             "source changed after the review bundle was created; "
             "rerun autoreview against the updated tree",
@@ -13531,21 +14253,51 @@ def main() -> int:
     has_findings = bool(report["findings"])
     overall_incorrect = report["overall_correctness"] == "patch is incorrect"
     if tests_status != 0:
-        return 1
-    if args.expect_findings:
-        return 0 if has_findings else 1
-    return 1 if has_findings or overall_incorrect else 0
+        outcome = "tests_failed"
+        exit_code = 1
+    elif args.expect_findings:
+        outcome = "expected_findings" if has_findings else "expected_findings_missing"
+        exit_code = 0 if has_findings else 1
+    elif has_findings or overall_incorrect:
+        outcome = "findings"
+        exit_code = 1
+    else:
+        outcome = "clean"
+        exit_code = 0
+    if telemetry:
+        telemetry.record_result(
+            report,
+            tests_status=tests_status,
+            outcome=outcome,
+        )
+    return exit_code
 
 
 def sanitized_main() -> int:
+    global _ACTIVE_RUN_TELEMETRY
     try:
-        return main()
+        exit_code = main()
+        if _ACTIVE_RUN_TELEMETRY is not None:
+            _ACTIVE_RUN_TELEMETRY.finish(exit_code)
+        return exit_code
     except SystemExit as exc:
+        exit_code = exc.code if isinstance(exc.code, int) else 1
+        if _ACTIVE_RUN_TELEMETRY is not None:
+            _ACTIVE_RUN_TELEMETRY.finish(
+                exit_code,
+                error_type="SystemExit",
+            )
         if isinstance(exc.code, str):
             raise SystemExit(
                 display_escape(exc.code, 4000, multiline=True)
             ) from None
         raise
+    except BaseException as exc:
+        if _ACTIVE_RUN_TELEMETRY is not None:
+            _ACTIVE_RUN_TELEMETRY.finish(1, error_type=type(exc).__name__)
+        raise
+    finally:
+        _ACTIVE_RUN_TELEMETRY = None
 
 
 if __name__ == "__main__":

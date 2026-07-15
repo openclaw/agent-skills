@@ -314,6 +314,651 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         )
         self.assertEqual(reviewers[1].thinking, "xhigh")
 
+    def test_chatgpt_codex_defaults_to_fast_without_overriding_explicit_tier(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            implicit = AUTOREVIEW.reviewer_test_args(codex_auth="chatgpt")
+            raw_tier = AUTOREVIEW.reviewer_test_args(
+                codex_auth="chatgpt",
+                codex_config=['service_tier="flex"'],
+            )
+            explicit = AUTOREVIEW.reviewer_test_args(
+                codex_auth="chatgpt",
+                codex_speed="default",
+            )
+            self.assertEqual(AUTOREVIEW.codex_speed_value(implicit), "fast")
+            self.assertIsNone(AUTOREVIEW.codex_speed_override(raw_tier))
+            self.assertEqual(AUTOREVIEW.codex_speed_value(raw_tier), "flex")
+            self.assertEqual(AUTOREVIEW.codex_speed_value(explicit), "default")
+
+    def test_codex_provider_profile_does_not_inherit_fast_default(self) -> None:
+        args = AUTOREVIEW.reviewer_test_args(
+            codex_auth="default",
+            codex_profile="bedrock",
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(AUTOREVIEW.codex_speed_value(args))
+
+    def test_run_telemetry_persists_private_bundle_report_and_history(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-telemetry-test.") as tempdir:
+            root = Path(tempdir)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Test"],
+                check=True,
+            )
+            (repo / "example.txt").write_text("example\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "example.txt"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "initial"],
+                check=True,
+            )
+            logs = root / "logs"
+            logs.mkdir(mode=0o755)
+            logs.chmod(0o755)
+            args = AUTOREVIEW.reviewer_test_args(
+                codex_auth="chatgpt",
+                model="gpt-5.6-sol",
+                thinking="high",
+                fallback_model="gpt-5.6-terra",
+                web_search=True,
+                stream_engine_output=False,
+                parallel_tests=None,
+                run_log_dir=str(logs),
+                log_bundle=True,
+            )
+            telemetry = AUTOREVIEW.RunTelemetry(
+                args,
+                repo,
+                "branch",
+                "origin/main",
+                [args],
+            )
+            self.assertEqual(logs.stat().st_mode & 0o777, 0o755)
+            self.assertEqual((logs / "runs").stat().st_mode & 0o777, 0o700)
+            args.run_telemetry = telemetry
+            telemetry.record_bundle(
+                "diff --git a/example.txt b/example.txt\n",
+                truncated=False,
+                changed_paths={"example.txt"},
+                prompts=["review prompt"],
+            )
+            reviewer_id = telemetry.start_reviewer(args)
+            attempt_id = telemetry.start_attempt(args)
+            telemetry.finish_attempt(attempt_id, status="completed", returncode=0)
+            telemetry.finish_reviewer(reviewer_id, status="completed", findings=0)
+            telemetry.record_result(FINAL_REPORT, tests_status=0, outcome="clean")
+            telemetry.finish(0)
+
+            metadata = json.loads(telemetry.metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["reviewers"][0]["speed_requested"], "fast")
+            self.assertEqual(metadata["bundle"]["changed_paths"], ["example.txt"])
+            self.assertEqual(metadata["attempts"][0]["status"], "completed")
+            self.assertEqual(metadata["result"]["outcome"], "clean")
+            self.assertEqual((telemetry.run_dir / "bundle.txt").read_text(), "diff --git a/example.txt b/example.txt\n")
+            self.assertTrue((telemetry.run_dir / "report.json").is_file())
+            history = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH.with_name("autoreview-history")),
+                    "--log-dir",
+                    str(logs),
+                    "--json",
+                ],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            )
+            summary = json.loads(history.stdout)
+            self.assertEqual(summary["runs"], 1)
+            self.assertEqual(
+                summary["configurations"][0]["speed_requested"],
+                "fast",
+            )
+
+            args.log_bundle = False
+            metadata_only = AUTOREVIEW.RunTelemetry(
+                args,
+                repo,
+                "branch",
+                "origin/main",
+                [args],
+            )
+            metadata_only.record_result(
+                FINAL_REPORT,
+                tests_status=0,
+                outcome="clean",
+            )
+            metadata_only.finish(0)
+            self.assertFalse((metadata_only.run_dir / "report.json").exists())
+            self.assertEqual(
+                json.loads(metadata_only.metadata_path.read_text())["artifacts"],
+                {"metadata": "metadata.json"},
+            )
+
+    def test_run_log_root_rejects_paths_inside_reviewed_repo(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-log-root-test.") as tempdir:
+            repo = Path(tempdir).resolve()
+            args = argparse.Namespace(run_log_dir=str(repo / "review-history"))
+            with self.assertRaisesRegex(SystemExit, "must be outside"):
+                AUTOREVIEW.run_log_root(args, repo)
+
+    def test_implicit_history_root_falls_back_outside_home_repository(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-home-repo-test.") as tempdir:
+            root = Path(tempdir).resolve()
+            repo = root / "home-repo"
+            fallback_parent = root / "system-temp"
+            repo.mkdir()
+            (repo / ".git").mkdir()
+            fallback_parent.mkdir()
+            args = argparse.Namespace(run_log_dir=None)
+            with (
+                mock.patch.object(Path, "home", return_value=repo),
+                mock.patch.object(tempfile, "gettempdir", return_value=str(fallback_parent)),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                history_root = AUTOREVIEW.run_log_root(args, repo)
+                (history_root / "runs").mkdir(parents=True)
+                history = runpy.run_path(
+                    str(SCRIPT_PATH.with_name("autoreview-history"))
+                )
+                reader_root = history["default_log_dir"]()
+            self.assertTrue(history_root.is_relative_to(fallback_parent))
+            self.assertFalse(history_root.is_relative_to(repo))
+            self.assertEqual(reader_root, history_root)
+
+    def test_history_runs_directory_must_not_overlap_repository(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-log-overlap-test.") as tempdir:
+            root = Path(tempdir).resolve()
+            repo = root / "runs"
+            repo.mkdir()
+            args = argparse.Namespace(run_log_dir=str(root))
+            with self.assertRaisesRegex(SystemExit, "must be outside"):
+                AUTOREVIEW.run_log_root(args, repo)
+
+    def test_existing_history_directory_must_not_be_shared_writable(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-history-mode-test.") as tempdir:
+            shared = Path(tempdir) / "shared"
+            shared.mkdir(mode=0o777)
+            shared.chmod(0o777)
+            with self.assertRaisesRegex(SystemExit, "group/world-writable"):
+                AUTOREVIEW.ensure_private_directory(shared)
+            self.assertEqual(shared.stat().st_mode & 0o777, 0o777)
+
+    def test_codex_setup_failure_finishes_telemetry_attempt(self) -> None:
+        args = AUTOREVIEW.reviewer_test_args(
+            codex_bin="codex",
+            codex_auth="chatgpt",
+            model="gpt-5.6-sol",
+            thinking="high",
+            fallback_model=None,
+        )
+        telemetry = mock.Mock(spec=AUTOREVIEW.RunTelemetry)
+        telemetry.start_attempt.return_value = 7
+        args.run_telemetry = telemetry
+        with tempfile.TemporaryDirectory(prefix="autoreview-codex-setup-test.") as tempdir, (
+            mock.patch.object(
+                AUTOREVIEW,
+                "prepare_codex_runtime_auth",
+                return_value=False,
+            )
+        ), mock.patch.object(
+            AUTOREVIEW,
+            "prepare_codex_runtime_profile",
+            return_value=False,
+        ), mock.patch.object(
+            AUTOREVIEW,
+            "codex_source_home",
+            return_value=None,
+        ), mock.patch.object(
+            AUTOREVIEW,
+            "codex_command",
+            side_effect=OSError("setup failed"),
+        ):
+            with self.assertRaisesRegex(OSError, "setup failed"):
+                AUTOREVIEW.run_codex(args, Path(tempdir), "review")
+        telemetry.finish_attempt.assert_called_once_with(7, status="failed")
+
+    def test_bundle_history_is_opt_in(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(
+                AUTOREVIEW.run_log_bundle_enabled(
+                    argparse.Namespace(log_bundle=None)
+                )
+            )
+            os.environ["AUTOREVIEW_RUN_LOG_BUNDLE"] = "1"
+            self.assertTrue(
+                AUTOREVIEW.run_log_bundle_enabled(
+                    argparse.Namespace(log_bundle=None)
+                )
+            )
+            self.assertFalse(
+                AUTOREVIEW.run_log_bundle_enabled(
+                    argparse.Namespace(log_bundle=False)
+                )
+            )
+            os.environ["AUTOREVIEW_RUN_LOG_BUNDLE"] = "typo"
+            with self.assertRaisesRegex(SystemExit, "invalid AUTOREVIEW_RUN_LOG_BUNDLE"):
+                AUTOREVIEW.run_log_bundle_enabled(
+                    argparse.Namespace(log_bundle=None)
+                )
+
+    def test_default_history_setup_falls_back_without_failing_review(self) -> None:
+        args = AUTOREVIEW.reviewer_test_args(run_log_dir=None, log_bundle=False)
+        fallback = mock.Mock(strict=True)
+        with mock.patch.object(
+            AUTOREVIEW,
+            "RunTelemetry",
+            side_effect=[OSError("read only"), fallback],
+        ) as constructor:
+            result = AUTOREVIEW.create_run_telemetry(
+                args,
+                Path("/repo"),
+                "local",
+                None,
+                [args],
+            )
+        self.assertIs(result, fallback)
+        self.assertFalse(fallback.strict)
+        self.assertEqual(constructor.call_count, 2)
+
+    def test_default_history_fallback_does_not_follow_symlink(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-history-symlink-test.") as tempdir:
+            root = Path(tempdir)
+            state_home = root / "blocked-state-home"
+            state_home.write_text("not a directory", encoding="utf-8")
+            fallback_parent = root / "system-temp"
+            fallback_parent.mkdir()
+            target = root / "owned-target"
+            target.mkdir()
+            fallback = fallback_parent / f"autoreview-state-{os.getuid()}"
+            fallback.symlink_to(target, target_is_directory=True)
+            args = AUTOREVIEW.reviewer_test_args(
+                run_log_dir=None,
+                log_bundle=False,
+            )
+            with (
+                mock.patch.object(
+                    AUTOREVIEW.tempfile,
+                    "gettempdir",
+                    return_value=str(fallback_parent),
+                ),
+                mock.patch.dict(
+                    os.environ,
+                    {"XDG_STATE_HOME": str(state_home)},
+                    clear=True,
+                ),
+            ):
+                telemetry = AUTOREVIEW.create_run_telemetry(
+                    args,
+                    root / "repo",
+                    "local",
+                    None,
+                    [args],
+                )
+            self.assertIsNone(telemetry)
+            self.assertFalse((target / "runs").exists())
+
+    def test_explicit_history_setup_failure_remains_strict(self) -> None:
+        args = AUTOREVIEW.reviewer_test_args(
+            run_log_dir="/explicit/history",
+            log_bundle=False,
+        )
+        with mock.patch.object(
+            AUTOREVIEW,
+            "RunTelemetry",
+            side_effect=OSError("read only"),
+        ), self.assertRaisesRegex(OSError, "read only"):
+            AUTOREVIEW.create_run_telemetry(
+                args,
+                Path("/repo"),
+                "local",
+                None,
+                [args],
+            )
+
+    def test_default_history_write_failure_disables_logging_only(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-history-write-test.") as tempdir:
+            repo = Path(tempdir) / "repo"
+            repo.mkdir()
+            args = AUTOREVIEW.reviewer_test_args(
+                run_log_dir=str(Path(tempdir) / "history"),
+                log_bundle=False,
+            )
+            telemetry = AUTOREVIEW.RunTelemetry(
+                args,
+                repo,
+                "local",
+                None,
+                [args],
+                strict=False,
+            )
+            with mock.patch.object(
+                AUTOREVIEW,
+                "atomic_write_text",
+                side_effect=OSError("read only"),
+            ):
+                attempt_id = telemetry.start_attempt(args)
+            self.assertEqual(attempt_id, 1)
+            self.assertFalse(telemetry.logging_available)
+
+    def test_explicit_history_write_failure_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-history-write-test.") as tempdir:
+            repo = Path(tempdir) / "repo"
+            repo.mkdir()
+            args = AUTOREVIEW.reviewer_test_args(
+                run_log_dir=str(Path(tempdir) / "history"),
+                log_bundle=False,
+            )
+            telemetry = AUTOREVIEW.RunTelemetry(
+                args,
+                repo,
+                "local",
+                None,
+                [args],
+                strict=True,
+            )
+            with mock.patch.object(
+                AUTOREVIEW,
+                "atomic_write_text",
+                side_effect=OSError("read only"),
+            ), self.assertRaisesRegex(OSError, "read only"):
+                telemetry.start_attempt(args)
+
+    def test_telemetry_finalization_is_idempotent_after_strict_write_failure(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-history-finish-test.") as tempdir:
+            repo = Path(tempdir) / "repo"
+            repo.mkdir()
+            args = AUTOREVIEW.reviewer_test_args(
+                run_log_dir=str(Path(tempdir) / "history"),
+                log_bundle=False,
+            )
+            telemetry = AUTOREVIEW.RunTelemetry(
+                args,
+                repo,
+                "local",
+                None,
+                [args],
+                strict=True,
+            )
+            attempt_id = telemetry.start_attempt(args)
+            reviewer_id = telemetry.start_reviewer(args)
+            with mock.patch.object(
+                AUTOREVIEW,
+                "atomic_write_text",
+                side_effect=OSError("read only"),
+            ):
+                with self.assertRaisesRegex(OSError, "read only"):
+                    telemetry.finish_attempt(attempt_id, status="completed")
+                telemetry.finish_attempt(attempt_id, status="failed")
+                with self.assertRaisesRegex(OSError, "read only"):
+                    telemetry.finish_reviewer(reviewer_id, status="completed")
+                telemetry.finish_reviewer(reviewer_id, status="failed")
+
+    def test_pi_records_model_attempt_separately_from_review_validation(self) -> None:
+        args = AUTOREVIEW.reviewer_test_args(
+            engine="pi",
+            model="openai/gpt-4o",
+            thinking="high",
+        )
+        telemetry = mock.Mock(spec=AUTOREVIEW.RunTelemetry)
+        telemetry.start_attempt.return_value = 3
+        args.run_telemetry = telemetry
+        with tempfile.TemporaryDirectory(prefix="autoreview-pi-telemetry-test.") as tempdir, (
+            mock.patch.object(
+                AUTOREVIEW,
+                "ensure_pi_isolation_supported",
+                return_value="pi",
+            )
+        ), mock.patch.object(
+            AUTOREVIEW,
+            "safe_temp_root",
+            return_value=tempdir,
+        ), mock.patch.object(
+            AUTOREVIEW,
+            "run_with_heartbeat",
+            return_value=subprocess.CompletedProcess(["pi"], 0, "{}", ""),
+        ):
+            self.assertEqual(AUTOREVIEW.run_pi(args, Path(tempdir), "review"), "{}")
+        telemetry.start_attempt.assert_called_once_with(args)
+        telemetry.finish_attempt.assert_called_once_with(
+            3,
+            status="completed",
+            returncode=0,
+        )
+
+    def test_history_uses_reviewer_runs_for_pi_and_preserves_inherited_speed(self) -> None:
+        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
+        summary = history["summarize"](
+            [
+                {
+                    "status": "completed",
+                    "result": {"outcome": "clean"},
+                    "attempts": [
+                        {
+                            "engine": "codex",
+                            "model": "gpt-5.6-sol",
+                            "thinking": "high",
+                            "auth": "default",
+                            "profile": None,
+                            "speed_requested": None,
+                            "pass": 1,
+                            "status": "completed",
+                            "duration_seconds": 2.0,
+                            "reason": "primary",
+                            "refusal": False,
+                        }
+                    ],
+                    "reviewer_runs": [
+                        {
+                            "engine": "codex",
+                            "model": "gpt-5.6-sol",
+                            "thinking": "high",
+                            "auth": "default",
+                            "profile": None,
+                            "speed_requested": None,
+                            "pass": 1,
+                            "status": "failed",
+                            "duration_seconds": 2.1,
+                        },
+                        {
+                            "engine": "pi",
+                            "model": "openai/gpt-4o",
+                            "thinking": "high",
+                            "pass": 1,
+                            "status": "completed",
+                            "duration_seconds": 3.0,
+                        }
+                    ],
+                }
+            ],
+            None,
+        )
+        by_engine = {
+            row["engine"]: row for row in summary["configurations"]
+        }
+        self.assertEqual(
+            by_engine["codex"]["speed_requested"],
+            "inherited",
+        )
+        self.assertEqual(by_engine["codex"]["completed"], 1)
+        self.assertEqual(by_engine["codex"]["review_failures"], 1)
+        self.assertEqual(by_engine["pi"]["attempts"], 0)
+        self.assertEqual(by_engine["pi"]["review_completed"], 1)
+        self.assertEqual(by_engine["pi"]["speed_requested"], "n/a")
+
+    def test_history_loads_runs_by_high_resolution_start_time(self) -> None:
+        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
+        with tempfile.TemporaryDirectory(prefix="autoreview-history-order-test.") as tempdir:
+            root = Path(tempdir)
+            for directory, run_id, started in (
+                ("z-random", "newer", 20),
+                ("a-random", "older", 10),
+            ):
+                run_dir = root / "runs" / directory
+                run_dir.mkdir(parents=True)
+                (run_dir / "metadata.json").write_text(
+                    json.dumps(
+                        {
+                            "run_id": run_id,
+                            "started_at_unix_ns": started,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            runs = history["load_runs"](root)
+            self.assertEqual([run["run_id"] for run in runs], ["older", "newer"])
+
+    def test_history_reader_detects_repository_below_default_runs_root(self) -> None:
+        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
+        with tempfile.TemporaryDirectory(prefix="autoreview-history-fallback-test.") as tempdir:
+            root = Path(tempdir).resolve()
+            state_home = root / "state"
+            repo = state_home / "autoreview" / "runs" / "project"
+            fallback_parent = root / "system-temp"
+            (repo / ".git").mkdir(parents=True)
+            fallback = fallback_parent / f"autoreview-state-{os.getuid()}"
+            (fallback / "runs").mkdir(parents=True)
+            with (
+                mock.patch.object(Path, "cwd", return_value=repo),
+                mock.patch.object(
+                    tempfile,
+                    "gettempdir",
+                    return_value=str(fallback_parent),
+                ),
+                mock.patch.dict(
+                    os.environ,
+                    {"XDG_STATE_HOME": str(state_home)},
+                    clear=True,
+                ),
+            ):
+                resolved = history["default_log_dir"]()
+            self.assertTrue(resolved.is_relative_to(fallback_parent))
+
+    def test_history_reader_uses_populated_fallback_when_default_is_unavailable(self) -> None:
+        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
+        with tempfile.TemporaryDirectory(prefix="autoreview-history-reader-test.") as tempdir:
+            root = Path(tempdir)
+            home = root / "home"
+            fallback_parent = root / "system-temp"
+            fallback = fallback_parent / f"autoreview-state-{os.getuid()}"
+            (fallback / "runs").mkdir(parents=True)
+            home.mkdir()
+            with (
+                mock.patch.object(Path, "home", return_value=home),
+                mock.patch.object(
+                    history["tempfile"],
+                    "gettempdir",
+                    return_value=str(fallback_parent),
+                ),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                resolved = history["default_log_dir"]()
+            self.assertEqual(resolved, fallback.resolve())
+
+    def test_history_reader_rejects_insecure_default_before_preferring_it(self) -> None:
+        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
+        with tempfile.TemporaryDirectory(prefix="autoreview-history-reader-test.") as tempdir:
+            root = Path(tempdir)
+            state_home = root / "state"
+            candidate = state_home / "autoreview"
+            fallback_parent = root / "system-temp"
+            fallback = fallback_parent / f"autoreview-state-{os.getuid()}"
+            (candidate / "runs").mkdir(parents=True)
+            candidate.chmod(0o775)
+            (fallback / "runs").mkdir(parents=True)
+            with (
+                mock.patch.object(
+                    history["tempfile"],
+                    "gettempdir",
+                    return_value=str(fallback_parent),
+                ),
+                mock.patch.dict(
+                    os.environ,
+                    {"XDG_STATE_HOME": str(state_home)},
+                    clear=True,
+                ),
+            ):
+                resolved = history["default_log_dir"]()
+            self.assertEqual(resolved, fallback.resolve())
+
+    def test_history_reader_ignores_untrusted_implicit_fallback(self) -> None:
+        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
+        with tempfile.TemporaryDirectory(prefix="autoreview-history-reader-test.") as tempdir:
+            root = Path(tempdir)
+            home = root / "home"
+            fallback_parent = root / "system-temp"
+            fallback = fallback_parent / f"autoreview-state-{os.getuid()}"
+            home.mkdir()
+            (fallback / "runs").mkdir(parents=True)
+            fallback.chmod(0o777)
+            with (
+                mock.patch.object(Path, "home", return_value=home),
+                mock.patch.object(
+                    history["tempfile"],
+                    "gettempdir",
+                    return_value=str(fallback_parent),
+                ),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                self.assertEqual(history["default_log_dirs"](), [])
+
+    def test_history_reader_does_not_follow_implicit_fallback_symlink(self) -> None:
+        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
+        with tempfile.TemporaryDirectory(prefix="autoreview-history-reader-test.") as tempdir:
+            root = Path(tempdir)
+            home = root / "home"
+            fallback_parent = root / "system-temp"
+            target = root / "owned-target"
+            fallback = fallback_parent / f"autoreview-state-{os.getuid()}"
+            home.mkdir()
+            (target / "runs").mkdir(parents=True)
+            fallback_parent.mkdir()
+            fallback.symlink_to(target, target_is_directory=True)
+            with (
+                mock.patch.object(Path, "home", return_value=home),
+                mock.patch.object(
+                    history["tempfile"],
+                    "gettempdir",
+                    return_value=str(fallback_parent),
+                ),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                self.assertEqual(history["default_log_dirs"](), [])
+
+    def test_history_reader_merges_default_and_fallback_runs(self) -> None:
+        history = runpy.run_path(str(SCRIPT_PATH.with_name("autoreview-history")))
+        with tempfile.TemporaryDirectory(prefix="autoreview-history-merge-test.") as tempdir:
+            root = Path(tempdir)
+            default = root / "default"
+            fallback = root / "fallback"
+            for history_root, run_id, started in (
+                (default, "default-run", 20),
+                (fallback, "fallback-run", 10),
+            ):
+                run_dir = history_root / "runs" / run_id
+                run_dir.mkdir(parents=True)
+                (run_dir / "metadata.json").write_text(
+                    json.dumps(
+                        {
+                            "run_id": run_id,
+                            "started_at_unix_ns": started,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            runs = history["load_run_roots"]([default, fallback])
+            self.assertEqual(
+                [run["run_id"] for run in runs],
+                ["fallback-run", "default-run"],
+            )
+
+
     def test_cursor_agent_keyed_option_normalizes_to_cursor(self) -> None:
         self.assertEqual(
             AUTOREVIEW.parse_keyed_options(["cursor-agent=auto"], "model"),
