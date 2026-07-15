@@ -2750,6 +2750,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             f'+    "UPDATE leases SET {binding_key}={binding_key}+1 '
             'WHERE task_id=?",\n'
         )
+        sql_comment_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f'+    "UPDATE leases SET {binding_key}={binding_key}+1 '
+            f'WHERE task_id=? -- {password_key} is {comment_fallback}",\n'
+        )
         environment_source_patch = (
             "diff --git a/runtime.py b/runtime.py\n"
             "--- a/runtime.py\n"
@@ -2825,6 +2833,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             f"+{password_key} = request.{password_key}  "
             f"# fallback: {comment_fallback}\n"
             f"+# fallback = {comment_fallback}\n"
+        )
+        multiple_hint_comment_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{password_key} = request.{password_key}  "
+            f"# default is required; {password_key} is {comment_fallback}\n"
         )
         benign_comment_source_patch = (
             "diff --git a/runtime.py b/runtime.py\n"
@@ -3030,12 +3046,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             fallback_source_patch,
             standalone_environment_source_patch,
             ordinary_counter_source_patch,
+            sql_comment_source_patch,
             unsafe_environment_source_patch,
             concatenated_marker_environment_patch,
             inline_comment_source_patch,
             multiline_comment_source_patch,
             adjacent_comment_source_patch,
             delimited_comment_source_patches,
+            multiple_hint_comment_source_patch,
             unsafe_annotation_source_patch,
             literal_annotation_source_patch,
             numeric_annotation_source_patch,

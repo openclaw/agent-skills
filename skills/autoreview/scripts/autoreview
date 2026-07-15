@@ -5523,6 +5523,15 @@ def safe_python_assignment_expression(
         rf"(?i){re.escape(expected_key)}\s*\+\s*1\b",
         text[cursor:],
     )
+    sql_suffix = ""
+    if counter is not None:
+        sql_suffix_start = cursor + counter.end()
+        sql_suffix_end = len(text)
+        for terminator in ("\n", "\r"):
+            found = text.find(terminator, sql_suffix_start)
+            if found >= 0:
+                sql_suffix_end = min(sql_suffix_end, found)
+        sql_suffix = text[sql_suffix_start:sql_suffix_end]
     if (
         counter is not None
         and re.search(
@@ -5532,11 +5541,15 @@ def safe_python_assignment_expression(
             re.IGNORECASE,
         )
         is not None
+        and sql_suffix
         and re.match(
             r"\s+(?:WHERE\b|RETURNING\b)",
-            text[cursor + counter.end() :],
+            sql_suffix,
             re.IGNORECASE,
         )
+        and "--" not in sql_suffix
+        and "/*" not in sql_suffix
+        and not python_comment_secret_risk(sql_suffix)
     ):
         return True
     line_end = cursor
@@ -5716,37 +5729,38 @@ def python_annotated_placeholder_is_safe(text: str, value_start: int) -> bool:
 def python_comment_secret_risk(comment: str) -> bool:
     if secret_literal_risk(comment, minimum_length=8):
         return True
-    hinted = re.search(
+    hints = re.finditer(
         r"(?i)\b(?:"
         r"(?:default|fallback)(?:\s+is\b\s*|\s*[:=]\s*|\s+)"
         r"|(?:credential|password|secret|token)\s*(?:is\b|[:=])\s*"
         r")(?P<value>[^\s,;]+)",
         comment,
     )
-    if hinted is None:
-        return False
-    raw_value = hinted.group("value")
-    quoted = (
-        len(raw_value) >= 2
-        and raw_value[0] in {"\"", "'", "`"}
-        and raw_value[-1] == raw_value[0]
-    )
-    value = raw_value.strip("\"'`()[]{}")
-    if not value or value.casefold() in SECRET_PLACEHOLDER_VALUES:
-        return False
-    return bool(
-        (quoted and len(value) >= 4)
-        or (
-            len(value) >= 6
-            and any(character.isalpha() for character in value)
-            and any(character.isdigit() for character in value)
+    for hinted in hints:
+        raw_value = hinted.group("value")
+        quoted = (
+            len(raw_value) >= 2
+            and raw_value[0] in {"\"", "'", "`"}
+            and raw_value[-1] == raw_value[0]
         )
-        or (
-            len(value) >= 6
-            and re.search(r"[^A-Za-z0-9_]", value) is not None
-        )
-        or secret_literal_risk(raw_value, minimum_length=8)
-    )
+        value = raw_value.strip("\"'`()[]{}")
+        if not value or value.casefold() in SECRET_PLACEHOLDER_VALUES:
+            continue
+        if (
+            (quoted and len(value) >= 4)
+            or (
+                len(value) >= 6
+                and any(character.isalpha() for character in value)
+                and any(character.isdigit() for character in value)
+            )
+            or (
+                len(value) >= 6
+                and re.search(r"[^A-Za-z0-9_]", value) is not None
+            )
+            or secret_literal_risk(raw_value, minimum_length=8)
+        ):
+            return True
+    return False
 
 
 def python_assignment_comment(text: str, value_start: int) -> bool:
