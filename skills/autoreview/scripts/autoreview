@@ -5634,21 +5634,36 @@ def python_assignment_value_start(
         if found >= 0:
             line_end = min(line_end, found)
     annotated = re.match(
-        rf"[ \t]*{re.escape(key)}[ \t]*:[^#=\r\n]{{1,512}}=[ \t]*",
+        rf"[ \t]*{re.escape(key)}[ \t]*:"
+        rf"(?P<annotation>[^#=\r\n]{{1,512}})=[ \t]*",
         text[line_start:line_end],
     )
-    if annotated is None:
+    if annotated is None or re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_.]*",
+        annotated.group("annotation").strip(),
+    ) is None:
         return default_start, separator
     return line_start + annotated.end(), "="
 
 
-def python_inline_assignment_comment(text: str, start: int) -> bool:
-    line_end = len(text)
-    for terminator in ("\n", "\r"):
-        found = text.find(terminator, start)
-        if found >= 0:
-            line_end = min(line_end, found)
-    return "#" in text[start:line_end]
+def python_assignment_comment(text: str, value_start: int) -> bool:
+    line_end = value_start
+    for _ in range(64):
+        next_line = text.find("\n", line_end)
+        line_end = len(text) if next_line < 0 else next_line
+        expression = text[value_start:line_end]
+        if "#" in expression:
+            return True
+        try:
+            ast.parse(expression.strip(), mode="eval")
+        except SyntaxError:
+            pass
+        else:
+            return False
+        if next_line < 0 or line_end - value_start > 32_768:
+            return False
+        line_end = next_line + 1
+    return False
 
 
 def basic_authorization_risk(text: str) -> bool:
@@ -5935,9 +5950,9 @@ def secret_text_risk(
             javascript_dialect=javascript_dialect,
         ):
             continue
-        if python_source and python_inline_assignment_comment(
+        if python_source and python_assignment_comment(
             text,
-            match.end(),
+            value_start,
         ):
             return True
         if python_source and safe_python_assignment_expression(

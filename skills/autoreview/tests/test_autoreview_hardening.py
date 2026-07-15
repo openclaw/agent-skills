@@ -2799,6 +2799,24 @@ class AutoreviewHardeningTests(unittest.TestCase):
             f"+{password_key} = request.{password_key}  "
             f"# fallback is {comment_fallback}\n"
         )
+        multiline_comment_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,3 @@\n"
+            f"+{password_key} = int(\n"
+            f"+    request.get({password_key!r}) or 0  "
+            f"# fallback {comment_fallback}\n"
+            "+)\n"
+        )
+        unsafe_annotation_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{password_key}: Literal[{comment_fallback!r}] = "
+            f"request.{password_key}\n"
+        )
         comment_spoofed_environment_patch = (
             "diff --git a/runtime.py b/runtime.py\n"
             "--- a/runtime.py\n"
@@ -2902,6 +2920,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             unsafe_environment_source_patch,
             concatenated_marker_environment_patch,
             inline_comment_source_patch,
+            multiline_comment_source_patch,
+            unsafe_annotation_source_patch,
             comment_spoofed_environment_patch,
             string_spoofed_environment_patch,
             multiline_string_spoofed_environment_patch,
