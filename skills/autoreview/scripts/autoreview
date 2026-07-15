@@ -5437,9 +5437,13 @@ def python_runtime_expression_is_safe(
         )
 
     def reference_chain(node: ast.AST) -> bool:
-        return isinstance(node, ast.Name) or (
-            isinstance(node, ast.Attribute) and reference_chain(node.value)
-        )
+        depth = 0
+        while isinstance(node, ast.Attribute):
+            node = node.value
+            depth += 1
+            if depth > 256:
+                return False
+        return isinstance(node, ast.Name)
 
     def lookup_expression(node: ast.AST) -> bool:
         if isinstance(node, ast.Subscript):
@@ -5676,6 +5680,37 @@ def python_assignment_value_start(
     ) is None:
         return default_start, separator
     return line_start + annotated.end(), "="
+
+
+def python_annotated_placeholder_is_safe(text: str, value_start: int) -> bool:
+    line_end = value_start
+    for _ in range(64):
+        next_line = text.find("\n", line_end)
+        line_end = len(text) if next_line < 0 else next_line
+        expression = text[value_start:line_end].strip()
+        try:
+            root = ast.parse(expression, mode="eval").body
+        except SyntaxError:
+            pass
+        else:
+            placeholder = (
+                isinstance(root, ast.Constant)
+                and (
+                    root.value is None
+                    or (
+                        isinstance(root.value, str)
+                        and (
+                            not root.value
+                            or root.value.casefold() in SECRET_PLACEHOLDER_VALUES
+                        )
+                    )
+                )
+            )
+            return placeholder and safe_secret_assignment_suffix(text, line_end)
+        if next_line < 0 or line_end - value_start > 32_768:
+            return False
+        line_end = next_line + 1
+    return False
 
 
 def python_comment_secret_risk(comment: str) -> bool:
@@ -5989,6 +6024,8 @@ def secret_text_risk(
         ):
             continue
         if python_source and value_start != default_value_start:
+            if python_annotated_placeholder_is_safe(text, value_start):
+                continue
             return True
         fallback = top_level_fallback_suffix(
             text[prefix.end() :],
@@ -6054,6 +6091,8 @@ def secret_text_risk(
         ):
             continue
         if python_source and value_start != default_value_start:
+            if python_annotated_placeholder_is_safe(text, value_start):
+                continue
             return True
         if (
             key.strip("\"'").lower() == "credentials"

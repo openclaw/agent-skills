@@ -2865,6 +2865,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "@@ -0,0 +1 @@\n"
             f"+{password_key}: int = 12345678901234567890\n"
         )
+        placeholder_annotation_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            f"+{password_key}: str = None\n"
+            f"+{binding_key}: str = ''\n"
+        )
         comment_spoofed_environment_patch = (
             "diff --git a/runtime.py b/runtime.py\n"
             "--- a/runtime.py\n"
@@ -2931,6 +2939,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.helper["validate_review_patch"](
                 "branch diff",
                 ["runtime.py"],
+                placeholder_annotation_source_patch,
+            ),
+            placeholder_annotation_source_patch,
+        )
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "branch diff",
+                ["runtime.py"],
                 sql_source_patch,
             ),
             sql_source_patch,
@@ -2963,6 +2979,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.helper["python_runtime_expression_is_safe"](
                 "chr(65) * 32",
                 key,
+                allow_environment_symbol=False,
+            )
+        )
+        deep_attribute = "obj" + ".a" * 2_000 + "." + password_key
+        self.assertFalse(
+            self.helper["python_runtime_expression_is_safe"](
+                deep_attribute,
+                password_key,
                 allow_environment_symbol=False,
             )
         )
