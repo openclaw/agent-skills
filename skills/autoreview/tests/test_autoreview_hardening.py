@@ -2003,6 +2003,56 @@ class AutoreviewHardeningTests(unittest.TestCase):
             )
         )
 
+    def test_review_patch_allows_provider_references_and_test_placeholders(
+        self,
+    ) -> None:
+        token_name = "to" + "ken"
+        key_name = "api_" + "key"
+        secret_name = "api_" + "secret"
+        safe_patch = (
+            "diff --git a/provider.ts b/provider.ts\n"
+            "--- a/provider.ts\n"
+            "+++ b/provider.ts\n"
+            "@@ -1 +1,6 @@\n"
+            f"-const {token_name} = data.session?.access_token;\n"
+            f"+const {token_name} = data.session?.access_token;\n"
+            "+const api" + f"Key = providerConfig.{key_name};\n"
+            "+const api" + "Sec" + f"ret = providerConfig.{secret_name};\n"
+            f'+const fixture = {{ {key_name}: "test-key" }};\n'
+            f'+const fixtureSecret = {{ {secret_name}: "test-secret" }};\n'
+            f'+const session = {{ access_{token_name}: "test-token" }};\n'
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "branch diff",
+                ["provider.ts"],
+                safe_patch,
+            ),
+            safe_patch,
+        )
+
+    def test_provider_reference_allowlist_still_rejects_real_credentials(
+        self,
+    ) -> None:
+        key_name = "api_" + "key"
+        literal_value = "actual-production-" + "secret"
+        structured_value = "ghp_" + "ActualToken1234567890"
+        unsafe_values = (
+            f'const config = {{ {key_name}: "{literal_value}" }};',
+            f'const config = {{ {key_name}: "{structured_value}" }};',
+            f'const config = {{ {key_name}: "test-key-extra" }};',
+        )
+
+        for content in unsafe_values:
+            with self.subTest(content=content):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        content,
+                        javascript_dialect="typescript",
+                    )
+                )
+
     def test_secret_detector_allows_typescript_object_secret_references(self) -> None:
         content = (
             "async function configure(context: RuntimeContext) {\n"
