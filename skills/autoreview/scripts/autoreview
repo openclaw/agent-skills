@@ -5563,15 +5563,15 @@ def safe_python_assignment_expression(
 
 
 def python_environment_mapping_context(text: str, value_start: int) -> bool:
-    lower = max(0, value_start - 8192)
-    context = text[lower:value_start]
-    candidates = list(
-        re.finditer(
-            r"(?m)^[ \t]*(?P<name>_*[A-Z][A-Z0-9_]*ENV[A-Z0-9_]*)"
-            r"\s*=\s*\{",
-            context,
-        )
-    )
+    scan_text = text[:value_start] + "'SAFE_ENVIRONMENT_NAME'\n}\n"
+    line_offsets = [0]
+    for line in scan_text.splitlines(keepends=True):
+        line_offsets.append(line_offsets[-1] + len(line))
+
+    def absolute(position: tuple[int, int]) -> int:
+        line, column = position
+        return line_offsets[line - 1] + column
+
     ignored = {
         tokenize.COMMENT,
         tokenize.DEDENT,
@@ -5581,35 +5581,65 @@ def python_environment_mapping_context(text: str, value_start: int) -> bool:
         tokenize.NL,
         tokenize.NEWLINE,
     }
-    for candidate in reversed(candidates):
-        snippet = textwrap.dedent(context[candidate.start() :])
-        tokens: list[tokenize.TokenInfo] = []
-        generator = tokenize.generate_tokens(io.StringIO(snippet).readline)
-        try:
-            while True:
-                token = next(generator)
-                if token.type not in ignored:
-                    tokens.append(token)
-        except (IndentationError, StopIteration, tokenize.TokenError):
-            pass
-        if len(tokens) < 3:
-            continue
-        brace_balance = sum(
-            1 if token.string == "{" else -1 if token.string == "}" else 0
-            for token in tokens
-            if token.type == tokenize.OP
-        )
-        if (
-            tokens[0].type == tokenize.NAME
-            and tokens[0].string == candidate.group("name")
-            and tokens[1].type == tokenize.OP
-            and tokens[1].string == "="
-            and tokens[2].type == tokenize.OP
-            and tokens[2].string == "{"
-            and brace_balance > 0
+    try:
+        tokens = [
+            token
+            for token in tokenize.generate_tokens(io.StringIO(scan_text).readline)
+            if token.type not in ignored
+        ]
+    except (IndentationError, tokenize.TokenError):
+        return False
+    for index in range(len(tokens) - 2):
+        name, assignment, opener = tokens[index : index + 3]
+        if not (
+            name.type == tokenize.NAME
+            and re.fullmatch(
+                r"_*[A-Z][A-Z0-9_]*ENV[A-Z0-9_]*",
+                name.string,
+            )
+            is not None
+            and assignment.type == tokenize.OP
+            and assignment.string == "="
+            and opener.type == tokenize.OP
+            and opener.string == "{"
+            and absolute(opener.end) <= value_start
         ):
-            return True
+            continue
+        depth = 0
+        for token in tokens[index + 2 :]:
+            if token.type != tokenize.OP or token.string not in {"{", "}"}:
+                continue
+            depth += 1 if token.string == "{" else -1
+            if depth == 0:
+                return value_start < absolute(token.start)
     return False
+
+
+def python_assignment_value_start(
+    text: str,
+    assignment_start: int,
+    default_start: int,
+    key: str,
+    separator: str,
+) -> tuple[int, str]:
+    if separator != ":" or key.startswith(("\"", "'")):
+        return default_start, separator
+    line_start = max(
+        text.rfind("\n", 0, assignment_start),
+        text.rfind("\r", 0, assignment_start),
+    ) + 1
+    line_end = len(text)
+    for terminator in ("\n", "\r"):
+        found = text.find(terminator, assignment_start)
+        if found >= 0:
+            line_end = min(line_end, found)
+    annotated = re.match(
+        rf"[ \t]*{re.escape(key)}[ \t]*:[^#=\r\n]{{1,512}}=[ \t]*",
+        text[line_start:line_end],
+    )
+    if annotated is None:
+        return default_start, separator
+    return line_start + annotated.end(), "="
 
 
 def python_inline_assignment_comment(text: str, start: int) -> bool:
@@ -5840,11 +5870,19 @@ def secret_text_risk(
             return True
         separator_match = re.search(r"[:=]", prefix.group(0))
         assert separator_match is not None
+        key = re.split(r"\s*[:=]\s*", prefix.group(0), maxsplit=1)[0]
+        value_start, separator = python_assignment_value_start(
+            text,
+            prefix.start(),
+            prefix.start() + separator_match.end(),
+            key,
+            separator_match.group(0),
+        )
         if python_source and safe_python_assignment_expression(
             text,
-            prefix.start() + separator_match.end(),
-            re.split(r"\s*[:=]\s*", prefix.group(0), maxsplit=1)[0],
-            separator_match.group(0),
+            value_start,
+            key,
+            separator,
         ):
             continue
         fallback = top_level_fallback_suffix(
@@ -5884,7 +5922,13 @@ def secret_text_risk(
         key = re.split(r"\s*[:=]\s*", match.group(0), maxsplit=1)[0]
         separator_match = re.search(r"[:=]", match.group(0))
         assert separator_match is not None
-        separator = separator_match.group(0)
+        value_start, separator = python_assignment_value_start(
+            text,
+            match.start(),
+            match.start() + separator_match.end(),
+            key,
+            separator_match.group(0),
+        )
         if safe_self_reference_assignment(
             text,
             match,
@@ -5898,7 +5942,7 @@ def secret_text_risk(
             return True
         if python_source and safe_python_assignment_expression(
             text,
-            match.start() + separator_match.end(),
+            value_start,
             key,
             separator,
         ):

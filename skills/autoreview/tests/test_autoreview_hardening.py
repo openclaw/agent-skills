@@ -2735,6 +2735,13 @@ class AutoreviewHardeningTests(unittest.TestCase):
             f"+    evidence.get({key!r}) or 0\n"
             "+),\n"
         )
+        annotated_source_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1 @@\n"
+            f"+{key}: int = attempt.{binding_key}\n"
+        )
         sql_source_patch = (
             "diff --git a/runtime.py b/runtime.py\n"
             "--- a/runtime.py\n"
@@ -2808,6 +2815,16 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "+mapping_hint = '_RUNTIME_ENV = {'\n"
             f"+{password_key}: {opaque_environment_name!r}\n"
         )
+        multiline_string_spoofed_environment_patch = (
+            "diff --git a/runtime.py b/runtime.py\n"
+            "--- a/runtime.py\n"
+            "+++ b/runtime.py\n"
+            "@@ -0,0 +1,4 @@\n"
+            '+mapping_hint = """\n'
+            "+_RUNTIME_ENV = {\n"
+            '+"""\n'
+            f"+{password_key}: {opaque_environment_name!r}\n"
+        )
 
         self.assertEqual(
             self.helper["validate_review_patch"](
@@ -2824,6 +2841,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 multiline_source_patch,
             ),
             multiline_source_patch,
+        )
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "branch diff",
+                ["runtime.py"],
+                annotated_source_patch,
+            ),
+            annotated_source_patch,
         )
         self.assertEqual(
             self.helper["validate_review_patch"](
@@ -2879,6 +2904,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             inline_comment_source_patch,
             comment_spoofed_environment_patch,
             string_spoofed_environment_patch,
+            multiline_string_spoofed_environment_patch,
         ):
             with self.subTest(patch=patch), self.assertRaisesRegex(
                 SystemExit,
