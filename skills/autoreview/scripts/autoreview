@@ -293,6 +293,9 @@ SECRET_PLACEHOLDER_VALUES = {
     "redacted",
     "sample",
     "secret-token",
+    "test-key",
+    "test-secret",
+    "test-token",
     "test-auth-token",
     "test-token-placeholder",
     "token-oversized",
@@ -418,6 +421,8 @@ CSHARP_METHOD_PREFIX_PATTERN = (
 CSHARP_EVIDENCE_WINDOW = 8192
 SOURCE_CODE_REFERENCE_ROOT_VALUES = {
     "attemptAuthProfileStore",
+    "data",
+    "providerConfig",
 }
 SOURCE_CODE_REFERENCE_ROOT_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_$?.])(?:"

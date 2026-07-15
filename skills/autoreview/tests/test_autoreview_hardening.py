@@ -2387,6 +2387,45 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 source_patch + config_patch,
             )
 
+    def test_review_patch_allows_provider_and_auth_references_on_both_diff_sides(self) -> None:
+        token_name = "to" + "ken"
+        api_key_name = "api" + "Key"
+        api_secret_name = "api" + "Secret"
+        patch = (
+            "diff --git a/src/photo-upload.ts b/src/photo-upload.ts\n"
+            "--- a/src/photo-upload.ts\n"
+            "+++ b/src/photo-upload.ts\n"
+            "@@ -1,2 +1,5 @@\n"
+            " const { data } = await supabase.auth.getSession();\n"
+            f"-const {token_name} = data.session?.access_token;\n"
+            f"+const {token_name} = data.session?.access_token;\n"
+            "+const providerConfig = cloudinary.config();\n"
+            f"+const {api_key_name} = providerConfig.api_key;\n"
+            f"+const {api_secret_name} = providerConfig.api_secret;\n"
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "branch diff",
+                ["src/photo-upload.ts"],
+                patch,
+            ),
+            patch,
+        )
+        for source_reference in (
+            f"const {token_name} = data.session?.access_token;",
+            f"const {api_key_name} = providerConfig.api_key;",
+            f"const {api_secret_name} = providerConfig.api_secret;",
+        ):
+            with self.subTest(source_reference=source_reference):
+                self.assertTrue(self.helper["secret_text_risk"](source_reference))
+                self.assertFalse(
+                    self.helper["secret_text_risk"](
+                        source_reference,
+                        javascript_dialect="typescript",
+                    )
+                )
+
     def test_review_patch_scans_rename_sides_with_their_own_file_types(self) -> None:
         property_name = "pass" + "word"
         reference = "context.driverPass" + "word"
@@ -2952,11 +2991,17 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertTrue(self.helper["secret_text_risk"](content))
 
     def test_secret_detector_allows_common_fixture_literals(self) -> None:
+        api_key_name = "api_" + "key"
+        api_secret_name = "api_" + "secret"
+        access_token_name = "access_" + "token"
         for content in (
             'token: "token-oversized"',
             'API_KEY = "clawrouter-e2e-secret"',
             'token: "very-long-browser-token-0123456789"',
             'token: "config-token"',
+            f'{api_key_name}: "test-key"',
+            f'{api_secret_name}: "test-secret"',
+            f'{access_token_name}: "test-token"',
         ):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
