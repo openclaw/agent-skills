@@ -6078,20 +6078,34 @@ def likely_private_key_token(value: str) -> bool:
     )
 
 
-def orphan_private_key_body_spans(text: str) -> list[tuple[int, int]]:
-    matches = list(PRIVATE_KEY_BODY_PATTERN.finditer(text))
-    if not matches:
-        return []
+def private_key_body_wrapper_only(
+    text: str,
+    matches: list[re.Match[str]],
+) -> bool:
     wrapper_parts: list[str] = []
     cursor = 0
     for match in matches:
         wrapper_parts.append(text[cursor : match.start()])
         cursor = match.end()
     wrapper_parts.append(text[cursor:])
-    if re.fullmatch(
-        r"(?:(?:#|//|/\*|\*)\s*)?[\s\"'`,;+\[\]]*",
-        "".join(wrapper_parts).strip(),
-    ) is None:
+    return (
+        re.fullmatch(
+            r"(?:(?:#|//|/\*|\*)\s*)?[\s\"'`,;+\[\]]*(?:\*/)?",
+            "".join(wrapper_parts).strip(),
+        )
+        is not None
+    )
+
+
+def orphan_private_key_body_spans(
+    text: str,
+    *,
+    allow_split_long_token: bool = False,
+) -> list[tuple[int, int]]:
+    matches = list(PRIVATE_KEY_BODY_PATTERN.finditer(text))
+    if not matches:
+        return []
+    if not private_key_body_wrapper_only(text, matches):
         return []
     values = [match.group(0) for match in matches]
     raw_encoded = "".join(values)
@@ -6113,8 +6127,10 @@ def orphan_private_key_body_spans(text: str) -> list[tuple[int, int]]:
         and any(char.islower() for char in encoded)
         and entropy >= 4.25
     )
-    long_base64_line = len(matches) == 1 and likely_private_key_token(raw_encoded)
-    if not long_base64_line and not mixed_short_chunks:
+    likely_encoded_block = (
+        len(matches) == 1 or allow_split_long_token
+    ) and likely_private_key_token(raw_encoded)
+    if not likely_encoded_block and not mixed_short_chunks:
         return []
     return [match.span() for match in matches]
 
@@ -6130,6 +6146,47 @@ def markerless_private_key_body_spans(text: str) -> list[tuple[int, int]]:
         and likely_private_key_token(match.group(0))
     )
     return sorted(set(spans))
+
+
+def markerless_private_key_spans_by_line(
+    text: str,
+) -> list[list[tuple[int, int]]]:
+    lines = text.split("\n")
+    spans_by_line = [markerless_private_key_body_spans(line) for line in lines]
+    run_start: int | None = None
+    for index in range(len(lines) + 1):
+        matches = (
+            list(PRIVATE_KEY_BODY_PATTERN.finditer(lines[index]))
+            if index < len(lines)
+            else []
+        )
+        candidate = len(matches) == 1 and private_key_body_wrapper_only(
+            lines[index],
+            matches,
+        )
+        if candidate:
+            if run_start is None:
+                run_start = index
+            continue
+        if run_start is None:
+            continue
+        block = "\n".join(
+            next(PRIVATE_KEY_BODY_PATTERN.finditer(lines[block_index])).group(0)
+            for block_index in range(run_start, index)
+        )
+        if orphan_private_key_body_spans(block, allow_split_long_token=True):
+            for block_index in range(run_start, index):
+                spans_by_line[block_index] = sorted(
+                    set(spans_by_line[block_index])
+                    | {
+                        match.span()
+                        for match in PRIVATE_KEY_BODY_PATTERN.finditer(
+                            lines[block_index]
+                        )
+                    }
+                )
+        run_start = None
+    return spans_by_line
 
 
 def pem_line_body_spans(
@@ -6178,11 +6235,13 @@ def pem_line_body_spans(
 def private_key_body_fragments(text: str) -> set[str]:
     fragments: set[str] = set()
     in_private_key = False
-    for line in text.split("\n"):
+    lines = text.split("\n")
+    markerless_spans = markerless_private_key_spans_by_line(text)
+    for line_index, line in enumerate(lines):
         spans, in_private_key = pem_line_body_spans(line, in_private_key)
         fragments.update(
             fragment
-            for start, end in spans
+            for start, end in set(spans) | set(markerless_spans[line_index])
             if (fragment := normalized_private_key_fragment(line, start, end))
         )
     if in_private_key:
@@ -6382,6 +6441,8 @@ def redact_secret_like_diff_section(
     )
     secret_fragments = set(known_secret_fragments or ())
     old_content, new_content = unified_diff_contents(section)
+    secret_fragments.update(private_key_body_fragments(old_content))
+    secret_fragments.update(private_key_body_fragments(new_content))
     old_risk = secret_text_risk(old_content, javascript_dialect=old_dialect)
     new_risk = secret_text_risk(new_content, javascript_dialect=new_dialect)
     for content, dialect, risk in (
@@ -6429,7 +6490,28 @@ def redact_secret_like_diff_section(
         assert prefix_match is not None
         prefix_columns = len(prefix_match.group(1)) - 1
         redacted.append(line)
-        for content_line in lines[index + 1 : hunk_end]:
+        hunk_lines = lines[index + 1 : hunk_end]
+        old_hunk_content: list[str] = []
+        new_hunk_content: list[str] = []
+        for content_line in hunk_lines:
+            body = content_line.rstrip("\r\n")
+            prefix = body[:prefix_columns]
+            if len(prefix) != prefix_columns or not set(prefix) <= {"+", "-", " "}:
+                continue
+            content = body[prefix_columns:]
+            if set(prefix) == {" "} or "-" in prefix:
+                old_hunk_content.append(content)
+            if set(prefix) == {" "} or "+" in prefix:
+                new_hunk_content.append(content)
+        old_markerless_spans = markerless_private_key_spans_by_line(
+            "\n".join(old_hunk_content)
+        )
+        new_markerless_spans = markerless_private_key_spans_by_line(
+            "\n".join(new_hunk_content)
+        )
+        old_hunk_index = 0
+        new_hunk_index = 0
+        for content_line in hunk_lines:
             body = content_line.rstrip("\r\n")
             ending = content_line[len(body) :]
             prefix = body[:prefix_columns]
@@ -6460,9 +6542,13 @@ def redact_secret_like_diff_section(
             spans.extend(repeated_secret_fragment_spans(content, fragment_pattern))
             spans.extend(match.span() for match in PRIVATE_KEY_END_PATTERN.finditer(content))
             if old_line:
+                spans.extend(old_markerless_spans[old_hunk_index])
+                old_hunk_index += 1
                 old_spans, old_pem = pem_line_body_spans(content, old_pem)
                 spans.extend(old_spans)
             if new_line:
+                spans.extend(new_markerless_spans[new_hunk_index])
+                new_hunk_index += 1
                 new_spans, new_pem = pem_line_body_spans(content, new_pem)
                 spans.extend(new_spans)
             redacted_content = redact_review_spans(content, spans)
