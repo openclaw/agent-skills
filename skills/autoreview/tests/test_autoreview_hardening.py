@@ -4351,6 +4351,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             path = Path(tempdir) / "shared-root"
             path.mkdir(mode=0o770)
+            path.chmod(0o770)
 
             with self.assertRaisesRegex(SystemExit, "must have the sticky bit"):
                 self.helper["require_trusted_shared_temp_root"](
