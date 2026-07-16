@@ -1790,9 +1790,19 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + type_name
             + " = defaultCredential) {}"
         )
+        multiline_cast_default = (
+            "function connect("
+            + parameter_name
+            + ": "
+            + type_name
+            + " = defaultCredential\n  as string + \""
+            + literal_value
+            + '\") {}'
+        )
 
         self.assertFalse(self.helper["secret_text_risk"](signature))
         self.assertFalse(self.helper["secret_text_risk"](benign_default))
+        self.assertTrue(self.helper["secret_text_risk"](multiline_cast_default))
         self.assertTrue(
             self.helper["secret_text_risk"](
                 signature + "\n  " + secret_assignment + "\n}"

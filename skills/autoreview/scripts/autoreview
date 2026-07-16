@@ -5127,6 +5127,7 @@ def bare_code_reference(
             return not fallback_secret_risk(
                 text[end + annotation_suffix.end() :],
                 minimum_length=8,
+                javascript_dialect="typescript",
             )
     if camel_reference is None and snake_reference is None:
         return False
