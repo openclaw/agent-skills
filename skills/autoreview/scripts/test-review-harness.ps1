@@ -1,10 +1,17 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('malicious', 'benign')]
+    [ValidateSet('malicious', 'benign', 'prompt-injection', 'all')]
     [string] $Fixture,
 
     [ValidateSet('codex', 'claude', 'pi')]
     [string[]] $Engine,
+
+    [ValidateRange(1, 2147483647)]
+    [int] $Trials,
+
+    [string] $ArtifactDir,
+
+    [switch] $ReleaseGate,
 
     [Alias('h')]
     [switch] $Help
@@ -27,6 +34,18 @@ if ($PSBoundParameters.ContainsKey('Engine')) {
     foreach ($SelectedEngine in $Engine) {
         $ForwardedArgs += @('--engine', $SelectedEngine)
     }
+}
+
+if ($PSBoundParameters.ContainsKey('Trials')) {
+    $ForwardedArgs += @('--trials', [string]$Trials)
+}
+
+if ($PSBoundParameters.ContainsKey('ArtifactDir')) {
+    $ForwardedArgs += @('--artifact-dir', $ArtifactDir)
+}
+
+if ($ReleaseGate) {
+    $ForwardedArgs += '--release-gate'
 }
 
 $PyLauncher = Get-Command py -ErrorAction SilentlyContinue
