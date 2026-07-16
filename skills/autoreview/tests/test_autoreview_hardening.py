@@ -4346,6 +4346,24 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     "parallel test home",
                 )
 
+    @unittest.skipIf(os.name == "nt", "POSIX shared-directory permissions")
+    def test_shared_testbox_root_requires_sticky_group_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "shared-root"
+            path.mkdir(mode=0o770)
+
+            with self.assertRaisesRegex(SystemExit, "must have the sticky bit"):
+                self.helper["require_trusted_shared_temp_root"](
+                    path,
+                    "short Testbox temp root",
+                )
+
+            path.chmod(0o1770)
+            self.helper["require_trusted_shared_temp_root"](
+                path,
+                "short Testbox temp root",
+            )
+
     def test_claude_fable_alias_requires_fable_safe_mode_version(self) -> None:
         args = argparse.Namespace(
             claude_bin="claude",

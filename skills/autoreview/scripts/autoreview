@@ -976,26 +976,36 @@ def safe_temp_root(repo: Path) -> Path:
 
 
 def parallel_test_temp_root(repo: Path) -> Path:
-    root = safe_temp_root(repo)
     if os.name == "nt" or not env_truthy("OPENCLAW_TESTBOX"):
-        return root
+        return safe_temp_root(repo)
 
     # Blacksmith stores its SSH control socket below HOME. macOS temp roots can
     # already consume the Unix-socket path budget before the socket name.
     try:
         short_root = Path("/tmp").resolve(strict=True)
-        short_root_stat = short_root.stat()
     except OSError as exc:
         raise SystemExit(f"unable to resolve short Testbox temp root: {exc}") from exc
-    if not stat.S_ISDIR(short_root_stat.st_mode):
-        raise SystemExit("short Testbox temp root must be a directory")
     if is_within(short_root, repo.resolve()):
         raise SystemExit("short Testbox temp root must be outside the reviewed repository")
-    if short_root_stat.st_mode & stat.S_IWOTH and not (
-        short_root_stat.st_mode & stat.S_ISVTX
-    ):
-        raise SystemExit("world-writable Testbox temp root must have the sticky bit set")
+    require_trusted_shared_temp_root(short_root, "short Testbox temp root")
     return short_root
+
+
+def require_trusted_shared_temp_root(path: Path, label: str) -> None:
+    try:
+        path_stat = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise SystemExit(f"unable to inspect {label}: {exc}") from exc
+    if not stat.S_ISDIR(path_stat.st_mode):
+        raise SystemExit(f"{label} must be a directory")
+    getuid = getattr(os, "geteuid", None)
+    if callable(getuid) and path_stat.st_uid not in {0, getuid()}:
+        raise SystemExit(f"{label} must be owned by root or the current user")
+    shared_write = path_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    if shared_write and not path_stat.st_mode & stat.S_ISVTX:
+        raise SystemExit(
+            f"group- or world-writable {label} must have the sticky bit set"
+        )
 
 
 def require_private_temp_directory(path: Path, label: str) -> None:
