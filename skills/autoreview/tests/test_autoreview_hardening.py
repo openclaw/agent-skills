@@ -720,6 +720,33 @@ class AutoreviewHardeningTests(unittest.TestCase):
                         "",
                     )
 
+    def test_chunk_report_merge_preserves_per_chunk_explanations(self) -> None:
+        reports = [
+            (
+                "chunk 1/2",
+                {
+                    "findings": [],
+                    "overall_correctness": "patch is correct",
+                    "overall_explanation": "First chunk preserves its rationale.",
+                    "overall_confidence": 0.8,
+                },
+            ),
+            (
+                "chunk 2/2",
+                {
+                    "findings": [],
+                    "overall_correctness": "patch is correct",
+                    "overall_explanation": "Second chunk preserves its rationale.",
+                    "overall_confidence": 0.9,
+                },
+            ),
+        ]
+
+        merged = self.helper["merge_chunk_reports"](reports)
+
+        self.assertIn("First chunk preserves its rationale.", merged["overall_explanation"])
+        self.assertIn("Second chunk preserves its rationale.", merged["overall_explanation"])
+
     def test_review_patch_escapes_controls_in_blocked_paths(self) -> None:
         path = ".env.\x1b]52;c;VEVTVA==\x07\udc9b"
 
@@ -3014,21 +3041,27 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertTrue(self.helper["secret_text_risk"](content))
 
-    def test_secret_detector_allows_common_fixture_literals(self) -> None:
-        api_key_name = "api_" + "key"
-        api_secret_name = "api_" + "secret"
-        access_token_name = "access_" + "token"
+    def test_secret_detector_allows_scoped_fixture_literals(self) -> None:
         for content in (
             'token: "token-oversized"',
             'API_KEY = "clawrouter-e2e-secret"',
             'token: "very-long-browser-token-0123456789"',
             'token: "config-token"',
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(self.helper["secret_text_risk"](content))
+
+    def test_secret_detector_rejects_generic_test_credentials(self) -> None:
+        api_key_name = "api_" + "key"
+        api_secret_name = "api_" + "secret"
+        access_token_name = "access_" + "token"
+        for content in (
             f'{api_key_name}: "test-key"',
             f'{api_secret_name}: "test-secret"',
             f'{access_token_name}: "test-token"',
         ):
             with self.subTest(content=content):
-                self.assertFalse(self.helper["secret_text_risk"](content))
+                self.assertTrue(self.helper["secret_text_risk"](content))
 
     def test_synthetic_secret_fixture_prefixes_are_generic(self) -> None:
         for prefix in self.helper["SYNTHETIC_SECRET_PREFIXES"]:
@@ -4297,6 +4330,21 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 selected = self.helper["parallel_test_temp_root"](repo)
 
             self.assertEqual(selected, configured_temp.resolve())
+
+    @unittest.skipIf(os.name == "nt", "POSIX private-directory permissions")
+    def test_parallel_test_home_must_be_private(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "test-home"
+            path.mkdir(mode=0o700)
+
+            self.helper["require_private_temp_directory"](path, "parallel test home")
+
+            path.chmod(0o755)
+            with self.assertRaisesRegex(SystemExit, "must not be accessible"):
+                self.helper["require_private_temp_directory"](
+                    path,
+                    "parallel test home",
+                )
 
     def test_claude_fable_alias_requires_fable_safe_mode_version(self) -> None:
         args = argparse.Namespace(

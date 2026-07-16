@@ -294,9 +294,6 @@ SECRET_PLACEHOLDER_VALUES = {
     "redacted",
     "sample",
     "secret-token",
-    "test-key",
-    "test-secret",
-    "test-token",
     "test-auth-token",
     "test-token-placeholder",
     "token-oversized",
@@ -999,6 +996,20 @@ def parallel_test_temp_root(repo: Path) -> Path:
     ):
         raise SystemExit("world-writable Testbox temp root must have the sticky bit set")
     return short_root
+
+
+def require_private_temp_directory(path: Path, label: str) -> None:
+    try:
+        path_stat = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise SystemExit(f"unable to inspect {label}: {exc}") from exc
+    if not stat.S_ISDIR(path_stat.st_mode):
+        raise SystemExit(f"{label} must be a directory")
+    if stat.S_IMODE(path_stat.st_mode) & 0o077:
+        raise SystemExit(f"{label} must not be accessible to other users")
+    getuid = getattr(os, "geteuid", None)
+    if callable(getuid) and path_stat.st_uid != getuid():
+        raise SystemExit(f"{label} must be owned by the current user")
 
 
 def safe_proxy_url(value: str) -> bool:
@@ -9033,6 +9044,7 @@ def start_parallel_tests(
         )
     )
     try:
+        require_private_temp_directory(test_home, "parallel test home")
         env = safe_test_env(repo, test_home)
         popen_kwargs = {
             "cwd": repo,
@@ -9458,8 +9470,12 @@ def merge_chunk_reports(reports: list[tuple[str, dict[str, Any]]]) -> dict[str, 
         f"{label}: {len(chunk_report['findings'])} finding(s)"
         for label, chunk_report in reports
     )
+    explanations = "\n".join(
+        f"{label}: {chunk_report['overall_explanation']}"
+        for label, chunk_report in reports
+    )
     report["overall_explanation"] = bounded_field(
-        f"Chunked review complete. {summary}.",
+        f"Chunked review complete. {summary}.\n\n{explanations}",
         3000,
     )
     return report
