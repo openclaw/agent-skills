@@ -392,6 +392,20 @@ class AutoreviewHardeningTests(unittest.TestCase):
             patch,
         )
 
+    def test_review_patch_rejects_over_cap_content_before_secret_scanning(self) -> None:
+        validator = self.helper["validate_review_patch"]
+        scanner = mock.Mock()
+        patch = "x" * (self.helper["MAX_REVIEW_BUNDLE_BYTES"] + 1)
+
+        with mock.patch.dict(
+            validator.__globals__,
+            {"require_no_secret_values": scanner},
+        ):
+            with self.assertRaisesRegex(SystemExit, "too large to review safely"):
+                validator("branch diff", ["safe.txt"], patch)
+
+        scanner.assert_not_called()
+
     def test_review_bundle_chunking_preserves_every_byte_and_diff_context(self) -> None:
         bundle = (
             "# Commit Diff\n\n"

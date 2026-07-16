@@ -272,6 +272,7 @@ MAX_BUNDLE_TEXT_BYTES = 180_000
 MAX_REVIEW_PROMPT_BYTES = 512_000
 MAX_REVIEW_CHUNK_CONTEXT_BYTES = 64_000
 MAX_REVIEW_PASSES = 8
+MAX_REVIEW_BUNDLE_BYTES = MAX_REVIEW_PROMPT_BYTES * MAX_REVIEW_PASSES
 
 
 class ReviewChunk(NamedTuple):
@@ -5629,7 +5630,7 @@ def validate_review_patch(
     label: str,
     paths: list[str],
     patch: str,
-    limit: int | None = None,
+    limit: int | None = MAX_REVIEW_BUNDLE_BYTES,
 ) -> str:
     blocked = [
         f"{display_escape(rel, 500)} ({risk})"
