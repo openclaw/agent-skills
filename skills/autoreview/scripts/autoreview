@@ -6245,6 +6245,10 @@ def review_scope_policy() -> str:
           redesign request.
         - Report a finding only when this diff introduces or exposes a concrete
           defect that must be fixed before this target can land.
+        - Deletion findings against this diff are in scope by default when they
+          remove duplicated lanes, parallel successor implementations, or
+          unrequested defensive machinery. The fix shrinks the diff and is not
+          scope creep.
         - If the best fix requires a new protocol, config, storage, public API,
           release process, migration, owner-boundary move, or canonical contract,
           say that directly in the finding and keep the finding tied to the
@@ -6654,6 +6658,12 @@ def render_review_prompt(
         - Shell commands, if available, must be read-only inspection commands. Do not run tests, formatters, package installs, generators, network mutation commands, git mutation commands, or commands that write files.
         - Report only actionable defects introduced or exposed by this change.
         - Prefer high-signal findings over style feedback.
+        - Review priorities, first and foremost, in this exact order:
+        - Priority 1: removal of duplicated code, duplicated lanes, and parallel successor implementations. A second implementation of something that already exists in the bundle or evidence (a copy, a near-copy, a wrapper, or a v2/successor kept alongside the original) is a defect; the fix is to DELETE the duplicate, not to polish or reconcile it.
+        - Priority 2: reduction and simplification of code. Prefer findings that make the change smaller: fewer layers, fewer branches, less machinery, direct reuse of existing infrastructure instead of new scaffolding.
+        - Priority 3: removal of unasked-for features, defensive programming, speculative validation, and paranoia layers that were never requested. A validator, guard, receipt, or defensive wrapper that no stated requirement and no real observed failure demands is a defect to report for deletion.
+        - a finding that a feature, validator, or defensive layer is unnecessary and should be DELETED is a P1-class finding.
+        - Demote any finding that proposes ADDING a validator, guard, receipt, or defensive layer: it must cite a real observed failure (a reproduced bug, failing test, log, incident, or a concrete exploitable path demonstrated in this diff), not a hypothetical. Without such a citation, do not report it; with one, it still ranks below deletion and simplification findings of equal confidence.
         - Report EVERY distinct actionable defect in this single pass, ordered most severe first. Each review round costs the caller a full fix-test-review cycle; withholding a known defect until a later round wastes one.
         - Before returning, sweep the bundle once more for independent defects in other files or failure modes that you may have stopped scanning for after an earlier find.
         - Include security findings: injection, secret leaks, authz/authn bypass, path traversal, unsafe deserialization, unsafe filesystem or shell use, privacy leaks, and credential handling.

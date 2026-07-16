@@ -22,8 +22,11 @@ Use when:
 - Treat review output as advisory. Never blindly apply it.
 - Verify every finding by reading the real code path and adjacent files.
 - Read dependency docs/source/types when the finding depends on external behavior.
+- Prioritize review findings in this order: remove duplicated code, duplicated lanes, and parallel successors; reduce and simplify code; then remove unrequested features, speculative validation, and defensive layers.
+- Treat a finding that an unnecessary feature, validator, or defensive layer should be deleted as P1-class.
+- Reject findings that only propose adding a validator, guard, receipt, or defensive layer unless they cite a real observed failure such as a reproduced bug, failing test, log, incident, or concrete exploitable path in the diff.
 - Reject unrealistic edge cases, speculative risks, broad rewrites, and fixes that over-complicate the codebase.
-- Prefer small fixes at the right ownership boundary; no refactor unless it clearly improves the bug class.
+- Prefer small fixes at the right ownership boundary; no refactor unless it clearly improves the bug class. Prefer deletion when it is the complete fix.
 - When an accepted finding shows a bug class or repeated pattern, inspect the current PR scope for sibling instances before fixing.
 - Fix the scoped bug class at once when practical; stop at touched surfaces, owner boundaries, and clear follow-up territory.
 - Keep going until structured review returns no accepted/actionable findings only while the work remains inside the original task scope.
@@ -56,9 +59,9 @@ Before the first review, freeze a scope baseline: original request or issue, tar
 
 Before patching a finding, classify it:
 
-- **In-scope blocker**: the finding is introduced by the current diff, affects the same owner boundary, and can be fixed without changing the task's contract.
+- **In-scope blocker**: the finding is introduced by the current diff, affects the same owner boundary, and can be fixed without changing the task's contract. Deletion of duplicated lanes, parallel successors, unrequested validators, or speculative defensive layers in the current diff is in scope by default.
 - **Follow-up**: the finding is real but belongs to an adjacent bug class, sibling surface, cleanup, or broader hardening track.
-- **Stop-and-escalate**: the finding requires a new protocol/config/storage/public API contract, a different owner boundary, a release-process change, or a design choice outside the original request.
+- **Stop-and-escalate**: the finding requires a new protocol/config/storage/public API contract, a different owner boundary, a release-process change, or a design choice outside the original request. Reject an evidence-free request to add a validator, guard, receipt, or defensive layer instead of treating it as a blocker.
 
 Stop patching and report the scope break instead of continuing when:
 

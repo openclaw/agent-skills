@@ -691,6 +691,41 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertTrue(prompt.endswith(bundle))
 
+    def test_review_prompt_prioritizes_deletion_before_defensive_additions(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            prompt = self.helper["render_review_prompt"](
+                repo,
+                "commit",
+                "HEAD",
+                self.helper["ReviewChunk"]("# Commit Diff\n+duplicate = True\n"),
+                "",
+                "",
+            )
+
+        priorities = (
+            "Priority 1: removal of duplicated code, duplicated lanes, and parallel successor implementations.",
+            "Priority 2: reduction and simplification of code.",
+            "Priority 3: removal of unasked-for features, defensive programming, speculative validation, and paranoia layers that were never requested.",
+        )
+        for priority in priorities:
+            self.assertIn(priority, prompt)
+        self.assertLess(prompt.index(priorities[0]), prompt.index(priorities[1]))
+        self.assertLess(prompt.index(priorities[1]), prompt.index(priorities[2]))
+        deletion_rule = (
+            "a finding that a feature, validator, or defensive layer is unnecessary and should be DELETED is a P1-class finding."
+        )
+        defensive_addition_rule = (
+            "Demote any finding that proposes ADDING a validator, guard, receipt, or defensive layer"
+        )
+        self.assertEqual(prompt.count(deletion_rule), 1)
+        self.assertEqual(prompt.count(defensive_addition_rule), 1)
+
+        scope_policy = " ".join(self.helper["review_scope_policy"]().split())
+        self.assertIn("Deletion findings against this diff are in scope by default", scope_policy)
+        self.assertNotIn("P1-class", scope_policy)
+        self.assertNotIn("Asking to ADD", scope_policy)
+
     def test_review_pass_count_is_bounded(self) -> None:
         builder = self.helper["build_review_prompts"]
         with tempfile.TemporaryDirectory() as tempdir:
