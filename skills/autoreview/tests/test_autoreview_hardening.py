@@ -4104,6 +4104,49 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertEqual(redacted_patch.count("redacted"), len(chunks))
         self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
 
+    def test_review_patch_does_not_propagate_wrapper_keyword_as_secret(self) -> None:
+        body = markerless_private_key_fixture()
+        chunks = [body[index : index + 4] for index in range(0, len(body), 4)]
+        patch = (
+            "diff --git a/fixture.py b/fixture.py\n"
+            "--- a/fixture.py\n"
+            "+++ b/fixture.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            + '+return "'
+            + '" + "'.join(chunks)
+            + '"\n'
+            + "+return ordinary_value\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.py"],
+            patch,
+        )
+
+        self.assertIn("+return ordinary_value\n", redacted_patch)
+        self.assertEqual(redacted_patch.count("redacted"), len(chunks) + 1)
+        self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
+
+    def test_review_patch_keeps_unquoted_key_beside_quoted_decoy(self) -> None:
+        body = markerless_private_key_fixture()
+        patch = (
+            "diff --git a/fixture.txt b/fixture.txt\n"
+            "--- a/fixture.txt\n"
+            "+++ b/fixture.txt\n"
+            "@@ -0,0 +1,1 @@\n"
+            + f'+{body} "note"\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.txt"],
+            patch,
+        )
+
+        self.assertNotIn(body, redacted_patch)
+        self.assertIn('+redacted "redacted"\n', redacted_patch)
+
     def test_review_patch_finds_key_after_adjacent_token_only_line(self) -> None:
         prefix = "A" * 128
         body = markerless_private_key_fixture()

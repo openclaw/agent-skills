@@ -5519,6 +5519,7 @@ def review_secret_fragments(
         fragment
         for fragment in private_key_body_fragments(text)
         if fragment.casefold() not in SECRET_PLACEHOLDER_VALUES
+        and re.fullmatch(r"[a-z_][a-z0-9_]*", fragment) is None
     }
     fragments = {
         text[start:end]
