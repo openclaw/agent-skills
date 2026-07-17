@@ -5510,6 +5510,13 @@ def require_no_known_secret_fragments(
         )
 
 
+def repeatable_private_key_fragment(fragment: str) -> bool:
+    return (
+        fragment.casefold() not in SECRET_PLACEHOLDER_VALUES
+        and re.fullmatch(r"[a-z_][a-z0-9_]*", fragment) is None
+    )
+
+
 def review_secret_fragments(
     text: str,
     *,
@@ -5518,8 +5525,7 @@ def review_secret_fragments(
     private_fragments = {
         fragment
         for fragment in private_key_body_fragments(text)
-        if fragment.casefold() not in SECRET_PLACEHOLDER_VALUES
-        and re.fullmatch(r"[a-z_][a-z0-9_]*", fragment) is None
+        if repeatable_private_key_fragment(fragment)
     }
     fragments = {
         text[start:end]
@@ -6202,6 +6208,14 @@ def markerless_private_key_run_ranges(
         matches = list(PRIVATE_KEY_BODY_PATTERN.finditer(lines[line_index]))
         assert matches
         values.append("".join(match.group(0) for match in matches))
+    run_value = "".join(value.rstrip("=") for value in values)
+    if not (
+        len(set(run_value)) >= 20
+        and any(char.islower() for char in run_value)
+        and any(char.isupper() for char in run_value)
+        and any(char.isdigit() or char in "+/" for char in run_value)
+    ):
+        return []
     ranges: list[tuple[int, int]] = []
     search_start = 0
     window_evaluations = 0
@@ -6514,11 +6528,11 @@ def review_hunk_header_secret_fragments(
             segment = header_section[begin.end() : segment_end]
             for start, end in private_key_token_spans(segment):
                 fragment = normalized_private_key_fragment(segment, start, end)
-                if fragment:
+                if fragment and repeatable_private_key_fragment(fragment):
                     fragments.add(fragment)
         for start, end in markerless_private_key_body_spans(header_section):
             fragment = normalized_private_key_fragment(header_section, start, end)
-            if fragment:
+            if fragment and repeatable_private_key_fragment(fragment):
                 fragments.add(fragment)
         for dialect in dialects:
             if not secret_text_risk(
@@ -6555,8 +6569,16 @@ def redact_secret_like_diff_section(
     )
     secret_fragments = set(known_secret_fragments or ())
     old_content, new_content = unified_diff_contents(section)
-    secret_fragments.update(private_key_body_fragments(old_content))
-    secret_fragments.update(private_key_body_fragments(new_content))
+    secret_fragments.update(
+        fragment
+        for fragment in private_key_body_fragments(old_content)
+        if repeatable_private_key_fragment(fragment)
+    )
+    secret_fragments.update(
+        fragment
+        for fragment in private_key_body_fragments(new_content)
+        if repeatable_private_key_fragment(fragment)
+    )
     old_risk = secret_text_risk(old_content, javascript_dialect=old_dialect)
     new_risk = secret_text_risk(new_content, javascript_dialect=new_dialect)
     for content, dialect, risk in (
