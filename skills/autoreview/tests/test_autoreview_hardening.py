@@ -4039,6 +4039,28 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertEqual(redacted_patch.count("+redacted\n"), len(chunks))
         self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
 
+    def test_review_patch_redacts_continued_markerless_private_key_lines(self) -> None:
+        body = markerless_private_key_fixture()
+        chunks = [body[index : index + 4] for index in range(0, len(body), 4)]
+        patch = (
+            "diff --git a/fixture.py b/fixture.py\n"
+            "--- a/fixture.py\n"
+            "+++ b/fixture.py\n"
+            f"@@ -0,0 +1,{len(chunks)} @@\n"
+            + "".join(f"+{chunk}\\\n" for chunk in chunks[:-1])
+            + f"+{chunks[-1]}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.py"],
+            patch,
+        )
+
+        self.assertEqual(redacted_patch.count("+redacted\\\n"), len(chunks) - 1)
+        self.assertIn("+redacted\n", redacted_patch)
+        self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
+
     def test_review_patch_redacts_commented_markerless_private_key_lines(self) -> None:
         body = markerless_private_key_fixture()
         chunks = [body[index : index + 4] for index in range(0, len(body), 4)]
@@ -4263,9 +4285,9 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
     def test_review_patch_preserves_ordinary_identifier_run(self) -> None:
         for values in (
-            ["identifier"] * 362,
-            ["Identifier1"] * 362,
-            ["identifier"] * 361 + ["Identifier1"],
+            ["identifier"] * 1025,
+            ["Identifier1"] * 1025,
+            ["identifier"] * 1024 + ["Identifier1"],
         ):
             with self.subTest(value_kinds=len(set(values))):
                 patch = (

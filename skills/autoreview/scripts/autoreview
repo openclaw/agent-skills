@@ -6104,7 +6104,7 @@ def private_key_body_wrapper_only(
 ) -> bool:
     return (
         re.fullmatch(
-            r"(?:(?:#|//|/\*|\*)\s*)?[\s\"'`,;+\[\]]*(?:\*/)?",
+            r"(?:(?:#|//|/\*|\*)\s*)?[\s\\\"'`,;+\[\]]*(?:\*/)?",
             private_key_body_wrapper_text(text, matches),
         )
         is not None
@@ -6199,16 +6199,14 @@ def markerless_private_key_run_ranges(
     run_start: int,
     run_end: int,
 ) -> list[tuple[int, int]]:
-    if run_end - run_start > 1024:
-        raise SystemExit(
-            "refusing review bundle with an oversized ambiguous markerless-key run"
-        )
     values = []
     for line_index in range(run_start, run_end):
         matches = list(PRIVATE_KEY_BODY_PATTERN.finditer(lines[line_index]))
         assert matches
         values.append("".join(match.group(0) for match in matches))
     run_value = "".join(value.rstrip("=") for value in values)
+    # Shannon entropy cannot exceed log2(alphabet size); 19 characters stay
+    # below the 4.25-bit key threshold regardless of run length.
     if not (
         len(set(run_value)) >= 20
         and any(char.islower() for char in run_value)
@@ -6216,6 +6214,10 @@ def markerless_private_key_run_ranges(
         and any(char.isdigit() or char in "+/" for char in run_value)
     ):
         return []
+    if run_end - run_start > 1024:
+        raise SystemExit(
+            "refusing review bundle with an oversized ambiguous markerless-key run"
+        )
     ranges: list[tuple[int, int]] = []
     search_start = 0
     window_evaluations = 0
@@ -6252,6 +6254,8 @@ def markerless_private_key_run_ranges(
                     encoded_length,
                     mixed_chunk_failures,
                 ):
+                    # Bare identifiers are also valid Base64 chunks. Keep the
+                    # maximal qualifying window so key tails cannot leak.
                     detected_end = candidate_end + 1
             if detected_end is not None:
                 detected = (candidate_start, detected_end)
