@@ -4425,8 +4425,49 @@ class AutoreviewHardeningTests(unittest.TestCase):
         )
 
         self.assertNotIn(body, redacted_patch)
-        self.assertIn(self.helper["REVIEW_SECRET_REDACTION"], redacted_patch)
+        self.assertNotIn("BEGIN PRIVATE KEY", redacted_patch)
         self.assertIn('+log("redacted");', redacted_patch)
+
+    def test_review_patch_rejects_residual_hunk_header_secret_risk(self) -> None:
+        primary = "CorrectHorse7" + "Battery"
+        backup = "BackupHorse8" + "Battery"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            '@@ -1 +1 @@ function f(pass'
+            + 'word = getenv("PASSWORD") '
+            + f'|| choose("{primary}", "{backup}"))\n'
+            + f'+log("{primary}");\n'
+        )
+
+        with self.assertRaisesRegex(SystemExit, "review diff hunk header"):
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.ts"],
+                patch,
+            )
+
+    def test_private_marker_redaction_does_not_hide_residual_header_risk(self) -> None:
+        primary = "CorrectHorse7" + "Battery"
+        backup = "BackupHorse8" + "Battery"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            '@@ -1 +1 @@ function f(pass'
+            + 'word = getenv("PASSWORD") '
+            + f'|| choose("{primary}", "{backup}")) {{ return "-----BEGIN '
+            + 'PRIVATE KEY-----"; }\n'
+            + f'+log("{primary}");\n'
+        )
+
+        with self.assertRaisesRegex(SystemExit, "review diff hunk header"):
+            self.helper["validate_review_patch"](
+                "local unstaged diff",
+                ["runtime.ts"],
+                patch,
+            )
 
     def test_review_patch_rejects_known_secret_in_diff_metadata(self) -> None:
         secret = realistic_secret_value()

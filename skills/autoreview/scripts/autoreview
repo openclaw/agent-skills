@@ -6466,23 +6466,28 @@ def redact_secret_like_hunk_headers(
             redacted.append(line)
             continue
         raw_header_section = header_match.group("section")
-        private_key_header = (
-            PRIVATE_KEY_BEGIN_PATTERN.search(raw_header_section) is not None
-            or PRIVATE_KEY_END_PATTERN.search(raw_header_section) is not None
-        )
+        marker_spans = [
+            match.span()
+            for pattern in (PRIVATE_KEY_BEGIN_PATTERN, PRIVATE_KEY_END_PATTERN)
+            for match in pattern.finditer(raw_header_section)
+        ]
         header_section = redact_review_spans(
             raw_header_section,
-            (
+            marker_spans
+            + (
                 [match.span() for match in fragment_pattern.finditer(raw_header_section)]
                 if fragment_pattern is not None
                 else []
             ),
         )
-        if private_key_header or any(
-            secret_text_risk(header_section, javascript_dialect=dialect)
-            for dialect in dialects
-        ):
-            header_section = f" {REVIEW_SECRET_REDACTION}"
+        # Never replace a still-risky header wholesale: doing so can hide an
+        # unextracted value that repeats in otherwise innocuous diff content.
+        for dialect in dialects:
+            require_no_secret_values(
+                "review diff hunk header",
+                header_section,
+                javascript_dialect=dialect,
+            )
         redacted.append(
             f"{header_match.group('marker')} {header_match.group('ranges')} "
             f"{header_match.group('marker')}{header_section}{ending}"
