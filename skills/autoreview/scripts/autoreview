@@ -6078,7 +6078,7 @@ def likely_private_key_token(value: str) -> bool:
     )
 
 
-def orphan_private_key_body_spans(text: str) -> list[tuple[int, int]]:
+def wrapped_private_key_body_matches(text: str) -> list[re.Match[str]]:
     matches = list(PRIVATE_KEY_BODY_PATTERN.finditer(text))
     if not matches:
         return []
@@ -6093,6 +6093,13 @@ def orphan_private_key_body_spans(text: str) -> list[tuple[int, int]]:
         r"(?:\*/[\s\\\"'`,;+\[\]]*)?",
         "".join(wrapper_parts).strip(),
     ) is None:
+        return []
+    return matches
+
+
+def orphan_private_key_body_spans(text: str) -> list[tuple[int, int]]:
+    matches = wrapped_private_key_body_matches(text)
+    if not matches:
         return []
     values = [match.group(0) for match in matches]
     raw_encoded = "".join(values)
@@ -6118,6 +6125,21 @@ def orphan_private_key_body_spans(text: str) -> list[tuple[int, int]]:
     if not long_base64_line and not mixed_short_chunks:
         return []
     return [match.span() for match in matches]
+
+
+def explicit_private_key_body_spans(text: str) -> list[tuple[int, int]]:
+    candidates = private_key_token_spans(text)
+    if not candidates:
+        return []
+    contexts = string_contexts_at(text, {start for start, _ in candidates})
+    wrapped = {match.span() for match in wrapped_private_key_body_matches(text)}
+    return [
+        (start, end)
+        for start, end in candidates
+        if (start, end) in wrapped
+        or contexts[start] is not None
+        or any(char.isdigit() or char in "+/=" for char in text[start:end])
+    ]
 
 
 def markerless_private_key_body_spans(text: str) -> list[tuple[int, int]]:
@@ -6155,7 +6177,16 @@ def pem_line_body_spans(
         if in_pem:
             spans.extend(
                 (cursor + body_start, cursor + body_end)
-                for body_start, body_end in private_key_token_spans(text[cursor:start])
+                for body_start, body_end in explicit_private_key_body_spans(
+                    text[cursor:start]
+                )
+            )
+        else:
+            spans.extend(
+                (cursor + body_start, cursor + body_end)
+                for body_start, body_end in markerless_private_key_body_spans(
+                    text[cursor:start]
+                )
             )
         if begins_pem:
             if in_pem:
@@ -6171,7 +6202,12 @@ def pem_line_body_spans(
     if in_pem:
         spans.extend(
             (cursor + body_start, cursor + body_end)
-            for body_start, body_end in private_key_token_spans(text[cursor:])
+            for body_start, body_end in explicit_private_key_body_spans(text[cursor:])
+        )
+    else:
+        spans.extend(
+            (cursor + body_start, cursor + body_end)
+            for body_start, body_end in markerless_private_key_body_spans(text[cursor:])
         )
     return spans, in_pem
 
@@ -6256,6 +6292,131 @@ def unified_diff_metadata(patch: str) -> str:
 
 
 REVIEW_SECRET_REDACTION = "[secret-like diff hunk redacted]"
+
+
+def private_key_markers_balanced(text: str) -> bool:
+    depth = 0
+    markers = sorted(
+        [(match.start(), True) for match in PRIVATE_KEY_BEGIN_PATTERN.finditer(text)]
+        + [(match.start(), False) for match in PRIVATE_KEY_END_PATTERN.finditer(text)]
+    )
+    for _, begins_pem in markers:
+        if begins_pem:
+            if depth != 0:
+                return False
+            depth = 1
+        else:
+            if depth == 0:
+                return False
+            depth = 0
+    return depth == 0
+
+
+def private_key_initial_depth(text: str) -> int:
+    balance = 0
+    minimum = 0
+    markers = sorted(
+        [(match.start(), 1) for match in PRIVATE_KEY_BEGIN_PATTERN.finditer(text)]
+        + [(match.start(), -1) for match in PRIVATE_KEY_END_PATTERN.finditer(text)]
+    )
+    for _, delta in markers:
+        balance += delta
+        minimum = min(minimum, balance)
+    return -minimum
+
+
+def tolerant_pem_line_spans(text: str, depth: int) -> tuple[list[tuple[int, int]], int]:
+    markers = sorted(
+        [(match.start(), match.end(), 1) for match in PRIVATE_KEY_BEGIN_PATTERN.finditer(text)]
+        + [(match.start(), match.end(), -1) for match in PRIVATE_KEY_END_PATTERN.finditer(text)]
+    )
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for start, end, delta in markers:
+        segment = text[cursor:start]
+        segment_matches = (
+            explicit_private_key_body_spans(segment)
+            if depth > 0
+            else []
+        )
+        spans.extend((cursor + start, cursor + end) for start, end in segment_matches)
+        spans.append((start, end))
+        depth = max(0, depth + delta)
+        cursor = end
+    if depth > 0:
+        spans.extend(
+            (cursor + start, cursor + end)
+            for start, end in explicit_private_key_body_spans(text[cursor:])
+        )
+    return spans, depth
+
+
+def redact_unbalanced_private_key_hunks(section: str) -> str:
+    """Redact inherited truncated PEM material while retaining changed code."""
+    lines = literal_lf_lines(section)
+    redacted = list(lines)
+    index = 0
+    while index < len(lines):
+        header = lines[index]
+        prefix_match = re.match(r"^(@{2,})", header)
+        if prefix_match is None:
+            index += 1
+            continue
+        hunk_end = index + 1
+        while hunk_end < len(lines) and not lines[hunk_end].startswith("@@"):
+            hunk_end += 1
+        prefix_columns = len(prefix_match.group(1)) - 1
+        old_content: list[str] = []
+        new_content: list[str] = []
+        raw_content: list[str] = []
+        hunk_lines: list[tuple[int, str, str, str]] = []
+        new_only_marker = False
+        for line_index in range(index + 1, hunk_end):
+            line = lines[line_index]
+            body = line.rstrip("\r\n")
+            ending = line[len(body) :]
+            prefix = body[:prefix_columns]
+            if len(prefix) != prefix_columns or not set(prefix) <= {"+", "-", " "}:
+                continue
+            content = body[prefix_columns:]
+            hunk_lines.append((line_index, prefix, content, ending))
+            raw_content.append(content)
+            if "+" in prefix and "-" not in prefix and (
+                PRIVATE_KEY_BEGIN_PATTERN.search(content) is not None
+                or PRIVATE_KEY_END_PATTERN.search(content) is not None
+            ):
+                new_only_marker = True
+            if set(prefix) == {" "} or "-" in prefix:
+                old_content.append(content)
+            if set(prefix) == {" "} or "+" in prefix:
+                new_content.append(content)
+        old_text = "\n".join(old_content)
+        new_text = "\n".join(new_content)
+        raw_text = "\n".join(raw_content)
+        old_balanced = private_key_markers_balanced(old_text)
+        new_balanced = private_key_markers_balanced(new_text)
+        raw_balanced = private_key_markers_balanced(raw_text)
+        if old_balanced and new_balanced and raw_balanced:
+            index = hunk_end
+            continue
+        if new_only_marker and not new_balanced:
+            index = hunk_end
+            continue
+        old_depth = private_key_initial_depth(old_text)
+        new_depth = private_key_initial_depth(new_text)
+        for line_index, prefix, content, ending in hunk_lines:
+            spans: list[tuple[int, int]] = []
+            if set(prefix) == {" "} or "-" in prefix:
+                old_spans, old_depth = tolerant_pem_line_spans(content, old_depth)
+                spans.extend(old_spans)
+            if set(prefix) == {" "} or "+" in prefix:
+                new_spans, new_depth = tolerant_pem_line_spans(content, new_depth)
+                spans.extend(new_spans)
+            redacted[line_index] = (
+                f"{prefix}{redact_review_spans(content, spans)}{ending}"
+            )
+        index = hunk_end
+    return "".join(redacted)
 
 
 def redact_secret_like_hunk_headers(
@@ -6700,6 +6861,13 @@ def validate_review_patch(
         )
     expected_paths = set(paths)
     units = review_bundle_units(patch)
+    units = [
+        redact_unbalanced_private_key_hunks(unit)
+        if unit.startswith("diff --git ")
+        else unit
+        for unit in units
+    ]
+    patch = "".join(units)
     known_secret_fragments: set[str] = set()
     for unit in units:
         if not unit.startswith("diff --git "):
