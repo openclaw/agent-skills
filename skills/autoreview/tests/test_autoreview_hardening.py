@@ -4039,6 +4039,59 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertEqual(redacted_patch.count("+redacted\n"), len(chunks))
         self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
 
+    def test_review_patch_redacts_padding_only_markerless_key_signal(self) -> None:
+        body = (
+            "ABCDEFGHIJKLMNOP"
+            + "QRSTUVWXYZabcdef"
+            + "ghijklmnopqrstuv="
+        )
+        patch = (
+            "diff --git a/fixture.txt b/fixture.txt\n"
+            "--- a/fixture.txt\n"
+            "+++ b/fixture.txt\n"
+            "@@ -0,0 +1,1 @@\n"
+            + f"+{body}\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.txt"],
+            patch,
+        )
+
+        self.assertNotIn(body, redacted_patch)
+        self.assertIn("+redacted\n", redacted_patch)
+
+    def test_review_patch_redacts_lowercase_special_mixed_chunks(self) -> None:
+        chunks = [
+            "ab1+",
+            "cd2/",
+            "ef3+",
+            "gh4/",
+            "ij5+",
+            "kl6/",
+            "mn7+",
+            "op8/",
+            "qr9+",
+            "st0/",
+        ]
+        patch = (
+            "diff --git a/fixture.txt b/fixture.txt\n"
+            "--- a/fixture.txt\n"
+            "+++ b/fixture.txt\n"
+            f"@@ -0,0 +1,{len(chunks)} @@\n"
+            + "".join(f"+{chunk}\n" for chunk in chunks)
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.txt"],
+            patch,
+        )
+
+        self.assertEqual(redacted_patch.count("+redacted\n"), len(chunks))
+        self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
+
     def test_review_patch_redacts_continued_markerless_private_key_lines(self) -> None:
         body = markerless_private_key_fixture()
         chunks = [body[index : index + 4] for index in range(0, len(body), 4)]

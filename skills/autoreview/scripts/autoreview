@@ -6204,11 +6204,23 @@ def markerless_private_key_run_ranges(
     run_value = "".join(value.rstrip("=") for value in values)
     # Shannon entropy cannot exceed log2(alphabet size); 19 characters stay
     # below the 4.25-bit key threshold regardless of run length.
+    has_lower = any(char.islower() for char in run_value)
+    has_upper = any(char.isupper() for char in run_value)
+    has_digit_or_special = any(
+        char.isdigit() or char in "+/" for char in run_value
+    ) or any(value.endswith("=") for value in values)
+    mixed_chunk_classes = all(
+        any(char.isdigit() for char in value)
+        and any(char.isupper() or char in "+/" for char in value)
+        for value in values
+    )
     if not (
         len(set(run_value)) >= 20
-        and any(char.islower() for char in run_value)
-        and any(char.isupper() for char in run_value)
-        and any(char.isdigit() or char in "+/" for char in run_value)
+        and has_lower
+        and (
+            (has_upper and has_digit_or_special)
+            or mixed_chunk_classes
+        )
     ):
         return []
     if run_end - run_start > 1024:
