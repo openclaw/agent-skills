@@ -4034,7 +4034,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertEqual(redacted_patch, patch)
 
     def test_review_patch_redacts_long_key_with_source_wrappers(self) -> None:
-        body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC1234567890abcdef"
+        body = "".join(
+            (
+                "MIIEvQIBADAN",
+                "BgkqhkiG9w0B",
+                "AQEFAASC1234",
+                "567890abcdef",
+            )
+        )
         cases = (
             (f"+/* {body} */\n", "+/* redacted */\n"),
             (f"+{body}\\\n", "+redacted\\\n"),
