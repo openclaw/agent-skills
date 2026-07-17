@@ -6089,7 +6089,8 @@ def orphan_private_key_body_spans(text: str) -> list[tuple[int, int]]:
         cursor = match.end()
     wrapper_parts.append(text[cursor:])
     if re.fullmatch(
-        r"(?:(?:#|//|/\*|\*)\s*)?[\s\\\"'`,;+\[\]]*(?:\*/)?",
+        r"(?:(?:#|//|/\*|\*)\s*)?[\s\\\"'`,;+\[\]]*"
+        r"(?:\*/[\s\\\"'`,;+\[\]]*)?",
         "".join(wrapper_parts).strip(),
     ) is None:
         return []

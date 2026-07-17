@@ -4044,6 +4044,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
         )
         cases = (
             (f"+/* {body} */\n", "+/* redacted */\n"),
+            (f"+/* {body} */;\\\n", "+/* redacted */;\\\n"),
             (f"+{body}\\\n", "+redacted\\\n"),
         )
         for addition, expected in cases:
