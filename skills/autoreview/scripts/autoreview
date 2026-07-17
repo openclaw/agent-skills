@@ -6078,20 +6078,27 @@ def likely_private_key_token(value: str) -> bool:
     )
 
 
-def private_key_body_wrapper_only(
+def private_key_body_wrapper_text(
     text: str,
     matches: list[re.Match[str]],
-) -> bool:
+) -> str:
     wrapper_parts: list[str] = []
     cursor = 0
     for match in matches:
         wrapper_parts.append(text[cursor : match.start()])
         cursor = match.end()
     wrapper_parts.append(text[cursor:])
+    return "".join(wrapper_parts).strip()
+
+
+def private_key_body_wrapper_only(
+    text: str,
+    matches: list[re.Match[str]],
+) -> bool:
     return (
         re.fullmatch(
             r"(?:(?:#|//|/\*|\*)\s*)?[\s\"'`,;+\[\]]*(?:\*/)?",
-            "".join(wrapper_parts).strip(),
+            private_key_body_wrapper_text(text, matches),
         )
         is not None
     )
@@ -6191,9 +6198,9 @@ def markerless_private_key_run_ranges(
         )
     values = []
     for line_index in range(run_start, run_end):
-        match = PRIVATE_KEY_BODY_PATTERN.search(lines[line_index])
-        assert match is not None
-        values.append(match.group(0))
+        matches = list(PRIVATE_KEY_BODY_PATTERN.finditer(lines[line_index]))
+        assert matches
+        values.append("".join(match.group(0) for match in matches))
     ranges: list[tuple[int, int]] = []
     search_start = 0
     window_evaluations = 0
@@ -6210,7 +6217,7 @@ def markerless_private_key_run_ranges(
                 normalized_value = value.rstrip("=")
                 window_evaluations += 1
                 scanned_characters += len(normalized_value)
-                if window_evaluations > 8192 or scanned_characters > 1_000_000:
+                if window_evaluations > 65_536 or scanned_characters > 1_000_000:
                     raise SystemExit(
                         "refusing review bundle with an oversized ambiguous markerless-key run"
                     )
@@ -6254,9 +6261,21 @@ def markerless_private_key_spans_by_line(
             if index < len(lines)
             else []
         )
-        candidate = len(matches) == 1 and private_key_body_wrapper_only(
-            lines[index],
-            matches,
+        # Callers pass reconstructed file content; unified-diff prefixes are
+        # already removed, so a plus here is an actual source-level wrapper.
+        wrapper_text = (
+            private_key_body_wrapper_text(lines[index], matches)
+            if matches
+            else ""
+        )
+        explicit_multi_value_wrapper = len(matches) == 1 or any(
+            marker in wrapper_text
+            for marker in ('"', "'", "`", "+", ",", "[", "]", "#", "//", "/*", "*")
+        )
+        candidate = (
+            bool(matches)
+            and explicit_multi_value_wrapper
+            and private_key_body_wrapper_only(lines[index], matches)
         )
         if candidate:
             if run_start is None:

@@ -4083,6 +4083,27 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertIn("+ * redacted */\n", redacted_patch)
         self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
 
+    def test_review_patch_redacts_multiple_key_fragments_per_line(self) -> None:
+        body = markerless_private_key_fixture()
+        chunks = [body[index : index + 4] for index in range(0, len(body), 4)]
+        pairs = list(zip(chunks[::2], chunks[1::2]))
+        patch = (
+            "diff --git a/fixture.txt b/fixture.txt\n"
+            "--- a/fixture.txt\n"
+            "+++ b/fixture.txt\n"
+            f"@@ -0,0 +1,{len(pairs)} @@\n"
+            + "".join(f'+"{left}" + "{right}"\n' for left, right in pairs)
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.txt"],
+            patch,
+        )
+
+        self.assertEqual(redacted_patch.count("redacted"), len(chunks))
+        self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
+
     def test_review_patch_finds_key_after_adjacent_token_only_line(self) -> None:
         prefix = "A" * 128
         body = markerless_private_key_fixture()
@@ -4178,7 +4199,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
 
     def test_review_patch_bounds_ambiguous_markerless_key_scan(self) -> None:
-        values = ["AbCd"] * 1024
+        values = ["AbC1"] * 512
         patch = (
             "diff --git a/fixture.txt b/fixture.txt\n"
             "--- a/fixture.txt\n"
@@ -4193,6 +4214,42 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 ["fixture.txt"],
                 patch,
             )
+
+    def test_review_patch_preserves_ordinary_identifier_run(self) -> None:
+        values = ["identifier"] * 128
+        patch = (
+            "diff --git a/fixture.txt b/fixture.txt\n"
+            "--- a/fixture.txt\n"
+            "+++ b/fixture.txt\n"
+            f"@@ -0,0 +1,{len(values)} @@\n"
+            + "".join(f"+{value}\n" for value in values)
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.txt"],
+            patch,
+        )
+
+        self.assertEqual(redacted_patch, patch)
+
+    def test_review_patch_preserves_bare_multi_token_added_lines(self) -> None:
+        values = ["AbC1 AbC1"] * 128
+        patch = (
+            "diff --git a/fixture.txt b/fixture.txt\n"
+            "--- a/fixture.txt\n"
+            "+++ b/fixture.txt\n"
+            f"@@ -0,0 +1,{len(values)} @@\n"
+            + "".join(f"+{value}\n" for value in values)
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.txt"],
+            patch,
+        )
+
+        self.assertEqual(redacted_patch, patch)
 
     def test_review_patch_keeps_scanning_after_transient_key_miss(self) -> None:
         chunks = [
