@@ -6097,11 +6097,7 @@ def private_key_body_wrapper_only(
     )
 
 
-def orphan_private_key_body_spans(
-    text: str,
-    *,
-    allow_split_long_token: bool = False,
-) -> list[tuple[int, int]]:
+def orphan_private_key_body_spans(text: str) -> list[tuple[int, int]]:
     matches = list(PRIVATE_KEY_BODY_PATTERN.finditer(text))
     if not matches:
         return []
@@ -6127,9 +6123,7 @@ def orphan_private_key_body_spans(
         and any(char.islower() for char in encoded)
         and entropy >= 4.25
     )
-    likely_encoded_block = (
-        len(matches) == 1 or allow_split_long_token
-    ) and likely_private_key_token(raw_encoded)
+    likely_encoded_block = len(matches) == 1 and likely_private_key_token(raw_encoded)
     if not likely_encoded_block and not mixed_short_chunks:
         return []
     return [match.span() for match in matches]
@@ -6146,6 +6140,106 @@ def markerless_private_key_body_spans(text: str) -> list[tuple[int, int]]:
         and likely_private_key_token(match.group(0))
     )
     return sorted(set(spans))
+
+
+def markerless_private_key_window_likely(
+    values: list[str],
+    start: int,
+    end: int,
+    counts: dict[str, int],
+    encoded_length: int,
+    mixed_chunk_failures: int,
+) -> bool:
+    if encoded_length == 0:
+        return False
+    entropy = -sum(
+        (frequency := count / encoded_length) * math.log2(frequency)
+        for count in counts.values()
+        if count > 0
+    )
+    has_lower = any(char.islower() and count > 0 for char, count in counts.items())
+    has_upper = any(char.isupper() and count > 0 for char, count in counts.items())
+    has_digit_or_special = values[end - 1].endswith("=") or any(
+        (char.isdigit() or char in "+/") and count > 0
+        for char, count in counts.items()
+    )
+    likely_encoded_block = (
+        (encoded_length >= 48 or values[start].startswith("MII"))
+        and has_lower
+        and has_upper
+        and has_digit_or_special
+        and entropy >= 4.25
+    )
+    mixed_short_chunks = (
+        encoded_length >= 20
+        and end - start >= 2
+        and mixed_chunk_failures == 0
+        and has_lower
+        and entropy >= 4.25
+    )
+    return likely_encoded_block or mixed_short_chunks
+
+
+def markerless_private_key_run_ranges(
+    lines: list[str],
+    run_start: int,
+    run_end: int,
+) -> list[tuple[int, int]]:
+    if run_end - run_start > 1024:
+        raise SystemExit(
+            "refusing review bundle with an oversized ambiguous markerless-key run"
+        )
+    values = []
+    for line_index in range(run_start, run_end):
+        match = PRIVATE_KEY_BODY_PATTERN.search(lines[line_index])
+        assert match is not None
+        values.append(match.group(0))
+    ranges: list[tuple[int, int]] = []
+    search_start = 0
+    window_evaluations = 0
+    scanned_characters = 0
+    while search_start < len(values):
+        detected: tuple[int, int] | None = None
+        for candidate_start in range(search_start, len(values)):
+            counts: dict[str, int] = {}
+            encoded_length = 0
+            mixed_chunk_failures = 0
+            detected_end: int | None = None
+            for candidate_end in range(candidate_start, len(values)):
+                value = values[candidate_end]
+                normalized_value = value.rstrip("=")
+                window_evaluations += 1
+                scanned_characters += len(normalized_value)
+                if window_evaluations > 8192 or scanned_characters > 1_000_000:
+                    raise SystemExit(
+                        "refusing review bundle with an oversized ambiguous markerless-key run"
+                    )
+                encoded_length += len(normalized_value)
+                for char in normalized_value:
+                    counts[char] = counts.get(char, 0) + 1
+                if not (
+                    any(char.isdigit() for char in value)
+                    and any(char.isupper() or char in "+/" for char in value)
+                ):
+                    mixed_chunk_failures += 1
+                if markerless_private_key_window_likely(
+                    values,
+                    candidate_start,
+                    candidate_end + 1,
+                    counts,
+                    encoded_length,
+                    mixed_chunk_failures,
+                ):
+                    detected_end = candidate_end + 1
+            if detected_end is not None:
+                detected = (candidate_start, detected_end)
+                break
+        if detected is None:
+            break
+        detected_start, detected_end = detected
+        ranges.append((run_start + detected_start, run_start + detected_end))
+        search_start = detected_end
+    return ranges
 
 
 def markerless_private_key_spans_by_line(
@@ -6170,12 +6264,12 @@ def markerless_private_key_spans_by_line(
             continue
         if run_start is None:
             continue
-        block = "\n".join(
-            next(PRIVATE_KEY_BODY_PATTERN.finditer(lines[block_index])).group(0)
-            for block_index in range(run_start, index)
-        )
-        if orphan_private_key_body_spans(block, allow_split_long_token=True):
-            for block_index in range(run_start, index):
+        for detected_start, detected_end in markerless_private_key_run_ranges(
+            lines,
+            run_start,
+            index,
+        ):
+            for block_index in range(detected_start, detected_end):
                 spans_by_line[block_index] = sorted(
                     set(spans_by_line[block_index])
                     | {
