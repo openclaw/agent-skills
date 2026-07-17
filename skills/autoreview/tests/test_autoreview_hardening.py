@@ -4368,6 +4368,31 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertNotIn(fixture_value, redacted_patch)
         self.assertIn("function rotate_redacted()", redacted_patch)
 
+    def test_review_patch_redacts_overlapping_known_secret_fragments(self) -> None:
+        prefix = "XAbcd" + "123"
+        longer = "Abcd123Sensitive" + "Tail9"
+        combined = "XAbcd123Sensitive" + "Tail9"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -1,2 +1 @@\n"
+            + f'-api{"Key"} = "{prefix}"\n'
+            + f'-access{"Token"} = "{longer}"\n'
+            + f'+log("{combined}");\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(prefix, redacted_patch)
+        self.assertNotIn(longer, redacted_patch)
+        self.assertNotIn("SensitiveTail9", redacted_patch)
+        self.assertIn('+log("redacted");', redacted_patch)
+
     def test_review_patch_learns_secret_from_hunk_header(self) -> None:
         fixture_value = realistic_secret_value()
         patch = (
@@ -4427,6 +4452,105 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertNotIn(body, redacted_patch)
         self.assertNotIn("BEGIN PRIVATE KEY", redacted_patch)
         self.assertIn('+log("redacted");', redacted_patch)
+
+    def test_review_patch_redacts_escaped_alphabetic_explicit_pem_body(self) -> None:
+        body = "AbCdEfGh" + "IjKlMnOp"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            '+const fixture = "-----BEGIN '
+            + "PRIVATE KEY-----\\n"
+            + body
+            + "\\n-----END "
+            + 'PRIVATE KEY-----";\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(body, redacted_patch)
+        self.assertNotIn("PRIVATE KEY", redacted_patch)
+
+    def test_review_patch_preserves_unwrapped_alphabetic_identifier(self) -> None:
+        identifier = "AbCdEfGh" + "IjKlMnOp"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + f"+const {identifier} = true;\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertIn(identifier, redacted_patch)
+
+    def test_review_patch_preserves_punctuation_wrapped_alphabetic_identifier(self) -> None:
+        identifier = "AbCdEfGh" + "IjKlMnOp"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + f"+  {identifier},\n"
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertIn(identifier, redacted_patch)
+
+    def test_review_patch_preserves_escaped_newline_beside_alphabetic_identifier(self) -> None:
+        identifier = "AbCdEfGh" + "IjKlMnOp"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            + f'+[{identifier}, "\\\\n"];\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertIn(identifier, redacted_patch)
+
+    def test_review_patch_preserves_bare_identifier_in_escaped_pem_concatenation(self) -> None:
+        identifier = "AbCdEfGh" + "IjKlMnOp"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            '+const fixture = "-----BEGIN '
+            + "PRIVATE KEY-----\\n\" + "
+            + identifier
+            + ' + "\\n-----END '
+            + 'PRIVATE KEY-----";\n'
+        )
+
+        redacted_patch = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertIn(identifier, redacted_patch)
 
     def test_review_patch_rejects_residual_hunk_header_secret_risk(self) -> None:
         primary = "CorrectHorse7" + "Battery"

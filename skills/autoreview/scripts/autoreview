@@ -5974,20 +5974,34 @@ def redact_review_spans(text: str, spans: list[tuple[int, int]]) -> str:
     return "".join(parts)
 
 
-def repeated_secret_fragment_spans(
+def known_secret_fragment_pattern(fragments: list[str]) -> re.Pattern[str] | None:
+    if not fragments:
+        return None
+    alternatives = "|".join(re.escape(fragment) for fragment in fragments)
+    return re.compile(rf"(?=(?P<fragment>{alternatives}))")
+
+
+def known_secret_fragment_spans(
     text: str,
     pattern: re.Pattern[str] | None,
 ) -> list[tuple[int, int]]:
     if pattern is None:
         return []
-    matches = list(pattern.finditer(text))
-    contexts = string_contexts_at(text, {match.start() for match in matches})
+    return [match.span("fragment") for match in pattern.finditer(text)]
+
+
+def repeated_secret_fragment_spans(
+    text: str,
+    pattern: re.Pattern[str] | None,
+) -> list[tuple[int, int]]:
+    matches = known_secret_fragment_spans(text, pattern)
+    contexts = string_contexts_at(text, {start for start, _ in matches})
     spans: list[tuple[int, int]] = []
-    for match in matches:
-        token_start = match.start()
+    for start, end in matches:
+        token_start = start
         while token_start > 0 and re.match(r"[A-Za-z0-9_$.-]", text[token_start - 1]):
             token_start -= 1
-        token_end = match.end()
+        token_end = end
         while token_end < len(text) and re.match(r"[A-Za-z0-9_$.-]", text[token_end]):
             token_end += 1
         key_position = re.match(
@@ -5995,21 +6009,21 @@ def repeated_secret_fragment_spans(
             text[token_end:],
         ) is not None
         unquoted_token_substring = (
-            contexts[match.start()] is None
-            and (token_start < match.start() or match.end() < token_end)
+            contexts[start] is None
+            and (token_start < start or end < token_end)
         )
         unquoted_identifier = (
-            contexts[match.start()] is None
-            and token_start == match.start()
-            and token_end == match.end()
-            and re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$.-]*", match.group(0))
+            contexts[start] is None
+            and token_start == start
+            and token_end == end
+            and re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$.-]*", text[start:end])
             is not None
         )
-        if contexts[match.start()] is None and (
+        if contexts[start] is None and (
             key_position or unquoted_token_substring or unquoted_identifier
         ):
             continue
-        spans.append(match.span())
+        spans.append((start, end))
     return spans
 
 
@@ -6127,18 +6141,56 @@ def orphan_private_key_body_spans(text: str) -> list[tuple[int, int]]:
     return [match.span() for match in matches]
 
 
-def explicit_private_key_body_spans(text: str) -> list[tuple[int, int]]:
+def bare_source_identifier_span(text: str, start: int, end: int) -> bool:
+    if re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", text[start:end]) is None:
+        return False
+    before = text[:start].rstrip()[-1:]
+    after = text[end:].lstrip()[:1]
+    return before in {"=", "+", "(", "[", "{", ",", ":"} and after in {
+        "+",
+        ")",
+        "]",
+        "}",
+        ",",
+        ";",
+        ":",
+    }
+
+
+def explicit_private_key_body_spans(
+    text: str,
+    *,
+    in_pem: bool,
+) -> list[tuple[int, int]]:
+    if not in_pem:
+        return []
     candidates = private_key_token_spans(text)
     if not candidates:
         return []
+    wrapper_parts: list[str] = []
+    cursor = 0
+    for start, end in candidates:
+        wrapper_parts.append(text[cursor:start])
+        cursor = end
+    wrapper_parts.append(text[cursor:])
+    wrapper_text = "".join(wrapper_parts).strip()
+    escaped_body_only = ("\\n" in wrapper_text or "\\r" in wrapper_text) and re.fullmatch(
+        r"(?:(?:\\[nr])|\s)*",
+        wrapper_text,
+    ) is not None
+    if escaped_body_only:
+        return candidates
     contexts = string_contexts_at(text, {start for start, _ in candidates})
     wrapped = {match.span() for match in wrapped_private_key_body_matches(text)}
     return [
         (start, end)
         for start, end in candidates
-        if (start, end) in wrapped
-        or contexts[start] is not None
-        or any(char.isdigit() or char in "+/=" for char in text[start:end])
+        if not bare_source_identifier_span(text, start, end)
+        and (
+            (start, end) in wrapped
+            or contexts[start] is not None
+            or any(char.isdigit() or char in "+/=" for char in text[start:end])
+        )
     ]
 
 
@@ -6178,7 +6230,8 @@ def pem_line_body_spans(
             spans.extend(
                 (cursor + body_start, cursor + body_end)
                 for body_start, body_end in explicit_private_key_body_spans(
-                    text[cursor:start]
+                    text[cursor:start],
+                    in_pem=in_pem,
                 )
             )
         else:
@@ -6202,7 +6255,10 @@ def pem_line_body_spans(
     if in_pem:
         spans.extend(
             (cursor + body_start, cursor + body_end)
-            for body_start, body_end in explicit_private_key_body_spans(text[cursor:])
+            for body_start, body_end in explicit_private_key_body_spans(
+                text[cursor:],
+                in_pem=in_pem,
+            )
         )
     else:
         spans.extend(
@@ -6335,7 +6391,7 @@ def tolerant_pem_line_spans(text: str, depth: int) -> tuple[list[tuple[int, int]
     for start, end, delta in markers:
         segment = text[cursor:start]
         segment_matches = (
-            explicit_private_key_body_spans(segment)
+            explicit_private_key_body_spans(segment, in_pem=depth > 0)
             if depth > 0
             else []
         )
@@ -6346,7 +6402,10 @@ def tolerant_pem_line_spans(text: str, depth: int) -> tuple[list[tuple[int, int]
     if depth > 0:
         spans.extend(
             (cursor + start, cursor + end)
-            for start, end in explicit_private_key_body_spans(text[cursor:])
+            for start, end in explicit_private_key_body_spans(
+                text[cursor:],
+                in_pem=depth > 0,
+            )
         )
     return spans, depth
 
@@ -6449,11 +6508,7 @@ def redact_secret_like_hunk_headers(
         known_secret_fragments or (),
         key=lambda fragment: (-len(fragment), fragment),
     )
-    fragment_pattern = (
-        re.compile("|".join(re.escape(fragment) for fragment in ordered_secret_fragments))
-        if ordered_secret_fragments
-        else None
-    )
+    fragment_pattern = known_secret_fragment_pattern(ordered_secret_fragments)
     redacted: list[str] = []
     for line in literal_lf_lines(section):
         body = line.rstrip("\r\n")
@@ -6474,11 +6529,7 @@ def redact_secret_like_hunk_headers(
         header_section = redact_review_spans(
             raw_header_section,
             marker_spans
-            + (
-                [match.span() for match in fragment_pattern.finditer(raw_header_section)]
-                if fragment_pattern is not None
-                else []
-            ),
+            + known_secret_fragment_spans(raw_header_section, fragment_pattern),
         )
         # Never replace a still-risky header wholesale: doing so can hide an
         # unextracted value that repeats in otherwise innocuous diff content.
@@ -6593,11 +6644,7 @@ def redact_secret_like_diff_section(
         secret_fragments,
         key=lambda fragment: (-len(fragment), fragment),
     )
-    fragment_pattern = (
-        re.compile("|".join(re.escape(fragment) for fragment in ordered_secret_fragments))
-        if ordered_secret_fragments
-        else None
-    )
+    fragment_pattern = known_secret_fragment_pattern(ordered_secret_fragments)
     redacted: list[str] = []
     lines = literal_lf_lines(section)
     index = 0
