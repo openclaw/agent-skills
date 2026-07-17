@@ -3327,6 +3327,35 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertNotIn("AB12cd34EF56", redacted)
         self.assertIn("+const timeout = 30_000;", redacted)
 
+    def test_review_patch_redacts_truncated_private_key_marker_replacement(self) -> None:
+        patch = (
+            "diff --git a/fixture.test.ts b/fixture.test.ts\n"
+            "--- a/fixture.test.ts\n"
+            "+++ b/fixture.test.ts\n"
+            "@@ -1,3 +1,3 @@\n"
+            '-const key = "-----BEGIN RSA '
+            + 'PRIVATE KEY-----";\n'
+            '+const key = "-----BEGIN '
+            + 'PRIVATE KEY-----";\n'
+            ' const body = "AB12cd34EF56";\n'
+            ' expect(key).toBeDefined();\n'
+            "@@ -20 +20 @@\n"
+            "-const timeout = 0;\n"
+            "+const timeout = 30_000;\n"
+        )
+
+        redacted = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.test.ts"],
+            patch,
+        )
+
+        self.assertNotIn("BEGIN PRIVATE KEY", redacted)
+        self.assertNotIn("BEGIN RSA PRIVATE KEY", redacted)
+        self.assertNotIn("AB12cd34EF56", redacted)
+        self.assertIn("expect(key).toBeDefined();", redacted)
+        self.assertIn("+const timeout = 30_000;", redacted)
+
     def test_review_patch_redacts_before_unmatched_private_key_end(self) -> None:
         patch = (
             "diff --git a/fixture.txt b/fixture.txt\n"

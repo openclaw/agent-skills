@@ -6370,7 +6370,8 @@ def redact_unbalanced_private_key_hunks(section: str) -> str:
         new_content: list[str] = []
         raw_content: list[str] = []
         hunk_lines: list[tuple[int, str, str, str]] = []
-        new_only_marker = False
+        old_only_marker_kinds: set[str] = set()
+        new_only_marker_kinds: set[str] = set()
         for line_index in range(index + 1, hunk_end):
             line = lines[line_index]
             body = line.rstrip("\r\n")
@@ -6381,11 +6382,18 @@ def redact_unbalanced_private_key_hunks(section: str) -> str:
             content = body[prefix_columns:]
             hunk_lines.append((line_index, prefix, content, ending))
             raw_content.append(content)
-            if "+" in prefix and "-" not in prefix and (
-                PRIVATE_KEY_BEGIN_PATTERN.search(content) is not None
-                or PRIVATE_KEY_END_PATTERN.search(content) is not None
-            ):
-                new_only_marker = True
+            marker_kinds = {
+                kind
+                for kind, pattern in (
+                    ("begin", PRIVATE_KEY_BEGIN_PATTERN),
+                    ("end", PRIVATE_KEY_END_PATTERN),
+                )
+                if pattern.search(content) is not None
+            }
+            if "+" in prefix and "-" not in prefix:
+                new_only_marker_kinds.update(marker_kinds)
+            elif "-" in prefix and "+" not in prefix:
+                old_only_marker_kinds.update(marker_kinds)
             if set(prefix) == {" "} or "-" in prefix:
                 old_content.append(content)
             if set(prefix) == {" "} or "+" in prefix:
@@ -6399,7 +6407,8 @@ def redact_unbalanced_private_key_hunks(section: str) -> str:
         if old_balanced and new_balanced and raw_balanced:
             index = hunk_end
             continue
-        if new_only_marker and not new_balanced:
+        genuinely_new_marker_kinds = new_only_marker_kinds - old_only_marker_kinds
+        if genuinely_new_marker_kinds and not new_balanced:
             index = hunk_end
             continue
         old_depth = private_key_initial_depth(old_text)
