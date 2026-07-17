@@ -5510,10 +5510,6 @@ def require_no_known_secret_fragments(
         )
 
 
-def repeatable_private_key_fragment(fragment: str) -> bool:
-    return fragment.casefold() not in SECRET_PLACEHOLDER_VALUES
-
-
 def review_secret_fragments(
     text: str,
     *,
@@ -5521,8 +5517,8 @@ def review_secret_fragments(
 ) -> set[str]:
     private_fragments = {
         fragment
-        for fragment in private_key_body_fragments(text, repeatable=True)
-        if repeatable_private_key_fragment(fragment)
+        for fragment in private_key_body_fragments(text)
+        if fragment.casefold() not in SECRET_PLACEHOLDER_VALUES
     }
     fragments = {
         text[start:end]
@@ -6082,37 +6078,20 @@ def likely_private_key_token(value: str) -> bool:
     )
 
 
-def private_key_body_wrapper_text(
-    text: str,
-    matches: list[re.Match[str]],
-) -> str:
+def orphan_private_key_body_spans(text: str) -> list[tuple[int, int]]:
+    matches = list(PRIVATE_KEY_BODY_PATTERN.finditer(text))
+    if not matches:
+        return []
     wrapper_parts: list[str] = []
     cursor = 0
     for match in matches:
         wrapper_parts.append(text[cursor : match.start()])
         cursor = match.end()
     wrapper_parts.append(text[cursor:])
-    return "".join(wrapper_parts).strip()
-
-
-def private_key_body_wrapper_only(
-    text: str,
-    matches: list[re.Match[str]],
-) -> bool:
-    return (
-        re.fullmatch(
-            r"(?:(?:#|//|/\*|\*)\s*)?[\s\\\"'`,;+\[\]]*(?:\*/)?",
-            private_key_body_wrapper_text(text, matches),
-        )
-        is not None
-    )
-
-
-def orphan_private_key_body_spans(text: str) -> list[tuple[int, int]]:
-    matches = list(PRIVATE_KEY_BODY_PATTERN.finditer(text))
-    if not matches:
-        return []
-    if not private_key_body_wrapper_only(text, matches):
+    if re.fullmatch(
+        r"(?:(?:#|//|/\*|\*)\s*)?[\s\\\"'`,;+\[\]]*(?:\*/)?",
+        "".join(wrapper_parts).strip(),
+    ) is None:
         return []
     values = [match.group(0) for match in matches]
     raw_encoded = "".join(values)
@@ -6134,8 +6113,8 @@ def orphan_private_key_body_spans(text: str) -> list[tuple[int, int]]:
         and any(char.islower() for char in encoded)
         and entropy >= 4.25
     )
-    likely_encoded_block = len(matches) == 1 and likely_private_key_token(raw_encoded)
-    if not likely_encoded_block and not mixed_short_chunks:
+    long_base64_line = len(matches) == 1 and likely_private_key_token(raw_encoded)
+    if not long_base64_line and not mixed_short_chunks:
         return []
     return [match.span() for match in matches]
 
@@ -6151,183 +6130,6 @@ def markerless_private_key_body_spans(text: str) -> list[tuple[int, int]]:
         and likely_private_key_token(match.group(0))
     )
     return sorted(set(spans))
-
-
-def markerless_private_key_window_likely(
-    values: list[str],
-    start: int,
-    end: int,
-    counts: dict[str, int],
-    encoded_length: int,
-    mixed_chunk_failures: int,
-) -> bool:
-    if encoded_length == 0:
-        return False
-    entropy = -sum(
-        (frequency := count / encoded_length) * math.log2(frequency)
-        for count in counts.values()
-        if count > 0
-    )
-    has_lower = any(char.islower() and count > 0 for char, count in counts.items())
-    has_upper = any(char.isupper() and count > 0 for char, count in counts.items())
-    has_digit_or_special = values[end - 1].endswith("=") or any(
-        (char.isdigit() or char in "+/") and count > 0
-        for char, count in counts.items()
-    )
-    likely_encoded_block = (
-        (encoded_length >= 48 or values[start].startswith("MII"))
-        and has_lower
-        and has_upper
-        and has_digit_or_special
-        and entropy >= 4.25
-    )
-    mixed_short_chunks = (
-        encoded_length >= 20
-        and end - start >= 2
-        and mixed_chunk_failures == 0
-        and has_lower
-        and entropy >= 4.25
-    )
-    return likely_encoded_block or mixed_short_chunks
-
-
-def markerless_private_key_run_ranges(
-    lines: list[str],
-    run_start: int,
-    run_end: int,
-) -> list[tuple[int, int]]:
-    values = []
-    for line_index in range(run_start, run_end):
-        matches = list(PRIVATE_KEY_BODY_PATTERN.finditer(lines[line_index]))
-        assert matches
-        values.append("".join(match.group(0) for match in matches))
-    run_value = "".join(value.rstrip("=") for value in values)
-    # Shannon entropy cannot exceed log2(alphabet size); 19 characters stay
-    # below the 4.25-bit key threshold regardless of run length.
-    has_lower = any(char.islower() for char in run_value)
-    has_upper = any(char.isupper() for char in run_value)
-    has_digit_or_special = any(
-        char.isdigit() or char in "+/" for char in run_value
-    ) or any(value.endswith("=") for value in values)
-    mixed_chunk_classes = all(
-        any(char.isdigit() for char in value)
-        and any(char.isupper() or char in "+/" for char in value)
-        for value in values
-    )
-    if not (
-        len(set(run_value)) >= 20
-        and has_lower
-        and (
-            (has_upper and has_digit_or_special)
-            or mixed_chunk_classes
-        )
-    ):
-        return []
-    if run_end - run_start > 1024:
-        raise SystemExit(
-            "refusing review bundle with an oversized ambiguous markerless-key run"
-        )
-    ranges: list[tuple[int, int]] = []
-    search_start = 0
-    window_evaluations = 0
-    scanned_characters = 0
-    while search_start < len(values):
-        detected: tuple[int, int] | None = None
-        for candidate_start in range(search_start, len(values)):
-            counts: dict[str, int] = {}
-            encoded_length = 0
-            mixed_chunk_failures = 0
-            detected_end: int | None = None
-            for candidate_end in range(candidate_start, len(values)):
-                value = values[candidate_end]
-                normalized_value = value.rstrip("=")
-                window_evaluations += 1
-                scanned_characters += len(normalized_value)
-                if window_evaluations > 65_536 or scanned_characters > 1_000_000:
-                    raise SystemExit(
-                        "refusing review bundle with an oversized ambiguous markerless-key run"
-                    )
-                encoded_length += len(normalized_value)
-                for char in normalized_value:
-                    counts[char] = counts.get(char, 0) + 1
-                if not (
-                    any(char.isdigit() for char in value)
-                    and any(char.isupper() or char in "+/" for char in value)
-                ):
-                    mixed_chunk_failures += 1
-                if markerless_private_key_window_likely(
-                    values,
-                    candidate_start,
-                    candidate_end + 1,
-                    counts,
-                    encoded_length,
-                    mixed_chunk_failures,
-                ):
-                    # Bare identifiers are also valid Base64 chunks. Keep the
-                    # maximal qualifying window so key tails cannot leak.
-                    detected_end = candidate_end + 1
-            if detected_end is not None:
-                detected = (candidate_start, detected_end)
-                break
-        if detected is None:
-            break
-        detected_start, detected_end = detected
-        ranges.append((run_start + detected_start, run_start + detected_end))
-        search_start = detected_end
-    return ranges
-
-
-def markerless_private_key_spans_by_line(
-    text: str,
-) -> list[list[tuple[int, int]]]:
-    lines = text.split("\n")
-    spans_by_line = [markerless_private_key_body_spans(line) for line in lines]
-    run_start: int | None = None
-    for index in range(len(lines) + 1):
-        matches = (
-            list(PRIVATE_KEY_BODY_PATTERN.finditer(lines[index]))
-            if index < len(lines)
-            else []
-        )
-        # Callers pass reconstructed file content; unified-diff prefixes are
-        # already removed, so a plus here is an actual source-level wrapper.
-        wrapper_text = (
-            private_key_body_wrapper_text(lines[index], matches)
-            if matches
-            else ""
-        )
-        explicit_multi_value_wrapper = len(matches) == 1 or any(
-            marker in wrapper_text
-            for marker in ('"', "'", "`", "+", ",", "[", "]", "#", "//", "/*", "*")
-        )
-        candidate = (
-            bool(matches)
-            and explicit_multi_value_wrapper
-            and private_key_body_wrapper_only(lines[index], matches)
-        )
-        if candidate:
-            if run_start is None:
-                run_start = index
-            continue
-        if run_start is None:
-            continue
-        for detected_start, detected_end in markerless_private_key_run_ranges(
-            lines,
-            run_start,
-            index,
-        ):
-            for block_index in range(detected_start, detected_end):
-                spans_by_line[block_index] = sorted(
-                    set(spans_by_line[block_index])
-                    | {
-                        match.span()
-                        for match in PRIVATE_KEY_BODY_PATTERN.finditer(
-                            lines[block_index]
-                        )
-                    }
-                )
-        run_start = None
-    return spans_by_line
 
 
 def pem_line_body_spans(
@@ -6373,34 +6175,17 @@ def pem_line_body_spans(
     return spans, in_pem
 
 
-def private_key_body_fragments(
-    text: str,
-    *,
-    repeatable: bool = False,
-) -> set[str]:
+def private_key_body_fragments(text: str) -> set[str]:
+    # Do not join short markerless chunks across lines. Without PEM boundaries,
+    # code and data are indistinguishable; explicit markers or long tokens redact.
     fragments: set[str] = set()
     in_private_key = False
-    lines = text.split("\n")
-    markerless_spans = markerless_private_key_spans_by_line(text)
-    for line_index, line in enumerate(lines):
+    for line in text.split("\n"):
         spans, in_private_key = pem_line_body_spans(line, in_private_key)
-        line_spans = set(spans) | set(markerless_spans[line_index])
-        contexts = string_contexts_at(line, {start for start, _end in line_spans})
-        has_quoted_fragment = any(
-            contexts[start] is not None
-            for start, _end in line_spans
-        )
         fragments.update(
             fragment
-            for start, end in line_spans
+            for start, end in spans
             if (fragment := normalized_private_key_fragment(line, start, end))
-            and not (
-                repeatable
-                and has_quoted_fragment
-                and contexts[start] is None
-                and not likely_private_key_token(fragment)
-                and re.fullmatch(r"[a-z_][a-z0-9_]*", fragment.casefold()) is not None
-            )
         )
     if in_private_key:
         raise SystemExit("refusing review bundle with an unterminated private-key block")
@@ -6558,11 +6343,17 @@ def review_hunk_header_secret_fragments(
             segment = header_section[begin.end() : segment_end]
             for start, end in private_key_token_spans(segment):
                 fragment = normalized_private_key_fragment(segment, start, end)
-                if fragment and repeatable_private_key_fragment(fragment):
+                if (
+                    fragment
+                    and fragment.casefold() not in SECRET_PLACEHOLDER_VALUES
+                ):
                     fragments.add(fragment)
         for start, end in markerless_private_key_body_spans(header_section):
             fragment = normalized_private_key_fragment(header_section, start, end)
-            if fragment and repeatable_private_key_fragment(fragment):
+            if (
+                fragment
+                and fragment.casefold() not in SECRET_PLACEHOLDER_VALUES
+            ):
                 fragments.add(fragment)
         for dialect in dialects:
             if not secret_text_risk(
@@ -6599,16 +6390,6 @@ def redact_secret_like_diff_section(
     )
     secret_fragments = set(known_secret_fragments or ())
     old_content, new_content = unified_diff_contents(section)
-    secret_fragments.update(
-        fragment
-        for fragment in private_key_body_fragments(old_content, repeatable=True)
-        if repeatable_private_key_fragment(fragment)
-    )
-    secret_fragments.update(
-        fragment
-        for fragment in private_key_body_fragments(new_content, repeatable=True)
-        if repeatable_private_key_fragment(fragment)
-    )
     old_risk = secret_text_risk(old_content, javascript_dialect=old_dialect)
     new_risk = secret_text_risk(new_content, javascript_dialect=new_dialect)
     for content, dialect, risk in (
@@ -6656,28 +6437,7 @@ def redact_secret_like_diff_section(
         assert prefix_match is not None
         prefix_columns = len(prefix_match.group(1)) - 1
         redacted.append(line)
-        hunk_lines = lines[index + 1 : hunk_end]
-        old_hunk_content: list[str] = []
-        new_hunk_content: list[str] = []
-        for content_line in hunk_lines:
-            body = content_line.rstrip("\r\n")
-            prefix = body[:prefix_columns]
-            if len(prefix) != prefix_columns or not set(prefix) <= {"+", "-", " "}:
-                continue
-            content = body[prefix_columns:]
-            if set(prefix) == {" "} or "-" in prefix:
-                old_hunk_content.append(content)
-            if set(prefix) == {" "} or "+" in prefix:
-                new_hunk_content.append(content)
-        old_markerless_spans = markerless_private_key_spans_by_line(
-            "\n".join(old_hunk_content)
-        )
-        new_markerless_spans = markerless_private_key_spans_by_line(
-            "\n".join(new_hunk_content)
-        )
-        old_hunk_index = 0
-        new_hunk_index = 0
-        for content_line in hunk_lines:
+        for content_line in lines[index + 1 : hunk_end]:
             body = content_line.rstrip("\r\n")
             ending = content_line[len(body) :]
             prefix = body[:prefix_columns]
@@ -6708,13 +6468,9 @@ def redact_secret_like_diff_section(
             spans.extend(repeated_secret_fragment_spans(content, fragment_pattern))
             spans.extend(match.span() for match in PRIVATE_KEY_END_PATTERN.finditer(content))
             if old_line:
-                spans.extend(old_markerless_spans[old_hunk_index])
-                old_hunk_index += 1
                 old_spans, old_pem = pem_line_body_spans(content, old_pem)
                 spans.extend(old_spans)
             if new_line:
-                spans.extend(new_markerless_spans[new_hunk_index])
-                new_hunk_index += 1
                 new_spans, new_pem = pem_line_body_spans(content, new_pem)
                 spans.extend(new_spans)
             redacted_content = redact_review_spans(content, spans)

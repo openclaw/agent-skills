@@ -62,10 +62,6 @@ def realistic_secret_value() -> str:
     return "A7f9K2m4Q8v6" + "N3x5R1p0T9z8"
 
 
-def markerless_private_key_fixture() -> str:
-    return "MIIE" + "vQIB" + "ADAN" + "Bgkq" + "hkiG" + "9w0B" + "AQEF" + "AASC" + "1234" + "5678" + "90ab" + "cdef"
-
-
 class AutoreviewHardeningTests(unittest.TestCase):
     def setUp(self) -> None:
         self.helper = load_helper()
@@ -4019,9 +4015,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertIn('+const fixture = "redacted";', redacted_patch)
         self.assertIn('+log("redacted");', redacted_patch)
 
-    def test_review_patch_redacts_markerless_private_key_in_short_lines(self) -> None:
-        body = markerless_private_key_fixture()
-        chunks = [body[index : index + 4] for index in range(0, len(body), 4)]
+    def test_review_patch_preserves_ambiguous_short_markerless_lines(self) -> None:
+        chunks = ["AB12", "CDef", "GH34", "ijKL", "MN56", "opQR"]
         patch = (
             "diff --git a/fixture.txt b/fixture.txt\n"
             "--- a/fixture.txt\n"
@@ -4036,321 +4031,22 @@ class AutoreviewHardeningTests(unittest.TestCase):
             patch,
         )
 
-        self.assertEqual(redacted_patch.count("+redacted\n"), len(chunks))
-        self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
+        self.assertEqual(redacted_patch, patch)
 
-    def test_review_patch_redacts_padding_only_markerless_key_signal(self) -> None:
-        body = (
-            "ABCDEFGHIJKLMNOP"
-            + "QRSTUVWXYZabcdef"
-            + "ghijklmnopqrstuv="
+    def test_review_patch_redacts_long_key_with_source_wrappers(self) -> None:
+        body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC1234567890abcdef"
+        cases = (
+            (f"+/* {body} */\n", "+/* redacted */\n"),
+            (f"+{body}\\\n", "+redacted\\\n"),
         )
-        patch = (
-            "diff --git a/fixture.txt b/fixture.txt\n"
-            "--- a/fixture.txt\n"
-            "+++ b/fixture.txt\n"
-            "@@ -0,0 +1,1 @@\n"
-            + f"+{body}\n"
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            "local unstaged diff",
-            ["fixture.txt"],
-            patch,
-        )
-
-        self.assertNotIn(body, redacted_patch)
-        self.assertIn("+redacted\n", redacted_patch)
-
-    def test_review_patch_redacts_lowercase_special_mixed_chunks(self) -> None:
-        chunks = [
-            "ab1+",
-            "cd2/",
-            "ef3+",
-            "gh4/",
-            "ij5+",
-            "kl6/",
-            "mn7+",
-            "op8/",
-            "qr9+",
-            "st0/",
-        ]
-        patch = (
-            "diff --git a/fixture.txt b/fixture.txt\n"
-            "--- a/fixture.txt\n"
-            "+++ b/fixture.txt\n"
-            f"@@ -0,0 +1,{len(chunks)} @@\n"
-            + "".join(f"+{chunk}\n" for chunk in chunks)
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            "local unstaged diff",
-            ["fixture.txt"],
-            patch,
-        )
-
-        self.assertEqual(redacted_patch.count("+redacted\n"), len(chunks))
-        self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
-
-    def test_review_patch_redacts_continued_markerless_private_key_lines(self) -> None:
-        body = markerless_private_key_fixture()
-        chunks = [body[index : index + 4] for index in range(0, len(body), 4)]
-        patch = (
-            "diff --git a/fixture.py b/fixture.py\n"
-            "--- a/fixture.py\n"
-            "+++ b/fixture.py\n"
-            f"@@ -0,0 +1,{len(chunks)} @@\n"
-            + "".join(f"+{chunk}\\\n" for chunk in chunks[:-1])
-            + f"+{chunks[-1]}\n"
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            "local unstaged diff",
-            ["fixture.py"],
-            patch,
-        )
-
-        self.assertEqual(redacted_patch.count("+redacted\\\n"), len(chunks) - 1)
-        self.assertIn("+redacted\n", redacted_patch)
-        self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
-
-    def test_review_patch_redacts_commented_markerless_private_key_lines(self) -> None:
-        body = markerless_private_key_fixture()
-        chunks = [body[index : index + 4] for index in range(0, len(body), 4)]
-        patch = (
-            "diff --git a/fixture.txt b/fixture.txt\n"
-            "--- a/fixture.txt\n"
-            "+++ b/fixture.txt\n"
-            f"@@ -0,0 +1,{len(chunks)} @@\n"
-            + "".join(f"+# {chunk}\n" for chunk in chunks)
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            "local unstaged diff",
-            ["fixture.txt"],
-            patch,
-        )
-
-        self.assertEqual(redacted_patch.count("+# redacted\n"), len(chunks))
-        self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
-
-    def test_review_patch_redacts_block_commented_markerless_key(self) -> None:
-        body = markerless_private_key_fixture()
-        chunks = [body[index : index + 4] for index in range(0, len(body), 4)]
-        key_lines = [f"+/* {chunks[0]}\n"]
-        key_lines.extend(f"+ * {chunk}\n" for chunk in chunks[1:-1])
-        key_lines.append(f"+ * {chunks[-1]} */\n")
-        patch = (
-            "diff --git a/fixture.txt b/fixture.txt\n"
-            "--- a/fixture.txt\n"
-            "+++ b/fixture.txt\n"
-            f"@@ -0,0 +1,{len(chunks)} @@\n"
-            + "".join(key_lines)
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            "local unstaged diff",
-            ["fixture.txt"],
-            patch,
-        )
-
-        self.assertIn("+/* redacted\n", redacted_patch)
-        self.assertIn("+ * redacted */\n", redacted_patch)
-        self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
-
-    def test_review_patch_redacts_multiple_key_fragments_per_line(self) -> None:
-        body = markerless_private_key_fixture()
-        chunks = [body[index : index + 4] for index in range(0, len(body), 4)]
-        pairs = list(zip(chunks[::2], chunks[1::2]))
-        patch = (
-            "diff --git a/fixture.txt b/fixture.txt\n"
-            "--- a/fixture.txt\n"
-            "+++ b/fixture.txt\n"
-            f"@@ -0,0 +1,{len(pairs)} @@\n"
-            + "".join(f'+"{left}" + "{right}"\n' for left, right in pairs)
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            "local unstaged diff",
-            ["fixture.txt"],
-            patch,
-        )
-
-        self.assertEqual(redacted_patch.count("redacted"), len(chunks))
-        self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
-
-    def test_review_patch_does_not_propagate_wrapper_keyword_as_secret(self) -> None:
-        body = markerless_private_key_fixture()
-        chunks = [body[index : index + 4] for index in range(0, len(body), 4)]
-        for wrapper in ("return", "RETURN", "ReturnValue"):
-            with self.subTest(wrapper=wrapper):
-                patch = (
-                    "diff --git a/fixture.py b/fixture.py\n"
-                    "--- a/fixture.py\n"
-                    "+++ b/fixture.py\n"
-                    "@@ -0,0 +1,2 @@\n"
-                    + f'+{wrapper} "'
-                    + '" + "'.join(chunks)
-                    + '"\n'
-                    + f"+{wrapper} ordinary_value\n"
-                )
-
-                redacted_patch = self.helper["validate_review_patch"](
-                    "local unstaged diff",
-                    ["fixture.py"],
-                    patch,
-                )
-
-                self.assertIn(f"+{wrapper} ordinary_value\n", redacted_patch)
-                self.assertEqual(redacted_patch.count("redacted"), len(chunks) + 1)
-                self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
-
-    def test_review_patch_keeps_unquoted_key_beside_quoted_decoy(self) -> None:
-        body = markerless_private_key_fixture()
-        patch = (
-            "diff --git a/fixture.txt b/fixture.txt\n"
-            "--- a/fixture.txt\n"
-            "+++ b/fixture.txt\n"
-            "@@ -0,0 +1,1 @@\n"
-            + f'+{body} "note"\n'
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            "local unstaged diff",
-            ["fixture.txt"],
-            patch,
-        )
-
-        self.assertNotIn(body, redacted_patch)
-        self.assertIn('+redacted "redacted"\n', redacted_patch)
-
-    def test_review_patch_finds_key_after_adjacent_token_only_line(self) -> None:
-        prefix = "A" * 128
-        body = markerless_private_key_fixture()
-        chunks = [body[index : index + 4] for index in range(0, len(body), 4)]
-        patch = (
-            "diff --git a/fixture.txt b/fixture.txt\n"
-            "--- a/fixture.txt\n"
-            "+++ b/fixture.txt\n"
-            f"@@ -0,0 +1,{len(chunks) + 1} @@\n"
-            f"+{prefix}\n"
-            + "".join(f"+{chunk}\n" for chunk in chunks)
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            "local unstaged diff",
-            ["fixture.txt"],
-            patch,
-        )
-
-        self.assertIn(f"+{prefix}\n", redacted_patch)
-        self.assertEqual(redacted_patch.count("+redacted\n"), len(chunks))
-        self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
-
-    def test_review_patch_finds_key_before_adjacent_token_only_line(self) -> None:
-        suffix = "A" * 128
-        body = markerless_private_key_fixture()
-        chunks = [body[index : index + 4] for index in range(0, len(body), 4)]
-        patch = (
-            "diff --git a/fixture.txt b/fixture.txt\n"
-            "--- a/fixture.txt\n"
-            "+++ b/fixture.txt\n"
-            f"@@ -0,0 +1,{len(chunks) + 1} @@\n"
-            + "".join(f"+{chunk}\n" for chunk in chunks)
-            + f"+{suffix}\n"
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            "local unstaged diff",
-            ["fixture.txt"],
-            patch,
-        )
-
-        self.assertIn(f"+{suffix}\n", redacted_patch)
-        self.assertEqual(redacted_patch.count("+redacted\n"), len(chunks))
-        self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
-
-    def test_review_patch_scans_complete_markerless_key_run(self) -> None:
-        chunks = ["AAAA"] * 129
-        chunks.extend(
-            markerless_private_key_fixture()[index : index + 4]
-            for _ in range(40)
-            for index in range(0, len(markerless_private_key_fixture()), 4)
-        )
-        patch = (
-            "diff --git a/fixture.txt b/fixture.txt\n"
-            "--- a/fixture.txt\n"
-            "+++ b/fixture.txt\n"
-            f"@@ -0,0 +1,{len(chunks)} @@\n"
-            + "".join(f"+{chunk}\n" for chunk in chunks)
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            "local unstaged diff",
-            ["fixture.txt"],
-            patch,
-        )
-
-        self.assertEqual(redacted_patch.count("+redacted\n"), len(chunks))
-
-    def test_review_patch_preserves_split_short_chunk_fallback(self) -> None:
-        chunks = [
-            "AB" + "12",
-            "CD" + "ef" + "34" + "56",
-            "GH" + "ij" + "78" + "90",
-            "KL" + "mn" + "12" + "34",
-            "OP" + "qr" + "56" + "78",
-        ]
-        patch = (
-            "diff --git a/fixture.txt b/fixture.txt\n"
-            "--- a/fixture.txt\n"
-            "+++ b/fixture.txt\n"
-            f"@@ -0,0 +1,{len(chunks)} @@\n"
-            + "".join(f"+{chunk}\n" for chunk in chunks)
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            "local unstaged diff",
-            ["fixture.txt"],
-            patch,
-        )
-
-        self.assertEqual(redacted_patch.count("+redacted\n"), len(chunks))
-        self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
-
-    def test_review_patch_bounds_ambiguous_markerless_key_scan(self) -> None:
-        values = [
-            f"A1{chr(97 + (index // 26) % 26)}{chr(97 + index % 26)}"
-            for index in range(512)
-        ]
-        patch = (
-            "diff --git a/fixture.txt b/fixture.txt\n"
-            "--- a/fixture.txt\n"
-            "+++ b/fixture.txt\n"
-            f"@@ -0,0 +1,{len(values)} @@\n"
-            + "".join(f"+{value}\n" for value in values)
-        )
-
-        with self.assertRaisesRegex(SystemExit, "oversized ambiguous markerless-key run"):
-            self.helper["validate_review_patch"](
-                "local unstaged diff",
-                ["fixture.txt"],
-                patch,
-            )
-
-    def test_review_patch_preserves_ordinary_identifier_run(self) -> None:
-        for values in (
-            ["identifier"] * 1025,
-            ["Identifier1"] * 1025,
-            ["identifier"] * 1024 + ["Identifier1"],
-        ):
-            with self.subTest(value_kinds=len(set(values))):
+        for addition, expected in cases:
+            with self.subTest(addition=addition[-4:]):
                 patch = (
                     "diff --git a/fixture.txt b/fixture.txt\n"
                     "--- a/fixture.txt\n"
                     "+++ b/fixture.txt\n"
-                    f"@@ -0,0 +1,{len(values)} @@\n"
-                    + "".join(f"+{value}\n" for value in values)
+                    "@@ -0,0 +1,1 @@\n"
+                    + addition
                 )
 
                 redacted_patch = self.helper["validate_review_patch"](
@@ -4359,75 +4055,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     patch,
                 )
 
-                self.assertEqual(redacted_patch, patch)
-
-    def test_review_patch_preserves_bare_multi_token_added_lines(self) -> None:
-        values = ["AbC1 AbC1"] * 128
-        patch = (
-            "diff --git a/fixture.txt b/fixture.txt\n"
-            "--- a/fixture.txt\n"
-            "+++ b/fixture.txt\n"
-            f"@@ -0,0 +1,{len(values)} @@\n"
-            + "".join(f"+{value}\n" for value in values)
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            "local unstaged diff",
-            ["fixture.txt"],
-            patch,
-        )
-
-        self.assertEqual(redacted_patch, patch)
-
-    def test_review_patch_keeps_scanning_after_transient_key_miss(self) -> None:
-        chunks = [
-            "AB" + "12",
-            "CD" + "34",
-            "ef" + "G5",
-            "HI" + "67",
-            "jk" + "L8",
-            "mn" + "op",
-            "QR" + "90",
-            "st" + "U1",
-            "VW" + "23",
-            "xy" + "Z4",
-            "AB" + "56",
-            "cd" + "E7",
-        ]
-        patch = (
-            "diff --git a/fixture.txt b/fixture.txt\n"
-            "--- a/fixture.txt\n"
-            "+++ b/fixture.txt\n"
-            f"@@ -0,0 +1,{len(chunks)} @@\n"
-            + "".join(f"+{chunk}\n" for chunk in chunks)
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            "local unstaged diff",
-            ["fixture.txt"],
-            patch,
-        )
-
-        self.assertEqual(redacted_patch.count("+redacted\n"), len(chunks))
-        self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
-
-    def test_review_patch_preserves_ordinary_short_identifier_lines(self) -> None:
-        values = ["name", "host", "port", "mode", "path", "kind"]
-        patch = (
-            "diff --git a/fixture.txt b/fixture.txt\n"
-            "--- a/fixture.txt\n"
-            "+++ b/fixture.txt\n"
-            f"@@ -0,0 +1,{len(values)} @@\n"
-            + "".join(f"+{value}\n" for value in values)
-        )
-
-        redacted_patch = self.helper["validate_review_patch"](
-            "local unstaged diff",
-            ["fixture.txt"],
-            patch,
-        )
-
-        self.assertEqual(redacted_patch, patch)
+                self.assertNotIn(body, redacted_patch)
+                self.assertIn(expected, redacted_patch)
 
     def test_review_patch_preserves_long_non_pem_identifier_lines(self) -> None:
         identifier = "runDangerousOperationWithLongIdentifier"
