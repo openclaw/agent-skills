@@ -5511,10 +5511,7 @@ def require_no_known_secret_fragments(
 
 
 def repeatable_private_key_fragment(fragment: str) -> bool:
-    return (
-        fragment.casefold() not in SECRET_PLACEHOLDER_VALUES
-        and re.fullmatch(r"[a-z_][a-z0-9_]*", fragment) is None
-    )
+    return fragment.casefold() not in SECRET_PLACEHOLDER_VALUES
 
 
 def review_secret_fragments(
@@ -5524,7 +5521,7 @@ def review_secret_fragments(
 ) -> set[str]:
     private_fragments = {
         fragment
-        for fragment in private_key_body_fragments(text)
+        for fragment in private_key_body_fragments(text, repeatable=True)
         if repeatable_private_key_fragment(fragment)
     }
     fragments = {
@@ -6364,17 +6361,34 @@ def pem_line_body_spans(
     return spans, in_pem
 
 
-def private_key_body_fragments(text: str) -> set[str]:
+def private_key_body_fragments(
+    text: str,
+    *,
+    repeatable: bool = False,
+) -> set[str]:
     fragments: set[str] = set()
     in_private_key = False
     lines = text.split("\n")
     markerless_spans = markerless_private_key_spans_by_line(text)
     for line_index, line in enumerate(lines):
         spans, in_private_key = pem_line_body_spans(line, in_private_key)
+        line_spans = set(spans) | set(markerless_spans[line_index])
+        contexts = string_contexts_at(line, {start for start, _end in line_spans})
+        has_quoted_fragment = any(
+            contexts[start] is not None
+            for start, _end in line_spans
+        )
         fragments.update(
             fragment
-            for start, end in set(spans) | set(markerless_spans[line_index])
+            for start, end in line_spans
             if (fragment := normalized_private_key_fragment(line, start, end))
+            and not (
+                repeatable
+                and has_quoted_fragment
+                and contexts[start] is None
+                and not likely_private_key_token(fragment)
+                and re.fullmatch(r"[a-z_][a-z0-9_]*", fragment.casefold()) is not None
+            )
         )
     if in_private_key:
         raise SystemExit("refusing review bundle with an unterminated private-key block")
@@ -6575,12 +6589,12 @@ def redact_secret_like_diff_section(
     old_content, new_content = unified_diff_contents(section)
     secret_fragments.update(
         fragment
-        for fragment in private_key_body_fragments(old_content)
+        for fragment in private_key_body_fragments(old_content, repeatable=True)
         if repeatable_private_key_fragment(fragment)
     )
     secret_fragments.update(
         fragment
-        for fragment in private_key_body_fragments(new_content)
+        for fragment in private_key_body_fragments(new_content, repeatable=True)
         if repeatable_private_key_fragment(fragment)
     )
     old_risk = secret_text_risk(old_content, javascript_dialect=old_dialect)

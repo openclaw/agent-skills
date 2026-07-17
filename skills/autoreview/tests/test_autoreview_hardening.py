@@ -4129,26 +4129,28 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_review_patch_does_not_propagate_wrapper_keyword_as_secret(self) -> None:
         body = markerless_private_key_fixture()
         chunks = [body[index : index + 4] for index in range(0, len(body), 4)]
-        patch = (
-            "diff --git a/fixture.py b/fixture.py\n"
-            "--- a/fixture.py\n"
-            "+++ b/fixture.py\n"
-            "@@ -0,0 +1,2 @@\n"
-            + '+return "'
-            + '" + "'.join(chunks)
-            + '"\n'
-            + "+return ordinary_value\n"
-        )
+        for wrapper in ("return", "RETURN", "ReturnValue"):
+            with self.subTest(wrapper=wrapper):
+                patch = (
+                    "diff --git a/fixture.py b/fixture.py\n"
+                    "--- a/fixture.py\n"
+                    "+++ b/fixture.py\n"
+                    "@@ -0,0 +1,2 @@\n"
+                    + f'+{wrapper} "'
+                    + '" + "'.join(chunks)
+                    + '"\n'
+                    + f"+{wrapper} ordinary_value\n"
+                )
 
-        redacted_patch = self.helper["validate_review_patch"](
-            "local unstaged diff",
-            ["fixture.py"],
-            patch,
-        )
+                redacted_patch = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["fixture.py"],
+                    patch,
+                )
 
-        self.assertIn("+return ordinary_value\n", redacted_patch)
-        self.assertEqual(redacted_patch.count("redacted"), len(chunks) + 1)
-        self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
+                self.assertIn(f"+{wrapper} ordinary_value\n", redacted_patch)
+                self.assertEqual(redacted_patch.count("redacted"), len(chunks) + 1)
+                self.assertTrue(all(chunk not in redacted_patch for chunk in chunks))
 
     def test_review_patch_keeps_unquoted_key_beside_quoted_decoy(self) -> None:
         body = markerless_private_key_fixture()
