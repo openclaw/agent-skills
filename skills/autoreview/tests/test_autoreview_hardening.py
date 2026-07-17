@@ -21,6 +21,8 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "autoreview"
+PRIVATE_KEY_BEGIN_TEXT = "BEGIN " + "PRIVATE KEY"
+RSA_PRIVATE_KEY_BEGIN_TEXT = "BEGIN RSA " + "PRIVATE KEY"
 
 
 def load_helper() -> dict[str, object]:
@@ -3199,7 +3201,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
         )
 
         self.assertIn('const key = ["redacted",', redacted)
-        self.assertNotIn("BEGIN PRIVATE KEY", redacted)
+        self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
         self.assertNotIn("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC1234567890", redacted)
         self.assertIn("+const timeout = 30_000;", redacted)
 
@@ -3224,20 +3226,22 @@ class AutoreviewHardeningTests(unittest.TestCase):
             patch,
         )
 
-        self.assertNotIn("BEGIN PRIVATE KEY", redacted)
+        self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
         self.assertNotIn("MIIEowIBAAKCAQEArEmoved0123456789ABCDEF", redacted)
         self.assertNotIn("MIIEowIBAAKCAQEAdDed0123456789ABCDEF", redacted)
 
     def test_review_patch_redacts_markerless_tokens_beside_pem_markers(self) -> None:
         before = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCbefore1234567890ABCDE"
         after = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCafter0987654321FGHIJ"
+        private_key_begin = "-----BEGIN " + "PRIVATE KEY-----"
+        private_key_end = "-----END " + "PRIVATE KEY-----"
         patch = (
             "diff --git a/fixture.test.ts b/fixture.test.ts\n"
             "--- a/fixture.test.ts\n"
             "+++ b/fixture.test.ts\n"
             "@@ -1 +1 @@\n"
-            f'+const keys = ["{before}", "-----BEGIN PRIVATE KEY-----", '
-            '"AB12cd34EF56", "-----END PRIVATE KEY-----", '
+            f'+const keys = ["{before}", "{private_key_begin}", '
+            f'"AB12cd34EF56", "{private_key_end}", '
             f'"{after}"];\n'
         )
 
@@ -3250,7 +3254,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertNotIn(before, redacted)
         self.assertNotIn(after, redacted)
         self.assertNotIn("AB12cd34EF56", redacted)
-        self.assertNotIn("BEGIN PRIVATE KEY", redacted)
+        self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
 
     def test_review_patch_fails_closed_after_added_unmatched_private_key_begin(self) -> None:
         patch = (
@@ -3294,7 +3298,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             patch,
         )
 
-        self.assertNotIn("BEGIN PRIVATE KEY", redacted)
+        self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
         self.assertNotIn("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC1234567890", redacted)
         self.assertIn("+expect(socket.closed).toBe(true);", redacted)
         self.assertIn("+runDangerousOperation();", redacted)
@@ -3350,8 +3354,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             patch,
         )
 
-        self.assertNotIn("BEGIN PRIVATE KEY", redacted)
-        self.assertNotIn("BEGIN RSA PRIVATE KEY", redacted)
+        self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
+        self.assertNotIn(RSA_PRIVATE_KEY_BEGIN_TEXT, redacted)
         self.assertNotIn("AB12cd34EF56", redacted)
         self.assertIn('const label = "visible";', redacted)
         self.assertIn("+const timeout = 30_000;", redacted)
@@ -4450,7 +4454,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
         )
 
         self.assertNotIn(body, redacted_patch)
-        self.assertNotIn("BEGIN PRIVATE KEY", redacted_patch)
+        self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted_patch)
         self.assertIn('+log("redacted");', redacted_patch)
 
     def test_review_patch_redacts_escaped_alphabetic_explicit_pem_body(self) -> None:
