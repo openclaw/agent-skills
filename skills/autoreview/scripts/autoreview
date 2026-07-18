@@ -334,6 +334,7 @@ class ReviewChunk(NamedTuple):
     content: str
     context: str = ""
 SECRET_PLACEHOLDER_VALUES = {
+    "__openclaw_redacted__",
     "changeme",
     "decoy-token",
     "dummy",

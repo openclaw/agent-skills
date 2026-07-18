@@ -3275,6 +3275,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertTrue(self.helper["secret_text_risk"](content))
 
+    def test_secret_detector_allows_openclaw_redaction_sentinel(self) -> None:
+        self.assertFalse(
+            self.helper["secret_text_risk"]('token: "__OPENCLAW_REDACTED__"')
+        )
+
     def test_normalized_secret_scan_does_not_cross_hunks(self) -> None:
         patch = (
             "@@ -1 +1 @@\n"
