@@ -21,6 +21,7 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "autoreview"
+FIXTURES = Path(__file__).with_name("fixtures")
 PRIVATE_KEY_BEGIN_TEXT = "BEGIN " + "PRIVATE KEY"
 RSA_PRIVATE_KEY_BEGIN_TEXT = "BEGIN RSA " + "PRIVATE KEY"
 
@@ -2311,6 +2312,116 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 javascript_dialect="typescript",
             )
         )
+
+    def test_secret_detector_allows_typescript_credential_plumbing_fixture(self) -> None:
+        source = (FIXTURES / "typescript-benign-references.ts").read_text(
+            encoding="utf-8"
+        )
+
+        fragments = self.helper["review_secret_fragments"](
+            source,
+            javascript_dialect="typescript",
+        )
+        self.assertNotIn("filePassword", fragments)
+        self.assertNotIn("passwordResolution.password", fragments)
+        self.assertNotIn("tokenResolution.token", fragments)
+        self.assertNotIn("CredentialUnavailableDiagnostic", fragments)
+        patch = (
+            "diff --git a/src/credential-plumbing.ts b/src/credential-plumbing.ts\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/src/credential-plumbing.ts\n"
+            f"@@ -0,0 +1,{len(source.splitlines())} @@\n"
+            + "".join(f"+{line}\n" for line in source.splitlines())
+        )
+        validated = self.helper["validate_review_patch"](
+            "typescript credential plumbing fixture",
+            ["src/credential-plumbing.ts"],
+            patch,
+        )
+        for reference in (
+            "filePassword",
+            "passwordResolution.password",
+            "tokenResolution.token",
+            "CredentialUnavailableDiagnostic",
+            "tokenRef",
+            "keyRef",
+        ):
+            self.assertIn(reference, validated)
+
+        token_term = "To" + "ken"
+        truncated_call_patch = (
+            "diff --git a/src/token.ts b/src/token.ts\n"
+            "--- a/src/token.ts\n"
+            "+++ b/src/token.ts\n"
+            "@@ -40,3 +40,4 @@ function resolveAccountToken() {\n"
+            f"+  const account{token_term} = resolveRuntime{token_term}Value({{\n"
+            "+    value: accountConfig.token,\n"
+            "@@ -70,3 +71,4 @@ function resolveConfigToken() {\n"
+            f"+  const config{token_term} = resolveRuntime{token_term}Value({{\n"
+            "+    value: merged.token,\n"
+        )
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "typescript truncated credential calls fixture",
+                ["src/token.ts"],
+                truncated_call_patch,
+            ),
+            truncated_call_patch,
+        )
+
+    def test_secret_detector_rejects_sensitive_literal_fixture_corpus(self) -> None:
+        source = (FIXTURES / "typescript-sensitive-literals.ts").read_text(
+            encoding="utf-8"
+        )
+        corpus = [line for line in source.splitlines() if line.strip()]
+
+        self.assertGreaterEqual(len(corpus), 7)
+        for literal_assignment in corpus:
+            with self.subTest(literal_assignment=literal_assignment):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        literal_assignment,
+                        javascript_dialect="typescript",
+                    )
+                )
+        truncated_literal = (
+            "const incompleteToken = resolveToken({ value: \""
+            + realistic_secret_value()
+            + "\";"
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                truncated_literal,
+                javascript_dialect="typescript",
+            )
+        )
+        truncated_short_literal = (
+            "const incompleteToken = resolveToken({ value: \""
+            + "short"
+            + "pwd"
+            + "\";"
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                truncated_short_literal,
+                javascript_dialect="typescript",
+            )
+        )
+
+    def test_known_secret_fragment_scan_handles_many_javascript_regexes(self) -> None:
+        fragment = "password file"
+        regex_count = 2_000
+        source = ";".join(f"/{fragment} {index}/" for index in range(regex_count))
+        pattern = self.helper["known_secret_fragment_pattern"]([fragment])
+
+        spans = self.helper["repeated_secret_fragment_spans"](
+            source,
+            pattern,
+            javascript_dialect="typescript",
+        )
+
+        self.assertEqual(len(spans), regex_count)
 
     def test_lifecycle_reference_scan_is_bounded_for_non_matching_identifier(self) -> None:
         source = "const value = resolved" + "A" * 100_000 + "X;"

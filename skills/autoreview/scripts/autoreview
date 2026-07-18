@@ -450,7 +450,10 @@ CSHARP_METHOD_PREFIX_PATTERN = (
 )
 CSHARP_EVIDENCE_WINDOW = 8192
 SOURCE_CODE_REFERENCE_ROOT_VALUES = {
+    "accountConfig",
     "attemptAuthProfileStore",
+    "baseConfig",
+    "merged",
 }
 SOURCE_CODE_REFERENCE_ROOT_PATTERN = re.compile(
     r"(?<![A-Za-z0-9_$?.])(?:"
@@ -533,13 +536,26 @@ SOURCE_CODE_REFERENCE_PATTERN = re.compile(
         for value in sorted(SOURCE_CODE_REFERENCE_VALUES, key=len, reverse=True)
     ) + r")(?![A-Za-z0-9_$])"
 )
+SOURCE_CODE_SECRET_REFERENCE_TERM_PATTERN = (
+    r"(?:apiKey|ApiKey|key|Key|credential|Credential|credentials|Credentials"
+    r"|password|Password|secret|Secret|token|Token)"
+)
+SOURCE_CODE_SECRET_REFERENCE_SUFFIX_PATTERN = (
+    r"(?:Diagnostics?|File|Info|Reference|Ref|Resolution|Result)"
+)
 SOURCE_CODE_LIFECYCLE_REFERENCE_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9_$?.])"
-    r"(?:(?:cached|current|existing|loaded|previous|resolved|saved|stored|successful)"
-    r"[A-Za-z0-9_$]*"
-    r"(?:ApiKey|Credential|Credentials|Password|Secret|Token)"
-    r"|(?:apiKey|credential|credentials|password|secret|token))(?:Info)?"
-    r"(?:(?:\?\.|\.)[A-Za-z_$][A-Za-z0-9_$]*)*"
+    r"(?<![A-Za-z0-9_$?.])(?:"
+    r"(?:account|base|cached|channel|current|existing|file|inline|loaded|merged"
+    r"|previous|resolved|saved|stored|successful)"
+    r"[A-Za-z0-9_$]{0,64}"
+    rf"{SOURCE_CODE_SECRET_REFERENCE_TERM_PATTERN}"
+    rf"(?:{SOURCE_CODE_SECRET_REFERENCE_SUFFIX_PATTERN})?"
+    r"|[A-Za-z0-9_$]{0,64}"
+    rf"{SOURCE_CODE_SECRET_REFERENCE_TERM_PATTERN}"
+    r"[A-Za-z0-9_$]{0,64}"
+    rf"{SOURCE_CODE_SECRET_REFERENCE_SUFFIX_PATTERN}"
+    rf"|{SOURCE_CODE_SECRET_REFERENCE_TERM_PATTERN}"
+    r")(?:(?:\?\.|\.)[A-Za-z_$][A-Za-z0-9_$]*)*"
     r"(?![A-Za-z0-9_$])"
 )
 DEFAULT_ENGINE_PATHS = ("/usr/local/bin", "/usr/bin", "/bin")
@@ -3885,6 +3901,13 @@ def secret_literal_risk(
                 continue
             if (
                 javascript_dialect is not None
+                and re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*:", value)
+            ):
+                # Object/type property names are syntax, not credential content.
+                # Any literal value after the colon is scanned independently.
+                continue
+            if (
+                javascript_dialect is not None
                 and SOURCE_CODE_REFERENCE_ROOT_PATTERN.fullmatch(value)
             ):
                 continue
@@ -4794,7 +4817,28 @@ def safe_secret_call_suffix(
     def safe_call_end(start: int, target: str) -> int | None:
         cursor = balanced_delimiter_end(text, start, "(", ")")
         if cursor is None:
-            return None
+            if javascript_dialect is None:
+                return None
+            boundary = re.search(r"(?m)^;\r?$", text[start + 1 :])
+            visible_end = (
+                start + 1 + boundary.start()
+                if boundary is not None
+                else len(text)
+            )
+            visible_arguments = text[start + 1 : visible_end]
+            return (
+                None
+                if any(
+                    pattern.search(visible_arguments)
+                    for pattern in SECRET_FALLBACK_LITERAL_PATTERNS
+                )
+                or fallback_secret_risk(
+                    visible_arguments,
+                    minimum_length=12,
+                    javascript_dialect=javascript_dialect,
+                )
+                else visible_end
+            )
         arguments = text[start + 1 : cursor - 1]
         return (
             None
@@ -5804,7 +5848,6 @@ def review_call_literal_spans(
         for literal in candidates
         if len(literal.group("value")) >= 7
         and any(char.isalpha() for char in literal.group("value"))
-        and any(char.isdigit() for char in literal.group("value"))
         and literal.group("value").casefold() not in SECRET_PLACEHOLDER_VALUES
         and not any(
             pattern.fullmatch(literal.group("value"))
@@ -5990,14 +6033,47 @@ def known_secret_fragment_spans(
     return [match.span("fragment") for match in pattern.finditer(text)]
 
 
+def javascript_regex_literal_ranges(text: str) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    while cursor < len(text):
+        end = javascript_regex_literal_end(text, cursor)
+        if end is None:
+            cursor += 1
+            continue
+        ranges.append((cursor, end))
+        cursor = end
+    return ranges
+
+
 def repeated_secret_fragment_spans(
     text: str,
     pattern: re.Pattern[str] | None,
+    *,
+    javascript_dialect: str | None = None,
 ) -> list[tuple[int, int]]:
     matches = known_secret_fragment_spans(text, pattern)
     contexts = string_contexts_at(text, {start for start, _ in matches})
+    regex_ranges = (
+        javascript_regex_literal_ranges(text)
+        if javascript_dialect is not None
+        else []
+    )
+    regex_index = 0
     spans: list[tuple[int, int]] = []
     for start, end in matches:
+        while (
+            regex_index < len(regex_ranges)
+            and regex_ranges[regex_index][1] <= start
+        ):
+            regex_index += 1
+        if (
+            regex_index < len(regex_ranges)
+            and regex_ranges[regex_index][0] <= start
+            and end <= regex_ranges[regex_index][1]
+        ):
+            spans.append((start, end))
+            continue
         token_start = start
         while token_start > 0 and re.match(r"[A-Za-z0-9_$.-]", text[token_start - 1]):
             token_start -= 1
@@ -6692,7 +6768,18 @@ def redact_secret_like_diff_section(
                         javascript_dialect=dialect,
                     )
                 )
-            spans.extend(repeated_secret_fragment_spans(content, fragment_pattern))
+            fragment_dialect = (
+                old_dialect
+                if old_line and old_dialect is not None
+                else new_dialect if new_line else None
+            )
+            spans.extend(
+                repeated_secret_fragment_spans(
+                    content,
+                    fragment_pattern,
+                    javascript_dialect=fragment_dialect,
+                )
+            )
             spans.extend(match.span() for match in PRIVATE_KEY_END_PATTERN.finditer(content))
             if old_line:
                 old_spans, old_pem = pem_line_body_spans(content, old_pem)
