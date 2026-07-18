@@ -3290,6 +3290,100 @@ class AutoreviewHardeningTests(unittest.TestCase):
             )
         )
 
+    def test_typescript_credential_property_scan_does_not_cross_hunks(self) -> None:
+        patch = (
+            "diff --git a/src/runtime-web-tools.ts b/src/runtime-web-tools.ts\n"
+            "--- a/src/runtime-web-tools.ts\n"
+            "+++ b/src/runtime-web-tools.ts\n"
+            "@@ -85,12 +84,9 @@ type RuntimeWebProviderSelectionParams<\n"
+            "     toolConfig: TToolConfig;\n"
+            "   }) => { path: string; value: unknown } | undefined;\n"
+            "   /** Resolves inline/env/SecretRef credentials and reports the winning source. */\n"
+            "-  resolveSecretInput: (params: {\n"
+            "-    providerId: string;\n"
+            "-    value: unknown;\n"
+            "-    path: string;\n"
+            "-    envVars: string[];\n"
+            "-  }) => Promise<SecretResolutionResult<TSource>>;\n"
+            "+  resolveSecretInput: (\n"
+            "+    params: RuntimeWebResolveSecretInputParams,\n"
+            "+  ) => Promise<SecretResolutionResult<TSource>>;\n"
+            "   /** Writes the selected credential into the resolved runtime config snapshot. */\n"
+            "   setResolvedCredential: (params: {\n"
+            "     resolvedConfig: OpenClawConfig;\n"
+            "@@ -418,6 +414,7 @@ function resolveRuntimeWebProviderSelection() {\n"
+            "     let keylessFallbackProvider: TProvider | undefined;\n"
+            " \n"
+            "     for (const provider of candidates) {\n"
+            "+      const contractDigest = resolveProviderContractDigest(provider.id);\n"
+            "       const isKeyless = provider.requiresCredential === false;\n"
+            "       if (isKeyless) {\n"
+            "         if (!params.configuredProvider && !params.allowKeylessAutoSelect) {\n"
+            "@@ -440,6 +437,7 @@ function resolveRuntimeWebProviderSelection() {\n"
+            "         value,\n"
+            "         path,\n"
+            "         envVars: getProviderEnvVars(provider),\n"
+            "+        contractDigest,\n"
+            "       });\n"
+            "       let selectedCandidatePath = path;\n"
+            "       let selectedCandidateResolution = resolution;\n"
+            "@@ -457,6 +455,7 @@ function resolveRuntimeWebProviderSelection() {\n"
+            "             value: fallback.value,\n"
+            "             path: fallback.path,\n"
+            "             envVars: getProviderEnvVars(provider),\n"
+            "+            contractDigest,\n"
+            "           });\n"
+            "         }\n"
+            "       } else if (resolution.source === \"env\" && !resolution.secretRefConfigured) {\n"
+        )
+
+        old_content, new_content = self.helper["unified_diff_contents"](patch)
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                old_content,
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                new_content,
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "typescript credential property diff",
+                ["src/runtime-web-tools.ts"],
+                patch,
+            ),
+            patch,
+        )
+
+    def test_typescript_hunk_scan_still_flags_sensitive_literal_fixture(self) -> None:
+        sensitive_line = next(
+            line
+            for line in (FIXTURES / "typescript-sensitive-literals.ts")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        )
+        patch = (
+            "@@ -1 +1 @@\n"
+            "+const tokenRef: SecretRef | undefined = candidate.tokenRef;\n"
+            "@@ -20 +20 @@\n"
+            f"+{sensitive_line}\n"
+        )
+
+        self.assertTrue(
+            any(
+                self.helper["secret_text_risk"](
+                    content,
+                    javascript_dialect="typescript",
+                )
+                for content in self.helper["unified_diff_contents"](patch)
+            )
+        )
+
     def test_normalized_secret_scan_handles_combined_diff_prefixes(self) -> None:
         value = "Correct-Horse!" + "@Battery$Staple"
         patch = (

@@ -51,6 +51,7 @@ SAFE_GIT_CONFIG_ARGS = (
     "pager.show=cat",
 )
 SAFE_DIFF_FLAGS = ("--no-ext-diff", "--no-textconv", "--no-renames")
+DIFF_HUNK_CONTENT_BOUNDARY = "\0autoreview-diff-hunk-boundary\0"
 ENGINE_GIT_CONFIG_OVERRIDES = (
     ("core.fsmonitor", "false"),
     ("core.pager", "cat"),
@@ -5519,6 +5520,11 @@ def secret_text_risk(
     *,
     javascript_dialect: str | None = None,
 ) -> bool:
+    if DIFF_HUNK_CONTENT_BOUNDARY in text:
+        return any(
+            secret_text_risk(segment, javascript_dialect=javascript_dialect)
+            for segment in text.split(DIFF_HUNK_CONTENT_BOUNDARY)
+        )
     uri_authorities = uri_authority_ranges(text)
     if credentialed_uri_risk(text, uri_authorities) or basic_authorization_risk(text) or any(
         pattern.search(text) for pattern in SECRET_VALUE_PATTERNS
@@ -5783,6 +5789,13 @@ def review_secret_fragments(
     *,
     javascript_dialect: str | None = None,
 ) -> set[str]:
+    if DIFF_HUNK_CONTENT_BOUNDARY in text:
+        return set().union(
+            *(
+                review_secret_fragments(segment, javascript_dialect=javascript_dialect)
+                for segment in text.split(DIFF_HUNK_CONTENT_BOUNDARY)
+            )
+        )
     private_fragments = {
         fragment
         for fragment in private_key_body_fragments(text)
@@ -6667,14 +6680,14 @@ def unified_diff_contents(patch: str) -> tuple[str, str]:
         line = line.removesuffix("\r")
         hunk_header = re.match(r"^(@{2,})", line)
         if hunk_header:
-            old_content.append(";")
-            new_content.append(";")
+            old_content.append(DIFF_HUNK_CONTENT_BOUNDARY)
+            new_content.append(DIFF_HUNK_CONTENT_BOUNDARY)
             in_hunk = True
             prefix_columns = len(hunk_header.group(1)) - 1
             continue
         if line.startswith("diff --"):
-            old_content.append(";")
-            new_content.append(";")
+            old_content.append(DIFF_HUNK_CONTENT_BOUNDARY)
+            new_content.append(DIFF_HUNK_CONTENT_BOUNDARY)
             in_hunk = False
             continue
         prefix = line[:prefix_columns]
