@@ -448,6 +448,33 @@ test("parses Pi/OpenClaw message and tool result entries", () => {
   );
 });
 
+test("keeps Pi/OpenClaw numeric message timestamps", () => {
+  const doc = parse(
+    JSON.stringify({
+      type: "message",
+      id: "m1",
+      message: { role: "assistant", timestamp: 1748165000000, content: [{ type: "text", text: "ok" }] },
+    }),
+  );
+  assert.equal(doc.format, "pi-openclaw");
+  assert.equal(doc.events[0]?.timestamp, "2025-05-25T09:23:20.000Z");
+});
+
+test("drops out-of-range Pi/OpenClaw numeric message timestamps", () => {
+  for (const timestamp of [1e300, Number.NaN, Number.POSITIVE_INFINITY, -8.64e15 - 1]) {
+    const doc = parse(
+      JSON.stringify({
+        type: "message",
+        id: "m1",
+        message: { role: "assistant", timestamp, content: [{ type: "text", text: "ok" }] },
+      }),
+    );
+    assert.equal(doc.format, "pi-openclaw");
+    assert.equal(doc.events.length, 1);
+    assert.equal(doc.events[0]?.timestamp, undefined);
+  }
+});
+
 test("parses Pi/OpenClaw direct image data blocks", () => {
   const doc = parse(
     [
