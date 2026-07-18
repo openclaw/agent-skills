@@ -245,6 +245,18 @@ SECRET_FALLBACK_UNQUOTED_PATTERN = re.compile(
     r"(?P<value>[A-Za-z0-9_./+=:@#$%&*!?-]{4,})"
     r"(?![A-Za-z0-9_./+=:@#$%&*!?-])"
 )
+CONFIG_PATH_SEGMENT_PATTERN = (
+    r"(?:[a-z][A-Za-z0-9]{0,63}|[a-z][a-z0-9]*(?:-[a-z0-9]+)+"
+    r"|\$\{[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\})"
+)
+CANONICAL_CONFIG_PATH_REFERENCE_PATTERN = re.compile(
+    rf"{CONFIG_PATH_SEGMENT_PATTERN}(?:\.{CONFIG_PATH_SEGMENT_PATTERN}){{2,}}"
+    r"\.[a-z][A-Za-z0-9]{0,63}"
+)
+CONFIG_PATH_CREDENTIAL_FIELD_PATTERN = re.compile(
+    r"(?:apiKey|password|Password|secret|Secret|token|Token|credential|Credential"
+    r"|keyRef|KeyRef|privateKey|PrivateKey|serviceAccount)"
+)
 SECRET_VALUE_PATTERNS = [
     PRIVATE_KEY_BEGIN_PATTERN,
     BEARER_CREDENTIAL_PATTERN,
@@ -4577,6 +4589,123 @@ def safe_credential_lookup_argument(
     )
 
 
+def mask_javascript_comments(text: str) -> str:
+    masked = list(text)
+    cursor = 0
+    quote: str | None = None
+    escaped = False
+    while cursor < len(text):
+        char = text[cursor]
+        next_char = text[cursor + 1] if cursor + 1 < len(text) else ""
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            cursor += 1
+            continue
+        regex_end = javascript_regex_literal_end(text, cursor)
+        if regex_end is not None:
+            cursor = regex_end
+            continue
+        if char == "/" and next_char == "/":
+            comment_end = text.find("\n", cursor + 2)
+            comment_end = len(text) if comment_end < 0 else comment_end
+            for index in range(cursor, comment_end):
+                masked[index] = " "
+            cursor = comment_end
+            continue
+        if char == "/" and next_char == "*":
+            comment_end = text.find("*/", cursor + 2)
+            comment_end = len(text) if comment_end < 0 else comment_end + 2
+            for index in range(cursor, comment_end):
+                if masked[index] not in "\r\n":
+                    masked[index] = " "
+            cursor = comment_end
+            continue
+        if char in {'"', "'", "`"}:
+            quote = char
+        cursor += 1
+    return "".join(masked)
+
+
+def safe_javascript_config_path_literal(
+    text: str,
+    literal: re.Match[str],
+    *,
+    call_target: str,
+    context_start: int,
+    context_end: int,
+    argument_index: int,
+    javascript_dialect: str | None = None,
+) -> bool:
+    if javascript_dialect is None:
+        return False
+    value = literal.group("value")
+    if CANONICAL_CONFIG_PATH_REFERENCE_PATTERN.fullmatch(value) is None:
+        return False
+    final_segment = value.rsplit(".", 1)[-1]
+    if CONFIG_PATH_CREDENTIAL_FIELD_PATTERN.search(final_segment) is None:
+        return False
+    normalized_target = call_target.replace("?.", ".").rsplit(".", 1)[-1]
+    secret_file_reader = normalized_target in {
+        "readCredentialFile",
+        "readCredentialFileSync",
+        "readSecretFile",
+        "readSecretFileSync",
+        "tryReadCredentialFile",
+        "tryReadCredentialFileSync",
+        "tryReadSecretFile",
+        "tryReadSecretFileSync",
+    }
+    quote_start = literal.start("value") - 1
+    quote_end = literal.end("value") + 1
+    argument_prefix = mask_javascript_comments(text[context_start:quote_start])
+    property_match = re.search(
+        r"(?:^|[^A-Za-z0-9_$])(?P<key>configPath|path)\s*:\s*$",
+        argument_prefix,
+    )
+    if property_match is not None:
+        return (
+            property_match.group("key") == "configPath" and secret_file_reader
+        ) or (
+            property_match.group("key") == "path"
+            and normalized_target == "normalizeResolvedSecretInputString"
+        )
+    return (
+        secret_file_reader
+        and argument_index == 1
+        and not text[context_start:quote_start].strip()
+        and not text[quote_end:context_end].strip()
+    )
+
+
+def mask_safe_javascript_config_path_literals(
+    argument: str,
+    call_target: str,
+    *,
+    argument_index: int,
+    javascript_dialect: str | None = None,
+) -> str:
+    spans = [
+        literal.span("value")
+        for pattern in SECRET_FALLBACK_LITERAL_PATTERNS
+        for literal in pattern.finditer(argument)
+        if safe_javascript_config_path_literal(
+            argument,
+            literal,
+            call_target=call_target,
+            context_start=0,
+            context_end=len(argument),
+            argument_index=argument_index,
+            javascript_dialect=javascript_dialect,
+        )
+    ]
+    return redact_review_spans(argument, spans)
+
+
 def prompt_service_segment_is_secret_like(segment: str) -> bool:
     suffix = re.search(r"\d{4,}$", segment)
     if suffix is None:
@@ -4727,10 +4856,16 @@ def call_arguments_risk(
             if public_risk:
                 return True
             continue
-        if not safe_credential_lookup_argument(
-            call_target, argument, index
-        ) and fallback_secret_risk(
+        scanned_argument = mask_safe_javascript_config_path_literals(
             argument,
+            call_target,
+            argument_index=index,
+            javascript_dialect=javascript_dialect,
+        )
+        if not safe_credential_lookup_argument(
+            call_target, scanned_argument, index
+        ) and fallback_secret_risk(
+            scanned_argument,
             minimum_length=12,
             javascript_dialect=javascript_dialect,
         ):
@@ -5838,20 +5973,65 @@ def review_call_literal_spans(
         javascript_dialect=javascript_dialect,
     ):
         return []
-    candidates = [
-        literal
-        for pattern in SECRET_FALLBACK_LITERAL_PATTERNS
-        for literal in pattern.finditer(text, call_start + 1, call_end - 1)
-    ]
+    candidates = sorted(
+        (
+            literal
+            for pattern in SECRET_FALLBACK_LITERAL_PATTERNS
+            for literal in pattern.finditer(text, call_start + 1, call_end - 1)
+        ),
+        key=lambda literal: literal.start("value"),
+    )
+    argument_ranges: list[tuple[int, int]] = []
+    argument_start = call_start + 1
+    for argument in split_top_level_call_arguments(
+        text[call_start + 1 : call_end - 1]
+    ):
+        argument_end = argument_start + len(argument)
+        argument_ranges.append((argument_start, argument_end))
+        argument_start = argument_end + 1
+    candidates_with_argument_index: list[tuple[re.Match[str], int]] = []
+    argument_index = 0
+    for literal in candidates:
+        while (
+            argument_index < len(argument_ranges)
+            and argument_ranges[argument_index][1] <= literal.start("value")
+        ):
+            argument_index += 1
+        matched_index = (
+            argument_index
+            if argument_index < len(argument_ranges)
+            and argument_ranges[argument_index][0]
+            <= literal.start("value")
+            < argument_ranges[argument_index][1]
+            else -1
+        )
+        candidates_with_argument_index.append((literal, matched_index))
     return [
         literal.span("value")
-        for literal in candidates
+        for literal, argument_index in candidates_with_argument_index
         if len(literal.group("value")) >= 7
         and any(char.isalpha() for char in literal.group("value"))
         and literal.group("value").casefold() not in SECRET_PLACEHOLDER_VALUES
         and not any(
             pattern.fullmatch(literal.group("value"))
             for pattern in QUOTED_SECRET_REFERENCE_PATTERNS
+        )
+        and not safe_javascript_config_path_literal(
+            text,
+            literal,
+            call_target=match.group("call_value") or "",
+            context_start=(
+                argument_ranges[argument_index][0]
+                if 0 <= argument_index < len(argument_ranges)
+                else call_start + 1
+            ),
+            context_end=(
+                argument_ranges[argument_index][1]
+                if 0 <= argument_index < len(argument_ranges)
+                else call_end - 1
+            ),
+            argument_index=argument_index,
+            javascript_dialect=javascript_dialect,
         )
     ]
 
