@@ -64,6 +64,18 @@ def realistic_secret_value() -> str:
     return "A7f9K2m4Q8v6" + "N3x5R1p0T9z8"
 
 
+def webp_bytes(payload: bytes) -> bytes:
+    bitstream = b"\x10\0\0\x9d\x01\x2a\x01\0\x01\0" + payload
+    padding = b"\0" if len(bitstream) % 2 else b""
+    body = (
+        b"WEBPVP8 "
+        + len(bitstream).to_bytes(4, "little")
+        + bitstream
+        + padding
+    )
+    return b"RIFF" + len(body).to_bytes(4, "little") + body
+
+
 class AutoreviewHardeningTests(unittest.TestCase):
     def setUp(self) -> None:
         self.helper = load_helper()
@@ -156,6 +168,213 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.helper["commit_bundle"](repo, "HEAD")
             with self.assertRaisesRegex(SystemExit, "refusing binary changes"):
                 self.helper["branch_bundle"](repo, base)
+
+    def test_tracked_webp_changes_are_omitted_and_reported_in_all_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            source = repo / "app.ts"
+            source.write_text("export const reviewed = false;\n", encoding="utf-8")
+            git(repo, "add", "app.ts")
+            git(repo, "commit", "-q", "-m", "base")
+            base = git(repo, "rev-parse", "HEAD").strip()
+
+            payload_marker = "DO-NOT-BUNDLE-WEBP-PAYLOAD"
+            webp = webp_bytes(payload_marker.encode())
+            source.write_text("export const reviewed = true;\n", encoding="utf-8")
+            asset = repo / "public" / "assets" / "proof.webp"
+            asset.parent.mkdir(parents=True)
+            asset.write_bytes(webp)
+            git(repo, "add", "app.ts", "public/assets/proof.webp")
+            with mock.patch.dict(
+                self.helper["binary_diff_manifest"].__globals__,
+                {"decoder_accepts_webp": lambda _repo, _data: True},
+            ):
+                local_bundle, local_truncated = self.helper["local_bundle"](repo)
+
+                git(repo, "commit", "-q", "-m", "mixed source and WebP")
+                commit_bundle, commit_truncated = self.helper["commit_bundle"](
+                    repo,
+                    "HEAD",
+                )
+                branch_bundle, branch_truncated = self.helper["branch_bundle"](
+                    repo,
+                    base,
+                )
+
+            for bundle, truncated in (
+                (local_bundle, local_truncated),
+                (commit_bundle, commit_truncated),
+                (branch_bundle, branch_truncated),
+            ):
+                self.assertFalse(truncated)
+                self.assertIn("+export const reviewed = true;", bundle)
+                self.assertIn('"path":"public/assets/proof.webp"', bundle)
+                self.assertIn('"type":"image/webp"', bundle)
+                self.assertIn('"change_status":"added"', bundle)
+                self.assertIn('"old_size_bytes":0', bundle)
+                self.assertIn(f'"new_size_bytes":{len(webp)}', bundle)
+                self.assertIn('"payload":"omitted"', bundle)
+                self.assertNotIn(payload_marker, bundle)
+                self.assertNotIn("GIT binary patch", bundle)
+
+    def test_local_bundle_reports_unstaged_webp_size(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            asset = repo / "proof.webp"
+            old_webp = webp_bytes(b"old")
+            new_webp = webp_bytes(b"new-content")
+            asset.write_bytes(old_webp)
+            git(repo, "add", "proof.webp")
+            git(repo, "commit", "-q", "-m", "base")
+
+            asset.write_bytes(new_webp)
+            with mock.patch.dict(
+                self.helper["binary_diff_manifest"].__globals__,
+                {"decoder_accepts_webp": lambda _repo, _data: True},
+            ):
+                bundle, truncated = self.helper["local_bundle"](repo)
+
+            self.assertFalse(truncated)
+            self.assertIn('"change_status":"modified"', bundle)
+            self.assertIn(f'"old_size_bytes":{len(old_webp)}', bundle)
+            self.assertIn(f'"new_size_bytes":{len(new_webp)}', bundle)
+
+    def test_branch_bundle_reports_webp_change_statuses_and_sizes(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            modified = repo / "modified.webp"
+            deleted = repo / "deleted.webp"
+            modified_old = webp_bytes(b"old")
+            modified_new = webp_bytes(b"changed")
+            deleted_old = webp_bytes(b"gone")
+            added_new = webp_bytes(b"new")
+            modified.write_bytes(modified_old)
+            deleted.write_bytes(deleted_old)
+            git(repo, "add", "modified.webp", "deleted.webp")
+            git(repo, "commit", "-q", "-m", "base")
+            base = git(repo, "rev-parse", "HEAD").strip()
+
+            modified.write_bytes(modified_new)
+            deleted.unlink()
+            (repo / "added.webp").write_bytes(added_new)
+            git(repo, "add", "-A")
+            git(repo, "commit", "-q", "-m", "change WebPs")
+
+            with mock.patch.dict(
+                self.helper["binary_diff_manifest"].__globals__,
+                {"decoder_accepts_webp": lambda _repo, _data: True},
+            ):
+                bundle, truncated = self.helper["branch_bundle"](repo, base)
+            records = {
+                record["path"]: record
+                for line in bundle.splitlines()
+                if line.startswith("binary-change: ")
+                for record in (json.loads(line.removeprefix("binary-change: ")),)
+            }
+
+            self.assertFalse(truncated)
+            self.assertEqual(
+                {
+                    path: (
+                        record["change_status"],
+                        record["old_size_bytes"],
+                        record["new_size_bytes"],
+                    )
+                    for path, record in records.items()
+                },
+                {
+                    "added.webp": ("added", 0, len(added_new)),
+                    "deleted.webp": ("deleted", len(deleted_old), 0),
+                    "modified.webp": (
+                        "modified",
+                        len(modified_old),
+                        len(modified_new),
+                    ),
+                },
+            )
+
+    def test_source_forced_binary_remains_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            (repo / ".gitattributes").write_text("*.ts -diff\n", encoding="utf-8")
+            source = repo / "app.ts"
+            source.write_text("export const reviewed = false;\n", encoding="utf-8")
+            git(repo, "add", ".gitattributes", "app.ts")
+            git(repo, "commit", "-q", "-m", "base")
+            base = git(repo, "rev-parse", "HEAD").strip()
+
+            source.write_text("export const reviewed = true;\n", encoding="utf-8")
+            git(repo, "add", "app.ts")
+            git(repo, "commit", "-q", "-m", "forced binary source")
+
+            with self.assertRaisesRegex(SystemExit, "refusing binary changes"):
+                self.helper["branch_bundle"](repo, base)
+
+    def test_invalid_webp_content_remains_blocked_in_all_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            (repo / "base.txt").write_text("base\n", encoding="utf-8")
+            git(repo, "add", "base.txt")
+            git(repo, "commit", "-q", "-m", "base")
+            base = git(repo, "rev-parse", "HEAD").strip()
+
+            (repo / "disguised.webp").write_bytes(b"not-a-webp\0executable-content")
+            git(repo, "add", "disguised.webp")
+            with self.assertRaisesRegex(SystemExit, "valid image/webp"):
+                self.helper["local_bundle"](repo)
+
+            git(repo, "commit", "-q", "-m", "disguised binary")
+            with self.assertRaisesRegex(SystemExit, "valid image/webp"):
+                self.helper["commit_bundle"](repo, "HEAD")
+            with self.assertRaisesRegex(SystemExit, "valid image/webp"):
+                self.helper["branch_bundle"](repo, base)
+
+    def test_webp_decoder_is_required_and_controls_acceptance(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            data = webp_bytes(b"payload")
+            globals_dict = self.helper["decoder_accepts_webp"].__globals__
+
+            with mock.patch.dict(
+                globals_dict,
+                {"find_command": lambda _name, _repo: None},
+            ), self.assertRaisesRegex(SystemExit, "dwebp is required"):
+                self.helper["decoder_accepts_webp"](repo, data)
+
+            for returncode, expected in ((0, True), (1, False)):
+                with self.subTest(returncode=returncode), mock.patch.dict(
+                    globals_dict,
+                    {"find_command": lambda _name, _repo: "/trusted/dwebp"},
+                ), mock.patch.object(
+                    subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess(
+                        ["/trusted/dwebp"],
+                        returncode,
+                        b"",
+                        b"",
+                    ),
+                ):
+                    self.assertEqual(
+                        self.helper["decoder_accepts_webp"](repo, data),
+                        expected,
+                    )
+
+    def test_binary_metadata_ignores_unrelated_raw_statuses(self) -> None:
+        old_object = "a" * 40
+        new_object = "b" * 40
+        raw_diff = (
+            f":100644 120000 {old_object} {new_object} T\0link.txt\0"
+            f":100644 100644 {old_object} {new_object} M\0proof.webp\0"
+        )
+
+        metadata = self.helper["raw_diff_metadata"](
+            "branch diff",
+            raw_diff,
+            {"proof.webp"},
+        )
+
+        self.assertEqual(metadata, {"proof.webp": ("M", old_object, new_object)})
 
     def test_gitlink_changes_are_blocked_in_all_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

@@ -7016,7 +7016,14 @@ def validate_review_patch(
     return patch
 
 
-def require_no_binary_diff(label: str, numstat: str) -> None:
+OPAQUE_BINARY_ASSET_TYPES = {
+    ".webp": "image/webp",
+}
+MAX_OPAQUE_BINARY_ASSET_BYTES = 20 * 1024 * 1024
+MAX_OPAQUE_BINARY_ASSET_PIXELS = 64 * 1024 * 1024
+
+
+def binary_diff_paths(numstat: str) -> list[str]:
     binary_paths: list[str] = []
     for record in numstat.split("\0"):
         if not record:
@@ -7024,16 +7031,294 @@ def require_no_binary_diff(label: str, numstat: str) -> None:
         fields = record.split("\t", 2)
         if len(fields) == 3 and fields[0] == "-" and fields[1] == "-":
             binary_paths.append(fields[2])
-    if binary_paths:
+    return binary_paths
+
+
+def refuse_unsupported_binary_diff(label: str, paths: list[str]) -> None:
+    if paths:
         details = "\n".join(
             f"- {display_escape(path, 500)}"
-            for path in binary_paths[:20]
+            for path in paths[:20]
         )
-        more = f"\n... {len(binary_paths) - 20} more" if len(binary_paths) > 20 else ""
+        more = f"\n... {len(paths) - 20} more" if len(paths) > 20 else ""
         raise SystemExit(
             f"refusing binary changes in {label} because their contents cannot be reviewed:\n"
             f"{details}{more}"
         )
+
+
+def raw_diff_metadata(
+    label: str,
+    raw_diff: str,
+    expected_paths: set[str],
+) -> dict[str, tuple[str, str, str]]:
+    records = raw_diff.split("\0")
+    if records and not records[-1]:
+        records.pop()
+    if len(records) % 2:
+        raise SystemExit(f"unable to parse raw metadata for {label}")
+    metadata: dict[str, tuple[str, str, str]] = {}
+    for index in range(0, len(records), 2):
+        header = records[index]
+        path = records[index + 1]
+        if path not in expected_paths:
+            continue
+        fields = header.split()
+        if (
+            len(fields) != 5
+            or not fields[0].startswith(":")
+            or not re.fullmatch(r"[0-9a-fA-F]+", fields[2])
+            or not re.fullmatch(r"[0-9a-fA-F]+", fields[3])
+        ):
+            raise SystemExit(f"unable to parse raw metadata for {label}")
+        status = fields[4]
+        if status not in {"A", "M", "D"} or path in metadata:
+            raise SystemExit(f"unsupported raw metadata for {label}: {display_escape(path, 500)}")
+        metadata[path] = (status, fields[2], fields[3])
+    return metadata
+
+
+def git_blob_size(repo: Path, label: str, object_id: str) -> int:
+    if object_id and set(object_id) == {"0"}:
+        return 0
+    if not re.fullmatch(r"[0-9a-fA-F]+", object_id):
+        raise SystemExit(f"invalid Git object metadata for {label}")
+    result = git_result(repo, "cat-file", "-s", object_id, check=False)
+    value = result.stdout.strip()
+    if result.returncode != 0 or not value.isdigit():
+        raise SystemExit(f"unable to read Git object metadata for {label}")
+    return int(value)
+
+
+def git_blob_data(
+    repo: Path,
+    label: str,
+    object_id: str,
+    expected_size: int,
+) -> bytes:
+    if not re.fullmatch(r"[0-9a-fA-F]+", object_id) or set(object_id) == {"0"}:
+        raise SystemExit(f"invalid Git object metadata for {label}")
+    if expected_size > MAX_OPAQUE_BINARY_ASSET_BYTES:
+        raise SystemExit(
+            f"refusing binary changes in {label} because the asset is too large "
+            f"to validate safely ({expected_size} bytes)"
+        )
+    result = subprocess.run(
+        [
+            resolve_command("git", repo),
+            "--no-optional-locks",
+            *SAFE_GIT_CONFIG_ARGS,
+            "cat-file",
+            "blob",
+            object_id,
+        ],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=safe_git_env(repo),
+    )
+    if result.returncode != 0 or len(result.stdout) != expected_size:
+        raise SystemExit(f"unable to read Git object metadata for {label}")
+    return result.stdout
+
+
+def worktree_binary_metadata(
+    repo: Path,
+    label: str,
+    rel: str,
+) -> tuple[int, bytes]:
+    kind, _file_mode, size, _digest = source_file_fingerprint(repo / rel)
+    if kind != "file":
+        raise SystemExit(
+            f"unable to read worktree binary metadata for {label}: "
+            f"{display_escape(rel, 500)}"
+        )
+    if size > MAX_OPAQUE_BINARY_ASSET_BYTES:
+        raise SystemExit(
+            f"refusing binary changes in {label} because the asset is too large "
+            f"to validate safely ({size} bytes):\n- {display_escape(rel, 500)}"
+        )
+    data, truncated = read_prefix(repo / rel, MAX_OPAQUE_BINARY_ASSET_BYTES)
+    if truncated or len(data) != size:
+        raise SystemExit(
+            f"unable to read worktree binary metadata for {label}: "
+            f"{display_escape(rel, 500)}"
+        )
+    return size, data
+
+
+def webp_canvas_dimensions(data: bytes) -> tuple[int, int] | None:
+    if len(data) < 30:
+        return None
+    chunk_type = data[12:16]
+    if chunk_type == b"VP8 ":
+        if data[23:26] != b"\x9d\x01\x2a":
+            return None
+        return (
+            int.from_bytes(data[26:28], "little") & 0x3FFF,
+            int.from_bytes(data[28:30], "little") & 0x3FFF,
+        )
+    if chunk_type == b"VP8L":
+        if data[20] != 0x2F:
+            return None
+        bits = int.from_bytes(data[21:25], "little")
+        return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+    if chunk_type == b"VP8X" and int.from_bytes(data[16:20], "little") == 10:
+        return (
+            int.from_bytes(data[24:27], "little") + 1,
+            int.from_bytes(data[27:30], "little") + 1,
+        )
+    return None
+
+
+def valid_webp_structure(data: bytes) -> bool:
+    dimensions = webp_canvas_dimensions(data)
+    if dimensions is None:
+        return False
+    width, height = dimensions
+    return (
+        data[:4] == b"RIFF"
+        and int.from_bytes(data[4:8], "little") + 8 == len(data)
+        and data[8:12] == b"WEBP"
+        and width > 0
+        and height > 0
+        and width * height <= MAX_OPAQUE_BINARY_ASSET_PIXELS
+    )
+
+
+def decoder_accepts_webp(repo: Path, data: bytes) -> bool:
+    decoder = find_command("dwebp", repo)
+    if not decoder:
+        raise SystemExit(
+            "dwebp is required to validate tracked WebP changes safely; "
+            "install the libwebp tools and rerun autoreview"
+        )
+    with tempfile.TemporaryDirectory(
+        prefix="autoreview-webp.",
+        dir=safe_temp_root(repo),
+    ) as tempdir:
+        input_path = Path(tempdir) / "asset.webp"
+        input_path.write_bytes(data)
+        try:
+            result = subprocess.run(
+                [decoder, str(input_path), "-quiet", "-o", os.devnull],
+                cwd=tempdir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=safe_git_env(repo),
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            return False
+    return result.returncode == 0
+
+
+def require_valid_opaque_binary_asset(
+    repo: Path,
+    label: str,
+    path: str,
+    side: str,
+    asset_type: str,
+    data: bytes,
+) -> None:
+    if (
+        asset_type == "image/webp"
+        and valid_webp_structure(data)
+        and decoder_accepts_webp(repo, data)
+    ):
+        return
+    raise SystemExit(
+        f"refusing binary changes in {label} because {side} content is not "
+        f"a valid {asset_type}:\n- {display_escape(path, 500)}"
+    )
+
+
+def binary_diff_manifest(
+    repo: Path,
+    label: str,
+    numstat: str,
+    raw_diff: str,
+    *,
+    worktree_new: bool = False,
+) -> str:
+    paths = binary_diff_paths(numstat)
+    if not paths:
+        return ""
+    unsupported = [
+        path
+        for path in paths
+        if Path(path).suffix.lower() not in OPAQUE_BINARY_ASSET_TYPES
+    ]
+    refuse_unsupported_binary_diff(label, unsupported)
+    raw_metadata = raw_diff_metadata(label, raw_diff, set(paths))
+    status_names = {"A": "added", "M": "modified", "D": "deleted"}
+    records: list[str] = []
+    for path in paths:
+        metadata = raw_metadata.get(path)
+        if metadata is None:
+            raise SystemExit(
+                f"missing raw metadata for binary change in {label}: "
+                f"{display_escape(path, 500)}"
+            )
+        status, old_object, new_object = metadata
+        asset_type = OPAQUE_BINARY_ASSET_TYPES[Path(path).suffix.lower()]
+        old_size = git_blob_size(repo, f"{label} {path}", old_object)
+        old_data = (
+            git_blob_data(repo, f"{label} {path}", old_object, old_size)
+            if old_size
+            else b""
+        )
+        if worktree_new and status != "D" and set(new_object) == {"0"}:
+            new_size, new_data = worktree_binary_metadata(
+                repo,
+                label,
+                path,
+            )
+        else:
+            new_size = git_blob_size(repo, f"{label} {path}", new_object)
+            new_data = (
+                git_blob_data(repo, f"{label} {path}", new_object, new_size)
+                if new_size
+                else b""
+            )
+        if old_size:
+            require_valid_opaque_binary_asset(
+                repo,
+                label,
+                path,
+                "old",
+                asset_type,
+                old_data,
+            )
+        if new_size:
+            require_valid_opaque_binary_asset(
+                repo,
+                label,
+                path,
+                "new",
+                asset_type,
+                new_data,
+            )
+        record = {
+            "path": path,
+            "type": asset_type,
+            "change_status": status_names[status],
+            "old_size_bytes": old_size,
+            "new_size_bytes": new_size,
+            "payload": "omitted",
+        }
+        records.append(
+            "binary-change: "
+            + json.dumps(record, ensure_ascii=True, separators=(",", ":"))
+        )
+    return "\n".join(
+        [
+            "# Binary Changes",
+            f"scope: {json.dumps(label)}",
+            "Opaque asset payloads are omitted from source review; validate them separately.",
+            *records,
+        ]
+    )
 
 
 def require_no_gitlink_diff(label: str, raw_diff: str) -> None:
@@ -7176,21 +7461,43 @@ def local_status(repo: Path, untracked: list[str]) -> str:
 def local_bundle(repo: Path) -> tuple[str, bool]:
     staged_patch = git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--patch")
     unstaged_patch = git(repo, "diff", *SAFE_DIFF_FLAGS, "--patch")
-    require_no_binary_diff(
-        "local staged diff",
-        git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--numstat", "-z"),
+    staged_numstat = git(
+        repo,
+        "diff",
+        *SAFE_DIFF_FLAGS,
+        "--cached",
+        "--numstat",
+        "-z",
     )
-    require_no_binary_diff(
-        "local unstaged diff",
-        git(repo, "diff", *SAFE_DIFF_FLAGS, "--numstat", "-z"),
+    unstaged_numstat = git(
+        repo,
+        "diff",
+        *SAFE_DIFF_FLAGS,
+        "--numstat",
+        "-z",
     )
+    staged_raw = git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--raw", "-z")
+    unstaged_raw = git(repo, "diff", *SAFE_DIFF_FLAGS, "--raw", "-z")
     require_no_gitlink_diff(
         "local staged diff",
-        git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--raw", "-z"),
+        staged_raw,
     )
     require_no_gitlink_diff(
         "local unstaged diff",
-        git(repo, "diff", *SAFE_DIFF_FLAGS, "--raw", "-z"),
+        unstaged_raw,
+    )
+    staged_binary_manifest = binary_diff_manifest(
+        repo,
+        "local staged diff",
+        staged_numstat,
+        staged_raw,
+    )
+    unstaged_binary_manifest = binary_diff_manifest(
+        repo,
+        "local unstaged diff",
+        unstaged_numstat,
+        unstaged_raw,
+        worktree_new=True,
     )
     staged_paths = git_path_list(
         repo,
@@ -7218,9 +7525,11 @@ def local_bundle(repo: Path) -> tuple[str, bool]:
         local_status(repo, untracked),
         "# Staged Diff",
         git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--stat"),
+        staged_binary_manifest,
         staged_patch,
         "# Unstaged Diff",
         git(repo, "diff", *SAFE_DIFF_FLAGS, "--stat"),
+        unstaged_binary_manifest,
         unstaged_patch,
     ]
     input_truncated = False
@@ -7411,29 +7720,33 @@ def branch_bundle(repo: Path, base_ref: str) -> tuple[str, bool]:
         "--end-of-options",
         diff_range,
     )
-    require_no_binary_diff(
-        "branch diff",
-        git(
-            repo,
-            "diff",
-            *SAFE_DIFF_FLAGS,
-            "--numstat",
-            "-z",
-            "--end-of-options",
-            diff_range,
-        ),
+    branch_numstat = git(
+        repo,
+        "diff",
+        *SAFE_DIFF_FLAGS,
+        "--numstat",
+        "-z",
+        "--end-of-options",
+        diff_range,
+    )
+    branch_raw = git(
+        repo,
+        "diff",
+        *SAFE_DIFF_FLAGS,
+        "--raw",
+        "-z",
+        "--end-of-options",
+        diff_range,
     )
     require_no_gitlink_diff(
         "branch diff",
-        git(
-            repo,
-            "diff",
-            *SAFE_DIFF_FLAGS,
-            "--raw",
-            "-z",
-            "--end-of-options",
-            diff_range,
-        ),
+        branch_raw,
+    )
+    branch_binary_manifest = binary_diff_manifest(
+        repo,
+        "branch diff",
+        branch_numstat,
+        branch_raw,
     )
     branch_patch = validate_review_patch("branch diff", branch_paths, branch_patch)
     return "\n\n".join(
@@ -7448,6 +7761,7 @@ def branch_bundle(repo: Path, base_ref: str) -> tuple[str, bool]:
                 "--end-of-options",
                 diff_range,
             ),
+            branch_binary_manifest,
             branch_patch,
         ]
     ), False
@@ -7480,31 +7794,35 @@ def commit_bundle(repo: Path, commit_ref: str) -> tuple[str, bool]:
         "--end-of-options",
         commit_ref,
     )
-    require_no_binary_diff(
-        "commit diff",
-        git(
-            repo,
-            "show",
-            *SAFE_DIFF_FLAGS,
-            "--numstat",
-            "--format=",
-            "-z",
-            "--end-of-options",
-            commit_ref,
-        ),
+    commit_numstat = git(
+        repo,
+        "show",
+        *SAFE_DIFF_FLAGS,
+        "--numstat",
+        "--format=",
+        "-z",
+        "--end-of-options",
+        commit_ref,
+    )
+    commit_raw = git(
+        repo,
+        "show",
+        *SAFE_DIFF_FLAGS,
+        "--raw",
+        "--format=",
+        "-z",
+        "--end-of-options",
+        commit_ref,
     )
     require_no_gitlink_diff(
         "commit diff",
-        git(
-            repo,
-            "show",
-            *SAFE_DIFF_FLAGS,
-            "--raw",
-            "--format=",
-            "-z",
-            "--end-of-options",
-            commit_ref,
-        ),
+        commit_raw,
+    )
+    commit_binary_manifest = binary_diff_manifest(
+        repo,
+        "commit diff",
+        commit_numstat,
+        commit_raw,
     )
     commit_patch = validate_review_patch("commit diff", commit_paths, commit_patch)
     return "\n\n".join(
@@ -7520,6 +7838,7 @@ def commit_bundle(repo: Path, commit_ref: str) -> tuple[str, bool]:
                 "--end-of-options",
                 commit_ref,
             ),
+            commit_binary_manifest,
             commit_patch,
         ]
     ), False
@@ -7669,6 +7988,7 @@ def review_bundle_units(bundle: str) -> list[str]:
         "# Untracked File\n",
         "# Branch Diff\n",
         "# Commit Diff\n",
+        "# Binary Changes\n",
     }
     units: list[str] = []
     current: list[str] = []
