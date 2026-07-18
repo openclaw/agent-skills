@@ -259,7 +259,8 @@ function redact(input, stats) {
     [/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{16,}/gi, "[REDACTED_AUTH_HEADER]"],
     [/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[REDACTED_EMAIL]"],
     [/\b(?:\+?\d[\d .()-]{7,}\d)\b/g, "[REDACTED_PHONE]"],
-    [/\/Users\/[^\s`"'>)]+/g, "[LOCAL_PATH]"],
+    [/[A-Za-z]:[\\/](?:Users|home)[\\/][^\s`"'>)]+/gi, "[LOCAL_PATH]"],
+    [/\/(?:Users|home)\/[^\s`"'>)]+/g, "[LOCAL_PATH]"],
     [/~\/[^\s`"'>)]+/g, "[HOME_PATH]"],
     [/([?&](?:token|key|secret|signature|sig|access_token|auth)=)[^\s`"'>&]+/gi, "$1[REDACTED]"],
   ];

@@ -50,6 +50,37 @@ test("render redacts common secrets and local identifiers", () => {
   assert.doesNotMatch(output, /abcdefghijklmnopqrstuvwxyz123456/);
 });
 
+test("render redacts Windows, Linux and WSL local paths", () => {
+  const dir = tempDir();
+  const session = path.join(dir, "session.jsonl");
+  writeJsonl(session, [
+    {
+      type: "response_item",
+      payload: {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: [
+              "windows C:\\Users\\ahmed\\Desktop\\notes.txt",
+              "windows-lower c:/users/ahmed/notes.txt",
+              "linux /home/ahmed/work/private.env",
+              "wsl /mnt/c/Users/ahmed/secret.txt",
+            ].join(" | "),
+          },
+        ],
+      },
+    },
+    { type: "response_item", payload: { role: "assistant", content: [{ type: "text", text: "Done." }] } },
+  ]);
+
+  const output = run(["render", "--session", session]);
+  assert.doesNotMatch(output, /ahmed/);
+  assert.doesNotMatch(output, /notes\.txt/);
+  assert.doesNotMatch(output, /private\.env/);
+  assert.doesNotMatch(output, /secret\.txt/);
+});
+
 test("render drops raw tool outputs but keeps a compact tool summary", () => {
   const dir = tempDir();
   const session = path.join(dir, "session.jsonl");
