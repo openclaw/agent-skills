@@ -2349,6 +2349,45 @@ class AutoreviewHardeningTests(unittest.TestCase):
         ):
             self.assertIn(reference, validated)
 
+    def test_secret_detector_allows_typescript_member_reference_assignment(self) -> None:
+        source = "legacyXSearchResolvedRecord.apiKey = resolution.value;"
+        patch = (
+            "diff --git a/src/runtime-web-tools.ts b/src/runtime-web-tools.ts\n"
+            "--- a/src/runtime-web-tools.ts\n"
+            "+++ b/src/runtime-web-tools.ts\n"
+            "@@ -20,2 +20,3 @@ function resolveLegacySearch() {\n"
+            f" {source}\n"
+            "+const contractDigest = digestRuntimeWebOwnerContract(contract);\n"
+        )
+
+        self.assertFalse(
+            self.helper["secret_text_risk"](
+                source,
+                javascript_dialect="typescript",
+            )
+        )
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "typescript member reference assignment",
+                ["src/runtime-web-tools.ts"],
+                patch,
+            ),
+            patch,
+        )
+
+        fake_literal = next(
+            line
+            for line in (FIXTURES / "typescript-sensitive-literals.ts")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        )
+        self.assertTrue(
+            self.helper["secret_text_risk"](
+                fake_literal,
+                javascript_dialect="typescript",
+            )
+        )
     def test_review_bundle_preserves_typescript_config_paths(self) -> None:
         source = (FIXTURES / "typescript-benign-config-path-references.ts").read_text(
             encoding="utf-8"
