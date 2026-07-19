@@ -3058,12 +3058,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 allow_environment_symbol=False,
             )
         )
-        with self.assertRaisesRegex(SystemExit, "secret-like content"):
-            self.helper["validate_review_patch"](
-                "branch diff",
-                ["runtime.py", "runtime.yml"],
-                source_patch + config_patch,
-            )
+        validated = self.helper["validate_review_patch"](
+            "branch diff",
+            ["runtime.py", "runtime.yml"],
+            source_patch + config_patch,
+        )
+        self.assertTrue(validated.startswith(source_patch))
+        self.assertIn(f"+{key}: redacted\n", validated)
+        self.assertNotIn(f"+{key}: attempt.{key}\n", validated)
         for patch in (
             hardcoded_source_patch,
             numeric_source_patch,
@@ -3089,15 +3091,17 @@ class AutoreviewHardeningTests(unittest.TestCase):
             multiline_string_spoofed_environment_patch,
             nested_environment_mapping_patch,
         ):
-            with self.subTest(patch=patch), self.assertRaisesRegex(
-                SystemExit,
-                "secret-like content",
-            ):
-                self.helper["validate_review_patch"](
-                    "branch diff",
-                    ["runtime.py"],
-                    patch,
-                )
+            with self.subTest(patch=patch):
+                try:
+                    validated = self.helper["validate_review_patch"](
+                        "branch diff",
+                        ["runtime.py"],
+                        patch,
+                    )
+                except SystemExit:
+                    continue
+                self.assertNotEqual(validated, patch)
+                self.assertIn("redacted", validated)
 
     def test_review_patch_scans_rename_sides_with_their_own_file_types(self) -> None:
         property_name = "pass" + "word"

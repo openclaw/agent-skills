@@ -6316,11 +6316,16 @@ def review_secret_fragments(
     text: str,
     *,
     javascript_dialect: str | None = None,
+    python_source: bool = False,
 ) -> set[str]:
     if DIFF_HUNK_CONTENT_BOUNDARY in text:
         return set().union(
             *(
-                review_secret_fragments(segment, javascript_dialect=javascript_dialect)
+                review_secret_fragments(
+                    segment,
+                    javascript_dialect=javascript_dialect,
+                    python_source=python_source,
+                )
                 for segment in text.split(DIFF_HUNK_CONTENT_BOUNDARY)
             )
         )
@@ -6334,6 +6339,7 @@ def review_secret_fragments(
         for start, end in review_repeatable_secret_spans(
             text,
             javascript_dialect=javascript_dialect,
+            python_source=python_source,
         )
         if text[start:end]
         and text[start:end].casefold() not in SECRET_PLACEHOLDER_VALUES
@@ -6670,6 +6676,7 @@ def review_repeatable_secret_spans(
     text: str,
     *,
     javascript_dialect: str | None = None,
+    python_source: bool = False,
 ) -> list[tuple[int, int]]:
     boolean_declarations = tuple(SECRET_BOOLEAN_DECLARATION_PATTERN.finditer(text))
     boolean_declaration_positions = {
@@ -6710,6 +6717,24 @@ def review_repeatable_secret_spans(
             javascript_dialect=javascript_dialect,
         ):
             continue
+        if python_source:
+            key = re.split(r"\s*[:=]\s*", match.group(0), maxsplit=1)[0]
+            separator_match = re.search(r"[:=]", match.group(0))
+            assert separator_match is not None
+            value_start, separator = python_assignment_value_start(
+                text,
+                match.start(),
+                match.start() + separator_match.end(),
+                key,
+                separator_match.group(0),
+            )
+            if safe_python_assignment_expression(
+                text,
+                value_start,
+                key,
+                separator,
+            ):
+                continue
         fallback_spans = (
             assignment_fallback_literal_spans(
                 text,
@@ -6734,6 +6759,7 @@ def review_repeatable_secret_spans(
         if secret_text_risk(
             match.group(0),
             javascript_dialect=javascript_dialect,
+            python_source=python_source,
         ):
             spans.append(match.span(selected_name))
     for pattern in SECRET_VALUE_PATTERNS:
@@ -6758,6 +6784,7 @@ def review_secret_value_spans(
     text: str,
     *,
     javascript_dialect: str | None = None,
+    python_source: bool = False,
 ) -> list[tuple[int, int]]:
     boolean_declarations = tuple(SECRET_BOOLEAN_DECLARATION_PATTERN.finditer(text))
     boolean_declaration_positions = {
@@ -6790,6 +6817,24 @@ def review_secret_value_spans(
                     javascript_dialect=javascript_dialect,
                 ):
                     break
+                if python_source:
+                    key = re.split(r"\s*[:=]\s*", match.group(0), maxsplit=1)[0]
+                    separator_match = re.search(r"[:=]", match.group(0))
+                    assert separator_match is not None
+                    value_start, separator = python_assignment_value_start(
+                        text,
+                        match.start(),
+                        match.start() + separator_match.end(),
+                        key,
+                        separator_match.group(0),
+                    )
+                    if safe_python_assignment_expression(
+                        text,
+                        value_start,
+                        key,
+                        separator,
+                    ):
+                        break
                 fallback_spans = (
                     assignment_fallback_literal_spans(
                         text,
@@ -6814,6 +6859,7 @@ def review_secret_value_spans(
                 if secret_text_risk(
                     match.group(0),
                     javascript_dialect=javascript_dialect,
+                    python_source=python_source,
                 ):
                     spans.append(match.span(name))
                 break
@@ -7533,13 +7579,31 @@ def redact_secret_like_diff_section(
         if new_path is not None and new_path in expected_paths
         else None
     )
+    old_python = (
+        python_review_source(old_path)
+        if old_path is not None and old_path in expected_paths
+        else False
+    )
+    new_python = (
+        python_review_source(new_path)
+        if new_path is not None and new_path in expected_paths
+        else False
+    )
     secret_fragments = set(known_secret_fragments or ())
     old_content, new_content = unified_diff_contents(section)
-    old_risk = secret_text_risk(old_content, javascript_dialect=old_dialect)
-    new_risk = secret_text_risk(new_content, javascript_dialect=new_dialect)
-    for content, dialect, risk in (
-        (old_content, old_dialect, old_risk),
-        (new_content, new_dialect, new_risk),
+    old_risk = secret_text_risk(
+        old_content,
+        javascript_dialect=old_dialect,
+        python_source=old_python,
+    )
+    new_risk = secret_text_risk(
+        new_content,
+        javascript_dialect=new_dialect,
+        python_source=new_python,
+    )
+    for content, dialect, python_source, risk in (
+        (old_content, old_dialect, old_python, old_risk),
+        (new_content, new_dialect, new_python, new_risk),
     ):
         if not risk:
             continue
@@ -7547,6 +7611,7 @@ def redact_secret_like_diff_section(
             review_secret_fragments(
                 content,
                 javascript_dialect=dialect,
+                python_source=python_source,
             )
         )
     if len(secret_fragments) > MAX_REVIEW_SECRET_FRAGMENTS:
@@ -7592,11 +7657,19 @@ def redact_secret_like_diff_section(
             line_secret_risk = (
                 old_line
                 and old_risk
-                and secret_text_risk(content, javascript_dialect=old_dialect)
+                and secret_text_risk(
+                    content,
+                    javascript_dialect=old_dialect,
+                    python_source=old_python,
+                )
             ) or (
                 new_line
                 and new_risk
-                and secret_text_risk(content, javascript_dialect=new_dialect)
+                and secret_text_risk(
+                    content,
+                    javascript_dialect=new_dialect,
+                    python_source=new_python,
+                )
             )
             if line_secret_risk:
                 dialect = old_dialect if old_line and old_risk else new_dialect
@@ -7604,6 +7677,9 @@ def redact_secret_like_diff_section(
                     review_secret_value_spans(
                         content,
                         javascript_dialect=dialect,
+                        python_source=(
+                            old_python if old_line and old_risk else new_python
+                        ),
                     )
                 )
             fragment_dialect = (
@@ -7881,6 +7957,11 @@ def validate_review_patch(
             all_fragments = review_secret_fragments(
                 content,
                 javascript_dialect=javascript_dialect,
+                python_source=(
+                    python_review_source(rel)
+                    if rel is not None and rel in expected_paths
+                    else False
+                ),
             )
             known_secret_fragments.update(all_fragments)
         known_secret_fragments.update(
