@@ -2064,38 +2064,77 @@ def raw_repo_path_has_symlink_component(repo: Path, rel_path: Path) -> bool:
     return False
 
 
-def fallback_expression(text: str, *, typescript: bool = False) -> str:
+def fallback_expression_end(
+    text: str,
+    start: int = 0,
+    *,
+    allow_multiline: bool = True,
+    diff_match_start: int | None = None,
+    end_limit: int | None = None,
+    operand_already_started: bool = False,
+    typescript: bool = False,
+) -> int:
+    scan_limit = len(text) if end_limit is None else min(len(text), end_limit)
+    line_start = bounded_line_start(text, start) + 1
+    prefix_end = start if diff_match_start is None else diff_match_start
+    diff_prefix = re.fullmatch(
+        r"(?P<prefix>[+-]{1,8})[ \t]*",
+        text[line_start:prefix_end],
+    )
+    diff_prefix_columns = (
+        len(diff_prefix.group("prefix")) if diff_prefix is not None else 0
+    )
     operator_keywords = (
         r"|as(?![\w$])|satisfies(?![\w$])" if typescript else ""
     )
-    operator = re.match(
-        r"\s*(?:\|\||&&|\?\?|[=<>!~:+\-*/%&|^?.,]"
+    operator = re.compile(
+        r"[ \t]*(?:\|\||&&|\?\?|[=<>!~:+\-*/%&|^?.,]"
         r"|and\b|else\b|if\b|in(?![\w$])|instanceof(?![\w$])"
         r"|is\b|not\b|or\b"
         r"|unless\b"
         + operator_keywords
         + r")",
-        text,
-    )
-    cursor = operator.end() if operator is not None else 0
+    ).match(text, start, scan_limit)
+    cursor = operator.end() if operator is not None else start
     stack: list[str] = []
-    operand_started = False
+    operand_started = operand_already_started and operator is None
+    expression_started = operand_already_started or operator is not None
     quote: str | None = None
     escaped = False
     line_comment = False
     block_comment = False
     pairs = {"(": ")", "[": "]", "{": "}"}
-    while cursor < len(text):
+    while cursor < scan_limit:
+        if text.startswith(DIFF_HUNK_CONTENT_BOUNDARY, cursor):
+            break
         char = text[cursor]
-        next_char = text[cursor + 1] if cursor + 1 < len(text) else ""
+        next_char = text[cursor + 1] if cursor + 1 < scan_limit else ""
         if line_comment:
             if char in "\r\n\u2028\u2029":
                 line_comment = False
                 if (
+                    diff_prefix_columns
+                    and raw_diff_continuation_start(
+                        text,
+                        cursor,
+                        diff_prefix_columns,
+                    )
+                    is None
+                ):
+                    break
+                if (
+                    not stack
+                    and not allow_multiline
+                    and (operand_started or not expression_started)
+                ):
+                    break
+                if (
                     operand_started
                     and not stack
-                    and not javascript_continues_after_line_terminator(
-                        text[cursor + 1 :],
+                    and not javascript_expression_continues_after_line(
+                        text,
+                        cursor,
+                        diff_prefix_columns=diff_prefix_columns,
                         typescript=typescript,
                     )
                 ):
@@ -2120,7 +2159,9 @@ def fallback_expression(text: str, *, typescript: bool = False) -> str:
             continue
         regex_end = javascript_regex_literal_end(text, cursor)
         if regex_end is not None:
-            cursor = regex_end
+            expression_started = True
+            operand_started = True
+            cursor = min(regex_end, scan_limit)
             continue
         if char == "/" and next_char == "/":
             line_comment = True
@@ -2137,11 +2178,13 @@ def fallback_expression(text: str, *, typescript: bool = False) -> str:
         if char in {'"', "'", "`"}:
             quote = char
             operand_started = True
+            expression_started = True
             cursor += 1
             continue
         if char in pairs:
             stack.append(pairs[char])
             operand_started = True
+            expression_started = True
             cursor += 1
             continue
         if stack and char == stack[-1]:
@@ -2150,15 +2193,34 @@ def fallback_expression(text: str, *, typescript: bool = False) -> str:
             continue
         if not stack and char in ",;)]}":
             break
-        if char in "\r\n\u2028\u2029" and operand_started and not stack:
-            if not javascript_continues_after_line_terminator(
-                text[cursor + 1 :],
-                typescript=typescript,
+        if (
+            char in "\r\n\u2028\u2029"
+            and diff_prefix_columns
+            and raw_diff_continuation_start(
+                text,
+                cursor,
+                diff_prefix_columns,
+            )
+            is None
+        ):
+            break
+        if char in "\r\n\u2028\u2029" and not stack:
+            if (
+                not allow_multiline
+                and (operand_started or not expression_started)
+            ) or (
+                operand_started
+                and not javascript_expression_continues_after_line(
+                    text,
+                    cursor,
+                    diff_prefix_columns=diff_prefix_columns,
+                    typescript=typescript,
+                )
             ):
                 break
         if not stack and (char.isalpha() or char in "_$"):
             word_end = cursor + 1
-            while word_end < len(text) and (
+            while word_end < scan_limit and (
                 text[word_end].isalnum() or text[word_end] in "_$"
             ):
                 word_end += 1
@@ -2167,14 +2229,89 @@ def fallback_expression(text: str, *, typescript: bool = False) -> str:
             if typescript:
                 word_operators.update({"as", "satisfies"})
             operand_started = word not in word_operators
+            expression_started = True
             cursor = word_end
             continue
         if not stack and char in "=<>!~:+-*/%&|^?.":
             operand_started = False
+            expression_started = True
         elif not char.isspace():
             operand_started = True
+            expression_started = True
         cursor += 1
-    return text[:cursor]
+    return min(cursor, scan_limit)
+
+
+def raw_diff_prefix_columns(text: str, position: int) -> int:
+    line_start = bounded_line_start(text, position) + 1
+    match = re.fullmatch(
+        r"(?P<prefix>[+-]{1,8})[ \t]*",
+        text[line_start:position],
+    )
+    return len(match.group("prefix")) if match is not None else 0
+
+
+def enclosing_string_content_end(
+    text: str,
+    context: tuple[str, int] | None,
+) -> int | None:
+    if context is None:
+        return None
+    quote, quote_start = context
+    end = quoted_string_end(text, quote, quote_start)
+    return None if end is None else end - len(quote)
+
+
+def fallback_expression(text: str, *, typescript: bool = False) -> str:
+    return text[:fallback_expression_end(text, typescript=typescript)]
+
+
+def javascript_expression_continues_after_line(
+    text: str,
+    line_end: int,
+    *,
+    diff_prefix_columns: int,
+    typescript: bool,
+) -> bool:
+    if diff_prefix_columns:
+        continuation_start = raw_diff_continuation_start(
+            text,
+            line_end,
+            diff_prefix_columns,
+        )
+        if continuation_start is None:
+            return False
+        return javascript_continues_after_line_terminator_at(
+            text,
+            continuation_start,
+            typescript=typescript,
+        )
+    next_start = line_end
+    while next_start < len(text) and text[next_start] in "\r\n\u2028\u2029":
+        next_start += 1
+    return not safe_javascript_reference_suffix(
+        text,
+        line_end,
+        typescript=typescript,
+    ) and javascript_continues_after_line_terminator_at(
+        text,
+        next_start,
+        typescript=typescript,
+    )
+
+
+def raw_diff_continuation_start(
+    text: str,
+    line_end: int,
+    prefix_columns: int,
+) -> int | None:
+    next_start = line_end
+    while next_start < len(text) and text[next_start] in "\r\n\u2028\u2029":
+        next_start += 1
+    prefix = text[next_start : next_start + prefix_columns]
+    if len(prefix) != prefix_columns or not set(prefix) <= {"+", "-", " "}:
+        return None
+    return next_start + prefix_columns
 
 
 def javascript_continues_after_line_terminator(
@@ -2182,20 +2319,34 @@ def javascript_continues_after_line_terminator(
     *,
     typescript: bool = False,
 ) -> bool:
-    suffix = text.lstrip()
-    if suffix.startswith(("++", "--", "~")) or (
-        suffix.startswith("!") and not suffix.startswith("!=")
+    return javascript_continues_after_line_terminator_at(
+        text,
+        0,
+        typescript=typescript,
+    )
+
+
+def javascript_continues_after_line_terminator_at(
+    text: str,
+    start: int,
+    *,
+    typescript: bool = False,
+) -> bool:
+    cursor = start
+    while cursor < len(text) and text[cursor].isspace():
+        cursor += 1
+    if text.startswith(("++", "--", "~"), cursor) or (
+        text.startswith("!", cursor) and not text.startswith("!=", cursor)
     ):
         return False
     type_operators = (
         r"|as(?![\w$])|satisfies(?![\w$])" if typescript else ""
     )
-    return re.match(
+    return re.compile(
         r"(?:[=<>!:+\-*/%&|^?.,([`]|in(?![\w$])|instanceof(?![\w$])"
         + type_operators
         + r")",
-        suffix,
-    ) is not None
+    ).match(text, cursor) is not None
 
 
 def top_level_fallback_suffix(
@@ -5856,38 +6007,52 @@ def assignment_fallback_literal_spans(
     text: str,
     match: re.Match[str],
     *,
+    expression_limit: int | None = None,
     javascript_dialect: str | None = None,
 ) -> list[tuple[int, int]]:
-    line_end_candidates = [
-        position
-        for position in (
-            text.find("\n", match.end()),
-            text.find("\r", match.end()),
-        )
-        if position >= 0
-    ]
-    line_end = min(line_end_candidates, default=len(text))
-    expression_end = line_end
-    if (
-        javascript_dialect is not None
-        and line_end < len(text)
-        and not safe_javascript_reference_suffix(
-            text,
-            line_end,
-            typescript=javascript_dialect == "typescript",
-        )
-    ):
-        continued = fallback_expression(
-            text[line_end:],
-            typescript=javascript_dialect == "typescript",
-        )
-        expression_end = line_end + len(continued)
     fallback_start = match.end()
+    diff_prefix_columns = raw_diff_prefix_columns(text, match.start())
+    adjusted_diff_continuation = False
+    if diff_prefix_columns:
+        cursor = fallback_start
+        while cursor < len(text) and text[cursor] in " \t":
+            cursor += 1
+        if cursor < len(text) and text[cursor] in "\r\n\u2028\u2029":
+            while cursor < len(text) and text[cursor] in "\r\n\u2028\u2029":
+                cursor += 1
+            prefix = text[cursor : cursor + diff_prefix_columns]
+            if (
+                len(prefix) != diff_prefix_columns
+                or not set(prefix) <= {"+", "-", " "}
+            ):
+                return []
+            continuation_start = cursor + diff_prefix_columns
+            if not javascript_continues_after_line_terminator_at(
+                text,
+                continuation_start,
+                typescript=javascript_dialect == "typescript",
+            ):
+                return []
+            fallback_start = continuation_start
+            adjusted_diff_continuation = True
+    expression_end = fallback_expression_end(
+        text,
+        fallback_start,
+        allow_multiline=javascript_dialect is not None,
+        diff_match_start=(None if adjusted_diff_continuation else match.start()),
+        end_limit=expression_limit,
+        operand_already_started=True,
+        typescript=javascript_dialect == "typescript",
+    )
     if match.group("call_value") is not None:
-        whitespace = re.match(r"[ \t]*", text[fallback_start:expression_end])
+        whitespace = re.compile(r"[ \t]*").match(
+            text,
+            fallback_start,
+            expression_end,
+        )
         assert whitespace is not None
-        call_start = fallback_start + whitespace.end()
-        if call_start < line_end and text[call_start] == "(":
+        call_start = whitespace.end()
+        if call_start < expression_end and text[call_start] == "(":
             depth = 0
             quote: str | None = None
             escaped = False
@@ -5919,32 +6084,6 @@ def assignment_fallback_literal_spans(
     if operator_span is None:
         return []
     expression_start = operator_span[1]
-    depth = 0
-    quote: str | None = None
-    escaped = False
-    cursor = expression_start
-    while cursor < line_end:
-        char = text[cursor]
-        if quote is not None:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == quote:
-                quote = None
-        elif char in {'"', "'", "`"}:
-            quote = char
-        elif char in "([{":
-            depth += 1
-        elif char in ")]}":
-            if depth == 0:
-                expression_end = cursor
-                break
-            depth -= 1
-        elif depth == 0 and char in ";,":
-            expression_end = cursor
-            break
-        cursor += 1
     return top_level_fallback_value_spans(
         text,
         expression_start,
@@ -5957,18 +6096,18 @@ def assignment_prefix_fallback_literal_spans(
     text: str,
     match: re.Match[str],
     *,
+    expression_limit: int | None = None,
     javascript_dialect: str | None = None,
 ) -> list[tuple[int, int]]:
-    suffix = text[match.end() :]
-    fallback = top_level_fallback_suffix(suffix)
-    if fallback is None:
-        return []
-    fallback_start = match.end() + len(suffix) - len(fallback)
-    expression = fallback_expression(
-        fallback,
+    fallback_start = match.end()
+    expression_end = fallback_expression_end(
+        text,
+        fallback_start,
+        allow_multiline=javascript_dialect is not None,
+        diff_match_start=match.start(),
+        end_limit=expression_limit,
         typescript=javascript_dialect == "typescript",
     )
-    expression_end = fallback_start + len(expression)
     operator_span = top_level_fallback_operator_span(
         text,
         fallback_start,
@@ -6150,6 +6289,7 @@ def review_call_literal_spans(
     text: str,
     match: re.Match[str],
     *,
+    expression_limit: int | None = None,
     javascript_dialect: str | None = None,
 ) -> list[tuple[int, int]]:
     whitespace = re.match(r"[ \t]*", text[match.end() :])
@@ -6158,9 +6298,13 @@ def review_call_literal_spans(
     if call_start >= len(text) or text[call_start] != "(":
         return []
     call_end = balanced_delimiter_end(text, call_start, "(", ")")
-    if call_end is None or not secret_text_risk(
-        text[match.start() : call_end],
-        javascript_dialect=javascript_dialect,
+    if (
+        call_end is None
+        or (expression_limit is not None and call_end > expression_limit)
+        or not secret_text_risk(
+            text[match.start() : call_end],
+            javascript_dialect=javascript_dialect,
+        )
     ):
         return []
     candidates = sorted(
@@ -6232,6 +6376,12 @@ def review_repeatable_secret_spans(
     javascript_dialect: str | None = None,
 ) -> list[tuple[int, int]]:
     boolean_declarations = tuple(SECRET_BOOLEAN_DECLARATION_PATTERN.finditer(text))
+    prefix_matches = tuple(SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(text))
+    assignment_matches = tuple(SECRET_ASSIGNMENT_PATTERN.finditer(text))
+    assignment_contexts = string_contexts_at(
+        text,
+        {match.start() for match in prefix_matches + assignment_matches},
+    )
     boolean_declaration_positions = {
         match.start("boolean_key") for match in boolean_declarations
     }
@@ -6246,17 +6396,25 @@ def review_repeatable_secret_spans(
     ]
     spans.extend(
         span
-        for match in SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(text)
+        for match in prefix_matches
         if match.start() not in boolean_declaration_positions
         for span in assignment_prefix_fallback_literal_spans(
             text,
             match,
+            expression_limit=enclosing_string_content_end(
+                text,
+                assignment_contexts.get(match.start()),
+            ),
             javascript_dialect=javascript_dialect,
         )
     )
-    for match in SECRET_ASSIGNMENT_PATTERN.finditer(text):
+    for match in assignment_matches:
         if match.start() in boolean_declaration_positions:
             continue
+        expression_limit = enclosing_string_content_end(
+            text,
+            assignment_contexts.get(match.start()),
+        )
         selected_name = next(
             (
                 name
@@ -6284,6 +6442,7 @@ def review_repeatable_secret_spans(
             assignment_fallback_literal_spans(
                 text,
                 match,
+                expression_limit=expression_limit,
                 javascript_dialect=javascript_dialect,
             )
             if selected_name in {"reference_value", "call_value", "bare_value"}
@@ -6297,6 +6456,7 @@ def review_repeatable_secret_spans(
                 review_call_literal_spans(
                     text,
                     match,
+                    expression_limit=expression_limit,
                     javascript_dialect=javascript_dialect,
                 )
             )
@@ -6330,6 +6490,12 @@ def review_secret_value_spans(
     javascript_dialect: str | None = None,
 ) -> list[tuple[int, int]]:
     boolean_declarations = tuple(SECRET_BOOLEAN_DECLARATION_PATTERN.finditer(text))
+    prefix_matches = tuple(SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(text))
+    assignment_matches = tuple(SECRET_ASSIGNMENT_PATTERN.finditer(text))
+    assignment_contexts = string_contexts_at(
+        text,
+        {match.start() for match in prefix_matches + assignment_matches},
+    )
     boolean_declaration_positions = {
         match.start("boolean_key") for match in boolean_declarations
     }
@@ -6344,17 +6510,25 @@ def review_secret_value_spans(
     ]
     spans.extend(
         span
-        for match in SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(text)
+        for match in prefix_matches
         if match.start() not in boolean_declaration_positions
         for span in assignment_prefix_fallback_literal_spans(
             text,
             match,
+            expression_limit=enclosing_string_content_end(
+                text,
+                assignment_contexts.get(match.start()),
+            ),
             javascript_dialect=javascript_dialect,
         )
     )
-    for match in SECRET_ASSIGNMENT_PATTERN.finditer(text):
+    for match in assignment_matches:
         if match.start() in boolean_declaration_positions:
             continue
+        expression_limit = enclosing_string_content_end(
+            text,
+            assignment_contexts.get(match.start()),
+        )
         for name in (
             "double_value",
             "single_value",
@@ -6374,6 +6548,7 @@ def review_secret_value_spans(
                     assignment_fallback_literal_spans(
                         text,
                         match,
+                        expression_limit=expression_limit,
                         javascript_dialect=javascript_dialect,
                     )
                     if name in {"reference_value", "call_value", "bare_value"}
@@ -6387,6 +6562,7 @@ def review_secret_value_spans(
                         review_call_literal_spans(
                             text,
                             match,
+                            expression_limit=expression_limit,
                             javascript_dialect=javascript_dialect,
                         )
                     )
@@ -7014,46 +7190,50 @@ def redact_unbalanced_private_key_hunks(section: str) -> tuple[str, set[str]]:
             continue
         ambiguous_changed_lines: set[int] = set()
         redact_ambiguous_hunk = False
-        for position, (_, prefix, content, _) in enumerate(hunk_lines):
-            if not (
-                PRIVATE_KEY_BEGIN_PATTERN.search(content)
-                or PRIVATE_KEY_END_PATTERN.search(content)
-            ):
+        sides = [diff_prefix_side(prefix) for _, prefix, _, _ in hunk_lines]
+        marker_lines = [
+            PRIVATE_KEY_BEGIN_PATTERN.search(content) is not None
+            or PRIVATE_KEY_END_PATTERN.search(content) is not None
+            for _, _, content, _ in hunk_lines
+        ]
+        runs: list[tuple[str, int, int, bool]] = []
+        run_start = 0
+        while run_start < len(hunk_lines):
+            side = sides[run_start]
+            run_end = run_start + 1
+            while run_end < len(hunk_lines) and sides[run_end] == side:
+                run_end += 1
+            runs.append(
+                (
+                    side,
+                    run_start,
+                    run_end,
+                    any(marker_lines[run_start:run_end]),
+                )
+            )
+            run_start = run_end
+        for run_index, (side, run_start, run_end, has_marker) in enumerate(runs):
+            if not has_marker:
                 continue
-            side = diff_prefix_side(prefix)
             if side == "":
                 redact_ambiguous_hunk = True
                 break
             if side not in {"+", "-"}:
                 continue
             opposite = "+" if side == "-" else "-"
-            run_start = position
-            while (
-                run_start > 0
-                and diff_prefix_side(hunk_lines[run_start - 1][1]) == side
-            ):
-                run_start -= 1
-            run_end = position
-            while (
-                run_end + 1 < len(hunk_lines)
-                and diff_prefix_side(hunk_lines[run_end + 1][1]) == side
-            ):
-                run_end += 1
-            for neighbor in (run_start - 1, run_end + 1):
-                opposite_run: list[int] = []
-                while (
-                    0 <= neighbor < len(hunk_lines)
-                    and diff_prefix_side(hunk_lines[neighbor][1]) == opposite
-                ):
-                    opposite_run.append(neighbor)
-                    neighbor += -1 if neighbor < run_start else 1
-                if not any(
-                    PRIVATE_KEY_BEGIN_PATTERN.search(hunk_lines[item][2])
-                    or PRIVATE_KEY_END_PATTERN.search(hunk_lines[item][2])
-                    for item in opposite_run
-                ):
+            for neighbor_run in (run_index - 1, run_index + 1):
+                if not 0 <= neighbor_run < len(runs):
+                    continue
+                (
+                    neighbor_side,
+                    neighbor_start,
+                    neighbor_end,
+                    neighbor_has_marker,
+                ) = runs[neighbor_run]
+                if neighbor_side == opposite and not neighbor_has_marker:
                     ambiguous_changed_lines.update(
-                        hunk_lines[item][0] for item in opposite_run
+                        hunk_lines[item][0]
+                        for item in range(neighbor_start, neighbor_end)
                     )
         if redact_ambiguous_hunk:
             for line_index, prefix, content, ending in hunk_lines:

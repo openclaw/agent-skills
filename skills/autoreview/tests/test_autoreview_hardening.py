@@ -4274,6 +4274,32 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertNotIn("END PRIVATE KEY", redacted)
         self.assertIn("+runDangerousOperation();", redacted)
 
+    def test_private_key_marker_run_scan_is_bounded(self) -> None:
+        marker = "-----BEGIN " + "PRIVATE KEY-----"
+        count = 1_000
+        patch = (
+            "diff --git a/fixture.test.ts b/fixture.test.ts\n"
+            "--- a/fixture.test.ts\n"
+            "+++ b/fixture.test.ts\n"
+            f"@@ -1,{count} +1,{count} @@\n"
+            + "".join(
+                f'-const marker{index} = "{marker}";\n'
+                for index in range(count)
+            )
+            + "".join(
+                "+sendCredentials();\n" for _ in range(count)
+            )
+        )
+
+        started = time.monotonic()
+        redacted, _ = self.helper["redact_unbalanced_private_key_hunks"](
+            patch
+        )
+
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertEqual(redacted.count("+sendCredentials();"), count)
+        self.assertNotIn(marker, redacted)
+
     def test_review_patch_redacts_net_new_unmatched_private_key_marker(self) -> None:
         patch = (
             "diff --git a/fixture.test.ts b/fixture.test.ts\n"
@@ -4880,6 +4906,31 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertIn('choose("redacted")', redacted)
         self.assertIn('log("redacted")', redacted)
 
+    def test_review_patch_redacts_multiline_arrow_fallback_literal(self) -> None:
+        secret = "fallback-secret-123"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1,6 @@\n"
+            "+password = (() => {\n"
+            "+  const value = source;\n"
+            "+  return value;\n"
+            f'+}})() || "{secret}";\n'
+            f'+log("{secret}");\n'
+            "+runDangerousOperation();\n"
+        )
+
+        redacted = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(secret, redacted)
+        self.assertIn('+log("redacted");', redacted)
+        self.assertIn("+runDangerousOperation();", redacted)
+
     def test_review_patch_omits_ambiguous_changed_line_before_repeated_value(
         self,
     ) -> None:
@@ -4944,6 +4995,182 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertIn(self.helper["REVIEW_SECRET_REDACTION"], redacted)
         self.assertIn('+log("long-status-label");', redacted)
+
+    def test_assignment_prefix_fallback_scan_is_bounded(self) -> None:
+        for separator in ("\n", ""):
+            with self.subTest(separator=repr(separator)):
+                content = separator.join(
+                    f"password = value_{index};" for index in range(5_000)
+                )
+
+                started = time.monotonic()
+                spans = self.helper["review_repeatable_secret_spans"](content)
+
+                self.assertLess(time.monotonic() - started, 5.0)
+                self.assertEqual(spans, [])
+
+    def test_assignment_prefix_scan_stops_at_raw_diff_line_boundary(self) -> None:
+        content = (
+            "+password = cachedPassword\n"
+            '+role = suppliedRole || "admin";\n'
+        )
+
+        spans = self.helper["review_repeatable_secret_spans"](
+            content,
+            javascript_dialect="typescript",
+        )
+
+        self.assertNotIn("admin", {content[start:end] for start, end in spans})
+
+    def test_assignment_prefix_scan_continues_after_trailing_operator(self) -> None:
+        content = (
+            "+password = supplied ||\n"
+            '+  "real-secret";\n'
+        )
+
+        spans = self.helper["review_repeatable_secret_spans"](
+            content,
+            javascript_dialect="typescript",
+        )
+
+        self.assertIn(
+            "real-secret",
+            {content[start:end] for start, end in spans},
+        )
+        prefix_match = next(
+            self.helper["SECRET_ASSIGNMENT_PREFIX_PATTERN"].finditer(content)
+        )
+        assignment_match = next(
+            self.helper["SECRET_ASSIGNMENT_PATTERN"].finditer(content)
+        )
+        for collector, match in (
+            ("assignment_prefix_fallback_literal_spans", prefix_match),
+            ("assignment_fallback_literal_spans", assignment_match),
+        ):
+            with self.subTest(collector=collector):
+                collected = self.helper[collector](
+                    content,
+                    match,
+                    javascript_dialect="typescript",
+                )
+                self.assertIn(
+                    "real-secret",
+                    {content[start:end] for start, end in collected},
+                )
+
+    def test_assignment_prefix_scan_accepts_raw_diff_context_line(self) -> None:
+        content = (
+            "+password = newSource\n"
+            '  || "real-secret";\n'
+        )
+
+        spans = self.helper["review_repeatable_secret_spans"](
+            content,
+            javascript_dialect="typescript",
+        )
+
+        self.assertIn(
+            "real-secret",
+            {content[start:end] for start, end in spans},
+        )
+
+    def test_generic_assignment_scan_stops_at_next_diff_line(self) -> None:
+        content = (
+            "+password = source or fallback\n"
+            '+(grant_role("admin"))\n'
+        )
+
+        spans = self.helper["review_repeatable_secret_spans"](content)
+
+        self.assertNotIn(
+            "admin",
+            {content[start:end] for start, end in spans},
+        )
+
+    def test_generic_literal_scan_stops_at_next_diff_line(self) -> None:
+        content = (
+            '+password = "foo"\n'
+            '+grant_role("admin")\n'
+        )
+
+        spans = self.helper["review_repeatable_secret_spans"](content)
+
+        self.assertNotIn(
+            "admin",
+            {content[start:end] for start, end in spans},
+        )
+
+    def test_generic_assignment_scan_continues_after_fallback_operator(self) -> None:
+        content = (
+            '+password = ENV["PASSWORD"] ||\n'
+            '+  "production-secret"\n'
+        )
+
+        spans = self.helper["review_repeatable_secret_spans"](content)
+
+        self.assertIn(
+            "production-secret",
+            {content[start:end] for start, end in spans},
+        )
+
+    def test_assignment_scan_bounds_encoded_source_fixture(self) -> None:
+        content = "'password = source || \"production-secret\";'"
+
+        spans = self.helper["review_repeatable_secret_spans"](content)
+
+        self.assertIn(
+            "production-secret",
+            {content[start:end] for start, end in spans},
+        )
+
+    def test_assignment_scan_redacts_command_payload_fallback(self) -> None:
+        content = 'run("password = ENV.PASSWORD || \'tenant-default\'")'
+
+        spans = self.helper["review_repeatable_secret_spans"](content)
+
+        self.assertIn(
+            "tenant-default",
+            {content[start:end] for start, end in spans},
+        )
+
+    def test_assignment_scan_redacts_serialized_string_payload(self) -> None:
+        secret = realistic_secret_value()
+        content = f"const body = '{{\"password\":\"{secret}\"}}'"
+
+        spans = self.helper["review_repeatable_secret_spans"](content)
+
+        self.assertIn(secret, {content[start:end] for start, end in spans})
+
+    def test_reference_scan_stops_before_independent_statement(self) -> None:
+        content = (
+            "password = process.env.PASSWORD\n"
+            'value || "public"\n'
+        )
+
+        spans = self.helper["review_repeatable_secret_spans"](
+            content,
+            javascript_dialect="typescript",
+        )
+
+        self.assertNotIn(
+            "public",
+            {content[start:end] for start, end in spans},
+        )
+
+    def test_assignment_scan_stops_at_hunk_boundary_with_open_call(self) -> None:
+        boundary = self.helper["DIFF_HUNK_CONTENT_BOUNDARY"]
+        content = (
+            "password = choose(\n"
+            f"{boundary}\n"
+            'grant_role("admin"))\n'
+        )
+
+        spans = self.helper["review_repeatable_secret_spans"](content)
+
+        self.assertNotIn(
+            "admin",
+            {content[start:end] for start, end in spans},
+        )
 
     def test_review_patch_ignores_fallback_literals_inside_comments(self) -> None:
         patch = (
