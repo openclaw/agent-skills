@@ -9,6 +9,7 @@ const MARKER_START = "<!-- agent-transcript:start -->";
 const MARKER_END = "<!-- agent-transcript:end -->";
 const DEFAULT_MAX_CHARS = 50000;
 const DEFAULT_ENTRY_MAX_CHARS = 6000;
+const MAX_JSONL_BOUNDARY_BYTES = 1024 * 1024;
 
 function usage() {
   console.log(`Usage:
@@ -110,6 +111,7 @@ function defaultRoots() {
   return [
     homePath(".codex", "sessions"),
     ...claudeProjectRoots(),
+    homePath(".copilot", "session-state"),
     homePath(".pi", "agent", "sessions"),
     ...openClawSessionRoots(),
   ];
@@ -171,6 +173,12 @@ function stringContent(value) {
 function detectAgent(file, rows) {
   if (file.includes(`${path.sep}.codex${path.sep}`)) return "codex";
   if (claudeProjectRoots().some((root) => isPathInside(file, root))) return "claude";
+  if (
+    isPathInside(file, homePath(".copilot", "session-state")) ||
+    rows.some((row) => row?.type === "session.start" && row?.data?.producer === "copilot-agent")
+  ) {
+    return "copilot";
+  }
   if (file.includes(`${path.sep}.pi${path.sep}`)) return "pi";
   if (
     file.includes(`${path.sep}.openclaw${path.sep}`) ||
@@ -184,6 +192,9 @@ function detectAgent(file, rows) {
 }
 
 function eventText(row) {
+  if (row?.type === "user.message" || row?.type === "assistant.message") {
+    return stringContent(row.data?.content);
+  }
   if (row?.type === "compacted_replacement_item") {
     return stringContent(row.payload?.content || row.payload?.summary || row.payload?.arguments || row.payload?.output);
   }
@@ -233,6 +244,16 @@ function eventRole(row) {
   if (row?.message?.role === "user") return "user";
   if (row?.message?.role === "assistant") return "assistant";
   if (row?.type === "tool_result" || row?.type === "tool_use") return "tool";
+  return null;
+}
+
+function copilotEventRole(row) {
+  if (row?.type === "user.message") return "user";
+  if (row?.type === "assistant.message") return "assistant";
+  if (row?.type === "tool.execution_start" || row?.type === "external_tool.requested") return "tool";
+  if (row?.type === "tool.execution_complete" || row?.type === "external_tool.completed") {
+    return "tool_output";
+  }
   return null;
 }
 
@@ -359,7 +380,7 @@ function shellFamily(command) {
 }
 
 function toolCallFamily(row) {
-  const name = row.payload?.name || row.name || row.message?.name || row.type || "tool";
+  const name = row.data?.toolName || row.payload?.name || row.name || row.message?.name || row.type || "tool";
   if (name === "exec_command") {
     try {
       const args = JSON.parse(row.payload?.arguments || "{}");
@@ -427,9 +448,10 @@ function renderSession(file, options = {}) {
     const type = row?.type === "event_msg" ? row.payload?.type : null;
     return type === "user_message" || type === "agent_message";
   });
-  const renderRows = rows.flatMap((row) => [row, ...expandCompactedReplacementItems(row)]);
+  const renderRows =
+    agent === "copilot" ? rows : rows.flatMap((row) => [row, ...expandCompactedReplacementItems(row)]);
   for (const row of renderRows) {
-    const role = eventRole(row);
+    const role = agent === "copilot" ? copilotEventRole(row) : eventRole(row);
     if (!role) continue;
     if (hasEventDialogue && row.type === "response_item" && (role === "user" || role === "assistant")) {
       continue;
@@ -673,14 +695,78 @@ function readBoundedText(file, maxBytes = 220000) {
   }
 }
 
+function readFileRange(fd, start, length) {
+  if (length <= 0) return Buffer.alloc(0);
+  const buffer = Buffer.alloc(length);
+  const bytesRead = fs.readSync(fd, buffer, 0, length, start);
+  return buffer.subarray(0, bytesRead);
+}
+
+function readBoundedJsonlRows(file, maxBytes = 220000) {
+  const fd = fs.openSync(file, "r");
+  try {
+    const stat = fs.fstatSync(fd);
+    if (stat.size <= maxBytes) return readJsonl(file);
+
+    const half = Math.max(1, Math.floor(maxBytes / 2));
+    const boundaryBytes = MAX_JSONL_BOUNDARY_BYTES;
+    const headLength = Math.min(stat.size, half + boundaryBytes);
+    const headBuffer = readFileRange(fd, 0, headLength);
+    const headBoundary = headBuffer.indexOf(0x0a, half);
+    let headEnd = headBuffer.length;
+    if (headBoundary >= 0) headEnd = headBoundary + 1;
+    else if (headLength < stat.size) headEnd = headBuffer.lastIndexOf(0x0a) + 1;
+
+    const desiredTailStart = Math.max(0, stat.size - half);
+    const tailReadStart = Math.max(0, desiredTailStart - boundaryBytes);
+    const tailBuffer = readFileRange(fd, tailReadStart, stat.size - tailReadStart);
+    const desiredOffset = desiredTailStart - tailReadStart;
+    const previousBoundary = tailBuffer.lastIndexOf(0x0a, Math.max(0, desiredOffset - 1));
+    const nextBoundary = tailBuffer.indexOf(0x0a, desiredOffset);
+    let tailStart =
+      previousBoundary >= 0
+        ? previousBoundary + 1
+        : tailReadStart === 0
+          ? 0
+          : nextBoundary >= 0
+            ? nextBoundary + 1
+            : tailBuffer.length;
+    if (tailReadStart + tailStart < headEnd) {
+      tailStart = Math.min(tailBuffer.length, headEnd - tailReadStart);
+    }
+    const headText = headBuffer.subarray(0, headEnd).toString("utf8");
+    const tailText = tailBuffer.subarray(tailStart).toString("utf8");
+    const lines = [...headText.split(/\n+/), ...tailText.split(/\n+/)].filter(Boolean);
+    return lines.flatMap((line) => {
+      try {
+        return [JSON.parse(line)];
+      } catch {
+        return [];
+      }
+    });
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function sessionScanRecord(file, maxBytes) {
   const stat = fs.statSync(file);
-  const agent = detectAgent(file, []);
+  const boundedText = readBoundedText(file, maxBytes);
+  const rows = readBoundedJsonlRows(file, maxBytes);
+  const agent = detectAgent(file, rows);
+  const scanText =
+    agent === "copilot"
+      ? rows
+          .filter((row) => row?.type === "user.message" || row?.type === "assistant.message")
+          .map((row) => stringContent(row.data?.content))
+          .filter(Boolean)
+          .join("\n")
+      : boundedText;
   return {
     file,
     agent,
     mtime: new Date(stat.mtimeMs).toISOString(),
-    haystack: `${file}\n${readBoundedText(file, maxBytes)}`.toLowerCase(),
+    haystack: `${file}\n${scanText}`.toLowerCase(),
   };
 }
 

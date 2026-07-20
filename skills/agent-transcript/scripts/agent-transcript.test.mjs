@@ -5,23 +5,322 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-const script = path.resolve("skills/agent-transcript/scripts/agent-transcript");
+const script = path.join(import.meta.dirname, "agent-transcript");
 
 function tempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "agent-transcript-test-"));
 }
 
 function writeJsonl(file, rows) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
 }
 
 function run(args, options = {}) {
   return execFileSync(process.execPath, [script, ...args], {
-    cwd: path.resolve("."),
+    cwd: import.meta.dirname,
     encoding: "utf8",
     ...options,
   });
 }
+
+function copilotEvents(messages) {
+  return [
+    {
+      type: "session.start",
+      data: {
+        sessionId: "copilot-session",
+        producer: "copilot-agent",
+      },
+    },
+    ...messages,
+  ];
+}
+
+test("find discovers Copilot sessions from the default local session-state root", () => {
+  const home = tempDir();
+  const session = path.join(home, ".copilot", "session-state", "copilot-session", "events.jsonl");
+  writeJsonl(
+    session,
+    copilotEvents([
+      {
+        type: "user.message",
+        data: {
+          content: "Implement portable-copilot-marker in a local checkout.",
+        },
+      },
+    ]),
+  );
+
+  const output = run(["find", "--query", "portable-copilot-marker", "--cwd", "."], {
+    env: { ...process.env, HOME: home, USERPROFILE: home },
+  });
+  const matches = JSON.parse(output);
+
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].file, session);
+  assert.equal(matches[0].agent, "copilot");
+});
+
+test("find detects Copilot producers in explicit roots and scans visible dialogue only", () => {
+  const dir = tempDir();
+  const home = tempDir();
+  const session = path.join(dir, "events.jsonl");
+  writeJsonl(
+    session,
+    copilotEvents([
+      {
+        type: "user.message",
+        data: {
+          content: "visible-copilot-marker",
+          transformedContent: "PRIVATE_TRANSFORMED_SCAN_MARKER",
+        },
+      },
+    ]),
+  );
+
+  const options = {
+    env: { ...process.env, HOME: home, USERPROFILE: home },
+  };
+  const visible = JSON.parse(
+    run(["find", "--query", "visible-copilot-marker", "--root", dir, "--since-days", "1"], options),
+  );
+  const privateField = JSON.parse(
+    run(["find", "--query", "PRIVATE_TRANSFORMED_SCAN_MARKER", "--root", dir, "--since-days", "1"], options),
+  );
+
+  assert.equal(visible.length, 1);
+  assert.equal(visible[0].file, session);
+  assert.equal(visible[0].agent, "copilot");
+  assert.deepEqual(privateField, []);
+});
+
+test("find parses Copilot visible events larger than the scan-byte budget", () => {
+  const dir = tempDir();
+  const home = tempDir();
+  const session = path.join(dir, "events.jsonl");
+  writeJsonl(
+    session,
+    copilotEvents([
+      {
+        type: "user.message",
+        data: {
+          content: `prefix-${"x".repeat(400)}-copilot-boundary-marker-${"y".repeat(400)}`,
+        },
+      },
+    ]),
+  );
+
+  const output = run(
+    [
+      "find",
+      "--query",
+      "copilot-boundary-marker",
+      "--root",
+      dir,
+      "--since-days",
+      "1",
+      "--scan-bytes",
+      "120",
+    ],
+    { env: { ...process.env, HOME: home, USERPROFILE: home } },
+  );
+  const matches = JSON.parse(output);
+
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].file, session);
+  assert.equal(matches[0].agent, "copilot");
+});
+
+test("find parses Copilot visible events up to the boundary record cap", () => {
+  const dir = tempDir();
+  const home = tempDir();
+  const session = path.join(dir, "events.jsonl");
+  writeJsonl(
+    session,
+    copilotEvents([
+      {
+        type: "user.message",
+        data: {
+          content: `prefix-${"x".repeat(330 * 1024)}-copilot-large-record-marker`,
+        },
+      },
+    ]),
+  );
+
+  const output = run(
+    [
+      "find",
+      "--query",
+      "copilot-large-record-marker",
+      "--root",
+      dir,
+      "--since-days",
+      "1",
+      "--scan-bytes",
+      "60000",
+    ],
+    { env: { ...process.env, HOME: home, USERPROFILE: home } },
+  );
+  const matches = JSON.parse(output);
+
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].file, session);
+  assert.equal(matches[0].agent, "copilot");
+});
+
+test("find keeps the first Copilot event after overlapping scan ranges", () => {
+  const dir = tempDir();
+  const home = tempDir();
+  const session = path.join(dir, "events.jsonl");
+  writeJsonl(
+    session,
+    copilotEvents([
+      {
+        type: "user.message",
+        data: {
+          content: `prefix-${"x".repeat(800)}`,
+        },
+      },
+      {
+        type: "assistant.message",
+        data: {
+          content: "first-non-overlapping-event-marker",
+        },
+      },
+    ]),
+  );
+
+  const output = run(
+    [
+      "find",
+      "--query",
+      "first-non-overlapping-event-marker",
+      "--root",
+      dir,
+      "--since-days",
+      "1",
+      "--scan-bytes",
+      "400",
+    ],
+    { env: { ...process.env, HOME: home, USERPROFILE: home } },
+  );
+  const matches = JSON.parse(output);
+
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].file, session);
+  assert.equal(matches[0].agent, "copilot");
+});
+
+test("render keeps visible Copilot dialogue and drops private event data", () => {
+  const dir = tempDir();
+  const session = path.join(dir, ".copilot", "session-state", "copilot-session", "events.jsonl");
+  writeJsonl(
+    session,
+    copilotEvents([
+      {
+        type: "system.message",
+        data: {
+          role: "system",
+          content: "PRIVATE_SYSTEM_PROMPT",
+        },
+      },
+      {
+        type: "user.message",
+        data: {
+          content: "Please update /Users/alice/repo/src/index.ts.",
+          transformedContent: "PRIVATE_TRANSFORMED_PROMPT",
+        },
+      },
+      {
+        type: "assistant.message",
+        data: {
+          content: "Updated ~/repo/src/index.ts.",
+          reasoningOpaque: "PRIVATE_REASONING",
+          encryptedContent: "PRIVATE_ENCRYPTED_CONTENT",
+        },
+      },
+      {
+        type: "hook.start",
+        data: {
+          content: "PRIVATE_HOOK_CONTENT",
+        },
+      },
+      {
+        type: "response_item",
+        payload: {
+          role: "assistant",
+          content: "PRIVATE_GENERIC_RESPONSE_ITEM",
+        },
+      },
+      {
+        type: "assistant",
+        content: "PRIVATE_GENERIC_ASSISTANT_ROW",
+      },
+      {
+        type: "compacted",
+        payload: {
+          replacement_history: [
+            {
+              role: "assistant",
+              content: "PRIVATE_COMPACTED_ROW",
+            },
+          ],
+        },
+      },
+      {
+        type: "tool.execution_start",
+        data: {
+          toolCallId: "tool-1",
+          toolName: "view",
+          arguments: {
+            path: "/Users/alice/repo/src/index.ts",
+          },
+        },
+      },
+      {
+        type: "tool.execution_complete",
+        data: {
+          toolCallId: "tool-1",
+          success: true,
+          result: "PRIVATE_TOOL_OUTPUT",
+        },
+      },
+      {
+        type: "external_tool.requested",
+        data: {
+          requestId: "tool-2",
+          toolName: "powershell",
+          arguments: {
+            command: "Get-ChildItem",
+          },
+        },
+      },
+      {
+        type: "external_tool.completed",
+        data: {
+          requestId: "tool-2",
+        },
+      },
+    ]),
+  );
+
+  const output = run(["render", "--session", session]);
+
+  assert.match(output, /<summary>Redacted copilot session transcript<\/summary>/);
+  assert.match(output, /\[user\]\nPlease update \[LOCAL_PATH\]/);
+  assert.match(output, /\[assistant\]\nUpdated \[HOME_PATH\]/);
+  assert.match(output, /1 read, 1 execute; raw tool outputs dropped: 2/);
+  assert.doesNotMatch(output, /PRIVATE_SYSTEM_PROMPT/);
+  assert.doesNotMatch(output, /PRIVATE_TRANSFORMED_PROMPT/);
+  assert.doesNotMatch(output, /PRIVATE_REASONING/);
+  assert.doesNotMatch(output, /PRIVATE_ENCRYPTED_CONTENT/);
+  assert.doesNotMatch(output, /PRIVATE_HOOK_CONTENT/);
+  assert.doesNotMatch(output, /PRIVATE_GENERIC_RESPONSE_ITEM/);
+  assert.doesNotMatch(output, /PRIVATE_GENERIC_ASSISTANT_ROW/);
+  assert.doesNotMatch(output, /PRIVATE_COMPACTED_ROW/);
+  assert.doesNotMatch(output, /PRIVATE_TOOL_OUTPUT/);
+});
 
 test("render redacts common secrets and local identifiers", () => {
   const dir = tempDir();
@@ -141,4 +440,48 @@ test("find labels explicit roots under trailing-slash CLAUDE_CONFIG_DIR as Claud
   assert.equal(matches.length, 1);
   assert.equal(matches[0].file, session);
   assert.equal(matches[0].agent, "claude");
+});
+
+test("render preserves Codex event dialogue and tool summaries", () => {
+  const dir = tempDir();
+  const session = path.join(dir, "session.jsonl");
+  writeJsonl(session, [
+    {
+      type: "event_msg",
+      payload: {
+        type: "user_message",
+        message: "Existing user message",
+      },
+    },
+    {
+      type: "event_msg",
+      payload: {
+        type: "agent_message",
+        message: "Existing assistant message",
+      },
+    },
+    {
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "apply_patch",
+        arguments: "{}",
+      },
+    },
+    {
+      type: "response_item",
+      payload: {
+        type: "function_call_output",
+        output: "PRIVATE_EXISTING_TOOL_OUTPUT",
+      },
+    },
+  ]);
+
+  const output = run(["render", "--session", session]);
+
+  assert.match(output, /<summary>Redacted codex session transcript<\/summary>/);
+  assert.match(output, /\[user\]\nExisting user message/);
+  assert.match(output, /\[assistant\]\nExisting assistant message/);
+  assert.match(output, /1 write; raw tool outputs dropped: 1/);
+  assert.doesNotMatch(output, /PRIVATE_EXISTING_TOOL_OUTPUT/);
 });

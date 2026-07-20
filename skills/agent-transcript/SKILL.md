@@ -17,6 +17,7 @@ Best-effort local-only provenance for OpenClaw PR/issue bodies. Use during agent
 - Fail closed on unresolved secrets, private keys, browser/session/cookie details, or auth URLs.
 - Drop system/developer prompts, raw tool outputs, reasoning, env, cookies, tokens, and broad local paths.
 - Keep user prompts, assistant visible decisions, terse tool summaries, and test/proof outcomes.
+- For GitHub Copilot, discover `~/.copilot/session-state/*/events.jsonl`, keep only visible `user.message` and `assistant.message` content, count tool starts, and drop tool completions/outputs plus system, transformed, reasoning, encrypted, and hook content.
 - Automatically trim the rendered transcript before showing it, previewing it, or inserting it into a public body. Never paste the raw full-session render into a PR/issue body just because `render` or `append-body` produced it.
 - Remove session turns unrelated to the PR/issue work. Use the PR/issue title, branch name, changed files, and stated goal as scope; omit earlier/later unrelated tasks even when they are in the same session log.
 - Best effort only: PR/issue creation must continue if no safe transcript is found.
@@ -25,48 +26,56 @@ Best-effort local-only provenance for OpenClaw PR/issue bodies. Use during agent
 
 ## Helper
 
-```bash
-skills/agent-transcript/scripts/agent-transcript --help
+```sh
+node "{baseDir}/scripts/agent-transcript" --help
 ```
 
 Find a likely local session:
 
-```bash
-skills/agent-transcript/scripts/agent-transcript find \
-  --query "$PR_TITLE $BRANCH_OR_PR_URL" \
-  --cwd "$PWD" \
+```sh
+node "{baseDir}/scripts/agent-transcript" find \
+  --query "PR title branch-or-URL" \
+  --cwd "." \
   --since-days 14
 ```
 
-`find` scans the newest 400 matching local JSONL logs by default across Codex, Claude, Pi, and OpenClaw agent sessions. Use `--max-files N` for a wider local search.
-
-In a downstream repo that syncs shared skills under `.agents/skills`, replace
-`skills/agent-transcript` with `.agents/skills/agent-transcript`.
+`find` scans the newest 400 matching local JSONL logs by default across Codex, Claude, GitHub Copilot, Pi, and OpenClaw agent sessions. Use `--max-files N` for a wider local search.
 
 Render a PR/issue body section:
 
-```bash
-skills/agent-transcript/scripts/agent-transcript render \
-  --session "$SESSION_JSONL" \
-  --out /tmp/agent-transcript.md
+```sh
+node "{baseDir}/scripts/agent-transcript" render \
+  --session "SESSION_JSONL" \
+  --out "agent-transcript.md"
 ```
+
+For Codex sessions whose JSONL was compacted or archived, prefer local app-server rendering:
+
+```sh
+node "{baseDir}/scripts/agent-transcript" render-thread \
+  --thread-id "THREAD_ID" \
+  --out "agent-transcript.md"
+```
+
+`render --app-server --session "SESSION_JSONL"` can infer a UUID thread ID from the session filename.
 
 Preview one candidate session locally:
 
-```bash
-skills/agent-transcript/scripts/agent-transcript preview \
-  --session "$SESSION_JSONL" \
-  --out /tmp/agent-transcript-preview.html
-open /tmp/agent-transcript-preview.html
+```sh
+node "{baseDir}/scripts/agent-transcript" preview \
+  --session "SESSION_JSONL" \
+  --out "agent-transcript-preview.html"
 ```
+
+Open the generated HTML locally with the platform's normal file viewer.
 
 Append/update a body file before `gh pr create --body-file` or connector PR creation:
 
-```bash
-skills/agent-transcript/scripts/agent-transcript append-body \
-  --body /tmp/pr-body.md \
-  --session "$SESSION_JSONL" \
-  --out /tmp/pr-body.with-transcript.md
+```sh
+node "{baseDir}/scripts/agent-transcript" append-body \
+  --body "pr-body.md" \
+  --session "SESSION_JSONL" \
+  --out "pr-body.with-transcript.md"
 ```
 
 ## PR/Issue Workflow
@@ -83,16 +92,16 @@ skills/agent-transcript/scripts/agent-transcript append-body \
 
 ## Validate
 
-```bash
-node --test skills/agent-transcript/scripts/agent-transcript.test.mjs
+```sh
+node --test "{baseDir}/scripts/agent-transcript.test.mjs"
 ```
 
 ## Review Artifacts
 
 For manual audits across many PR/session candidates, create a local HTML preview from a local JSON file. This is for maintainers only and is not part of the PR/issue workflow:
 
-```bash
-skills/agent-transcript/scripts/agent-transcript html \
-  --prs /tmp/recent-prs.json \
-  --out /tmp/agent-transcript-preview.html
+```sh
+node "{baseDir}/scripts/agent-transcript" html \
+  --prs "recent-prs.json" \
+  --out "agent-transcript-preview.html"
 ```
