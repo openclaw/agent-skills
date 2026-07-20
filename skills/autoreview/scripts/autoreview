@@ -5953,6 +5953,37 @@ def assignment_fallback_literal_spans(
     )
 
 
+def assignment_prefix_fallback_literal_spans(
+    text: str,
+    match: re.Match[str],
+    *,
+    javascript_dialect: str | None = None,
+) -> list[tuple[int, int]]:
+    suffix = text[match.end() :]
+    fallback = top_level_fallback_suffix(suffix)
+    if fallback is None:
+        return []
+    fallback_start = match.end() + len(suffix) - len(fallback)
+    expression = fallback_expression(
+        fallback,
+        typescript=javascript_dialect == "typescript",
+    )
+    expression_end = fallback_start + len(expression)
+    operator_span = top_level_fallback_operator_span(
+        text,
+        fallback_start,
+        expression_end,
+    )
+    if operator_span is None:
+        return []
+    return top_level_fallback_value_spans(
+        text,
+        operator_span[1],
+        expression_end,
+        include_nested=True,
+    )
+
+
 def top_level_fallback_operator_span(
     text: str,
     start: int,
@@ -6075,7 +6106,10 @@ def top_level_fallback_value_spans(
                         include_nested
                         and value.casefold() not in SECRET_PLACEHOLDER_VALUES
                         and len(value) >= 7
-                        and any(character.isdigit() for character in value)
+                        and (
+                            len(value) >= 12
+                            or any(character.isdigit() for character in value)
+                        )
                         and not any(
                             pattern.fullmatch(value)
                             for pattern in QUOTED_SECRET_REFERENCE_PATTERNS
@@ -6210,6 +6244,16 @@ def review_repeatable_secret_spans(
             javascript_dialect=javascript_dialect,
         )
     ]
+    spans.extend(
+        span
+        for match in SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(text)
+        if match.start() not in boolean_declaration_positions
+        for span in assignment_prefix_fallback_literal_spans(
+            text,
+            match,
+            javascript_dialect=javascript_dialect,
+        )
+    )
     for match in SECRET_ASSIGNMENT_PATTERN.finditer(text):
         if match.start() in boolean_declaration_positions:
             continue
@@ -6298,6 +6342,16 @@ def review_secret_value_spans(
             javascript_dialect=javascript_dialect,
         )
     ]
+    spans.extend(
+        span
+        for match in SECRET_ASSIGNMENT_PREFIX_PATTERN.finditer(text)
+        if match.start() not in boolean_declaration_positions
+        for span in assignment_prefix_fallback_literal_spans(
+            text,
+            match,
+            javascript_dialect=javascript_dialect,
+        )
+    )
     for match in SECRET_ASSIGNMENT_PATTERN.finditer(text):
         if match.start() in boolean_declaration_positions:
             continue
@@ -6853,11 +6907,27 @@ def tolerant_pem_line_spans(text: str, depth: int) -> tuple[list[tuple[int, int]
     return spans, depth
 
 
+def diff_prefix_side(prefix: str) -> str:
+    """Return the semantic side for a unified or combined-diff prefix."""
+    has_addition = "+" in prefix
+    has_removal = "-" in prefix
+    if has_addition and not has_removal:
+        return "+"
+    if has_removal and not has_addition:
+        return "-"
+    if not has_addition and not has_removal:
+        return " "
+    return ""
+
+
 def redact_unbalanced_private_key_hunks(section: str) -> tuple[str, set[str]]:
     """Redact inherited truncated PEM material while retaining changed code."""
     lines = literal_lf_lines(section)
     redacted = list(lines)
     secret_fragments: set[str] = set()
+    section_old_text, section_new_text = unified_diff_contents(section)
+    old_depth = private_key_initial_depth(section_old_text)
+    new_depth = private_key_initial_depth(section_new_text)
     index = 0
     while index < len(lines):
         header = lines[index]
@@ -6871,9 +6941,7 @@ def redact_unbalanced_private_key_hunks(section: str) -> tuple[str, set[str]]:
         prefix_columns = len(prefix_match.group(1)) - 1
         old_content: list[str] = []
         new_content: list[str] = []
-        raw_content: list[str] = []
         hunk_lines: list[tuple[int, str, str, str]] = []
-        has_changed_marker = False
         for line_index in range(index + 1, hunk_end):
             line = lines[line_index]
             body = line.rstrip("\r\n")
@@ -6883,32 +6951,138 @@ def redact_unbalanced_private_key_hunks(section: str) -> tuple[str, set[str]]:
                 continue
             content = body[prefix_columns:]
             hunk_lines.append((line_index, prefix, content, ending))
-            raw_content.append(content)
-            if set(prefix) != {" "} and (
-                PRIVATE_KEY_BEGIN_PATTERN.search(content) is not None
-                or PRIVATE_KEY_END_PATTERN.search(content) is not None
-            ):
-                has_changed_marker = True
             if set(prefix) == {" "} or "-" in prefix:
                 old_content.append(content)
             if set(prefix) == {" "} or "+" in prefix:
                 new_content.append(content)
         old_text = "\n".join(old_content)
         new_text = "\n".join(new_content)
-        raw_text = "\n".join(raw_content)
         old_balanced = private_key_markers_balanced(old_text)
         new_balanced = private_key_markers_balanced(new_text)
-        raw_balanced = private_key_markers_balanced(raw_text)
-        if old_balanced and new_balanced and raw_balanced:
+        if old_balanced and new_balanced and old_depth == 0 and new_depth == 0:
             index = hunk_end
             continue
-        if has_changed_marker:
+        ambiguous_changed_lines: set[int] = set()
+        redact_ambiguous_hunk = False
+        for position, (_, prefix, content, _) in enumerate(hunk_lines):
+            if not (
+                PRIVATE_KEY_BEGIN_PATTERN.search(content)
+                or PRIVATE_KEY_END_PATTERN.search(content)
+            ):
+                continue
+            side = diff_prefix_side(prefix)
+            if side == "":
+                redact_ambiguous_hunk = True
+                break
+            if side not in {"+", "-"}:
+                continue
+            opposite = "+" if side == "-" else "-"
+            run_start = position
+            while (
+                run_start > 0
+                and diff_prefix_side(hunk_lines[run_start - 1][1]) == side
+            ):
+                run_start -= 1
+            run_end = position
+            while (
+                run_end + 1 < len(hunk_lines)
+                and diff_prefix_side(hunk_lines[run_end + 1][1]) == side
+            ):
+                run_end += 1
+            for neighbor in (run_start - 1, run_end + 1):
+                opposite_run: list[int] = []
+                while (
+                    0 <= neighbor < len(hunk_lines)
+                    and diff_prefix_side(hunk_lines[neighbor][1]) == opposite
+                ):
+                    opposite_run.append(neighbor)
+                    neighbor += -1 if neighbor < run_start else 1
+                if not any(
+                    PRIVATE_KEY_BEGIN_PATTERN.search(hunk_lines[item][2])
+                    or PRIVATE_KEY_END_PATTERN.search(hunk_lines[item][2])
+                    for item in opposite_run
+                ):
+                    ambiguous_changed_lines.update(
+                        hunk_lines[item][0] for item in opposite_run
+                    )
+        if redact_ambiguous_hunk:
+            for line_index, prefix, content, ending in hunk_lines:
+                spans: list[tuple[int, int]] = []
+                if old_depth > 0 or new_depth > 0:
+                    spans.extend(
+                        explicit_private_key_body_spans(
+                            content,
+                            in_pem=True,
+                        )
+                    )
+                if set(prefix) == {" "} or "-" in prefix:
+                    old_spans, old_depth = tolerant_pem_line_spans(
+                        content,
+                        old_depth,
+                    )
+                    spans.extend(old_spans)
+                if set(prefix) == {" "} or "+" in prefix:
+                    new_spans, new_depth = tolerant_pem_line_spans(
+                        content,
+                        new_depth,
+                    )
+                    spans.extend(new_spans)
+                marker_spans = {
+                    match.span()
+                    for pattern in (
+                        PRIVATE_KEY_BEGIN_PATTERN,
+                        PRIVATE_KEY_END_PATTERN,
+                    )
+                    for match in pattern.finditer(content)
+                }
+                secret_fragments.update(
+                    fragment
+                    for start, end in spans
+                    if (start, end) not in marker_spans
+                    and (
+                        fragment := normalized_private_key_fragment(
+                            content,
+                            start,
+                            end,
+                        )
+                    )
+                    and fragment.casefold() not in SECRET_PLACEHOLDER_VALUES
+                )
+                redacted[line_index] = (
+                    f"{prefix}{REVIEW_SECURITY_REDACTION}{ending}"
+                )
             index = hunk_end
             continue
-        old_depth = private_key_initial_depth(old_text)
-        new_depth = private_key_initial_depth(new_text)
         for line_index, prefix, content, ending in hunk_lines:
+            if line_index in ambiguous_changed_lines:
+                candidate_spans = explicit_private_key_body_spans(
+                    content,
+                    in_pem=True,
+                )
+                secret_fragments.update(
+                    fragment
+                    for start, end in candidate_spans
+                    if (
+                        fragment := normalized_private_key_fragment(
+                            content,
+                            start,
+                            end,
+                        )
+                    )
+                    and fragment.casefold() not in SECRET_PLACEHOLDER_VALUES
+                )
+                redacted[line_index] = (
+                    f"{prefix}{REVIEW_SECRET_REDACTION}{ending}"
+                )
+                continue
             spans: list[tuple[int, int]] = []
+            if (old_depth > 0 or new_depth > 0) and set(prefix) != {" "}:
+                spans.extend(
+                    explicit_private_key_body_spans(
+                        content,
+                        in_pem=True,
+                    )
+                )
             if set(prefix) == {" "} or "-" in prefix:
                 old_spans, old_depth = tolerant_pem_line_spans(content, old_depth)
                 spans.extend(old_spans)
@@ -7468,7 +7642,7 @@ def validate_review_patch(
     redacted_units: list[str] = []
     known_secret_fragments: set[str] = set()
     for unit in units:
-        if unit.startswith("diff --git "):
+        if unit.startswith(("diff --git ", "diff --cc ", "diff --combined ")):
             try:
                 unit, fragments = redact_unbalanced_private_key_hunks(unit)
                 known_secret_fragments.update(fragments)

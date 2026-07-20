@@ -3886,7 +3886,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertNotIn("AB12cd34EF56", redacted)
         self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
 
-    def test_review_patch_omits_added_unmatched_private_key_begin(self) -> None:
+    def test_review_patch_redacts_added_unmatched_private_key_begin(self) -> None:
         patch = (
             "diff --git a/fixture.txt b/fixture.txt\n"
             "--- a/fixture.txt\n"
@@ -3903,11 +3903,9 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ["fixture.txt"],
             patch,
         )
-        self.assertEqual(
-            redacted,
-            self.helper["REVIEW_SECURITY_REDACTION"] + "\n",
-        )
         self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
+        self.assertNotIn("MIIEowIBAAKCAQEAunmatched0123456789ABCDEF", redacted)
+        self.assertIn("+runDangerousOperation();", redacted)
 
     def test_review_patch_redacts_truncated_inherited_private_key_context(self) -> None:
         patch = (
@@ -3994,7 +3992,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertIn('const label = "visible";', redacted)
         self.assertIn("+const timeout = 30_000;", redacted)
 
-    def test_review_patch_omits_truncated_private_key_marker_replacement(self) -> None:
+    def test_review_patch_redacts_truncated_private_key_marker_replacement(self) -> None:
         patch = (
             "diff --git a/fixture.test.ts b/fixture.test.ts\n"
             "--- a/fixture.test.ts\n"
@@ -4016,13 +4014,12 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ["fixture.test.ts"],
             patch,
         )
-        self.assertEqual(
-            redacted,
-            self.helper["REVIEW_SECURITY_REDACTION"] + "\n",
-        )
         self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
+        self.assertNotIn("AB12cd34EF56", redacted)
+        self.assertIn("expect(key).toBeDefined();", redacted)
+        self.assertIn("+const timeout = 30_000;", redacted)
 
-    def test_review_patch_omits_removed_private_key_end_marker(self) -> None:
+    def test_review_patch_redacts_removed_private_key_end_marker(self) -> None:
         replacement = "AB12cd34EF56gh78"
         patch = (
             "diff --git a/fixture.test.ts b/fixture.test.ts\n"
@@ -4043,13 +4040,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ["fixture.test.ts"],
             patch,
         )
-        self.assertEqual(
-            redacted,
-            self.helper["REVIEW_SECURITY_REDACTION"] + "\n",
-        )
         self.assertNotIn(replacement, redacted)
+        self.assertNotIn("END PRIVATE KEY", redacted)
+        self.assertIn("+const timeout = 30_000;", redacted)
 
-    def test_review_patch_omits_removed_private_key_begin_marker(self) -> None:
+    def test_review_patch_redacts_removed_private_key_begin_marker(self) -> None:
         replacement = "AB12cd34EF56gh78"
         patch = (
             "diff --git a/fixture.test.ts b/fixture.test.ts\n"
@@ -4070,13 +4065,168 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ["fixture.test.ts"],
             patch,
         )
-        self.assertEqual(
-            redacted,
-            self.helper["REVIEW_SECURITY_REDACTION"] + "\n",
-        )
         self.assertNotIn(replacement, redacted)
+        self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
+        self.assertIn("+const timeout = 30_000;", redacted)
 
-    def test_review_patch_omits_net_new_unmatched_private_key_marker(self) -> None:
+    def test_review_patch_redacts_multiline_private_key_replacement(self) -> None:
+        replacement = "MIIEowIBAAKCAQEAreplacement0123456789ABCDEF"
+        patch = (
+            "diff --git a/fixture.test.ts b/fixture.test.ts\n"
+            "--- a/fixture.test.ts\n"
+            "+++ b/fixture.test.ts\n"
+            "@@ -1,2 +1,2 @@\n"
+            '-const begin = "-----BEGIN '
+            + 'PRIVATE KEY-----";\n'
+            '-const oldBody = "ZX90yu12WV34";\n'
+            f'+const replacement = "{replacement}";\n'
+            '+const replacementLabel = "visible later";\n'
+            "@@ -20 +20 @@\n"
+            "-const timeout = 0;\n"
+            "+runDangerousOperation();\n"
+        )
+
+        redacted = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.test.ts"],
+            patch,
+        )
+
+        self.assertNotIn(replacement, redacted)
+        self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
+        self.assertIn("+runDangerousOperation();", redacted)
+
+    def test_review_patch_carries_private_key_state_across_hunks(self) -> None:
+        replacement = "MIIEowIBAAKCAQEAcrosshunk0123456789ABCDEF"
+        patch = (
+            "diff --git a/fixture.test.ts b/fixture.test.ts\n"
+            "--- a/fixture.test.ts\n"
+            "+++ b/fixture.test.ts\n"
+            "@@ -1 +1 @@\n"
+            '-const begin = "-----BEGIN '
+            + 'PRIVATE KEY-----";\n'
+            '+const begin = "removed";\n'
+            "@@ -20 +20,2 @@\n"
+            '-const oldBody = "ZX90yu12WV34";\n'
+            f'+const replacement = "{replacement}";\n'
+            "+runDangerousOperation();\n"
+        )
+
+        redacted = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.test.ts"],
+            patch,
+        )
+
+        self.assertNotIn(replacement, redacted)
+        self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
+        self.assertIn("+runDangerousOperation();", redacted)
+
+    def test_review_patch_redacts_ambiguous_combined_diff_hunk_only(self) -> None:
+        replacement = "MIIEowIBAAKCAQEAcombined0123456789ABCDEF"
+        patch = (
+            "diff --cc fixture.test.ts\n"
+            "index 1111111,2222222..3333333\n"
+            "--- a/fixture.test.ts\n"
+            "+++ b/fixture.test.ts\n"
+            "@@@ -1,2 -1,2 +1,2 @@@\n"
+            '-+const end = "-----END '
+            + 'PRIVATE KEY-----";\n'
+            f'++const replacement = "{replacement}";\n'
+            "@@@ -20,1 -20,1 +20,1 @@@\n"
+            "--const timeout = 0;\n"
+            "++runDangerousOperation();\n"
+        )
+
+        redacted = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.test.ts"],
+            patch,
+        )
+
+        self.assertNotIn(replacement, redacted)
+        self.assertNotIn("END PRIVATE KEY", redacted)
+        self.assertIn("++runDangerousOperation();", redacted)
+
+    def test_review_patch_carries_ambiguous_combined_diff_state(self) -> None:
+        body = "MIIEowIBAAKCAQEAcombinedbody0123456789ABCDEF"
+        patch = (
+            "diff --cc fixture.test.ts\n"
+            "index 1111111,2222222..3333333\n"
+            "--- a/fixture.test.ts\n"
+            "+++ b/fixture.test.ts\n"
+            "@@@ -1,1 -1,1 +1,1 @@@\n"
+            '-+const begin = "-----BEGIN '
+            + 'PRIVATE KEY-----";\n'
+            "@@@ -10,1 -10,1 +10,2 @@@\n"
+            f'++const body = "{body}";\n'
+            "++runDangerousOperation();\n"
+        )
+
+        redacted = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.test.ts"],
+            patch,
+        )
+
+        self.assertNotIn(body, redacted)
+        self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
+        self.assertIn("++runDangerousOperation();", redacted)
+
+    def test_review_patch_redacts_repeated_ambiguous_combined_fragment(self) -> None:
+        body = "MIIEowIBAAKCAQEArepeatedbody0123456789ABCDEF"
+        patch = (
+            "diff --cc fixture.test.ts\n"
+            "index 1111111,2222222..3333333\n"
+            "--- a/fixture.test.ts\n"
+            "+++ b/fixture.test.ts\n"
+            "@@@ -1,2 -1,2 +1,2 @@@\n"
+            '-+const key = "-----BEGIN '
+            + 'PRIVATE KEY-----";\n'
+            f'-+const body = "{body}";\n'
+            "@@@ -10,1 -10,1 +10,1 @@@\n"
+            '-+const end = "-----END '
+            + 'PRIVATE KEY-----";\n'
+            "@@@ -20,1 -20,1 +20,1 @@@\n"
+            f'++log("{body}");\n'
+        )
+
+        redacted = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.test.ts"],
+            patch,
+        )
+
+        self.assertNotIn(body, redacted)
+
+    def test_review_patch_skips_no_newline_metadata_when_pairing(self) -> None:
+        replacement = "MIIEowIBAAKCAQEAnewline0123456789ABCDEF"
+        patch = (
+            "diff --git a/fixture.test.ts b/fixture.test.ts\n"
+            "--- a/fixture.test.ts\n"
+            "+++ b/fixture.test.ts\n"
+            "@@ -1 +1 @@\n"
+            '-const end = "-----END '
+            + 'PRIVATE KEY-----";\n'
+            "\\ No newline at end of file\n"
+            f'+const replacement = "{replacement}";\n'
+            "\\ No newline at end of file\n"
+            "@@ -20 +20 @@\n"
+            "-const timeout = 0;\n"
+            "+runDangerousOperation();\n"
+        )
+
+        redacted = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.test.ts"],
+            patch,
+        )
+
+        self.assertNotIn(replacement, redacted)
+        self.assertNotIn("END PRIVATE KEY", redacted)
+        self.assertIn("+runDangerousOperation();", redacted)
+
+    def test_review_patch_redacts_net_new_unmatched_private_key_marker(self) -> None:
         patch = (
             "diff --git a/fixture.test.ts b/fixture.test.ts\n"
             "--- a/fixture.test.ts\n"
@@ -4095,11 +4245,28 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ["fixture.test.ts"],
             patch,
         )
-        self.assertEqual(
-            redacted,
-            self.helper["REVIEW_SECURITY_REDACTION"] + "\n",
-        )
         self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
+        self.assertIn("@@ -1 +1,2 @@", redacted)
+
+    def test_review_patch_redacts_changed_unmatched_private_key_end_marker(self) -> None:
+        patch = (
+            "diff --git a/fixture.test.ts b/fixture.test.ts\n"
+            "--- a/fixture.test.ts\n"
+            "+++ b/fixture.test.ts\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+const end = \"-----END "
+            + "PRIVATE KEY-----\";\n"
+            "+runDangerousOperation();\n"
+        )
+
+        redacted = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.test.ts"],
+            patch,
+        )
+
+        self.assertNotIn("END PRIVATE KEY", redacted)
+        self.assertIn("+runDangerousOperation();", redacted)
 
     def test_review_patch_redacts_before_unmatched_private_key_end(self) -> None:
         patch = (
@@ -4139,11 +4306,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ["fixture.txt"],
             patch,
         )
-        self.assertEqual(
-            redacted,
-            self.helper["REVIEW_SECURITY_REDACTION"] + "\n",
-        )
         self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
+        self.assertNotIn("CDef3456GHij7890", redacted)
 
     def test_review_patch_redacts_secret_like_hunk_header_section(self) -> None:
         fixture_value = realistic_secret_value()
@@ -4668,6 +4832,29 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertIn('choose("redacted")', redacted)
         self.assertIn('log("redacted")', redacted)
 
+    def test_review_patch_omits_ambiguous_changed_line_before_repeated_value(
+        self,
+    ) -> None:
+        secret = "correct-horse-battery-staple"
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1,2 @@\n"
+            f'+password = env || choose("{secret}");\n'
+            f'+log("{secret}");\n'
+        )
+
+        redacted = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertNotIn(secret, redacted)
+        self.assertIn('choose("redacted")', redacted)
+        self.assertIn('log("redacted")', redacted)
+
     def test_review_patch_preserves_repeated_nested_noncredential_literals(self) -> None:
         short_secret = "hunter2"
         patch = (
@@ -4675,7 +4862,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "--- a/runtime.ts\n"
             "+++ b/runtime.ts\n"
             "@@ -0,0 +1,3 @@\n"
-            f'+password = derive(input, "application/json") || choose("application/json", "{short_secret}");\n'
+            f'+password = derive(input, "application/json") || choose("{short_secret}");\n'
             '+log("application/json");\n'
             f'+log("{short_secret}");\n'
         )
@@ -4689,6 +4876,26 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertNotIn(short_secret, redacted)
         self.assertIn(self.helper["REVIEW_SECRET_REDACTION"], redacted)
         self.assertIn('log("application/json")', redacted)
+        self.assertIn('log("redacted")', redacted)
+
+    def test_review_patch_preserves_boolean_fallback_literals(self) -> None:
+        patch = (
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1,2 @@\n"
+            '+const password: boolean = enabled || choose("long-status-label");\n'
+            '+log("long-status-label");\n'
+        )
+
+        redacted = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["runtime.ts"],
+            patch,
+        )
+
+        self.assertIn(self.helper["REVIEW_SECRET_REDACTION"], redacted)
+        self.assertIn('+log("long-status-label");', redacted)
 
     def test_review_patch_ignores_fallback_literals_inside_comments(self) -> None:
         patch = (
