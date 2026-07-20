@@ -4122,7 +4122,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
         self.assertIn("+runDangerousOperation();", redacted)
 
-    def test_review_patch_redacts_ambiguous_combined_diff_hunk_only(self) -> None:
+    def test_review_patch_omits_ambiguous_combined_diff_section_only(self) -> None:
         replacement = "MIIEowIBAAKCAQEAcombined0123456789ABCDEF"
         patch = (
             "diff --cc fixture.test.ts\n"
@@ -4136,17 +4136,23 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "@@@ -20,1 -20,1 +20,1 @@@\n"
             "--const timeout = 0;\n"
             "++runDangerousOperation();\n"
+            "diff --git a/safe.ts b/safe.ts\n"
+            "--- a/safe.ts\n"
+            "+++ b/safe.ts\n"
+            "@@ -0,0 +1 @@\n"
+            "+runSafeReviewOperation();\n"
         )
 
         redacted = self.helper["validate_review_patch"](
             "local unstaged diff",
-            ["fixture.test.ts"],
+            ["fixture.test.ts", "safe.ts"],
             patch,
         )
 
         self.assertNotIn(replacement, redacted)
         self.assertNotIn("END PRIVATE KEY", redacted)
-        self.assertIn("++runDangerousOperation();", redacted)
+        self.assertNotIn("++runDangerousOperation();", redacted)
+        self.assertIn("+runSafeReviewOperation();", redacted)
 
     def test_review_patch_carries_ambiguous_combined_diff_state(self) -> None:
         body = "MIIEowIBAAKCAQEAcombinedbody0123456789ABCDEF"
@@ -4161,17 +4167,23 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "@@@ -10,1 -10,1 +10,2 @@@\n"
             f'++const body = "{body}";\n'
             "++runDangerousOperation();\n"
+            "diff --git a/safe.ts b/safe.ts\n"
+            "--- a/safe.ts\n"
+            "+++ b/safe.ts\n"
+            "@@ -0,0 +1 @@\n"
+            "+runSafeReviewOperation();\n"
         )
 
         redacted = self.helper["validate_review_patch"](
             "local unstaged diff",
-            ["fixture.test.ts"],
+            ["fixture.test.ts", "safe.ts"],
             patch,
         )
 
         self.assertNotIn(body, redacted)
         self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
-        self.assertIn("++runDangerousOperation();", redacted)
+        self.assertNotIn("++runDangerousOperation();", redacted)
+        self.assertIn("+runSafeReviewOperation();", redacted)
 
     def test_review_patch_redacts_repeated_ambiguous_combined_fragment(self) -> None:
         body = "MIIEowIBAAKCAQEArepeatedbody0123456789ABCDEF"
@@ -4189,15 +4201,26 @@ class AutoreviewHardeningTests(unittest.TestCase):
             + 'PRIVATE KEY-----";\n'
             "@@@ -20,1 -20,1 +20,1 @@@\n"
             f'++log("{body}");\n'
+            "diff --git a/runtime.ts b/runtime.ts\n"
+            "--- a/runtime.ts\n"
+            "+++ b/runtime.ts\n"
+            "@@ -0,0 +1 @@\n"
+            f'+log("{body}");\n'
+            "diff --git a/safe.ts b/safe.ts\n"
+            "--- a/safe.ts\n"
+            "+++ b/safe.ts\n"
+            "@@ -0,0 +1 @@\n"
+            "+runSafeReviewOperation();\n"
         )
 
         redacted = self.helper["validate_review_patch"](
             "local unstaged diff",
-            ["fixture.test.ts"],
+            ["fixture.test.ts", "runtime.ts", "safe.ts"],
             patch,
         )
 
         self.assertNotIn(body, redacted)
+        self.assertIn("+runSafeReviewOperation();", redacted)
 
     def test_review_patch_skips_no_newline_metadata_when_pairing(self) -> None:
         replacement = "MIIEowIBAAKCAQEAnewline0123456789ABCDEF"

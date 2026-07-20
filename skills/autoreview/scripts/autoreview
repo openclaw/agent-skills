@@ -6925,6 +6925,50 @@ def redact_unbalanced_private_key_hunks(section: str) -> tuple[str, set[str]]:
     lines = literal_lf_lines(section)
     redacted = list(lines)
     secret_fragments: set[str] = set()
+    combined_diff = section.startswith(("diff --cc ", "diff --combined "))
+    has_private_key_marker = (
+        PRIVATE_KEY_BEGIN_PATTERN.search(section) is not None
+        or PRIVATE_KEY_END_PATTERN.search(section) is not None
+    )
+    if combined_diff and has_private_key_marker:
+        in_hunk = False
+        prefix_columns = 1
+        for line in lines:
+            body = line.rstrip("\r\n")
+            header = re.match(r"^(@{2,})", body)
+            if header is not None:
+                in_hunk = True
+                prefix_columns = len(header.group(1)) - 1
+                continue
+            prefix = body[:prefix_columns]
+            if (
+                not in_hunk
+                or len(prefix) != prefix_columns
+                or not set(prefix) <= {"+", "-", " "}
+            ):
+                continue
+            content = body[prefix_columns:]
+            marker_spans = [
+                match.span()
+                for pattern in (
+                    PRIVATE_KEY_BEGIN_PATTERN,
+                    PRIVATE_KEY_END_PATTERN,
+                )
+                for match in pattern.finditer(content)
+            ]
+            for start, end in explicit_private_key_body_spans(
+                content,
+                in_pem=True,
+            ):
+                if any(
+                    marker_start < end and start < marker_end
+                    for marker_start, marker_end in marker_spans
+                ):
+                    continue
+                fragment = normalized_private_key_fragment(content, start, end)
+                if fragment.casefold() not in SECRET_PLACEHOLDER_VALUES:
+                    secret_fragments.add(fragment)
+        return REVIEW_SECURITY_REDACTION + "\n", secret_fragments
     section_old_text, section_new_text = unified_diff_contents(section)
     old_depth = private_key_initial_depth(section_old_text)
     new_depth = private_key_initial_depth(section_new_text)
@@ -8450,7 +8494,9 @@ def review_bundle_units(bundle: str) -> list[str]:
     units: list[str] = []
     current: list[str] = []
     for line in literal_lf_lines(bundle):
-        boundary = line.startswith("diff --git ") or line in section_boundaries
+        boundary = line.startswith(
+            ("diff --git ", "diff --cc ", "diff --combined ")
+        ) or line in section_boundaries
         if boundary and current:
             units.append("".join(current))
             current = []
