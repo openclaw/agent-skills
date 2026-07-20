@@ -50,6 +50,19 @@ Do not require autoreview for a change whose entire diff is prose-only internal 
 - If Gitcrawl reports a portable manifest mismatch, source/runtime DB health error, or stale portable-store checkout, run `gitcrawl doctor --json` and inspect `source_db_health`, `runtime_db_health`, and `portable_store_status` before falling back to live GitHub.
 - Do not push just to review. Push only when the user requested push/ship/PR update.
 
+## Finding Convergence
+
+Before editing, cluster accepted findings by violated invariant, trust boundary, or state transition. Do not patch findings one by one when they are manifestations of the same root cause.
+
+For each cluster:
+
+- Build the smallest useful failure matrix inside the frozen scope. Check sibling paths governed by the same boundary and relevant lifecycle variants such as create, update, delete, retry, recovery, migration, rollback, concurrency, or restart. Skip states the diff cannot affect.
+- Make one coherent fix at the owning boundary. Avoid condition-by-condition patches when a shared invariant can make the whole cluster correct.
+- Add regression proof for the reported case and the affected sibling variants. Stateful fixes need at least one multi-run or recovery test when that is how the defect can recur.
+- Re-read the final diff against the cluster's invariant before requesting confirmation review.
+
+If confirmation review finds another manifestation of the same root-cause family, do not apply another narrow patch immediately. Reconstruct the invariant and failure matrix, then reclassify the remaining work under the Scope Governor. Continue only when the coherent fix remains in scope; otherwise stop and escalate or preserve it as follow-up work.
+
 ## Scope Governor
 
 Autoreview is a closeout gate, not permission to rewrite the task.

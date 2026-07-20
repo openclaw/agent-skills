@@ -8630,6 +8630,9 @@ def render_review_prompt(
         - Report only actionable defects introduced or exposed by this change.
         - Prefer high-signal findings over style feedback.
         - Report EVERY distinct actionable defect in this single pass, ordered most severe first. Each review round costs the caller a full fix-test-review cycle; withholding a known defect until a later round wastes one.
+        - For each defect, identify the violated invariant, trust boundary, or state transition. Before returning, sweep every changed path governed by that same cause for sibling manifestations.
+        - Report all actionable manifestations of the same root cause in this pass, including lifecycle, retry, recovery, migration, rollback, concurrency, or restart variants directly evidenced by the bundle. Do not invent defects that require unavailable unchanged context.
+        - When multiple findings share a root cause, say so in each finding body and name the related changed paths or conditions so the caller can repair the owning boundary once.
         - Before returning, sweep the bundle once more for independent defects in other files or failure modes that you may have stopped scanning for after an earlier find.
         - Include security findings: injection, secret leaks, authz/authn bypass, path traversal, unsafe deserialization, unsafe filesystem or shell use, privacy leaks, and credential handling.
         - Do not reject legitimate functionality merely because it touches shell, filesystem, network, auth, or sensitive data. Report a security finding only when the patch creates a concrete exploitable risk, removes an important safety check, or lacks validation at a trust boundary.

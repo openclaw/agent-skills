@@ -154,6 +154,8 @@ def validate_prompt_policy(repo: Path, autoreview: Path) -> None:
         "Do not turn a narrow patch into a broad",
         "If this is release-branch or release-process work",
         "Non-blocking design,",
+        "identify the violated invariant",
+        "manifestations of the same root cause",
     )
     missing = [needle for needle in required if needle not in prompt]
     if missing:

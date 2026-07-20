@@ -701,6 +701,30 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertTrue(prompt.endswith(bundle))
 
+    def test_review_prompt_requires_root_cause_family_sweep(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            prompt = self.helper["render_review_prompt"](
+                repo,
+                "commit",
+                "HEAD",
+                self.helper["ReviewChunk"]("# Commit Diff\n+changed\n"),
+                "",
+                "",
+            )
+
+        self.assertIn("identify the violated invariant", prompt)
+        self.assertIn("manifestations of the same root cause", prompt)
+        self.assertIn("repair the owning boundary once", prompt)
+
+    def test_skill_requires_root_cause_repair_convergence(self) -> None:
+        skill = SCRIPT.parent.parent.joinpath("SKILL.md").read_text(encoding="utf-8")
+
+        self.assertIn("cluster accepted findings", skill)
+        self.assertIn("one coherent fix at the owning boundary", skill)
+        self.assertIn("multi-run or recovery test", skill)
+        self.assertIn("another manifestation of the same root-cause family", skill)
+
     def test_review_pass_count_is_bounded(self) -> None:
         builder = self.helper["build_review_prompts"]
         with tempfile.TemporaryDirectory() as tempdir:
