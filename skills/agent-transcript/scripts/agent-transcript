@@ -4,12 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const MARKER_START = "<!-- agent-transcript:start -->";
 const MARKER_END = "<!-- agent-transcript:end -->";
 const DEFAULT_MAX_CHARS = 50000;
 const DEFAULT_ENTRY_MAX_CHARS = 6000;
 const MAX_JSONL_BOUNDARY_BYTES = 1024 * 1024;
+const COPILOT_PRODUCER_PROBE_BYTES = 64 * 1024;
 
 function usage() {
   console.log(`Usage:
@@ -702,6 +704,35 @@ function readFileRange(fd, start, length) {
   return buffer.subarray(0, bytesRead);
 }
 
+function readCopilotProducerProbe(file) {
+  const fd = fs.openSync(file, "r");
+  try {
+    const stat = fs.fstatSync(fd);
+    const length = Math.min(stat.size, COPILOT_PRODUCER_PROBE_BYTES);
+    const buffer = readFileRange(fd, 0, length);
+    let end = buffer.length;
+    if (length < stat.size) {
+      const boundary = buffer.lastIndexOf(0x0a);
+      end = boundary >= 0 ? boundary + 1 : 0;
+    }
+    return buffer
+      .subarray(0, end)
+      .toString("utf8")
+      .split(/\n+/)
+      .filter(Boolean)
+      .flatMap((line) => {
+        try {
+          const row = JSON.parse(line);
+          return row?.type === "session.start" ? [row] : [];
+        } catch {
+          return [];
+        }
+      });
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function readBoundedJsonlRows(file, maxBytes = 220000) {
   const fd = fs.openSync(file, "r");
   try {
@@ -749,11 +780,19 @@ function readBoundedJsonlRows(file, maxBytes = 220000) {
   }
 }
 
-function sessionScanRecord(file, maxBytes) {
+function sessionScanRecord(file, maxBytes, readers = {}) {
   const stat = fs.statSync(file);
   const boundedText = readBoundedText(file, maxBytes);
-  const rows = readBoundedJsonlRows(file, maxBytes);
-  const agent = detectAgent(file, rows);
+  const readProducerProbe = readers.readCopilotProducerProbe || readCopilotProducerProbe;
+  const readRows = readers.readBoundedJsonlRows || readBoundedJsonlRows;
+  let agent = detectAgent(file, []);
+  let rows = [];
+  if (agent === "copilot") {
+    rows = readRows(file, maxBytes);
+  } else if (agent === "agent") {
+    agent = detectAgent(file, readProducerProbe(file));
+    if (agent === "copilot") rows = readRows(file, maxBytes);
+  }
   const scanText =
     agent === "copilot"
       ? rows
@@ -987,9 +1026,16 @@ async function main() {
   process.exitCode = 2;
 }
 
-try {
-  await main();
-} catch (error) {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
+const isMain =
+  process.argv[1] &&
+  fs.realpathSync(path.resolve(process.argv[1])) === fs.realpathSync(fileURLToPath(import.meta.url));
+if (isMain) {
+  try {
+    await main();
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
 }
+
+export { sessionScanRecord };

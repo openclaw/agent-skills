@@ -4,8 +4,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
 const script = path.join(import.meta.dirname, "agent-transcript");
+const { sessionScanRecord } = await import(pathToFileURL(script).href);
 
 function tempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "agent-transcript-test-"));
@@ -36,6 +38,27 @@ function copilotEvents(messages) {
     ...messages,
   ];
 }
+
+test("CLI runs through a symlinked entry point", (t) => {
+  const dir = tempDir();
+  const link = path.join(dir, "agent-transcript");
+  try {
+    fs.symlinkSync(script, link, "file");
+  } catch (error) {
+    if (error?.code === "EPERM") {
+      t.skip("symlink creation is unavailable");
+      return;
+    }
+    throw error;
+  }
+
+  const output = execFileSync(process.execPath, [link, "--help"], {
+    encoding: "utf8",
+  });
+
+  assert.match(output, /Usage:/);
+  assert.match(output, /agent-transcript find/);
+});
 
 test("find discovers Copilot sessions from the default local session-state root", () => {
   const home = tempDir();
@@ -93,6 +116,83 @@ test("find detects Copilot producers in explicit roots and scans visible dialogu
   assert.equal(visible[0].file, session);
   assert.equal(visible[0].agent, "copilot");
   assert.deepEqual(privateField, []);
+});
+
+test("scan avoids complete-row parsing for known Codex and Claude paths", () => {
+  const dir = tempDir();
+  const claudeConfig = path.join(dir, "claude-config");
+  const sessions = [
+    {
+      agent: "codex",
+      file: path.join(dir, ".codex", "sessions", "codex.jsonl"),
+    },
+    {
+      agent: "claude",
+      file: path.join(claudeConfig, "projects", "-tmp-project", "claude.jsonl"),
+    },
+  ];
+  const previousClaudeConfig = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = claudeConfig;
+  try {
+    for (const session of sessions) {
+      writeJsonl(session.file, [
+        {
+          type: "response_item",
+          payload: {
+            role: "user",
+            content: [{ type: "text", text: `${session.agent}-visible-marker` }],
+          },
+        },
+      ]);
+      const record = sessionScanRecord(session.file, 120, {
+        readCopilotProducerProbe() {
+          throw new Error(`producer probe should not run for known ${session.agent} paths`);
+        },
+        readBoundedJsonlRows() {
+          throw new Error(`complete-row parser should not run for known ${session.agent} paths`);
+        },
+      });
+
+      assert.equal(record.agent, session.agent);
+      assert.match(record.haystack, new RegExp(`${session.agent}-visible-marker`));
+    }
+  } finally {
+    if (previousClaudeConfig == null) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = previousClaudeConfig;
+  }
+});
+
+test("scan promotes an unknown path after a bounded Copilot producer probe", () => {
+  const dir = tempDir();
+  const session = path.join(dir, "events.jsonl");
+  writeJsonl(session, [{ type: "private.event", data: { content: "PRIVATE_SCAN_MARKER" } }]);
+  let probeCalls = 0;
+  let completeRowCalls = 0;
+
+  const record = sessionScanRecord(session, 120, {
+    readCopilotProducerProbe() {
+      probeCalls++;
+      return copilotEvents([]);
+    },
+    readBoundedJsonlRows() {
+      completeRowCalls++;
+      return copilotEvents([
+        {
+          type: "user.message",
+          data: {
+            content: "visible-producer-marker",
+            transformedContent: "PRIVATE_TRANSFORMED_MARKER",
+          },
+        },
+      ]);
+    },
+  });
+
+  assert.equal(record.agent, "copilot");
+  assert.equal(probeCalls, 1);
+  assert.equal(completeRowCalls, 1);
+  assert.match(record.haystack, /visible-producer-marker/);
+  assert.doesNotMatch(record.haystack, /PRIVATE_SCAN_MARKER|PRIVATE_TRANSFORMED_MARKER/);
 });
 
 test("find parses Copilot visible events larger than the scan-byte budget", () => {
