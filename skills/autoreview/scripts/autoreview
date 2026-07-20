@@ -328,7 +328,6 @@ MAX_BUNDLE_TEXT_BYTES = 180_000
 MAX_REVIEW_PROMPT_BYTES = 512_000
 MAX_REVIEW_CHUNK_CONTEXT_BYTES = 64_000
 MAX_REVIEW_PASSES = 8
-MAX_REVIEW_SECRET_FRAGMENTS = 256
 
 
 class ReviewChunk(NamedTuple):
@@ -5810,48 +5809,6 @@ def require_no_secret_values(
         )
 
 
-def require_no_known_secret_fragments(
-    label: str,
-    text: str,
-    fragments: set[str],
-) -> None:
-    if any(fragment and fragment in text for fragment in fragments):
-        raise SystemExit(
-            f"refusing to include a known secret-like value in {label}; "
-            "move or remove the ambiguous occurrence before running autoreview"
-        )
-
-
-def review_secret_fragments(
-    text: str,
-    *,
-    javascript_dialect: str | None = None,
-) -> set[str]:
-    if DIFF_HUNK_CONTENT_BOUNDARY in text:
-        return set().union(
-            *(
-                review_secret_fragments(segment, javascript_dialect=javascript_dialect)
-                for segment in text.split(DIFF_HUNK_CONTENT_BOUNDARY)
-            )
-        )
-    private_fragments = {
-        fragment
-        for fragment in private_key_body_fragments(text)
-        if fragment.casefold() not in SECRET_PLACEHOLDER_VALUES
-    }
-    fragments = {
-        text[start:end]
-        for start, end in review_repeatable_secret_spans(
-            text,
-            javascript_dialect=javascript_dialect,
-        )
-        if text[start:end]
-        and text[start:end].casefold() not in SECRET_PLACEHOLDER_VALUES
-    }
-    fragments.update(private_fragments)
-    return fragments
-
-
 def assignment_fallback_literal_spans(
     text: str,
     match: re.Match[str],
@@ -6760,418 +6717,9 @@ def unified_diff_contents(patch: str) -> tuple[str, str]:
     return "\n".join(old_content), "\n".join(new_content)
 
 
-def unified_diff_metadata(patch: str) -> str:
-    metadata: list[str] = []
-    in_hunk = False
-    prefix_columns = 1
-    for line in patch.split("\n"):
-        line = line.removesuffix("\r")
-        hunk_header = re.match(r"^(@{2,})", line)
-        if hunk_header:
-            metadata.append(line)
-            in_hunk = True
-            prefix_columns = len(hunk_header.group(1)) - 1
-            continue
-        if line.startswith("diff --"):
-            metadata.append(line)
-            in_hunk = False
-            continue
-        prefix = line[:prefix_columns]
-        hunk_content = (
-            in_hunk
-            and len(prefix) == prefix_columns
-            and set(prefix) <= {"+", "-", " "}
-        )
-        if not hunk_content:
-            metadata.append(line)
-    return "\n".join(metadata)
-
-
-REVIEW_SECRET_REDACTION = "[secret-like diff hunk redacted]"
 REVIEW_SECURITY_REDACTION = (
     "[security-sensitive review material omitted before model review]"
 )
-
-
-def private_key_markers_balanced(text: str) -> bool:
-    depth = 0
-    markers = sorted(
-        [(match.start(), True) for match in PRIVATE_KEY_BEGIN_PATTERN.finditer(text)]
-        + [(match.start(), False) for match in PRIVATE_KEY_END_PATTERN.finditer(text)]
-    )
-    for _, begins_pem in markers:
-        if begins_pem:
-            if depth != 0:
-                return False
-            depth = 1
-        else:
-            if depth == 0:
-                return False
-            depth = 0
-    return depth == 0
-
-
-def private_key_initial_depth(text: str) -> int:
-    balance = 0
-    minimum = 0
-    markers = sorted(
-        [(match.start(), 1) for match in PRIVATE_KEY_BEGIN_PATTERN.finditer(text)]
-        + [(match.start(), -1) for match in PRIVATE_KEY_END_PATTERN.finditer(text)]
-    )
-    for _, delta in markers:
-        balance += delta
-        minimum = min(minimum, balance)
-    return -minimum
-
-
-def tolerant_pem_line_spans(text: str, depth: int) -> tuple[list[tuple[int, int]], int]:
-    markers = sorted(
-        [(match.start(), match.end(), 1) for match in PRIVATE_KEY_BEGIN_PATTERN.finditer(text)]
-        + [(match.start(), match.end(), -1) for match in PRIVATE_KEY_END_PATTERN.finditer(text)]
-    )
-    spans: list[tuple[int, int]] = []
-    cursor = 0
-    for start, end, delta in markers:
-        segment = text[cursor:start]
-        segment_matches = (
-            explicit_private_key_body_spans(segment, in_pem=depth > 0)
-            if depth > 0
-            else []
-        )
-        spans.extend((cursor + start, cursor + end) for start, end in segment_matches)
-        spans.append((start, end))
-        depth = max(0, depth + delta)
-        cursor = end
-    if depth > 0:
-        spans.extend(
-            (cursor + start, cursor + end)
-            for start, end in explicit_private_key_body_spans(
-                text[cursor:],
-                in_pem=depth > 0,
-            )
-        )
-    return spans, depth
-
-
-def redact_unbalanced_private_key_hunks(section: str) -> tuple[str, set[str]]:
-    """Redact inherited truncated PEM material while retaining changed code."""
-    lines = literal_lf_lines(section)
-    redacted = list(lines)
-    secret_fragments: set[str] = set()
-    index = 0
-    while index < len(lines):
-        header = lines[index]
-        prefix_match = re.match(r"^(@{2,})", header)
-        if prefix_match is None:
-            index += 1
-            continue
-        hunk_end = index + 1
-        while hunk_end < len(lines) and not lines[hunk_end].startswith("@@"):
-            hunk_end += 1
-        prefix_columns = len(prefix_match.group(1)) - 1
-        old_content: list[str] = []
-        new_content: list[str] = []
-        raw_content: list[str] = []
-        hunk_lines: list[tuple[int, str, str, str]] = []
-        has_changed_marker = False
-        for line_index in range(index + 1, hunk_end):
-            line = lines[line_index]
-            body = line.rstrip("\r\n")
-            ending = line[len(body) :]
-            prefix = body[:prefix_columns]
-            if len(prefix) != prefix_columns or not set(prefix) <= {"+", "-", " "}:
-                continue
-            content = body[prefix_columns:]
-            hunk_lines.append((line_index, prefix, content, ending))
-            raw_content.append(content)
-            if set(prefix) != {" "} and (
-                PRIVATE_KEY_BEGIN_PATTERN.search(content) is not None
-                or PRIVATE_KEY_END_PATTERN.search(content) is not None
-            ):
-                has_changed_marker = True
-            if set(prefix) == {" "} or "-" in prefix:
-                old_content.append(content)
-            if set(prefix) == {" "} or "+" in prefix:
-                new_content.append(content)
-        old_text = "\n".join(old_content)
-        new_text = "\n".join(new_content)
-        raw_text = "\n".join(raw_content)
-        old_balanced = private_key_markers_balanced(old_text)
-        new_balanced = private_key_markers_balanced(new_text)
-        raw_balanced = private_key_markers_balanced(raw_text)
-        if old_balanced and new_balanced and raw_balanced:
-            index = hunk_end
-            continue
-        if has_changed_marker:
-            index = hunk_end
-            continue
-        old_depth = private_key_initial_depth(old_text)
-        new_depth = private_key_initial_depth(new_text)
-        for line_index, prefix, content, ending in hunk_lines:
-            spans: list[tuple[int, int]] = []
-            if set(prefix) == {" "} or "-" in prefix:
-                old_spans, old_depth = tolerant_pem_line_spans(content, old_depth)
-                spans.extend(old_spans)
-            if set(prefix) == {" "} or "+" in prefix:
-                new_spans, new_depth = tolerant_pem_line_spans(content, new_depth)
-                spans.extend(new_spans)
-            marker_spans = {
-                match.span()
-                for pattern in (PRIVATE_KEY_BEGIN_PATTERN, PRIVATE_KEY_END_PATTERN)
-                for match in pattern.finditer(content)
-            }
-            secret_fragments.update(
-                fragment
-                for start, end in spans
-                if (start, end) not in marker_spans
-                and (fragment := normalized_private_key_fragment(content, start, end))
-                and fragment.casefold() not in SECRET_PLACEHOLDER_VALUES
-            )
-            redacted[line_index] = (
-                f"{prefix}{redact_review_spans(content, spans)}{ending}"
-            )
-        index = hunk_end
-    return "".join(redacted), secret_fragments
-
-
-def redact_secret_like_hunk_headers(
-    section: str,
-    expected_paths: set[str],
-    known_secret_fragments: set[str] | None = None,
-) -> str:
-    old_path, new_path = diff_section_paths(section)
-    dialects = {
-        javascript_review_dialect(rel)
-        for rel in (old_path, new_path)
-        if rel is not None and rel in expected_paths
-    }
-    if not dialects:
-        dialects = {None}
-    ordered_secret_fragments = sorted(
-        known_secret_fragments or (),
-        key=lambda fragment: (-len(fragment), fragment),
-    )
-    fragment_pattern = known_secret_fragment_pattern(ordered_secret_fragments)
-    redacted: list[str] = []
-    omit_section = False
-    for line in literal_lf_lines(section):
-        body = line.rstrip("\r\n")
-        ending = line[len(body) :]
-        header_match = re.match(
-            r"^(?P<marker>@{2,}) (?P<ranges>.+?) (?P=marker)(?P<section> .+)$",
-            body,
-        )
-        if header_match is None:
-            redacted.append(line)
-            continue
-        raw_header_section = header_match.group("section")
-        marker_spans = [
-            match.span()
-            for pattern in (PRIVATE_KEY_BEGIN_PATTERN, PRIVATE_KEY_END_PATTERN)
-            for match in pattern.finditer(raw_header_section)
-        ]
-        header_section = redact_review_spans(
-            raw_header_section,
-            marker_spans
-            + known_secret_fragment_spans(raw_header_section, fragment_pattern),
-        )
-        if any(
-            secret_text_risk(header_section, javascript_dialect=dialect)
-            for dialect in dialects
-        ):
-            omit_section = True
-        redacted.append(
-            f"{header_match.group('marker')} {header_match.group('ranges')} "
-            f"{header_match.group('marker')}{header_section}{ending}"
-        )
-    if omit_section:
-        return REVIEW_SECURITY_REDACTION + "\n"
-    return "".join(redacted)
-
-
-def review_hunk_header_secret_fragments(
-    section: str,
-    expected_paths: set[str],
-) -> set[str]:
-    old_path, new_path = diff_section_paths(section)
-    dialects = {
-        javascript_review_dialect(rel)
-        for rel in (old_path, new_path)
-        if rel is not None and rel in expected_paths
-    }
-    if not dialects:
-        dialects = {None}
-    fragments: set[str] = set()
-    for line in literal_lf_lines(section):
-        body = line.rstrip("\r\n")
-        header_match = re.match(
-            r"^(?P<marker>@{2,}) (?P<ranges>.+?) (?P=marker)(?P<section> .+)$",
-            body,
-        )
-        if header_match is None:
-            continue
-        header_section = header_match.group("section")
-        for begin in PRIVATE_KEY_BEGIN_PATTERN.finditer(header_section):
-            end = PRIVATE_KEY_END_PATTERN.search(header_section, begin.end())
-            segment_end = end.start() if end is not None else len(header_section)
-            segment = header_section[begin.end() : segment_end]
-            for start, end in private_key_token_spans(segment):
-                fragment = normalized_private_key_fragment(segment, start, end)
-                if (
-                    fragment
-                    and fragment.casefold() not in SECRET_PLACEHOLDER_VALUES
-                ):
-                    fragments.add(fragment)
-        for start, end in markerless_private_key_body_spans(header_section):
-            fragment = normalized_private_key_fragment(header_section, start, end)
-            if (
-                fragment
-                and fragment.casefold() not in SECRET_PLACEHOLDER_VALUES
-            ):
-                fragments.add(fragment)
-        for dialect in dialects:
-            if not secret_text_risk(
-                header_section,
-                javascript_dialect=dialect,
-            ):
-                continue
-            fragments.update(
-                header_section[start:end]
-                for start, end in review_repeatable_secret_spans(
-                    header_section,
-                    javascript_dialect=dialect,
-                )
-                if header_section[start:end]
-            )
-    return fragments
-
-
-def redact_secret_like_diff_section(
-    section: str,
-    expected_paths: set[str],
-    known_secret_fragments: set[str] | None = None,
-) -> str:
-    old_path, new_path = diff_section_paths(section)
-    old_dialect = (
-        javascript_review_dialect(old_path)
-        if old_path is not None and old_path in expected_paths
-        else None
-    )
-    new_dialect = (
-        javascript_review_dialect(new_path)
-        if new_path is not None and new_path in expected_paths
-        else None
-    )
-    secret_fragments = set(known_secret_fragments or ())
-    old_content, new_content = unified_diff_contents(section)
-    old_risk = secret_text_risk(old_content, javascript_dialect=old_dialect)
-    new_risk = secret_text_risk(new_content, javascript_dialect=new_dialect)
-    for content, dialect, risk in (
-        (old_content, old_dialect, old_risk),
-        (new_content, new_dialect, new_risk),
-    ):
-        if not risk:
-            continue
-        secret_fragments.update(
-            review_secret_fragments(
-                content,
-                javascript_dialect=dialect,
-            )
-        )
-    if len(secret_fragments) > MAX_REVIEW_SECRET_FRAGMENTS:
-        return REVIEW_SECURITY_REDACTION + "\n"
-    ordered_secret_fragments = sorted(
-        secret_fragments,
-        key=lambda fragment: (-len(fragment), fragment),
-    )
-    fragment_pattern = known_secret_fragment_pattern(ordered_secret_fragments)
-    redacted: list[str] = []
-    lines = literal_lf_lines(section)
-    index = 0
-    old_pem = False
-    new_pem = False
-    while index < len(lines):
-        line = lines[index]
-        if not line.startswith("@@"):
-            redacted.append(line)
-            index += 1
-            continue
-        hunk_end = index + 1
-        while hunk_end < len(lines) and not lines[hunk_end].startswith("@@"):
-            hunk_end += 1
-        header = line.rstrip("\r\n")
-        prefix_match = re.match(r"^(@{2,})", header)
-        assert prefix_match is not None
-        prefix_columns = len(prefix_match.group(1)) - 1
-        redacted.append(line)
-        for content_line in lines[index + 1 : hunk_end]:
-            body = content_line.rstrip("\r\n")
-            ending = content_line[len(body) :]
-            prefix = body[:prefix_columns]
-            if len(prefix) != prefix_columns or not set(prefix) <= {"+", "-", " "}:
-                redacted.append(content_line)
-                continue
-            content = body[prefix_columns:]
-            old_line = set(prefix) == {" "} or "-" in prefix
-            new_line = set(prefix) == {" "} or "+" in prefix
-            spans: list[tuple[int, int]] = []
-            line_secret_risk = (
-                old_line
-                and old_risk
-                and secret_text_risk(content, javascript_dialect=old_dialect)
-            ) or (
-                new_line
-                and new_risk
-                and secret_text_risk(content, javascript_dialect=new_dialect)
-            )
-            if line_secret_risk:
-                dialect = old_dialect if old_line and old_risk else new_dialect
-                spans.extend(
-                    review_secret_value_spans(
-                        content,
-                        javascript_dialect=dialect,
-                    )
-                )
-            fragment_dialect = (
-                old_dialect
-                if old_line and old_dialect is not None
-                else new_dialect if new_line else None
-            )
-            spans.extend(
-                repeated_secret_fragment_spans(
-                    content,
-                    fragment_pattern,
-                    javascript_dialect=fragment_dialect,
-                )
-            )
-            spans.extend(match.span() for match in PRIVATE_KEY_END_PATTERN.finditer(content))
-            if old_line:
-                old_spans, old_pem = pem_line_body_spans(content, old_pem)
-                spans.extend(old_spans)
-            if new_line:
-                new_spans, new_pem = pem_line_body_spans(content, new_pem)
-                spans.extend(new_spans)
-            redacted_content = redact_review_spans(content, spans)
-            line_still_risky = (
-                old_line
-                and old_risk
-                and secret_text_risk(
-                    redacted_content,
-                    javascript_dialect=old_dialect,
-                )
-            ) or (
-                new_line
-                and new_risk
-                and secret_text_risk(
-                    redacted_content,
-                    javascript_dialect=new_dialect,
-                )
-            )
-            if line_still_risky:
-                redacted_content = REVIEW_SECRET_REDACTION
-            redacted.append(f"{prefix}{redacted_content}{ending}")
-        index = hunk_end
-    return "".join(redacted)
 
 
 def sensitive_repo_path_risk(rel: str) -> str | None:
@@ -7409,44 +6957,90 @@ def omit_tracked_sensitive_diff_units(
     return "".join(retained)
 
 
-def redact_residual_review_unit(
-    unit: str,
-    expected_paths: set[str],
-    known_secret_fragments: set[str],
-) -> str:
-    if any(fragment and fragment in unit for fragment in known_secret_fragments):
-        return REVIEW_SECURITY_REDACTION + "\n"
-    if not unit.startswith("diff --git "):
-        if secret_text_risk(unified_diff_metadata(unit)):
-            return REVIEW_SECURITY_REDACTION + "\n"
-        if any(line.startswith("@@") for line in unit.splitlines()):
-            old_content, new_content = unified_diff_contents(unit)
-            return (
-                REVIEW_SECURITY_REDACTION + "\n"
-                if any(
-                    secret_text_risk(content)
-                    for content in (old_content, new_content)
-                )
-                else unit
-            )
-        return (
+def redact_review_patch_metadata(patch: str) -> str:
+    redacted: list[str] = []
+    metadata: list[str] = []
+    in_hunk = False
+    prefix_columns = 1
+    old_remaining: list[int] = []
+    new_remaining = 0
+
+    def flush_metadata() -> None:
+        if not metadata:
+            return
+        text = "".join(metadata)
+        redacted.append(
             REVIEW_SECURITY_REDACTION + "\n"
-            if secret_text_risk(unit)
-            else unit
+            if secret_text_risk(text)
+            else text
         )
-    if secret_text_risk(unified_diff_metadata(unit)):
-        return REVIEW_SECURITY_REDACTION + "\n"
-    old_path, new_path = diff_section_paths(unit)
-    old_content, new_content = unified_diff_contents(unit)
-    for rel, content in ((old_path, old_content), (new_path, new_content)):
-        dialect = (
-            javascript_review_dialect(rel)
-            if rel is not None and rel in expected_paths
-            else None
+        metadata.clear()
+
+    def parse_range_count(token: str) -> int | None:
+        match = re.fullmatch(r"[+-]\d+(?:,(\d+))?", token)
+        if match is None:
+            return None
+        return int(match.group(1) or "1")
+
+    for line in literal_lf_lines(patch):
+        body = line.rstrip("\r\n")
+        if body.startswith("diff --"):
+            flush_metadata()
+            metadata.append(line)
+            in_hunk = False
+            prefix_columns = 1
+            old_remaining = []
+            new_remaining = 0
+            continue
+        hunk_header = re.match(
+            r"^(?P<marker>@{2,}) (?P<ranges>.+?) (?P=marker)(?: .*)?$",
+            body,
         )
-        if secret_text_risk(content, javascript_dialect=dialect):
-            return REVIEW_SECURITY_REDACTION + "\n"
-    return unit
+        if hunk_header:
+            flush_metadata()
+            metadata.append(line)
+            marker = hunk_header.group("marker")
+            ranges = hunk_header.group("ranges").split()
+            old_counts = [
+                count
+                for token in ranges
+                if token.startswith("-")
+                and (count := parse_range_count(token)) is not None
+            ]
+            new_counts = [
+                count
+                for token in ranges
+                if token.startswith("+")
+                and (count := parse_range_count(token)) is not None
+            ]
+            prefix_columns = len(marker) - 1
+            in_hunk = (
+                len(old_counts) == prefix_columns
+                and len(new_counts) == 1
+            )
+            old_remaining = old_counts
+            new_remaining = new_counts[0] if new_counts else 0
+            continue
+        prefix = body[:prefix_columns]
+        hunk_content = (
+            in_hunk
+            and len(prefix) == prefix_columns
+            and set(prefix) <= {"+", "-", " "}
+        )
+        if hunk_content:
+            flush_metadata()
+            redacted.append(line)
+            for index, marker in enumerate(prefix):
+                if marker != "+":
+                    old_remaining[index] = max(0, old_remaining[index] - 1)
+            if any(marker != "-" for marker in prefix):
+                new_remaining = max(0, new_remaining - 1)
+            if new_remaining == 0 and not any(old_remaining):
+                in_hunk = False
+        else:
+            metadata.append(line)
+    flush_metadata()
+    return "".join(redacted)
 
 
 def validate_review_patch(
@@ -7463,84 +7057,11 @@ def validate_review_patch(
         )
     blocked_paths = tracked_sensitive_paths(paths)
     patch = omit_tracked_sensitive_diff_units(patch, paths, blocked_paths)
-    expected_paths = set(paths) - blocked_paths
-    units = review_bundle_units(patch)
-    redacted_units: list[str] = []
-    known_secret_fragments: set[str] = set()
-    for unit in units:
-        if unit.startswith("diff --git "):
-            try:
-                unit, fragments = redact_unbalanced_private_key_hunks(unit)
-                known_secret_fragments.update(fragments)
-            except SystemExit:
-                unit = REVIEW_SECURITY_REDACTION + "\n"
-        redacted_units.append(unit)
-    units = redacted_units
-    patch = "".join(units)
-    for unit_index, unit in enumerate(units):
-        if not unit.startswith("diff --git "):
-            continue
-        old_path, new_path = diff_section_paths(unit)
-        old_content, new_content = unified_diff_contents(unit)
-        omit_unit = False
-        for rel, content in (
-            (old_path, old_content),
-            (new_path, new_content),
-        ):
-            javascript_dialect = (
-                javascript_review_dialect(rel)
-                if rel is not None and rel in expected_paths
-                else None
-            )
-            try:
-                all_fragments = review_secret_fragments(
-                    content,
-                    javascript_dialect=javascript_dialect,
-                )
-                known_secret_fragments.update(all_fragments)
-            except SystemExit:
-                omit_unit = True
-                break
-        if omit_unit:
-            units[unit_index] = REVIEW_SECURITY_REDACTION + "\n"
-            continue
-        try:
-            known_secret_fragments.update(
-                review_hunk_header_secret_fragments(unit, expected_paths)
-            )
-        except SystemExit:
-            units[unit_index] = REVIEW_SECURITY_REDACTION + "\n"
-    if len(known_secret_fragments) > MAX_REVIEW_SECRET_FRAGMENTS:
-        return REVIEW_SECURITY_REDACTION + "\n"
-    patch = "".join(
-        redact_secret_like_hunk_headers(
-            unit,
-            expected_paths,
-            known_secret_fragments,
-        )
-        if unit.startswith("diff --git ")
-        else unit
-        for unit in units
-    )
-    units = review_bundle_units(patch)
-    patch = "".join(
-        redact_secret_like_diff_section(
-            unit,
-            expected_paths,
-            known_secret_fragments,
-        )
-        if unit.startswith("diff --git ")
-        else unit
-        for unit in units
-    )
-    patch = "".join(
-        redact_residual_review_unit(unit, expected_paths, known_secret_fragments)
-        for unit in review_bundle_units(patch)
-    )
+    patch = redact_review_patch_metadata(patch)
     patch_bytes = len(patch.encode("utf-8"))
     if limit is not None and patch_bytes > limit:
         raise SystemExit(
-            f"{label} is too large to review safely after redaction "
+            f"{label} is too large to review safely after metadata redaction "
             f"({patch_bytes} bytes; limit {limit}); split the change into smaller review targets"
         )
     return patch
@@ -7651,11 +7172,6 @@ def file_bundle_snapshot(
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return "", True, "non-UTF-8 file"
-    if secret_text_risk(
-        text,
-        javascript_dialect=javascript_review_dialect(rel),
-    ):
-        return "", True, "secret-like content"
     return text, False, None
 
 

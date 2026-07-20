@@ -159,13 +159,6 @@ class AutoreviewSecretScannerTests(unittest.TestCase):
                         javascript_dialect=javascript_dialect,
                     )
                 )
-                self.assertIn(
-                    literal_value,
-                    AUTOREVIEW.review_secret_fragments(
-                        content,
-                        javascript_dialect=javascript_dialect,
-                    ),
-                )
 
     def test_boolean_prefix_values_remain_credentials(self) -> None:
         field_name = "client" + "Secret"
@@ -174,10 +167,6 @@ class AutoreviewSecretScannerTests(unittest.TestCase):
             content = f"{field_name}: {literal_value}"
             with self.subTest(content=content):
                 self.assertTrue(AUTOREVIEW.secret_text_risk(content))
-                self.assertIn(
-                    literal_value,
-                    AUTOREVIEW.review_secret_fragments(content),
-                )
 
     def test_boolean_type_tokens_in_config_remain_credentials(self) -> None:
         field_name = "client" + "Secret"
