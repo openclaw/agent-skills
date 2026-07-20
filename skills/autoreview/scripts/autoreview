@@ -6933,7 +6933,7 @@ def redact_unbalanced_private_key_hunks(section: str) -> tuple[str, set[str]]:
     if combined_diff and has_private_key_marker:
         in_hunk = False
         prefix_columns = 1
-        for line in lines:
+        for line_index, line in enumerate(lines):
             body = line.rstrip("\r\n")
             header = re.match(r"^(@{2,})", body)
             if header is not None:
@@ -6956,10 +6956,11 @@ def redact_unbalanced_private_key_hunks(section: str) -> tuple[str, set[str]]:
                 )
                 for match in pattern.finditer(content)
             ]
-            for start, end in explicit_private_key_body_spans(
+            body_spans = explicit_private_key_body_spans(
                 content,
                 in_pem=True,
-            ):
+            )
+            for start, end in body_spans:
                 if any(
                     marker_start < end and start < marker_end
                     for marker_start, marker_end in marker_spans
@@ -6968,7 +6969,12 @@ def redact_unbalanced_private_key_hunks(section: str) -> tuple[str, set[str]]:
                 fragment = normalized_private_key_fragment(content, start, end)
                 if fragment.casefold() not in SECRET_PLACEHOLDER_VALUES:
                     secret_fragments.add(fragment)
-        return REVIEW_SECURITY_REDACTION + "\n", secret_fragments
+            redacted[line_index] = (
+                f"{prefix}"
+                f"{redact_review_spans(content, marker_spans + body_spans)}"
+                f"{line[len(body):]}"
+            )
+        return "".join(redacted), secret_fragments
     section_old_text, section_new_text = unified_diff_contents(section)
     old_depth = private_key_initial_depth(section_old_text)
     new_depth = private_key_initial_depth(section_new_text)
@@ -7116,7 +7122,7 @@ def redact_unbalanced_private_key_hunks(section: str) -> tuple[str, set[str]]:
                     and fragment.casefold() not in SECRET_PLACEHOLDER_VALUES
                 )
                 redacted[line_index] = (
-                    f"{prefix}{REVIEW_SECRET_REDACTION}{ending}"
+                    f"{prefix}{redact_review_spans(content, candidate_spans)}{ending}"
                 )
                 continue
             spans: list[tuple[int, int]] = []

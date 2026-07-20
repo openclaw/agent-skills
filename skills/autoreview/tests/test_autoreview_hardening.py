@@ -4094,6 +4094,31 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertNotIn(replacement, redacted)
         self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
+        self.assertIn("+const replacementLabel =", redacted)
+        self.assertIn("+runDangerousOperation();", redacted)
+
+    def test_review_patch_preserves_nonsecret_private_key_replacement(self) -> None:
+        patch = (
+            "diff --git a/fixture.test.ts b/fixture.test.ts\n"
+            "--- a/fixture.test.ts\n"
+            "+++ b/fixture.test.ts\n"
+            "@@ -1 +1 @@\n"
+            '-const begin = "-----BEGIN '
+            + 'PRIVATE KEY-----";\n'
+            "+sendCredentials();\n"
+            "@@ -20 +20 @@\n"
+            "-const timeout = 0;\n"
+            "+runDangerousOperation();\n"
+        )
+
+        redacted = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.test.ts"],
+            patch,
+        )
+
+        self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
+        self.assertIn("+sendCredentials();", redacted)
         self.assertIn("+runDangerousOperation();", redacted)
 
     def test_review_patch_carries_private_key_state_across_hunks(self) -> None:
@@ -4122,7 +4147,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
         self.assertIn("+runDangerousOperation();", redacted)
 
-    def test_review_patch_omits_ambiguous_combined_diff_section_only(self) -> None:
+    def test_review_patch_redacts_ambiguous_combined_diff_spans(self) -> None:
         replacement = "MIIEowIBAAKCAQEAcombined0123456789ABCDEF"
         patch = (
             "diff --cc fixture.test.ts\n"
@@ -4151,7 +4176,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertNotIn(replacement, redacted)
         self.assertNotIn("END PRIVATE KEY", redacted)
-        self.assertNotIn("++runDangerousOperation();", redacted)
+        self.assertIn("++runDangerousOperation();", redacted)
         self.assertIn("+runSafeReviewOperation();", redacted)
 
     def test_review_patch_carries_ambiguous_combined_diff_state(self) -> None:
@@ -4182,7 +4207,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertNotIn(body, redacted)
         self.assertNotIn(PRIVATE_KEY_BEGIN_TEXT, redacted)
-        self.assertNotIn("++runDangerousOperation();", redacted)
+        self.assertIn("++runDangerousOperation();", redacted)
         self.assertIn("+runSafeReviewOperation();", redacted)
 
     def test_review_patch_redacts_repeated_ambiguous_combined_fragment(self) -> None:
