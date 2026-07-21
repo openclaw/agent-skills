@@ -330,6 +330,54 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     "file\n",
                 )
 
+    def test_local_trufflehog_snapshot_supports_path_type_transitions(self) -> None:
+        for transition in ("directory-to-file", "file-to-directory"):
+            with self.subTest(transition=transition), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                entry = repo / "entry"
+                nested = entry / "nested.txt"
+                if transition == "directory-to-file":
+                    entry.mkdir()
+                    nested.write_text("nested\n", encoding="utf-8")
+                    git(repo, "add", "entry/nested.txt")
+                else:
+                    entry.write_text("file\n", encoding="utf-8")
+                    git(repo, "add", "entry")
+                git(repo, "commit", "-q", "-m", "base")
+
+                if transition == "directory-to-file":
+                    nested.unlink()
+                    entry.rmdir()
+                    entry.write_text("file\n", encoding="utf-8")
+                    expected_path = "entry"
+                    expected_content = "file\n"
+                else:
+                    entry.unlink()
+                    entry.mkdir()
+                    nested.write_text("nested\n", encoding="utf-8")
+                    expected_path = "entry/nested.txt"
+                    expected_content = "nested\n"
+
+                with tempfile.TemporaryDirectory() as scan_dir:
+                    scan_repo = Path(scan_dir)
+                    self.helper["prepare_trufflehog_history"](
+                        repo,
+                        "local",
+                        None,
+                        "HEAD",
+                        scan_repo,
+                    )
+                    commits = git(
+                        scan_repo,
+                        "log",
+                        "--reverse",
+                        "--format=%H",
+                    ).splitlines()
+                    self.assertEqual(
+                        git(scan_repo, "show", f"{commits[2]}:{expected_path}"),
+                        expected_content,
+                    )
+
     def test_trufflehog_findings_and_errors_do_not_leak_scanner_output(self) -> None:
         for returncode, expected in (
             (

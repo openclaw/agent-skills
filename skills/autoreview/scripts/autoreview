@@ -2055,7 +2055,7 @@ def copy_worktree_file(repo: Path, root: Path, rel: str) -> bool:
     source = repo.joinpath(*PurePosixPath(rel).parts)
     try:
         source_stat = source.lstat()
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         return False
     except OSError as exc:
         raise SystemExit(
@@ -2072,6 +2072,8 @@ def copy_worktree_file(repo: Path, root: Path, rel: str) -> bool:
             ) from exc
         write_snapshot_blob(root, rel, content)
         return True
+    if stat.S_ISDIR(source_stat.st_mode):
+        return False
     if not stat.S_ISREG(source_stat.st_mode):
         raise SystemExit(
             "changed content is not a regular file; remove it or resolve the repository state before rerunning autoreview"
