@@ -2238,7 +2238,7 @@ def clear_snapshot_paths(root: Path, paths: list[str]) -> None:
 
 
 def commit_snapshot(repo: Path, label: str) -> str:
-    git(repo, "add", "-A")
+    git(repo, "add", "-A", "-f")
     git(
         repo,
         "-c",

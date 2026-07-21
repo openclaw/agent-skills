@@ -368,6 +368,19 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     "staged\n",
                 )
 
+    def test_trufflehog_snapshot_force_stages_ignored_materialized_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            (repo / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+            (repo / "ignored.txt").write_text("review me\n", encoding="utf-8")
+
+            commit = self.helper["commit_snapshot"](repo, "snapshot")
+
+            self.assertEqual(
+                git(repo, "show", f"{commit}:ignored.txt"),
+                "review me\n",
+            )
+
     def test_trufflehog_snapshot_rejects_symlinked_parent_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
