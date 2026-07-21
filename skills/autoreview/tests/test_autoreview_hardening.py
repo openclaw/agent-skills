@@ -330,6 +330,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     "file\n",
                 )
 
+    @unittest.skipIf(os.name == "nt", "Windows filenames cannot use Git pathspec magic prefixes")
     def test_trufflehog_snapshot_treats_git_paths_as_literals(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
