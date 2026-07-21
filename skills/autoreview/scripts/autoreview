@@ -3172,18 +3172,7 @@ def credentialed_uri_risk(
             )
         ):
             return True
-        if uri_password_is_interpolated(
-            text,
-            credential.scheme_start,
-            credential.value,
-            credential.host,
-            credential.context,
-        ):
-            continue
-        if credential.has_password or uri_userinfo_literal_risk(
-            credential.value,
-            allow_plus_address=True,
-        ):
+        if uri_credential_value_risk(text, credential):
             return True
     return False
 
@@ -3775,6 +3764,24 @@ def uri_password_is_format_placeholder(
         ):
             return True
     return False
+
+
+def uri_credential_value_risk(
+    text: str,
+    credential: UriAuthorityCredential,
+) -> bool:
+    if uri_password_is_interpolated(
+        text,
+        credential.scheme_start,
+        credential.value,
+        credential.host,
+        credential.context,
+    ):
+        return False
+    return credential.has_password or uri_userinfo_literal_risk(
+        credential.value,
+        allow_plus_address=True,
+    )
 
 
 def format_arguments_are_references(arguments: str) -> bool:
@@ -6275,7 +6282,11 @@ def review_repeatable_secret_spans(
     )
     for authority_range in uri_authority_ranges(text):
         credential = uri_authority_credential(text, authority_range)
-        if credential is not None and credential.value:
+        if (
+            credential is not None
+            and credential.value
+            and uri_credential_value_risk(text, credential)
+        ):
             spans.append((credential.value_start, credential.value_end))
     return spans
 
@@ -6356,7 +6367,11 @@ def review_secret_value_spans(
     )
     for authority_range in uri_authority_ranges(text):
         credential = uri_authority_credential(text, authority_range)
-        if credential is not None and credential.value:
+        if (
+            credential is not None
+            and credential.value
+            and uri_credential_value_risk(text, credential)
+        ):
             spans.append((credential.value_start, credential.value_end))
     return spans
 

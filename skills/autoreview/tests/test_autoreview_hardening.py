@@ -3271,6 +3271,50 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.subTest(content=content):
                 self.assertFalse(self.helper["secret_text_risk"](content))
 
+    def test_review_patch_preserves_safe_uri_userinfo(self) -> None:
+        safe_lines = (
+            'url = f"ssh://{ssh_user}@git.example.invalid/org/repo.git"',
+            'url = "https://alice@github.com/example/repo"',
+            'url = "https://username:@host/repo"',
+            'remote = "ssh://git@github.com/org/repo.git"',
+        )
+        for line in safe_lines:
+            with self.subTest(line=line):
+                patch = (
+                    "diff --git a/fixture.py b/fixture.py\n"
+                    "--- a/fixture.py\n"
+                    "+++ b/fixture.py\n"
+                    "@@ -0,0 +1 @@\n"
+                    f"+{line}\n"
+                )
+
+                validated = self.helper["validate_review_patch"](
+                    "local unstaged diff",
+                    ["fixture.py"],
+                    patch,
+                )
+
+                self.assertIn(f"+{line}", validated)
+                self.assertNotIn("redacted@", validated)
+
+    def test_review_patch_still_redacts_uri_passwords(self) -> None:
+        patch = (
+            "diff --git a/fixture.py b/fixture.py\n"
+            "--- a/fixture.py\n"
+            "+++ b/fixture.py\n"
+            "@@ -0,0 +1 @@\n"
+            '+dsn = "postgres://user:hunter2pass@db.example/app"\n'
+        )
+
+        validated = self.helper["validate_review_patch"](
+            "local unstaged diff",
+            ["fixture.py"],
+            patch,
+        )
+
+        self.assertIn("postgres://user:redacted@db.example/app", validated)
+        self.assertNotIn("hunter2pass", validated)
+
     def test_secret_detector_allows_referenced_uri_credentials(self) -> None:
         for content in (
             "postgres:" + "//user:password@localhost/db",
