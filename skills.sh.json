@@ -15,7 +15,7 @@
     {
       "title": "Sessions",
       "description": "Skills for inspecting and sharing local agent sessions.",
-      "skills": ["session-viewer"]
+      "skills": ["session-viewer", "beam"]
     }
   ]
 }

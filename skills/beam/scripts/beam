@@ -1,0 +1,355 @@
+#!/usr/bin/env node
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const TRANSCRIPT_HELPER = path.resolve(SCRIPT_DIR, "../../agent-transcript/scripts/agent-transcript");
+const MAX_UPLOAD_BYTES = 52 * 1024;
+const DEFAULT_TIMEOUT_MS = 15_000;
+
+function usage() {
+  console.log(`Usage:
+  beam publish --endpoint URL [--session FILE | --session-id ID | --thread-id ID] [--title TEXT] [--complete] [--dry-run]
+  beam hook --endpoint URL [--quiet] [--dry-run]
+
+Environment:
+  BEAM_ENDPOINT       Default receiver URL
+  BEAM_ACCESS_TOKEN   Cloudflare Access application token (sent as cf-access-token)
+  BEAM_AUTH_TOKEN     Gateway bearer token fallback (sent as Authorization: Bearer)
+
+The hook command reads Claude Code or Codex hook JSON from stdin. Raw transcripts never leave the machine.`);
+}
+
+function parseArgs(argv) {
+  const result = { _: [] };
+  for (let index = 0; index < argv.length; index++) {
+    const argument = argv[index];
+    if (!argument.startsWith("--")) {
+      result._.push(argument);
+      continue;
+    }
+    const key = argument.slice(2);
+    const value = argv[index + 1];
+    if (value == null || value.startsWith("--")) {
+      result[key] = true;
+      continue;
+    }
+    result[key] = value;
+    index++;
+  }
+  return result;
+}
+
+function runTranscriptHelper(args, options = {}) {
+  return execFileSync(process.execPath, [TRANSCRIPT_HELPER, ...args], {
+    encoding: "utf8",
+    maxBuffer: 4 * 1024 * 1024,
+    ...options,
+  });
+}
+
+function readStdinJson() {
+  const raw = fs.readFileSync(0, "utf8").trim();
+  if (!raw) return {};
+  const value = JSON.parse(raw);
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("hook input must be a JSON object");
+  }
+  return value;
+}
+
+function existingFile(candidate) {
+  if (typeof candidate !== "string" || !candidate.trim()) return null;
+  const resolved = path.resolve(candidate);
+  try {
+    return fs.statSync(resolved).isFile() ? resolved : null;
+  } catch {
+    return null;
+  }
+}
+
+function findSession(options, hook) {
+  const explicitSession = existingFile(options.session);
+  if (options.session && !explicitSession) {
+    throw new Error(`session file does not exist: ${options.session}`);
+  }
+  const direct =
+    explicitSession || existingFile(hook.transcript_path) || existingFile(hook.agent_transcript_path);
+  if (direct) return direct;
+
+  const identity =
+    options["thread-id"] ||
+    options.threadId ||
+    options["session-id"] ||
+    options.sessionId ||
+    hook.thread_id ||
+    hook.session_id ||
+    process.env.CODEX_THREAD_ID ||
+    process.env.CLAUDE_SESSION_ID;
+  if (!identity) {
+    throw new Error("could not identify the current session; pass --session, --session-id, or --thread-id");
+  }
+  const cwd = options.cwd || hook.cwd || process.cwd();
+  const query = [identity, cwd].filter(Boolean).join(" ");
+
+  const results = JSON.parse(
+    runTranscriptHelper([
+      "find",
+      "--query",
+      query,
+      "--cwd",
+      cwd,
+      "--since-days",
+      String(options["since-days"] || 14),
+      "--limit",
+      "5",
+    ]),
+  );
+  const exact = identity
+    ? results.find((entry) => path.basename(entry.file).includes(String(identity)))
+    : undefined;
+  const candidate = identity ? exact : results[0];
+  if (!candidate?.file) throw new Error("no matching local coding session was found");
+  return candidate.file;
+}
+
+function sanitizeAssistantMessage(text, entryMaxChars) {
+  const sanitized = JSON.parse(
+    runTranscriptHelper(
+      ["sanitize", "--role", "assistant", "--entry-max-chars", String(entryMaxChars)],
+      { input: text },
+    ),
+  );
+  return typeof sanitized.text === "string" ? sanitized.text.trim() : "";
+}
+
+function normalizeItems(rendered, hook, options) {
+  const items = Array.isArray(rendered.items)
+    ? rendered.items
+        .filter(
+          (item) =>
+            item &&
+            ["user", "assistant", "tool summary"].includes(item.role) &&
+            typeof item.text === "string" &&
+            item.text.trim(),
+        )
+        .map((item) => ({
+          type:
+            item.role === "user"
+              ? "userMessage"
+              : item.role === "assistant"
+                ? "agentMessage"
+                : "other",
+          text: item.text.trim(),
+        }))
+    : [];
+  const entryMaxChars = Number(options["entry-max-chars"] || 6_000);
+  const lastAssistant =
+    typeof hook.last_assistant_message === "string" && hook.last_assistant_message.trim()
+      ? sanitizeAssistantMessage(hook.last_assistant_message, entryMaxChars)
+      : "";
+  const previousAssistant = items.findLast((item) => item.type === "agentMessage")?.text;
+  if (lastAssistant && previousAssistant !== lastAssistant) {
+    items.push({ type: "agentMessage", text: lastAssistant });
+  }
+  return items;
+}
+
+function titleFromItems(items, explicit) {
+  if (typeof explicit === "string" && explicit.trim()) return explicit.trim().slice(0, 160);
+  const firstUser = items.find((item) => item.type === "userMessage")?.text || "Beamed coding session";
+  return firstUser.split(/\r?\n/, 1)[0].trim().slice(0, 160) || "Beamed coding session";
+}
+
+function stableBeamId(source, identity) {
+  return createHash("sha256").update(`${source}:${identity}`).digest("hex").slice(0, 32);
+}
+
+function fitPayload(payload) {
+  const next = structuredClone(payload);
+  while (Buffer.byteLength(JSON.stringify(next)) > MAX_UPLOAD_BYTES && next.items.length > 1) {
+    next.items.shift();
+    next.truncated = true;
+  }
+  if (Buffer.byteLength(JSON.stringify(next)) > MAX_UPLOAD_BYTES) {
+    const only = next.items[0];
+    if (!only) throw new Error("sanitized session payload is empty");
+    const excess = Buffer.byteLength(JSON.stringify(next)) - MAX_UPLOAD_BYTES;
+    only.text = `${only.text.slice(0, Math.max(0, only.text.length - excess - 128)).trimEnd()}\n...[truncated for Beam]`;
+    next.truncated = true;
+  }
+  if (Buffer.byteLength(JSON.stringify(next)) > MAX_UPLOAD_BYTES) {
+    throw new Error("sanitized session payload exceeds the Beam upload limit");
+  }
+  return next;
+}
+
+function buildPayload(options, hook) {
+  const session = findSession(options, hook);
+  const rendered = JSON.parse(
+    runTranscriptHelper([
+      "render-json",
+      "--session",
+      session,
+      "--max-chars",
+      String(options["max-chars"] || 48_000),
+      "--entry-max-chars",
+      String(options["entry-max-chars"] || 6_000),
+    ]),
+  );
+  const items = normalizeItems(rendered, hook, options);
+  if (!items.length) throw new Error("the sanitized session contains no shareable messages");
+
+  const source = typeof rendered.agent === "string" ? rendered.agent : "agent";
+  const identity =
+    rendered.threadId ||
+    options["thread-id"] ||
+    options["session-id"] ||
+    hook.thread_id ||
+    hook.session_id ||
+    session;
+  const hookEvent = typeof hook.hook_event_name === "string" ? hook.hook_event_name : undefined;
+  return fitPayload({
+    version: 1,
+    beamId: stableBeamId(source, identity),
+    source,
+    title: titleFromItems(items, options.title),
+    updatedAt: new Date().toISOString(),
+    completed: Boolean(options.complete || hookEvent === "SessionEnd"),
+    ...(hookEvent ? { hookEvent } : {}),
+    items,
+  });
+}
+
+function isLoopbackUrl(url) {
+  return ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+}
+
+function endpointUrl(options) {
+  const raw = options.endpoint || process.env.BEAM_ENDPOINT;
+  if (!raw) throw new Error("--endpoint or BEAM_ENDPOINT is required");
+  const url = new URL(raw);
+  if (url.protocol !== "https:" && !isLoopbackUrl(url)) {
+    throw new Error("Beam endpoints must use HTTPS unless they are loopback-local");
+  }
+  return url;
+}
+
+function cloudflaredToken(origin) {
+  try {
+    const cached = execFileSync("cloudflared", ["access", "token", `--app=${origin}`], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (cached) return cached;
+  } catch {
+    // Continue into the interactive browser login below.
+  }
+  execFileSync("cloudflared", ["access", "login", "--quiet", origin], {
+    stdio: ["inherit", "ignore", "inherit"],
+  });
+  return execFileSync("cloudflared", ["access", "token", `--app=${origin}`], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
+}
+
+function authHeaders(url, allowInteractiveLogin) {
+  const accessToken = process.env.BEAM_ACCESS_TOKEN?.trim();
+  if (accessToken) return { "cf-access-token": accessToken };
+  const bearer = process.env.BEAM_AUTH_TOKEN?.trim();
+  if (bearer) return { authorization: `Bearer ${bearer}` };
+  if (isLoopbackUrl(url)) return {};
+  if (!allowInteractiveLogin) {
+    throw new Error("no Beam credentials configured for non-interactive hook publishing");
+  }
+  const token = cloudflaredToken(url.origin);
+  if (!token) throw new Error("Cloudflare Access login did not return a token");
+  return { "cf-access-token": token };
+}
+
+function safeReceiverMessage(value, fallback) {
+  if (typeof value !== "string") return fallback;
+  const ansiEscape = new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`, "g");
+  const sanitized = value
+    .replace(ansiEscape, "")
+    .replace(/[\x00-\x1f\x7f-\x9f]/g, " ")
+    .trim()
+    .slice(0, 240);
+  return sanitized || fallback;
+}
+
+async function publish(payload, options) {
+  const url = endpointUrl(options);
+  if (options["dry-run"] || options.dryRun) {
+    process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+    return { ok: true, beamId: payload.beamId, dryRun: true };
+  }
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "user-agent": "openclaw-agent-skills-beam/1",
+      ...authHeaders(url, options.hookMode !== true),
+    },
+    body: JSON.stringify(payload),
+    redirect: "error",
+    signal: AbortSignal.timeout(Number(options.timeout || DEFAULT_TIMEOUT_MS)),
+  });
+  const text = await response.text();
+  let result;
+  try {
+    result = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error(`Beam receiver returned invalid JSON (HTTP ${response.status})`);
+  }
+  if (!response.ok || result?.ok === false) {
+    const message = safeReceiverMessage(result?.error, `HTTP ${response.status}`);
+    throw new Error(`Beam upload failed: ${message}`);
+  }
+  if (typeof result.url === "string") {
+    const resultUrl = new URL(result.url, url);
+    if (!["http:", "https:"].includes(resultUrl.protocol) || resultUrl.origin !== url.origin) {
+      throw new Error("Beam receiver returned an unsafe session URL");
+    }
+    result.url = resultUrl.toString();
+  }
+  return result;
+}
+
+async function main() {
+  const [command, ...rest] = process.argv.slice(2);
+  const options = parseArgs(rest);
+  if (!command || command === "--help" || command === "-h" || options.help) {
+    usage();
+    return;
+  }
+  if (command !== "publish" && command !== "hook") {
+    usage();
+    process.exitCode = 2;
+    return;
+  }
+  const hook = command === "hook" ? readStdinJson() : {};
+  options.hookMode = command === "hook";
+  const event = hook.hook_event_name;
+  if (command === "hook" && event && !["Stop", "SessionEnd", "SubagentStop"].includes(event)) {
+    return;
+  }
+  const payload = buildPayload(options, hook);
+  const result = await publish(payload, options);
+  if (!options.quiet) {
+    const target = result.url || payload.beamId;
+    console.log(options["dry-run"] ? "Beam dry run complete." : `Beamed session: ${target}`);
+  }
+}
+
+try {
+  await main();
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+}

@@ -44,6 +44,8 @@ jobs:
       - name: Run Python tests
         run: python -m unittest skills/autoreview/scripts/autoreview_test.py skills.autoreview.tests.test_autoreview_hardening
       - name: Check Node scripts
-        run: node --check skills/agent-transcript/scripts/agent-transcript
+        run: |
+          node --check skills/agent-transcript/scripts/agent-transcript
+          node --check skills/beam/scripts/beam
       - name: Run Node tests
-        run: node --test skills/agent-transcript/scripts/agent-transcript.test.mjs skills/session-viewer/scripts/session-viewer.test.ts
+        run: node --test skills/agent-transcript/scripts/agent-transcript.test.mjs skills/beam/scripts/beam.test.mjs skills/session-viewer/scripts/session-viewer.test.ts

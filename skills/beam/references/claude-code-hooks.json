@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /absolute/path/to/agent-skills/skills/beam/scripts/beam hook --endpoint \"$BEAM_ENDPOINT\" --quiet",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /absolute/path/to/agent-skills/skills/beam/scripts/beam hook --endpoint \"$BEAM_ENDPOINT\" --quiet",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
