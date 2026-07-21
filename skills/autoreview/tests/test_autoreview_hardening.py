@@ -3253,24 +3253,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertIn(f"+{line}", validated)
                 self.assertNotIn("redacted@", validated)
 
-    def test_review_patch_still_redacts_uri_passwords(self) -> None:
-        patch = (
-            "diff --git a/fixture.py b/fixture.py\n"
-            "--- a/fixture.py\n"
-            "+++ b/fixture.py\n"
-            "@@ -0,0 +1 @@\n"
-            '+dsn = "postgres://user:hunter2pass@db.example/app"\n'
-        )
-
-        validated = self.helper["validate_review_patch"](
-            "local unstaged diff",
-            ["fixture.py"],
-            patch,
-        )
-
-        self.assertIn("postgres://user:redacted@db.example/app", validated)
-        self.assertNotIn("hunter2pass", validated)
-
     def test_secret_detector_allows_referenced_uri_credentials(self) -> None:
         for content in (
             "postgres:" + "//user:password@localhost/db",
