@@ -627,8 +627,13 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             source.write_text("after\n")
 
             cursor_bin = root / "cursor-agent"
+            trufflehog_bin = root / "trufflehog"
             record_path = root / "record.json"
             AUTOREVIEW.write_executable(cursor_bin, AUTOREVIEW.fake_cursor_script())
+            AUTOREVIEW.write_executable(
+                trufflehog_bin,
+                "#!/usr/bin/env python3\nraise SystemExit(0)\n",
+            )
             env = os.environ.copy()
             env.update(
                 {
@@ -637,7 +642,10 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                     "GIT_CONFIG_GLOBAL": str(root / "hostile-gitconfig"),
                     "NODE_OPTIONS": "--require=hostile.js",
                     "PYTHONPATH": str(root / "hostile-python"),
-                    "PATH": f"{repo}{os.pathsep}{env.get('PATH', '')}",
+                    "PATH": (
+                        f"{root}{os.pathsep}{repo}{os.pathsep}"
+                        f"{env.get('PATH', '')}"
+                    ),
                     "HOME": str(root),
                     "USERPROFILE": str(root),
                 }

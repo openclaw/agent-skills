@@ -1923,6 +1923,407 @@ def validate_git_ref(repo: Path, ref: str, label: str) -> str:
     return ref
 
 
+TRUFFLEHOG_INSTALL_URL = "https://github.com/trufflesecurity/trufflehog#installation"
+TRUFFLEHOG_FINDINGS_EXIT_CODE = 183
+
+
+def git_bytes(
+    repo: Path,
+    *args: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    result = subprocess.run(
+        [
+            resolve_command("git", repo),
+            "--no-optional-locks",
+            *SAFE_GIT_CONFIG_ARGS,
+            *args,
+        ],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=safe_git_env(repo),
+    )
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout).decode(
+            SUBPROCESS_TEXT_ENCODING,
+            errors=SUBPROCESS_TEXT_ERRORS,
+        )
+        raise SystemExit(
+            f"Git failed while preparing the TruffleHog scan ({result.returncode}): "
+            f"{display_escape(detail, 1000, multiline=True)}"
+        )
+    return result
+
+
+def snapshot_destination(root: Path, rel: str) -> Path:
+    path = PurePosixPath(rel)
+    if (
+        path.is_absolute()
+        or not path.parts
+        or path.parts[0].casefold() == ".git"
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise SystemExit("Git returned an unsafe path while preparing the TruffleHog scan")
+    destination = root.joinpath(*path.parts)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    return destination
+
+
+def write_snapshot_blob(root: Path, rel: str, content: bytes) -> None:
+    destination = snapshot_destination(root, rel)
+    try:
+        destination.write_bytes(content)
+    except OSError as exc:
+        raise SystemExit(
+            "unable to prepare changed content for the TruffleHog scan: "
+            f"{display_escape(exc, 500)}"
+        ) from exc
+
+
+def materialize_index_snapshot(repo: Path, root: Path, paths: list[str]) -> int:
+    if not paths:
+        return 0
+    records = git_bytes(
+        repo,
+        "ls-files",
+        "--stage",
+        "-z",
+        "--",
+        *paths,
+    ).stdout
+    count = 0
+    for record in records.split(b"\0"):
+        if not record:
+            continue
+        metadata, raw_path = record.split(b"\t", 1)
+        mode, object_id, stage = metadata.split()
+        if stage != b"0":
+            raise SystemExit(
+                "cannot run TruffleHog with unmerged index entries; resolve the conflict and rerun autoreview"
+            )
+        if mode == b"160000":
+            continue
+        rel = raw_path.decode(SUBPROCESS_TEXT_ENCODING, errors="strict")
+        content = git_bytes(
+            repo,
+            "cat-file",
+            "blob",
+            object_id.decode("ascii"),
+        ).stdout
+        write_snapshot_blob(root, rel, content)
+        count += 1
+    return count
+
+
+def materialize_tree_snapshot(
+    repo: Path,
+    root: Path,
+    ref: str,
+    paths: list[str],
+) -> int:
+    if not paths:
+        return 0
+    records = git_bytes(
+        repo,
+        "ls-tree",
+        "-rz",
+        ref,
+        "--",
+        *paths,
+    ).stdout
+    count = 0
+    for record in records.split(b"\0"):
+        if not record:
+            continue
+        metadata, raw_path = record.split(b"\t", 1)
+        mode, object_type, object_id = metadata.split()
+        if object_type != b"blob" or mode == b"160000":
+            continue
+        rel = raw_path.decode(SUBPROCESS_TEXT_ENCODING, errors="strict")
+        content = git_bytes(
+            repo,
+            "cat-file",
+            "blob",
+            object_id.decode("ascii"),
+        ).stdout
+        write_snapshot_blob(root, rel, content)
+        count += 1
+    return count
+
+
+def copy_worktree_file(repo: Path, root: Path, rel: str) -> bool:
+    source = repo.joinpath(*PurePosixPath(rel).parts)
+    try:
+        source_stat = source.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise SystemExit(
+            "unable to read changed content for the TruffleHog scan: "
+            f"{display_escape(exc, 500)}"
+        ) from exc
+    if stat.S_ISLNK(source_stat.st_mode):
+        try:
+            content = os.fsencode(os.readlink(source))
+        except OSError as exc:
+            raise SystemExit(
+                "unable to read changed symlink for the TruffleHog scan: "
+                f"{display_escape(exc, 500)}"
+            ) from exc
+        write_snapshot_blob(root, rel, content)
+        return True
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise SystemExit(
+            "changed content is not a regular file; remove it or resolve the repository state before rerunning autoreview"
+        )
+    destination = snapshot_destination(root, rel)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            source,
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or (
+            source_stat.st_dev,
+            source_stat.st_ino,
+        ) != (
+            opened.st_dev,
+            opened.st_ino,
+        ):
+            raise OSError("file changed while opening")
+        with destination.open("wb") as output:
+            while chunk := os.read(descriptor, 1024 * 1024):
+                output.write(chunk)
+        after = os.fstat(descriptor)
+        if (
+            opened.st_mode,
+            opened.st_size,
+            opened.st_mtime_ns,
+        ) != (
+            after.st_mode,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise OSError("file changed while reading")
+    except OSError as exc:
+        destination.unlink(missing_ok=True)
+        raise SystemExit(
+            "unable to snapshot changed content for the TruffleHog scan: "
+            f"{display_escape(exc, 500)}"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return True
+
+
+def materialize_worktree_snapshot(repo: Path, root: Path, paths: list[str]) -> int:
+    return sum(copy_worktree_file(repo, root, rel) for rel in paths)
+
+
+def clear_snapshot_paths(root: Path, paths: list[str]) -> None:
+    for rel in paths:
+        destination = snapshot_destination(root, rel)
+        if destination.is_symlink() or destination.is_file():
+            destination.unlink()
+        elif destination.exists():
+            shutil.rmtree(destination)
+
+
+def commit_snapshot(repo: Path, label: str) -> str:
+    git(repo, "add", "-A")
+    git(
+        repo,
+        "-c",
+        "user.name=Autoreview",
+        "-c",
+        "user.email=autoreview@example.invalid",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        label,
+    )
+    return git(repo, "rev-parse", "HEAD").strip()
+
+
+def safe_trufflehog_env(repo: Path) -> dict[str, str]:
+    env = safe_git_env(repo)
+    for key in (
+        "ALL_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    ):
+        value = os.environ.get(key)
+        if not value:
+            continue
+        if key.casefold() != "no_proxy" and not safe_proxy_url(value):
+            raise SystemExit(
+                f"unsafe credentialed or malformed proxy URL in {key}; "
+                "configure a credential-free proxy URL before running autoreview"
+            )
+        env[key] = value
+    return env
+
+
+def prepare_trufflehog_history(
+    repo: Path,
+    target: str,
+    target_ref: str | None,
+    commit_ref: str,
+    root: Path,
+) -> str:
+    git(root, "init", "-q")
+    if target == "local":
+        staged_paths = git_path_list(
+            repo,
+            "diff",
+            *SAFE_DIFF_FLAGS,
+            "--name-only",
+            "--cached",
+            "-z",
+        )
+        unstaged_paths = git_path_list(
+            repo,
+            "diff",
+            *SAFE_DIFF_FLAGS,
+            "--name-only",
+            "-z",
+        )
+        unstaged_paths.extend(
+            git_path_list(
+                repo,
+                *global_excludes_git_args(repo),
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            )
+        )
+        paths = sorted(set(staged_paths + unstaged_paths))
+        head = git(repo, "rev-parse", "--verify", "HEAD", check=False).strip()
+        if head:
+            materialize_tree_snapshot(repo, root, head, paths)
+        base_commit = commit_snapshot(root, "baseline")
+        clear_snapshot_paths(root, paths)
+        materialize_index_snapshot(repo, root, paths)
+        commit_snapshot(root, "staged")
+        clear_snapshot_paths(root, paths)
+        materialize_worktree_snapshot(repo, root, paths)
+        commit_snapshot(root, "working")
+        return base_commit
+
+    if target == "branch":
+        assert target_ref
+        target_ref = validate_git_ref(repo, target_ref, "base")
+        paths = git_path_list(
+            repo,
+            "diff",
+            *SAFE_DIFF_FLAGS,
+            "--name-only",
+            "-z",
+            "--end-of-options",
+            f"{target_ref}...HEAD",
+        )
+        base_ref = git(repo, "merge-base", target_ref, "HEAD").strip()
+        reviewed_ref = "HEAD"
+    else:
+        reviewed_ref = validate_git_ref(repo, commit_ref, "commit")
+        parents = git(repo, "rev-list", "--parents", "-n", "1", reviewed_ref).split()
+        if len(parents) > 2:
+            raise SystemExit(
+                "commit review does not accept merge commits; review the branch diff "
+                "or an individual parent-relative commit instead"
+            )
+        base_ref = parents[1] if len(parents) == 2 else ""
+        paths = git_path_list(
+            repo,
+            "show",
+            *SAFE_DIFF_FLAGS,
+            "--name-only",
+            "--format=",
+            "-z",
+            "--end-of-options",
+            reviewed_ref,
+        )
+    if base_ref:
+        materialize_tree_snapshot(repo, root, base_ref, paths)
+    base_commit = commit_snapshot(root, "baseline")
+    clear_snapshot_paths(root, paths)
+    materialize_tree_snapshot(repo, root, reviewed_ref, paths)
+    commit_snapshot(root, "reviewed")
+    return base_commit
+
+
+def run_trufflehog_preflight(
+    repo: Path,
+    target: str,
+    target_ref: str | None,
+    commit_ref: str,
+) -> None:
+    trufflehog_bin = find_command("trufflehog", repo)
+    if not trufflehog_bin:
+        raise SystemExit(
+            "TruffleHog is required but was not found. Install it using the official "
+            f"instructions, then rerun autoreview: {TRUFFLEHOG_INSTALL_URL}"
+        )
+    started = time.monotonic()
+    with tempfile.TemporaryDirectory(
+        prefix="autoreview-trufflehog.",
+        dir=safe_temp_root(repo),
+    ) as tempdir:
+        scan_repo = Path(tempdir)
+        base_commit = prepare_trufflehog_history(
+            repo,
+            target,
+            target_ref,
+            commit_ref,
+            scan_repo,
+        )
+        result = run(
+            [
+                trufflehog_bin,
+                "git",
+                scan_repo.resolve().as_uri(),
+                "--since-commit",
+                base_commit,
+                "--branch",
+                "HEAD",
+                "--no-update",
+                "--no-color",
+                # Match TruffleHog's pre-commit mode. Unverified heuristic
+                # candidates are excluded to avoid restoring false positives.
+                "--results=verified,unknown",
+                "--fail",
+                "--fail-on-scan-errors",
+            ],
+            repo,
+            check=False,
+            env=safe_trufflehog_env(repo),
+        )
+    if result.returncode == TRUFFLEHOG_FINDINGS_EXIT_CODE:
+        raise SystemExit(
+            "TruffleHog found verified or unknown credentials in the reviewed changes. "
+            "Remove or rotate them, then rerun autoreview."
+        )
+    if result.returncode != 0:
+        raise SystemExit(
+            "TruffleHog could not complete the credential scan. Run TruffleHog directly "
+            "to diagnose the scanner error, then rerun autoreview."
+        )
+    print(f"trufflehog: clean ({time.monotonic() - started:.1f}s)")
+
+
 def bounded(text: str, limit: int = 180_000) -> str:
     if len(text) <= limit:
         return text
@@ -11345,6 +11746,7 @@ def main() -> int:
         return 0
 
     review_source_snapshot = source_tree_snapshot(repo)
+    run_trufflehog_preflight(repo, target, target_ref, args.commit)
     if target == "local":
         bundle, bundle_truncated = local_bundle(repo)
     elif target == "branch":

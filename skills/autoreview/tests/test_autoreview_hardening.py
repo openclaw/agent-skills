@@ -65,9 +65,249 @@ def realistic_secret_value() -> str:
     return "A7f9K2m4Q8v6" + "N3x5R1p0T9z8"
 
 
+def add_fake_trufflehog(
+    helper: dict[str, object],
+    root: Path,
+    env: dict[str, str],
+) -> None:
+    helper["write_executable"](
+        root / "trufflehog",
+        "#!/usr/bin/env python3\nraise SystemExit(0)\n",
+    )
+    env["PATH"] = f"{root}{os.pathsep}{env.get('PATH', '')}"
+
+
 class AutoreviewHardeningTests(unittest.TestCase):
     def setUp(self) -> None:
         self.helper = load_helper()
+
+    def test_trufflehog_missing_binary_has_platform_neutral_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            with mock.patch.dict(
+                self.helper["run_trufflehog_preflight"].__globals__,
+                {"find_command": lambda _name, _repo: None},
+            ):
+                with self.assertRaises(SystemExit) as error:
+                    self.helper["run_trufflehog_preflight"](
+                        repo,
+                        "local",
+                        None,
+                        "HEAD",
+                    )
+
+        message = str(error.exception)
+        self.assertIn("TruffleHog is required but was not found", message)
+        self.assertIn(self.helper["TRUFFLEHOG_INSTALL_URL"], message)
+        self.assertNotIn("brew", message.casefold())
+
+    def test_trufflehog_scans_staged_and_working_versions_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            source = repo / "runtime.txt"
+            source.write_text("base\n", encoding="utf-8")
+            git(repo, "add", "runtime.txt")
+            git(repo, "commit", "-q", "-m", "base")
+            source.write_text("staged version\n", encoding="utf-8")
+            git(repo, "add", "runtime.txt")
+            source.write_text("working version\n", encoding="utf-8")
+
+            original_find_command = self.helper["find_command"]
+            original_run = self.helper["run"]
+            scanned: dict[str, str] = {}
+
+            def find_command(name: str, checkout: Path) -> str | None:
+                if name == "trufflehog":
+                    return "/trusted/trufflehog"
+                return original_find_command(name, checkout)
+
+            def run_scanner(
+                command: list[str],
+                cwd: Path,
+                **_kwargs: object,
+            ) -> subprocess.CompletedProcess[str]:
+                if command[0] != "/trusted/trufflehog":
+                    return original_run(command, cwd, **_kwargs)
+                self.assertEqual(
+                    command[0:2],
+                    [
+                        "/trusted/trufflehog",
+                        "git",
+                    ],
+                )
+                self.assertEqual(command[3], "--since-commit")
+                self.assertEqual(command[5:7], ["--branch", "HEAD"])
+                self.assertEqual(
+                    command[7:],
+                    [
+                        "--no-update",
+                        "--no-color",
+                        "--results=verified,unknown",
+                        "--fail",
+                        "--fail-on-scan-errors",
+                    ],
+                )
+                scan_path = command[2].removeprefix("file://")
+                if os.name == "nt":
+                    scan_path = scan_path.lstrip("/")
+                scan_repo = Path(scan_path)
+                commits = git(
+                    scan_repo,
+                    "log",
+                    "--reverse",
+                    "--format=%H",
+                ).splitlines()
+                scanned["staged"] = git(
+                    scan_repo,
+                    "show",
+                    f"{commits[1]}:runtime.txt",
+                )
+                scanned["working"] = git(
+                    scan_repo,
+                    "show",
+                    f"{commits[2]}:runtime.txt",
+                )
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with mock.patch.dict(
+                self.helper["run_trufflehog_preflight"].__globals__,
+                {
+                    "find_command": find_command,
+                    "run": run_scanner,
+                },
+            ):
+                self.helper["run_trufflehog_preflight"](
+                    repo,
+                    "local",
+                    None,
+                    "HEAD",
+                )
+
+        self.assertEqual(
+            scanned,
+            {
+                "staged": "staged version\n",
+                "working": "working version\n",
+            },
+        )
+
+    def test_trufflehog_scans_only_changed_content_at_reviewed_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            unchanged = repo / "unchanged.txt"
+            changed = repo / "changed.txt"
+            unchanged.write_text("unchanged\n", encoding="utf-8")
+            changed.write_text("base\n", encoding="utf-8")
+            git(repo, "add", "unchanged.txt", "changed.txt")
+            git(repo, "commit", "-q", "-m", "base")
+            base = git(repo, "rev-parse", "HEAD").strip()
+            changed.write_text("reviewed version\n", encoding="utf-8")
+            git(repo, "add", "changed.txt")
+            git(repo, "commit", "-q", "-m", "change")
+            reviewed_commit = git(repo, "rev-parse", "HEAD").strip()
+            changed.write_text("later working version\n", encoding="utf-8")
+
+            for target, target_ref, commit_ref in (
+                ("branch", base, "HEAD"),
+                ("commit", None, reviewed_commit),
+            ):
+                with self.subTest(target=target), tempfile.TemporaryDirectory() as scan_dir:
+                    scan_repo = Path(scan_dir)
+                    base_commit = self.helper["prepare_trufflehog_history"](
+                        repo,
+                        target,
+                        target_ref,
+                        commit_ref,
+                        scan_repo,
+                    )
+
+                    commits = git(
+                        scan_repo,
+                        "log",
+                        "--reverse",
+                        "--format=%H",
+                    ).splitlines()
+                    self.assertEqual(commits[0], base_commit)
+                    self.assertEqual(len(commits), 2)
+                    self.assertEqual(
+                        git(
+                            scan_repo,
+                            "show",
+                            f"{commits[1]}:changed.txt",
+                        ),
+                        "reviewed version\n",
+                    )
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        subprocess.run(
+                            [
+                                "git",
+                                "show",
+                                f"{commits[1]}:unchanged.txt",
+                            ],
+                            cwd=scan_repo,
+                            check=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                        )
+
+    def test_trufflehog_findings_and_errors_do_not_leak_scanner_output(self) -> None:
+        for returncode, expected in (
+            (
+                self.helper["TRUFFLEHOG_FINDINGS_EXIT_CODE"],
+                "found verified or unknown credentials",
+            ),
+            (1, "could not complete the credential scan"),
+        ):
+            with self.subTest(returncode=returncode), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                (repo / "runtime.txt").write_text("review me\n", encoding="utf-8")
+                original_find_command = self.helper["find_command"]
+                original_run = self.helper["run"]
+                scanner_output = "detected-value-that-must-not-leak"
+
+                def find_command(name: str, checkout: Path) -> str | None:
+                    if name == "trufflehog":
+                        return "/trusted/trufflehog"
+                    return original_find_command(name, checkout)
+
+                def run_scanner(
+                    command: list[str],
+                    cwd: Path,
+                    **_kwargs: object,
+                ) -> subprocess.CompletedProcess[str]:
+                    if command[0] != "/trusted/trufflehog":
+                        return original_run(command, cwd, **_kwargs)
+                    return subprocess.CompletedProcess(
+                        command,
+                        returncode,
+                        scanner_output,
+                        scanner_output,
+                    )
+
+                output = io.StringIO()
+                with (
+                    mock.patch.dict(
+                        self.helper["run_trufflehog_preflight"].__globals__,
+                        {
+                            "find_command": find_command,
+                            "run": run_scanner,
+                        },
+                    ),
+                    contextlib.redirect_stdout(output),
+                    contextlib.redirect_stderr(output),
+                    self.assertRaises(SystemExit) as error,
+                ):
+                    self.helper["run_trufflehog_preflight"](
+                        repo,
+                        "local",
+                        None,
+                        "HEAD",
+                    )
+
+                combined = output.getvalue() + str(error.exception)
+                self.assertIn(expected, combined)
+                self.assertNotIn(scanner_output, combined)
 
     def test_powershell_harness_exposes_runnable_engines_only(self) -> None:
         harness = SCRIPT.with_name("test-review-harness.ps1").read_text(encoding="utf-8")
@@ -4333,6 +4573,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             )
             record_path = root / "record.json"
             env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
             env.update(
                 {
                     "AUTOREVIEW_FAKE_RECORD": str(record_path),
@@ -4380,6 +4621,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             )
             record_path = root / "record.json"
             env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
             env.update(
                 {
                     "AUTOREVIEW_FAKE_MUTATE": str(source),
