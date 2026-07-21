@@ -1965,14 +1965,13 @@ def snapshot_destination(root: Path, rel: str) -> Path:
         or any(part in {"", ".", ".."} for part in path.parts)
     ):
         raise SystemExit("Git returned an unsafe path while preparing the TruffleHog scan")
-    destination = root.joinpath(*path.parts)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    return destination
+    return root.joinpath(*path.parts)
 
 
 def write_snapshot_blob(root: Path, rel: str, content: bytes) -> None:
     destination = snapshot_destination(root, rel)
     try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(content)
     except OSError as exc:
         raise SystemExit(
@@ -2080,6 +2079,7 @@ def copy_worktree_file(repo: Path, root: Path, rel: str) -> bool:
     destination = snapshot_destination(root, rel)
     descriptor: int | None = None
     try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(
             source,
             os.O_RDONLY
@@ -2221,6 +2221,15 @@ def prepare_trufflehog_history(
         clear_snapshot_paths(root, paths)
         materialize_worktree_snapshot(repo, root, paths)
         commit_snapshot(root, "working")
+        # TruffleHog's Git parser scans additions only. Reverse commits make
+        # deleted bytes additions without exposing unchanged baseline content.
+        clear_snapshot_paths(root, paths)
+        materialize_index_snapshot(repo, root, paths)
+        commit_snapshot(root, "reverse staged")
+        clear_snapshot_paths(root, paths)
+        if head:
+            materialize_tree_snapshot(repo, root, head, paths)
+        commit_snapshot(root, "reverse baseline")
         return base_commit
 
     if target == "branch":
@@ -2262,6 +2271,12 @@ def prepare_trufflehog_history(
     clear_snapshot_paths(root, paths)
     materialize_tree_snapshot(repo, root, reviewed_ref, paths)
     commit_snapshot(root, "reviewed")
+    # Scan the reverse diff too so deleted bytes become additions for
+    # TruffleHog without scanning unchanged content from the baseline.
+    clear_snapshot_paths(root, paths)
+    if base_ref:
+        materialize_tree_snapshot(repo, root, base_ref, paths)
+    commit_snapshot(root, "reverse baseline")
     return base_commit
 
 
@@ -7363,7 +7378,7 @@ def omit_tracked_sensitive_diff_units(
     ]
     if len(diff_indexes) != len(paths):
         return REVIEW_SECURITY_REDACTION + "\n"
-    path_by_unit = dict(zip(diff_indexes, paths, strict=True))
+    path_by_unit = dict(zip(diff_indexes, paths))
     retained = [
         unit
         for index, unit in enumerate(units)

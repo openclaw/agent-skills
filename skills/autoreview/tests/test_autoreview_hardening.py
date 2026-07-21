@@ -228,7 +228,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                         "--format=%H",
                     ).splitlines()
                     self.assertEqual(commits[0], base_commit)
-                    self.assertEqual(len(commits), 2)
+                    self.assertEqual(len(commits), 3)
                     self.assertEqual(
                         git(
                             scan_repo,
@@ -250,6 +250,85 @@ class AutoreviewHardeningTests(unittest.TestCase):
                             stderr=subprocess.PIPE,
                             text=True,
                         )
+
+    def test_trufflehog_history_scans_deleted_content_in_reverse_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            source = repo / "removed.txt"
+            source.write_text("removed baseline content\n", encoding="utf-8")
+            git(repo, "add", "removed.txt")
+            git(repo, "commit", "-q", "-m", "base")
+            base = git(repo, "rev-parse", "HEAD").strip()
+            source.unlink()
+            git(repo, "add", "removed.txt")
+            git(repo, "commit", "-q", "-m", "remove credential")
+
+            with tempfile.TemporaryDirectory() as scan_dir:
+                scan_repo = Path(scan_dir)
+                scan_base = self.helper["prepare_trufflehog_history"](
+                    repo,
+                    "branch",
+                    base,
+                    "HEAD",
+                    scan_repo,
+                )
+                commits = git(
+                    scan_repo,
+                    "log",
+                    "--reverse",
+                    "--format=%H",
+                ).splitlines()
+
+                self.assertEqual(commits[0], scan_base)
+                self.assertEqual(len(commits), 3)
+                self.assertEqual(
+                    git(scan_repo, "show", f"{commits[2]}:removed.txt"),
+                    "removed baseline content\n",
+                )
+                with self.assertRaises(subprocess.CalledProcessError):
+                    subprocess.run(
+                        ["git", "show", f"{commits[1]}:removed.txt"],
+                        cwd=scan_repo,
+                        check=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+
+    def test_trufflehog_snapshot_supports_directory_to_file_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            nested = repo / "entry" / "nested.txt"
+            nested.parent.mkdir()
+            nested.write_text("nested\n", encoding="utf-8")
+            git(repo, "add", "entry/nested.txt")
+            git(repo, "commit", "-q", "-m", "directory")
+            base = git(repo, "rev-parse", "HEAD").strip()
+            nested.unlink()
+            nested.parent.rmdir()
+            (repo / "entry").write_text("file\n", encoding="utf-8")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-q", "-m", "file")
+
+            with tempfile.TemporaryDirectory() as scan_dir:
+                scan_repo = Path(scan_dir)
+                self.helper["prepare_trufflehog_history"](
+                    repo,
+                    "branch",
+                    base,
+                    "HEAD",
+                    scan_repo,
+                )
+                commits = git(
+                    scan_repo,
+                    "log",
+                    "--reverse",
+                    "--format=%H",
+                ).splitlines()
+                self.assertEqual(
+                    git(scan_repo, "show", f"{commits[1]}:entry"),
+                    "file\n",
+                )
 
     def test_trufflehog_findings_and_errors_do_not_leak_scanner_output(self) -> None:
         for returncode, expected in (
