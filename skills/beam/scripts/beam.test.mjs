@@ -238,47 +238,44 @@ test("hook fails fast instead of starting interactive login without credentials"
   assert.ok(Date.now() - startedAt < 5_000);
 });
 
-test("publish asks cloudflared for the application token with --app", async () => {
-  const session = claudeSession();
-  const binDir = tempDir();
-  const argsFile = path.join(binDir, "args.txt");
-  const executable = path.join(binDir, process.platform === "win32" ? "cloudflared.cmd" : "cloudflared");
-  if (process.platform === "win32") {
-    fs.writeFileSync(
-      executable,
-      `@echo off\r\necho %* > "%BEAM_TEST_ARGS%"\r\n<nul set /p =test-access-token\r\n`,
-    );
-  } else {
+test(
+  "publish asks cloudflared for the application token with --app",
+  { skip: process.platform === "win32" },
+  async () => {
+    const session = claudeSession();
+    const binDir = tempDir();
+    const argsFile = path.join(binDir, "args.txt");
+    const executable = path.join(binDir, "cloudflared");
     fs.writeFileSync(
       executable,
       `#!/bin/sh\nprintf '%s' "$*" > "$BEAM_TEST_ARGS"\nprintf '%s' test-access-token\n`,
     );
     fs.chmodSync(executable, 0o755);
-  }
 
-  const result = await run(
-    [
-      "publish",
-      "--endpoint",
-      "https://beam.invalid/api/v1/beam/sessions",
-      "--session",
-      session,
-      "--timeout",
-      "50",
-    ],
-    {
-      env: {
-        BEAM_ACCESS_TOKEN: "",
-        BEAM_AUTH_TOKEN: "",
-        BEAM_TEST_ARGS: argsFile,
-        PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+    const result = await run(
+      [
+        "publish",
+        "--endpoint",
+        "https://beam.invalid/api/v1/beam/sessions",
+        "--session",
+        session,
+        "--timeout",
+        "50",
+      ],
+      {
+        env: {
+          BEAM_ACCESS_TOKEN: "",
+          BEAM_AUTH_TOKEN: "",
+          BEAM_TEST_ARGS: argsFile,
+          PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+        },
       },
-    },
-  );
+    );
 
-  assert.equal(result.code, 1);
-  assert.equal(fs.readFileSync(argsFile, "utf8").trim(), "access token --app=https://beam.invalid");
-});
+    assert.equal(result.code, 1);
+    assert.equal(fs.readFileSync(argsFile, "utf8").trim(), "access token --app=https://beam.invalid");
+  },
+);
 
 test("hook does not duplicate the final assistant message when a tool summary follows it", async () => {
   const dir = tempDir();
