@@ -1985,6 +1985,7 @@ def materialize_index_snapshot(repo: Path, root: Path, paths: list[str]) -> int:
         return 0
     records = git_bytes(
         repo,
+        "--literal-pathspecs",
         "ls-files",
         "--stage",
         "-z",
@@ -2025,6 +2026,7 @@ def materialize_tree_snapshot(
         return 0
     records = git_bytes(
         repo,
+        "--literal-pathspecs",
         "ls-tree",
         "-rz",
         ref,
@@ -2051,44 +2053,108 @@ def materialize_tree_snapshot(
     return count
 
 
-def copy_worktree_file(repo: Path, root: Path, rel: str) -> bool:
-    source = repo.joinpath(*PurePosixPath(rel).parts)
+def open_worktree_parent(repo: Path, rel_path: Path) -> int | bool | None:
+    required_dir_fd = {os.open, os.stat, os.readlink}
+    if not required_dir_fd <= os.supports_dir_fd:
+        return None
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(repo.resolve(), flags)
     try:
-        source_stat = source.lstat()
-    except (FileNotFoundError, NotADirectoryError):
-        return False
+        for part in rel_path.parts[:-1]:
+            try:
+                component = os.stat(
+                    part,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            except (FileNotFoundError, NotADirectoryError):
+                os.close(descriptor)
+                return False
+            if stat.S_ISLNK(component.st_mode):
+                raise OSError("symlinked parent directory")
+            if not stat.S_ISDIR(component.st_mode):
+                os.close(descriptor)
+                return False
+            next_descriptor = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
     except OSError as exc:
+        os.close(descriptor)
         raise SystemExit(
-            "unable to read changed content for the TruffleHog scan: "
+            "refusing to snapshot changed content through a symlinked or unstable parent directory: "
             f"{display_escape(exc, 500)}"
         ) from exc
-    if stat.S_ISLNK(source_stat.st_mode):
+
+
+def copy_worktree_file(repo: Path, root: Path, rel: str) -> bool:
+    rel_path = Path(*PurePosixPath(rel).parts)
+    parent_descriptor = open_worktree_parent(repo, rel_path)
+    if parent_descriptor is False:
+        return False
+    if parent_descriptor is not None:
         try:
-            content = os.fsencode(os.readlink(source))
+            source_stat = os.stat(
+                rel_path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except (FileNotFoundError, NotADirectoryError):
+            os.close(parent_descriptor)
+            return False
         except OSError as exc:
+            os.close(parent_descriptor)
             raise SystemExit(
-                "unable to read changed symlink for the TruffleHog scan: "
+                "unable to read changed content for the TruffleHog scan: "
                 f"{display_escape(exc, 500)}"
             ) from exc
-        write_snapshot_blob(root, rel, content)
-        return True
-    if stat.S_ISDIR(source_stat.st_mode):
-        return False
-    if not stat.S_ISREG(source_stat.st_mode):
-        raise SystemExit(
-            "changed content is not a regular file; remove it or resolve the repository state before rerunning autoreview"
-        )
-    destination = snapshot_destination(root, rel)
-    descriptor: int | None = None
-    try:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(
-            source,
+        if stat.S_ISLNK(source_stat.st_mode):
+            try:
+                content = os.fsencode(
+                    os.readlink(rel_path.name, dir_fd=parent_descriptor)
+                )
+            except OSError as exc:
+                raise SystemExit(
+                    "unable to read changed symlink for the TruffleHog scan: "
+                    f"{display_escape(exc, 500)}"
+                ) from exc
+            finally:
+                os.close(parent_descriptor)
+            write_snapshot_blob(root, rel, content)
+            return True
+        if stat.S_ISDIR(source_stat.st_mode):
+            os.close(parent_descriptor)
+            return False
+        if not stat.S_ISREG(source_stat.st_mode):
+            os.close(parent_descriptor)
+            raise SystemExit(
+                "changed content is not a regular file; remove it or resolve the repository state before rerunning autoreview"
+            )
+        flags = (
             os.O_RDONLY
             | getattr(os, "O_BINARY", 0)
             | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
+            | getattr(os, "O_NOFOLLOW", 0)
         )
+        try:
+            descriptor = os.open(
+                rel_path.name,
+                flags,
+                dir_fd=parent_descriptor,
+            )
+        except OSError as exc:
+            raise SystemExit(
+                "unable to snapshot changed content for the TruffleHog scan: "
+                f"{display_escape(exc, 500)}"
+            ) from exc
+        finally:
+            os.close(parent_descriptor)
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode) or (
             source_stat.st_dev,
@@ -2097,30 +2163,64 @@ def copy_worktree_file(repo: Path, root: Path, rel: str) -> bool:
             opened.st_dev,
             opened.st_ino,
         ):
-            raise OSError("file changed while opening")
-        with destination.open("wb") as output:
-            while chunk := os.read(descriptor, 1024 * 1024):
-                output.write(chunk)
-        after = os.fstat(descriptor)
-        if (
-            opened.st_mode,
-            opened.st_size,
-            opened.st_mtime_ns,
-        ) != (
-            after.st_mode,
-            after.st_size,
-            after.st_mtime_ns,
-        ):
-            raise OSError("file changed while reading")
-    except OSError as exc:
-        destination.unlink(missing_ok=True)
-        raise SystemExit(
-            "unable to snapshot changed content for the TruffleHog scan: "
-            f"{display_escape(exc, 500)}"
-        ) from exc
-    finally:
-        if descriptor is not None:
             os.close(descriptor)
+            raise SystemExit(
+                "unable to snapshot changed content for the TruffleHog scan: file changed while opening"
+            )
+        destination = snapshot_destination(root, rel)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with destination.open("wb") as output:
+                while chunk := os.read(descriptor, 1024 * 1024):
+                    output.write(chunk)
+            after = os.fstat(descriptor)
+            if (
+                opened.st_mode,
+                opened.st_size,
+                opened.st_mtime_ns,
+            ) != (
+                after.st_mode,
+                after.st_size,
+                after.st_mtime_ns,
+            ):
+                raise OSError("file changed while reading")
+        except OSError as exc:
+            destination.unlink(missing_ok=True)
+            raise SystemExit(
+                "unable to snapshot changed content for the TruffleHog scan: "
+                f"{display_escape(exc, 500)}"
+            ) from exc
+        finally:
+            os.close(descriptor)
+        return True
+
+    source = repo / rel_path
+    if rel_path.parent != Path(".") and raw_repo_path_has_symlink_component(
+        repo,
+        rel_path.parent,
+    ):
+        raise SystemExit(
+            "refusing to snapshot changed content through a symlinked parent directory"
+        )
+    try:
+        source_stat = source.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    if stat.S_ISLNK(source_stat.st_mode):
+        write_snapshot_blob(root, rel, os.fsencode(os.readlink(source)))
+        return True
+    if stat.S_ISDIR(source_stat.st_mode):
+        return False
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise SystemExit(
+            "changed content is not a regular file; remove it or resolve the repository state before rerunning autoreview"
+        )
+    content = source.read_bytes()
+    if source.lstat() != source_stat:
+        raise SystemExit(
+            "unable to snapshot changed content for the TruffleHog scan: file changed while reading"
+        )
+    write_snapshot_blob(root, rel, content)
     return True
 
 

@@ -330,6 +330,66 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     "file\n",
                 )
 
+    def test_trufflehog_snapshot_treats_git_paths_as_literals(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            rel = ":(exclude).txt"
+            source = repo / rel
+            source.write_text("base\n", encoding="utf-8")
+            git(repo, "--literal-pathspecs", "add", "--", rel)
+            git(repo, "commit", "-q", "-m", "base")
+            source.write_text("staged\n", encoding="utf-8")
+            git(repo, "--literal-pathspecs", "add", "--", rel)
+
+            with tempfile.TemporaryDirectory() as index_dir:
+                index_root = Path(index_dir)
+                self.helper["materialize_index_snapshot"](
+                    repo,
+                    index_root,
+                    [rel],
+                )
+                self.assertEqual(
+                    (index_root / rel).read_text(encoding="utf-8"),
+                    "staged\n",
+                )
+
+            git(repo, "commit", "-q", "-m", "staged")
+            with tempfile.TemporaryDirectory() as tree_dir:
+                tree_root = Path(tree_dir)
+                self.helper["materialize_tree_snapshot"](
+                    repo,
+                    tree_root,
+                    "HEAD",
+                    [rel],
+                )
+                self.assertEqual(
+                    (tree_root / rel).read_text(encoding="utf-8"),
+                    "staged\n",
+                )
+
+    def test_trufflehog_snapshot_rejects_symlinked_parent_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "review.txt").write_text("outside\n", encoding="utf-8")
+            parent = repo / "nested"
+            try:
+                parent.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                    self.skipTest("Windows symlink privilege is not available")
+                raise
+
+            with tempfile.TemporaryDirectory() as snapshot_dir:
+                with self.assertRaisesRegex(SystemExit, "symlinked parent"):
+                    self.helper["copy_worktree_file"](
+                        repo,
+                        Path(snapshot_dir),
+                        "nested/review.txt",
+                    )
+
     def test_local_trufflehog_snapshot_supports_path_type_transitions(self) -> None:
         for transition in ("directory-to-file", "file-to-directory"):
             with self.subTest(transition=transition), tempfile.TemporaryDirectory() as tempdir:
