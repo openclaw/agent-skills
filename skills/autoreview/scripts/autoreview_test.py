@@ -205,6 +205,37 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             namespace["parse_args"](["--engine", "cursor"])
 
+    def test_codex_command_uses_current_exec_flags(self) -> None:
+        args = argparse.Namespace(
+            codex_bin="codex",
+            web_search=True,
+            model="gpt-5.5",
+            codex_config=None,
+            thinking="high",
+            codex_speed=None,
+            stream_engine_output=False,
+        )
+        with mock.patch.object(AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex"), mock.patch.object(
+            AUTOREVIEW, "codex_config_isolation_flags", return_value=[]
+        ), mock.patch.object(AUTOREVIEW, "codex_auth_config_flags", return_value=[]), mock.patch.object(
+            AUTOREVIEW, "codex_exec_isolation_flags", return_value=["-s", "read-only"]
+        ):
+            command = AUTOREVIEW.codex_command(
+                args,
+                Path("/tmp/source-repo"),
+                Path("/tmp/review-root"),
+                Path("/tmp/runtime-root"),
+                Path("/tmp/schema.json"),
+                Path("/tmp/output.json"),
+                "gpt-5.5",
+            )
+
+        self.assertNotIn("--ask-for-approval", command)
+        self.assertNotIn("--search", command)
+        self.assertIn("--ephemeral", command)
+        self.assertIn("-s", command)
+        self.assertIn("read-only", command)
+
     def test_cursor_agent_bin_cli_alias(self) -> None:
         with mock.patch.object(
             sys,

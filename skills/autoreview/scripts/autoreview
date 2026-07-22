@@ -9227,9 +9227,13 @@ def codex_command(
     *,
     force_file_auth: bool = False,
 ) -> list[str]:
-    cmd = [resolve_command(args.codex_bin, source_repo), "--ask-for-approval", "never"]
-    if args.web_search:
-        cmd.append("--search")
+    # Current Codex exposes approval/sandbox control through the `exec`
+    # subcommand (`--sandbox`/`-s`), not the retired top-level
+    # `--ask-for-approval` flag.  Likewise, web search is configured by the
+    # Codex runtime rather than an `exec --search` switch.  Passing either
+    # retired flag makes modern Codex exit before producing the structured
+    # output file, leaving autoreview with no validated receipt.
+    cmd = [resolve_command(args.codex_bin, source_repo)]
     if model:
         cmd.extend(["--model", model])
     # User overrides go before the isolation flags so isolation stays authoritative on conflicts.
