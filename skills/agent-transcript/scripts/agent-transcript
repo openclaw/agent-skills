@@ -14,8 +14,6 @@ function usage() {
   console.log(`Usage:
   agent-transcript find --query TEXT [--cwd PATH] [--since-days N] [--max-files N] [--root PATH...]
   agent-transcript render --session FILE [--app-server] [--thread-id ID] [--out FILE] [--max-chars N] [--entry-max-chars N] [--title TEXT] [--url URL]
-  agent-transcript render-json --session FILE [--app-server] [--thread-id ID] [--out FILE] [--max-chars N] [--entry-max-chars N]
-  agent-transcript sanitize --role user|assistant [--entry-max-chars N]
   agent-transcript render-thread --thread-id ID [--out FILE] [--max-chars N] [--entry-max-chars N] [--title TEXT] [--url URL]
   agent-transcript preview --session FILE [--app-server] [--thread-id ID] [--out FILE] [--max-chars N] [--entry-max-chars N] [--title TEXT] [--url URL]
   agent-transcript append-body --body FILE --session FILE [--app-server] [--thread-id ID] [--out FILE] [--max-chars N] [--entry-max-chars N]
@@ -108,18 +106,9 @@ function claudeProjectRoots() {
   return uniquePaths(roots);
 }
 
-function codexHome() {
-  return path.resolve(process.env.CODEX_HOME || homePath(".codex"));
-}
-
-function codexSessionRoots() {
-  const root = codexHome();
-  return [path.join(root, "sessions"), path.join(root, "archived_sessions")];
-}
-
 function defaultRoots() {
   return [
-    ...codexSessionRoots(),
+    homePath(".codex", "sessions"),
     ...claudeProjectRoots(),
     homePath(".pi", "agent", "sessions"),
     ...openClawSessionRoots(),
@@ -165,22 +154,6 @@ function sessionThreadId(file) {
   return match ? match[1] : null;
 }
 
-function codexThreadIdFromRows(rows) {
-  const meta = rows.find((row) => row?.type === "session_meta" && typeof row?.payload?.id === "string");
-  return meta?.payload?.id || null;
-}
-
-function normalizedItemType(item) {
-  return String(item?.type || "")
-    .replace(/[^a-z0-9]/gi, "")
-    .toLowerCase();
-}
-
-function completedTurnItem(row) {
-  if (row?.type !== "event_msg" || row?.payload?.type !== "item_completed") return null;
-  return row.payload.item && typeof row.payload.item === "object" ? row.payload.item : null;
-}
-
 function stringContent(value) {
   if (value == null) return "";
   if (typeof value === "string") return value;
@@ -196,7 +169,6 @@ function stringContent(value) {
 }
 
 function detectAgent(file, rows) {
-  if (codexSessionRoots().some((root) => isPathInside(file, root))) return "codex";
   if (file.includes(`${path.sep}.codex${path.sep}`)) return "codex";
   if (claudeProjectRoots().some((root) => isPathInside(file, root))) return "claude";
   if (file.includes(`${path.sep}.pi${path.sep}`)) return "pi";
@@ -217,10 +189,6 @@ function eventText(row) {
   }
   if (row?.type === "event_msg") {
     const payload = row.payload || {};
-    const completed = completedTurnItem(row);
-    if (completed) {
-      return stringContent(completed.content || completed.text || completed.summary_text);
-    }
     return stringContent(payload.message || payload.text_elements || payload.content);
   }
   if (row?.type === "response_item") {
@@ -248,14 +216,6 @@ function eventRole(row) {
     const type = row.payload?.type;
     if (type === "user_message") return "user";
     if (type === "agent_message") return "assistant";
-    if (type === "item_completed") {
-      const itemType = normalizedItemType(completedTurnItem(row));
-      if (itemType === "usermessage") return "user";
-      if (itemType === "agentmessage") return "assistant";
-      if (itemType === "reasoning" || itemType === "plan" || itemType === "contextcompaction") return null;
-      if (itemType === "websearch") return "web";
-      return "tool";
-    }
     if (type === "token_count" || type === "task_started" || type === "task_complete") return null;
     if (type === "web_search_end") return "web";
   }
@@ -399,8 +359,7 @@ function shellFamily(command) {
 }
 
 function toolCallFamily(row) {
-  const completed = completedTurnItem(row);
-  const name = completed?.tool || completed?.type || row.payload?.name || row.name || row.message?.name || row.type || "tool";
+  const name = row.payload?.name || row.name || row.message?.name || row.type || "tool";
   if (name === "exec_command") {
     try {
       const args = JSON.parse(row.payload?.arguments || "{}");
@@ -466,9 +425,7 @@ function renderSession(file, options = {}) {
   const seenEntries = new Set();
   const hasEventDialogue = rows.some((row) => {
     const type = row?.type === "event_msg" ? row.payload?.type : null;
-    if (type === "user_message" || type === "agent_message") return true;
-    const itemType = normalizedItemType(completedTurnItem(row));
-    return itemType === "usermessage" || itemType === "agentmessage";
+    return type === "user_message" || type === "agent_message";
   });
   const renderRows = rows.flatMap((row) => [row, ...expandCompactedReplacementItems(row)]);
   for (const row of renderRows) {
@@ -533,16 +490,7 @@ ${joined}
 </details>
 ${MARKER_END}
 `;
-  return {
-    file,
-    agent,
-    threadId: agent === "codex" ? codexThreadIdFromRows(rows) || sessionThreadId(file) : sessionThreadId(file),
-    safe,
-    unsafeAfter,
-    stats,
-    items: renderedItems.map((entry) => ({ role: entryRole(entry), text: entryBody(entry) })),
-    markdown,
-  };
+  return { file, agent, safe, unsafeAfter, stats, markdown };
 }
 
 function appServerThreadRead(threadId) {
@@ -693,26 +641,12 @@ ${joined}
 </details>
 ${MARKER_END}
 `;
-  return {
-    file: null,
-    agent: "codex",
-    threadId,
-    safe,
-    unsafeAfter,
-    stats,
-    items: renderedItems.map((entry) => ({ role: entryRole(entry), text: entryBody(entry) })),
-    markdown,
-  };
+  return { file: null, agent: "codex", safe, unsafeAfter, stats, markdown };
 }
 
 async function renderTranscript(options) {
   if (options["app-server"] || options.appServer || options.threadId || options["thread-id"]) {
-    const explicitThreadId = options.threadId || options["thread-id"];
-    const inferredThreadId =
-      !explicitThreadId && options.session
-        ? codexThreadIdFromRows(readJsonl(options.session)) || sessionThreadId(options.session)
-        : null;
-    const threadId = explicitThreadId || inferredThreadId;
+    const threadId = options.threadId || options["thread-id"] || sessionThreadId(options.session);
     if (!threadId) throw new Error("--thread-id is required when --app-server cannot infer it from --session");
     return renderThread(threadId, options);
   }
@@ -883,57 +817,12 @@ async function main() {
     console.log(JSON.stringify(findSessions(args), null, 2));
     return;
   }
-  if (command === "sanitize") {
-    const role = args.role;
-    if (role !== "user" && role !== "assistant") {
-      throw new Error("--role must be user or assistant");
-    }
-    const stats = {
-      agent: "text",
-      entries: 0,
-      user: 0,
-      assistant: 0,
-      toolCalls: 0,
-      toolOutputsDropped: 0,
-      web: 0,
-      redactions: 0,
-      omittedUnsafe: 0,
-    };
-    const entry = normalizeEntry(role, fs.readFileSync(0, "utf8"), stats, args);
-    if (!entry) throw new Error("input contains no shareable text");
-    const text = entryBody(entry);
-    const unsafeAfter = unsafe(text);
-    if (unsafeAfter.length) throw new Error(`unsafe text after redaction: ${unsafeAfter.join(", ")}`);
-    process.stdout.write(`${JSON.stringify({ role, text, stats })}\n`);
-    return;
-  }
   if (command === "render") {
     if (!args.session) throw new Error("--session is required");
     const rendered = await renderTranscript(args);
     if (!rendered.safe) throw new Error(`unsafe transcript after redaction: ${rendered.unsafeAfter.join(", ")}`);
     if (args.out) fs.writeFileSync(args.out, rendered.markdown);
     else process.stdout.write(rendered.markdown);
-    return;
-  }
-  if (command === "render-json") {
-    if (!args.session && !args["thread-id"] && !args.threadId) {
-      throw new Error("--session or --thread-id is required");
-    }
-    const rendered = await renderTranscript(args);
-    if (!rendered.safe) throw new Error(`unsafe transcript after redaction: ${rendered.unsafeAfter.join(", ")}`);
-    const output = JSON.stringify(
-      {
-        version: 1,
-        agent: rendered.agent,
-        threadId: rendered.threadId,
-        stats: rendered.stats,
-        items: rendered.items,
-      },
-      null,
-      2,
-    );
-    if (args.out) fs.writeFileSync(args.out, `${output}\n`);
-    else process.stdout.write(`${output}\n`);
     return;
   }
   if (command === "render-thread") {

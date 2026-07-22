@@ -2,13 +2,16 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
-import path from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
+import {
+  renderSession,
+  resolveClaudeSession,
+  resolveCodexSession,
+  sanitizeVisibleText,
+} from "./beam-session.js";
 
-const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const TRANSCRIPT_HELPER = path.resolve(SCRIPT_DIR, "../../agent-transcript/scripts/agent-transcript");
 const MAX_UPLOAD_BYTES = 52 * 1024;
+const MAX_UPLOAD_ITEMS = 200;
 const DEFAULT_TIMEOUT_MS = 15_000;
 
 function usage() {
@@ -44,14 +47,6 @@ function parseArgs(argv) {
   return result;
 }
 
-function runTranscriptHelper(args, options = {}) {
-  return execFileSync(process.execPath, [TRANSCRIPT_HELPER, ...args], {
-    encoding: "utf8",
-    maxBuffer: 4 * 1024 * 1024,
-    ...options,
-  });
-}
-
 function readStdinJson() {
   const raw = fs.readFileSync(0, "utf8").trim();
   if (!raw) return {};
@@ -62,95 +57,63 @@ function readStdinJson() {
   return value;
 }
 
-function existingFile(candidate) {
+function exactFile(candidate, label) {
   if (typeof candidate !== "string" || !candidate.trim()) return null;
-  const resolved = path.resolve(candidate);
   try {
-    return fs.statSync(resolved).isFile() ? resolved : null;
+    const file = fs.realpathSync(candidate);
+    if (!fs.statSync(file).isFile()) throw new Error();
+    return file;
   } catch {
-    return null;
+    throw new Error(`${label} file does not exist: ${candidate}`);
   }
 }
 
-function findSession(options, hook) {
-  const explicitSession = existingFile(options.session);
-  if (options.session && !explicitSession) {
-    throw new Error(`session file does not exist: ${options.session}`);
+function tryResolve(resolve, identity) {
+  try {
+    return resolve(identity);
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("no exact ")) return null;
+    throw error;
   }
-  const direct =
-    explicitSession || existingFile(hook.transcript_path) || existingFile(hook.agent_transcript_path);
-  if (direct) return direct;
-
-  const identity =
-    options["thread-id"] ||
-    options.threadId ||
-    options["session-id"] ||
-    options.sessionId ||
-    hook.thread_id ||
-    hook.session_id ||
-    process.env.CODEX_THREAD_ID ||
-    process.env.CLAUDE_SESSION_ID;
-  if (!identity) {
-    throw new Error("could not identify the current session; pass --session, --session-id, or --thread-id");
-  }
-  const cwd = options.cwd || hook.cwd || process.cwd();
-  const query = [identity, cwd].filter(Boolean).join(" ");
-
-  const results = JSON.parse(
-    runTranscriptHelper([
-      "find",
-      "--query",
-      query,
-      "--cwd",
-      cwd,
-      "--since-days",
-      String(options["since-days"] || 14),
-      "--limit",
-      "5",
-    ]),
-  );
-  const exact = identity
-    ? results.find((entry) => path.basename(entry.file).includes(String(identity)))
-    : undefined;
-  const candidate = identity ? exact : results[0];
-  if (!candidate?.file) throw new Error("no matching local coding session was found");
-  return candidate.file;
 }
 
-function sanitizeAssistantMessage(text, entryMaxChars) {
-  const sanitized = JSON.parse(
-    runTranscriptHelper(
-      ["sanitize", "--role", "assistant", "--entry-max-chars", String(entryMaxChars)],
-      { input: text },
-    ),
-  );
-  return typeof sanitized.text === "string" ? sanitized.text.trim() : "";
+function resolveHookSession(hook) {
+  if (hook.thread_id) return resolveCodexSession(hook.thread_id);
+  if (!hook.session_id) return null;
+  const candidates = [
+    tryResolve(resolveClaudeSession, hook.session_id),
+    tryResolve(resolveCodexSession, hook.session_id),
+  ].filter(Boolean);
+  if (candidates.length === 1) return candidates[0];
+  if (candidates.length > 1) throw new Error("hook session id matches both Claude and Codex transcripts");
+  throw new Error("no exact transcript was found for the hook session id");
+}
+
+function resolveSession(options, hook) {
+  if (options.session) {
+    return { file: exactFile(options.session, "session"), source: undefined, identity: undefined };
+  }
+  const hookFile = hook.transcript_path || hook.agent_transcript_path;
+  if (hookFile) {
+    return { file: exactFile(hookFile, "hook transcript"), source: undefined, identity: undefined };
+  }
+  const explicitThreadId = options["thread-id"] || options.threadId;
+  if (explicitThreadId) return resolveCodexSession(explicitThreadId);
+  const explicitSessionId = options["session-id"] || options.sessionId;
+  if (explicitSessionId) return resolveClaudeSession(explicitSessionId);
+  const hookSession = resolveHookSession(hook);
+  if (hookSession) return hookSession;
+  if (process.env.CODEX_THREAD_ID) return resolveCodexSession(process.env.CODEX_THREAD_ID);
+  if (process.env.CLAUDE_SESSION_ID) return resolveClaudeSession(process.env.CLAUDE_SESSION_ID);
+  throw new Error("could not identify the current session; pass --session, --session-id, or --thread-id");
 }
 
 function normalizeItems(rendered, hook, options) {
-  const items = Array.isArray(rendered.items)
-    ? rendered.items
-        .filter(
-          (item) =>
-            item &&
-            ["user", "assistant", "tool summary"].includes(item.role) &&
-            typeof item.text === "string" &&
-            item.text.trim(),
-        )
-        .map((item) => ({
-          type:
-            item.role === "user"
-              ? "userMessage"
-              : item.role === "assistant"
-                ? "agentMessage"
-                : "other",
-          text: item.text.trim(),
-        }))
-    : [];
-  const entryMaxChars = Number(options["entry-max-chars"] || 6_000);
+  const items = rendered.items.map((item) => ({ ...item }));
+  const entryMaxChars = positiveInteger(options["entry-max-chars"], 6_000, "--entry-max-chars");
   const lastAssistant =
     typeof hook.last_assistant_message === "string" && hook.last_assistant_message.trim()
-      ? sanitizeAssistantMessage(hook.last_assistant_message, entryMaxChars)
+      ? sanitizeVisibleText(hook.last_assistant_message, { maxChars: entryMaxChars })
       : "";
   const previousAssistant = items.findLast((item) => item.type === "agentMessage")?.text;
   if (lastAssistant && previousAssistant !== lastAssistant) {
@@ -159,21 +122,65 @@ function normalizeItems(rendered, hook, options) {
   return items;
 }
 
-function titleFromItems(items, explicit) {
-  if (typeof explicit === "string" && explicit.trim()) return explicit.trim().slice(0, 160);
+function positiveInteger(value, fallback, label, minimum = 1) {
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < minimum) {
+    throw new Error(`${label} must be an integer of at least ${minimum}`);
+  }
+  return Math.floor(parsed);
+}
+
+function titleFromItems(items) {
   const firstUser = items.find((item) => item.type === "userMessage")?.text || "Beamed coding session";
   return firstUser.split(/\r?\n/, 1)[0].trim().slice(0, 160) || "Beamed coding session";
+}
+
+function explicitTitle(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const sanitized = sanitizeVisibleText(value, { maxChars: 160 });
+  return sanitized ? sanitized.split(/\r?\n/, 1)[0] : null;
 }
 
 function stableBeamId(source, identity) {
   return createHash("sha256").update(`${source}:${identity}`).digest("hex").slice(0, 32);
 }
 
-function fitPayload(payload) {
+function fitPayload(payload, maxChars, explicitTitle) {
   const next = structuredClone(payload);
-  while (Buffer.byteLength(JSON.stringify(next)) > MAX_UPLOAD_BYTES && next.items.length > 1) {
+  let totalChars = next.items.reduce((sum, item) => sum + item.text.length, 0);
+  while (totalChars > maxChars && next.items.length > 1) {
+    const visibleCount = next.items.filter((item) => item.type !== "other").length;
+    const removableIndex =
+      visibleCount <= 1 ? next.items.findIndex((item) => item.type === "other") : 0;
+    const index = removableIndex >= 0 ? removableIndex : 0;
+    totalChars -= next.items.splice(index, 1)[0].text.length;
+    next.truncated = true;
+  }
+  if (totalChars > maxChars && next.items[0]) {
+    const marker = "\n...[truncated for Beam]";
+    next.items[0].text =
+      maxChars <= marker.length
+        ? marker.slice(0, maxChars)
+        : `${next.items[0].text.slice(0, maxChars - marker.length).trimEnd()}${marker}`;
+    next.truncated = true;
+  }
+  while (next.items.length > MAX_UPLOAD_ITEMS) {
     next.items.shift();
     next.truncated = true;
+  }
+  const refreshDerivedTitle = () => {
+    if (!explicitTitle) next.title = titleFromItems(next.items);
+  };
+  refreshDerivedTitle();
+  while (Buffer.byteLength(JSON.stringify(next)) > MAX_UPLOAD_BYTES && next.items.length > 1) {
+    const visibleCount = next.items.filter((item) => item.type !== "other").length;
+    const removableIndex =
+      visibleCount <= 1 ? next.items.findIndex((item) => item.type === "other") : 0;
+    const index = removableIndex >= 0 ? removableIndex : 0;
+    next.items.splice(index, 1);
+    next.truncated = true;
+    refreshDerivedTitle();
   }
   if (Buffer.byteLength(JSON.stringify(next)) > MAX_UPLOAD_BYTES) {
     const only = next.items[0];
@@ -181,6 +188,7 @@ function fitPayload(payload) {
     const excess = Buffer.byteLength(JSON.stringify(next)) - MAX_UPLOAD_BYTES;
     only.text = `${only.text.slice(0, Math.max(0, only.text.length - excess - 128)).trimEnd()}\n...[truncated for Beam]`;
     next.truncated = true;
+    refreshDerivedTitle();
   }
   if (Buffer.byteLength(JSON.stringify(next)) > MAX_UPLOAD_BYTES) {
     throw new Error("sanitized session payload exceeds the Beam upload limit");
@@ -189,40 +197,40 @@ function fitPayload(payload) {
 }
 
 function buildPayload(options, hook) {
-  const session = findSession(options, hook);
-  const rendered = JSON.parse(
-    runTranscriptHelper([
-      "render-json",
-      "--session",
-      session,
-      "--max-chars",
-      String(options["max-chars"] || 48_000),
-      "--entry-max-chars",
-      String(options["entry-max-chars"] || 6_000),
-    ]),
-  );
+  const session = resolveSession(options, hook);
+  const rendered = renderSession(session.file, {
+    source: session.source,
+    maxChars: positiveInteger(options["entry-max-chars"], 6_000, "--entry-max-chars"),
+  });
   const items = normalizeItems(rendered, hook, options);
   if (!items.length) throw new Error("the sanitized session contains no shareable messages");
 
-  const source = typeof rendered.agent === "string" ? rendered.agent : "agent";
+  const source = rendered.source;
   const identity =
-    rendered.threadId ||
+    rendered.identity ||
+    session.identity ||
     options["thread-id"] ||
     options["session-id"] ||
     hook.thread_id ||
     hook.session_id ||
-    session;
+    session.file;
   const hookEvent = typeof hook.hook_event_name === "string" ? hook.hook_event_name : undefined;
-  return fitPayload({
-    version: 1,
-    beamId: stableBeamId(source, identity),
-    source,
-    title: titleFromItems(items, options.title),
-    updatedAt: new Date().toISOString(),
-    completed: Boolean(options.complete || hookEvent === "SessionEnd"),
-    ...(hookEvent ? { hookEvent } : {}),
-    items,
-  });
+  const sanitizedExplicitTitle = explicitTitle(options.title);
+  return fitPayload(
+    {
+      version: 1,
+      beamId: stableBeamId(source, identity),
+      source,
+      title: sanitizedExplicitTitle || titleFromItems(items),
+      updatedAt: new Date().toISOString(),
+      completed: Boolean(options.complete || hookEvent === "SessionEnd"),
+      ...(rendered.truncated ? { truncated: true } : {}),
+      ...(hookEvent ? { hookEvent } : {}),
+      items,
+    },
+    positiveInteger(options["max-chars"], 48_000, "--max-chars", 32),
+    Boolean(sanitizedExplicitTitle),
+  );
 }
 
 function isLoopbackUrl(url) {

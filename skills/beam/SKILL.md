@@ -11,7 +11,7 @@ Use when the user explicitly asks to beam, publish, or share the current local c
 
 - Treat invoking this skill as approval for one snapshot upload to the named destination.
 - Never upload raw JSONL, reasoning, system/developer prompts, tool output, environment values, credentials, browser state, cookies, or local paths.
-- The helper delegates transcript discovery and redaction to the adjacent `agent-transcript` skill, then uploads only its normalized user/assistant messages and compact tool counts.
+- The helper is self-contained: it resolves and parses exact Claude Code or Codex transcripts, then uploads only locally redacted user/assistant messages and compact tool counts.
 - Beam is a read-only projection. Do not connect a node, expose a terminal, resume the local harness remotely, or grant the receiver filesystem/tool access.
 - Require HTTPS except for loopback development endpoints.
 - Authenticate with `BEAM_ACCESS_TOKEN`, `BEAM_AUTH_TOKEN`, or an interactive `cloudflared access login`. Never print those values.
@@ -25,12 +25,12 @@ Set or obtain the destination receiver URL first:
 export BEAM_ENDPOINT="https://example.internal/api/v1/beam/sessions"
 ```
 
-Prefer the harness-specific exact identifier.
+Prefer the harness-specific exact identifier. Resolve the directory containing this `SKILL.md` as `BEAM_SKILL_DIR` first.
 
-Claude Code substitutes the current session id and skill directory:
+Claude Code exposes the current session id:
 
 ```bash
-node "${CLAUDE_SKILL_DIR}/scripts/beam" publish \
+node "$BEAM_SKILL_DIR/scripts/beam" publish \
   --endpoint "$BEAM_ENDPOINT" \
   --session-id "${CLAUDE_SESSION_ID}"
 ```
@@ -48,7 +48,7 @@ Prefer exact harness metadata when available:
 - Claude Code: `${CLAUDE_SESSION_ID}` identifies the current local conversation; the helper finds its transcript.
 - Codex shell tools: `CODEX_THREAD_ID` identifies the current thread.
 - Hook adapters: pass their JSON to `beam hook`; `transcript_path` is authoritative.
-- Fallback: the helper calls `agent-transcript find` using the session/thread id and current working directory.
+- Exact fallback: Beam scans only the native Claude/Codex session roots for the supplied id and fails closed on no match or ambiguity.
 
 Useful options:
 
@@ -78,10 +78,14 @@ Configure `Stop` for turn-by-turn updates and `SessionEnd` for finalization. See
 
 Hook failures must not block the coding session. Keep them quiet on success; log one concise redacted error on failure.
 
+Full installation, authentication, data-boundary, and hook documentation:
+[`README.md`](README.md).
+
 ## Development
 
 ```bash
 node --check skills/beam/scripts/beam
+node --check skills/beam/scripts/beam-session.js
 node --test skills/beam/scripts/beam.test.mjs
 scripts/validate-skills
 ```

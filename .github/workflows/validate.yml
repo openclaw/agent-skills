@@ -47,5 +47,6 @@ jobs:
         run: |
           node --check skills/agent-transcript/scripts/agent-transcript
           node --check skills/beam/scripts/beam
+          node --check skills/beam/scripts/beam-session.js
       - name: Run Node tests
         run: node --test skills/agent-transcript/scripts/agent-transcript.test.mjs skills/beam/scripts/beam.test.mjs skills/session-viewer/scripts/session-viewer.test.ts

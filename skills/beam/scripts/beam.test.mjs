@@ -5,6 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import test from "node:test";
+import {
+  renderSession,
+  resolveClaudeSession,
+  resolveCodexSession,
+  sanitizeVisibleText,
+} from "./beam-session.js";
 
 const script = path.resolve("skills/beam/scripts/beam");
 
@@ -41,11 +47,156 @@ function claudeSession() {
   const dir = tempDir();
   const session = path.join(dir, "11111111-2222-4333-8444-555555555555.jsonl");
   writeJsonl(session, [
-    { type: "user", message: { role: "user", content: "Fix the upload flow at /Users/tester/project with Bearer abcdefghijklmnopqrstuvwxyz123456" } },
+    { type: "user", sessionId: "11111111-2222-4333-8444-555555555555", message: { role: "user", content: "Fix the upload flow at /Users/tester/project with Bearer abcdefghijklmnopqrstuvwxyz123456" } },
+    { type: "user", isCompactSummary: true, message: { role: "user", content: "hidden compact summary with /workspace/private" } },
     { type: "assistant", message: { role: "assistant", content: "Implemented the fix." } },
   ]);
   return session;
 }
+
+test("standalone redaction strips internal wrappers, credentials, and local paths", () => {
+  const value = sanitizeVisibleText(
+    `<system-reminder>private policy text</system-reminder>\n<environment_context>cwd=/workspace/private timezone=secret</environment_context>\nUse /root, /customer-secret.db, /app/customers/acme, D:/src/private, and file:///Users/tester/project with Bearer abcdefghijklmnopqrstuvwxyz123456, github_pat_abcdefghijklmnopqrstuvwxyz123456, BEAM_AUTH_TOKEN="opaque-secret-value", DATABASE_URL=postgres://user:pass@localhost/db, {"access_token":"structured-secret-value"}, X-API-Key: header-secret-value, and https://example.test/callback#access_token=opaquecredentialvalue.`,
+  );
+  assert.equal(
+    value,
+    'Use [LOCAL_PATH], [LOCAL_PATH], [LOCAL_PATH], [LOCAL_PATH], and [LOCAL_PATH] with [REDACTED_AUTH_HEADER], [REDACTED_GITHUB_TOKEN], BEAM_AUTH_TOKEN=[REDACTED], DATABASE_URL=[REDACTED], {"access_token": [REDACTED]}, X-API-Key: [REDACTED], and https://example.test/callback#access_token=[REDACTED]',
+  );
+});
+
+test("standalone redaction removes YAML secret block bodies", () => {
+  const value = sanitizeVisibleText(
+    `password: |\n  correct horse battery\n  second secret line\nnext: visible\nclient_secret: correct horse battery staple`,
+  );
+  assert.equal(
+    value,
+    "password: [REDACTED]\nnext: visible\nclient_secret: [REDACTED]",
+  );
+});
+
+test("standalone redaction removes full header, CLI, assignment, and quoted path values", () => {
+  const value = sanitizeVisibleText(
+    `Authorization: AWS4-HMAC Credential=abc Signature=def\nCookie: sid=secret-one; csrf=secret-two\ncurl -H 'Authorization: Token opaque-secret-value' https://example.test\ndeploy --password=correct-horse --api-key opaque-value password=lowercase-value cwd:'/Users/Jane Doe/private' source=/Users/alice/Client Secret/file.js; cat >/Users/alice/private/output.txt`,
+  );
+  assert.equal(
+    value,
+    "Authorization: [REDACTED]\nCookie: [REDACTED]\ncurl -H 'Authorization: [REDACTED]' https://example.test\ndeploy --password=[REDACTED] --api-key=[REDACTED] password=[REDACTED] cwd:[LOCAL_PATH] source=[LOCAL_PATH]; cat >[LOCAL_PATH]",
+  );
+});
+
+test("standalone sanitizer keeps ordinary AGENTS.md tasks", () => {
+  assert.equal(
+    sanitizeVisibleText("Update AGENTS.md with your instructions for the new command."),
+    "Update AGENTS.md with your instructions for the new command.",
+  );
+});
+
+test("standalone Claude discovery requires one exact session-id filename", () => {
+  const configDir = tempDir();
+  const projectDir = path.join(configDir, "projects", "demo");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const id = "11111111-2222-4333-8444-555555555555";
+  const session = path.join(projectDir, `${id}.jsonl`);
+  writeJsonl(session, [
+    { type: "user", sessionId: id, message: { role: "user", content: "Exact Claude session" } },
+  ]);
+
+  assert.equal(resolveClaudeSession(id, { CLAUDE_CONFIG_DIR: configDir }).file, fs.realpathSync(session));
+});
+
+test("standalone Codex discovery verifies metadata across active and archived rollouts", () => {
+  const codexHome = tempDir();
+  const activeDir = path.join(codexHome, "sessions", "2026", "07", "21");
+  const archivedDir = path.join(codexHome, "archived_sessions");
+  fs.mkdirSync(activeDir, { recursive: true });
+  fs.mkdirSync(archivedDir, { recursive: true });
+  const wanted = "22222222-3333-4444-8555-666666666666";
+  const decoy = path.join(activeDir, `rollout-decoy-${wanted}.jsonl`);
+  const archived = path.join(archivedDir, `rollout-2026-07-21-${wanted}.jsonl`);
+  writeJsonl(decoy, [{ type: "session_meta", payload: { id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" } }]);
+  writeJsonl(archived, [
+    { type: "session_meta", payload: { id: wanted } },
+    { type: "event_msg", payload: { type: "user_message", message: "Archived Codex session" } },
+  ]);
+
+  assert.equal(resolveCodexSession(wanted, { CODEX_HOME: codexHome }).file, fs.realpathSync(archived));
+});
+
+test("standalone Claude parser omits wrappers, thinking, and tool output", () => {
+  const session = path.join(tempDir(), "claude.jsonl");
+  writeJsonl(session, [
+    {
+      type: "user",
+      isMeta: true,
+      message: { role: "user", content: "hidden skill expansion metadata" },
+    },
+    {
+      type: "user",
+      sessionId: "44444444-5555-4666-8777-888888888888",
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: "<system-reminder>private policy</system-reminder>\nInspect /Users/tester/code" },
+          { type: "tool_result", content: "raw private result" },
+        ],
+      },
+    },
+    {
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "private chain" },
+          { type: "text", text: "Inspection complete" },
+          { type: "tool_use", name: "Read", input: { file: "/private" } },
+        ],
+      },
+    },
+  ]);
+
+  const rendered = renderSession(session, { source: "claude" });
+  assert.deepEqual(rendered.items.slice(0, 2), [
+    { type: "userMessage", text: "Inspect [LOCAL_PATH]" },
+    { type: "agentMessage", text: "Inspection complete" },
+  ]);
+  assert.deepEqual(rendered.items.at(-1), {
+    type: "other",
+    text: "1 read; raw tool outputs dropped: 1",
+  });
+  assert.doesNotMatch(
+    JSON.stringify(rendered),
+    /hidden skill expansion metadata|private policy|raw private result|private chain/,
+  );
+});
+
+test("standalone parser handles modern Codex items without reasoning or raw output", () => {
+  const session = path.join(tempDir(), "rollout.jsonl");
+  writeJsonl(session, [
+    { type: "session_meta", payload: { id: "33333333-4444-4555-8666-777777777777" } },
+    { type: "event_msg", payload: { type: "item_completed", item: { type: "user_message", content: [{ type: "text", text: "Run proof" }] } } },
+    { type: "event_msg", payload: { type: "item_completed", item: { type: "reasoning", text: "private reasoning" } } },
+    { type: "event_msg", payload: { type: "item_completed", item: { type: "web_search", query: "docs" } } },
+    { type: "event_msg", payload: { type: "item_completed", item: { type: "file_change", changes: ["file.ts"] } } },
+    { type: "event_msg", payload: { type: "item_completed", item: { type: "command_execution", command: ["npm", "test"], aggregatedOutput: "raw command output" } } },
+    { type: "event_msg", payload: { type: "item_completed", item: { type: "mcp_tool_call", result: { content: "raw MCP result" } } } },
+    { type: "event_msg", payload: { type: "item_completed", item: { type: "agent_message", content: [{ type: "text", text: "Proof passed" }] } } },
+  ]);
+
+  const rendered = renderSession(session, { source: "codex" });
+  assert.equal(rendered.identity, "33333333-4444-4555-8666-777777777777");
+  assert.deepEqual(rendered.items.slice(0, 2), [
+    { type: "userMessage", text: "Run proof" },
+    { type: "agentMessage", text: "Proof passed" },
+  ]);
+  assert.deepEqual(rendered.items.at(-1), {
+    type: "other",
+    text: "1 write, 2 execute, 1 network; raw tool outputs dropped: 2",
+  });
+  assert.doesNotMatch(
+    JSON.stringify(rendered),
+    /private reasoning|raw command output|raw MCP result/,
+  );
+});
 
 test("publish dry-run emits a sanitized versioned payload", async () => {
   const session = claudeSession();
@@ -62,12 +213,92 @@ test("publish dry-run emits a sanitized versioned payload", async () => {
   const start = result.stdout.indexOf("{");
   const payload = JSON.parse(result.stdout.slice(start, result.stdout.lastIndexOf("}") + 1));
   assert.equal(payload.version, 1);
-  assert.equal(payload.source, "agent");
+  assert.equal(payload.source, "claude");
   assert.equal(payload.items[0].type, "userMessage");
   assert.match(payload.items[0].text, /\[LOCAL_PATH\]/);
   assert.match(payload.items[0].text, /\[REDACTED_AUTH_HEADER\]/);
-  assert.doesNotMatch(result.stdout, /abcdefghijklmnopqrstuvwxyz123456/);
+  assert.doesNotMatch(result.stdout, /abcdefghijklmnopqrstuvwxyz123456|hidden compact summary/);
   assert.equal(payload.beamId.length, 32);
+});
+
+test("publish bounds transcript item count for the receiver schema", async () => {
+  const session = path.join(tempDir(), "many-messages.jsonl");
+  writeJsonl(
+    session,
+    Array.from({ length: 205 }, (_, index) => ({
+      type: index % 2 === 0 ? "user" : "assistant",
+      message: { role: index % 2 === 0 ? "user" : "assistant", content: `message-${index}` },
+    })),
+  );
+  const result = await run([
+    "publish",
+    "--endpoint",
+    "http://127.0.0.1:9/api/v1/beam/sessions",
+    "--session",
+    session,
+    "--dry-run",
+    "--quiet",
+  ]);
+
+  assert.equal(result.code, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.items.length, 200);
+  assert.equal(payload.truncated, true);
+  assert.equal(payload.items[0].text, "message-5");
+});
+
+test("publish honors the total max-chars disclosure limit", async () => {
+  const session = path.join(tempDir(), "limited.jsonl");
+  writeJsonl(session, [
+    { type: "user", message: { role: "user", content: "A".repeat(80) } },
+    { type: "assistant", message: { role: "assistant", content: "B".repeat(80) } },
+  ]);
+  const result = await run([
+    "publish",
+    "--endpoint",
+    "http://127.0.0.1:9/api/v1/beam/sessions",
+    "--session",
+    session,
+    "--max-chars",
+    "50",
+    "--title",
+    "   ",
+    "--dry-run",
+    "--quiet",
+  ]);
+
+  assert.equal(result.code, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.truncated, true);
+  assert.ok(payload.items.reduce((sum, item) => sum + item.text.length, 0) <= 50);
+  assert.doesNotMatch(payload.title, /^A/);
+});
+
+test("publish preserves a visible message when byte trimming drops tool summaries", async () => {
+  const session = path.join(tempDir(), "multibyte.jsonl");
+  writeJsonl(session, [
+    { type: "user", message: { role: "user", content: "🦞".repeat(20_000) } },
+    { type: "tool_use", name: "exec" },
+  ]);
+  const result = await run([
+    "publish",
+    "--endpoint",
+    "http://127.0.0.1:9/api/v1/beam/sessions",
+    "--session",
+    session,
+    "--max-chars",
+    "48000",
+    "--entry-max-chars",
+    "48000",
+    "--dry-run",
+    "--quiet",
+  ]);
+
+  assert.equal(result.code, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.items.some((item) => item.type === "userMessage"), true);
+  assert.equal(payload.items.every((item) => item.type !== "other"), true);
+  assert.equal(payload.truncated, true);
 });
 
 test("publish accepts IPv6 loopback development endpoints", async () => {
@@ -110,7 +341,7 @@ test("publish fails closed when an explicit session id has no exact transcript",
   );
 
   assert.equal(result.code, 1);
-  assert.match(result.stderr, /no matching local coding session was found/);
+  assert.match(result.stderr, /no exact Claude session transcript was found/);
   assert.equal(result.stdout, "");
 });
 
@@ -132,7 +363,7 @@ test("publish keeps display titles out of exact session discovery", async () => 
       "--session-id",
       sessionId,
       "--title",
-      "Words absent from transcript",
+      "Share /workspace/private with Bearer abcdefghijklmnopqrstuvwxyz123456",
       "--cwd",
       projectDir,
       "--dry-run",
@@ -142,7 +373,10 @@ test("publish keeps display titles out of exact session discovery", async () => 
   );
 
   assert.equal(result.code, 0, result.stderr);
-  assert.equal(JSON.parse(result.stdout).title, "Words absent from transcript");
+  assert.equal(
+    JSON.parse(result.stdout).title,
+    "Share [LOCAL_PATH] with [REDACTED_AUTH_HEADER]",
+  );
 });
 
 test("publish refuses fuzzy newest-session fallback when no identity is available", async () => {
@@ -193,6 +427,98 @@ test("publish rejects a missing explicit session path instead of discovering ano
   assert.equal(result.stdout, "");
 });
 
+test("hook identifiers override stale ambient session variables", async () => {
+  const configDir = tempDir();
+  const projectDir = path.join(configDir, "projects", "demo");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const hookId = "77777777-8888-4999-8aaa-bbbbbbbbbbbb";
+  const staleId = "88888888-9999-4aaa-8bbb-cccccccccccc";
+  writeJsonl(path.join(projectDir, `${hookId}.jsonl`), [
+    { type: "user", sessionId: hookId, message: { role: "user", content: "Authoritative hook session" } },
+  ]);
+  writeJsonl(path.join(projectDir, `${staleId}.jsonl`), [
+    { type: "user", sessionId: staleId, message: { role: "user", content: "Stale ambient session" } },
+  ]);
+  const result = await run(
+    ["hook", "--endpoint", "http://127.0.0.1:9/api/v1/beam/sessions", "--dry-run", "--quiet"],
+    {
+      env: { CLAUDE_CONFIG_DIR: configDir, CLAUDE_SESSION_ID: staleId, CODEX_THREAD_ID: "" },
+      stdin: JSON.stringify({ session_id: hookId, hook_event_name: "Stop" }),
+    },
+  );
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /Authoritative hook session/);
+  assert.doesNotMatch(result.stdout, /Stale ambient session/);
+});
+
+test("unresolved hook identifiers fail closed instead of using ambient sessions", async () => {
+  const configDir = tempDir();
+  const projectDir = path.join(configDir, "projects", "demo");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const staleId = "99999999-aaaa-4bbb-8ccc-dddddddddddd";
+  writeJsonl(path.join(projectDir, `${staleId}.jsonl`), [
+    { type: "user", sessionId: staleId, message: { role: "user", content: "Ambient session must not publish" } },
+  ]);
+  const result = await run(
+    ["hook", "--endpoint", "http://127.0.0.1:9/api/v1/beam/sessions", "--dry-run", "--quiet"],
+    {
+      env: { CLAUDE_CONFIG_DIR: configDir, CLAUDE_SESSION_ID: staleId, CODEX_THREAD_ID: "" },
+      stdin: JSON.stringify({
+        session_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        hook_event_name: "Stop",
+      }),
+    },
+  );
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /no exact transcript was found for the hook session id/);
+  assert.doesNotMatch(result.stdout, /Ambient session/);
+});
+
+test("hook prefers transcript_path over agent_transcript_path", async () => {
+  const authoritative = claudeSession();
+  const stale = path.join(tempDir(), "stale.jsonl");
+  writeJsonl(stale, [
+    { type: "user", message: { role: "user", content: "Wrong transcript" } },
+  ]);
+  const result = await run(
+    ["hook", "--endpoint", "http://127.0.0.1:9/api/v1/beam/sessions", "--dry-run", "--quiet"],
+    {
+      stdin: JSON.stringify({
+        session_id: "11111111-2222-4333-8444-555555555555",
+        transcript_path: authoritative,
+        agent_transcript_path: stale,
+        hook_event_name: "Stop",
+      }),
+    },
+  );
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /Fix the upload flow/);
+  assert.doesNotMatch(result.stdout, /Wrong transcript/);
+});
+
+test("hook resolves an exact Claude session from session_id when no path is supplied", async () => {
+  const configDir = tempDir();
+  const projectDir = path.join(configDir, "projects", "demo");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const sessionId = "66666666-7777-4888-8999-000000000000";
+  writeJsonl(path.join(projectDir, `${sessionId}.jsonl`), [
+    { type: "user", sessionId, message: { role: "user", content: "Hook id fallback" } },
+  ]);
+  const result = await run(
+    ["hook", "--endpoint", "http://127.0.0.1:9/api/v1/beam/sessions", "--dry-run", "--quiet"],
+    {
+      env: { CLAUDE_CONFIG_DIR: configDir, CLAUDE_SESSION_ID: "", CODEX_THREAD_ID: "" },
+      stdin: JSON.stringify({ session_id: sessionId, hook_event_name: "Stop" }),
+    },
+  );
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /Hook id fallback/);
+});
+
 test("hook consumes Codex-style stdin and appends the reliable final message", async () => {
   const session = claudeSession();
   const hook = {
@@ -216,6 +542,26 @@ test("hook consumes Codex-style stdin and appends the reliable final message", a
     text: "Final response from [LOCAL_PATH] with [REDACTED_AUTH_HEADER]",
   });
   assert.doesNotMatch(result.stdout, /abcdefghijklmnopqrstuvwxyz123456/);
+});
+
+test("hook can publish the reliable final message before transcript flush", async () => {
+  const session = path.join(tempDir(), "empty.jsonl");
+  writeJsonl(session, [{ type: "summary", summary: "hidden context" }]);
+  const result = await run(
+    ["hook", "--endpoint", "http://127.0.0.1:9/api/v1/beam/sessions", "--dry-run", "--quiet"],
+    {
+      stdin: JSON.stringify({
+        transcript_path: session,
+        hook_event_name: "Stop",
+        last_assistant_message: "Final response before flush",
+      }),
+    },
+  );
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout).items, [
+    { type: "agentMessage", text: "Final response before flush" },
+  ]);
 });
 
 test("hook fails fast instead of starting interactive login without credentials", async () => {

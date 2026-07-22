@@ -38,7 +38,7 @@ skills/agent-transcript/scripts/agent-transcript find \
   --since-days 14
 ```
 
-`find` scans the newest 400 matching local JSONL logs by default across Codex, Claude, Pi, and OpenClaw agent sessions. Codex discovery honors `CODEX_HOME` and includes active plus archived rollouts. Use `--max-files N` for a wider local search.
+`find` scans the newest 400 matching local JSONL logs by default across Codex, Claude, Pi, and OpenClaw agent sessions. Use `--max-files N` for a wider local search.
 
 In a downstream repo that syncs shared skills under `.agents/skills`, replace
 `skills/agent-transcript` with `.agents/skills/agent-transcript`.
@@ -49,14 +49,6 @@ Render a PR/issue body section:
 skills/agent-transcript/scripts/agent-transcript render \
   --session "$SESSION_JSONL" \
   --out /tmp/agent-transcript.md
-```
-
-Local tools that need normalized redacted messages can use the JSON projection without parsing raw provider logs:
-
-```bash
-skills/agent-transcript/scripts/agent-transcript render-json \
-  --session "$SESSION_JSONL" \
-  --out /tmp/agent-transcript.json
 ```
 
 Preview one candidate session locally:
