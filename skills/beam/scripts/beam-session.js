@@ -36,7 +36,11 @@ function uniqueRealFiles(files) {
 }
 
 function walkJsonl(root, match, state, out) {
-  if (!root || !fs.existsSync(root) || state.files >= MAX_DISCOVERY_FILES) return;
+  if (!root || !fs.existsSync(root)) return;
+  if (state.files >= state.maxFiles) {
+    state.exhausted = true;
+    return;
+  }
   let entries;
   try {
     entries = fs.readdirSync(root, { withFileTypes: true });
@@ -44,7 +48,10 @@ function walkJsonl(root, match, state, out) {
     return;
   }
   for (const entry of entries) {
-    if (state.files >= MAX_DISCOVERY_FILES) break;
+    if (state.files >= state.maxFiles) {
+      state.exhausted = true;
+      break;
+    }
     if (entry.name === ".git" || entry.name === "node_modules") continue;
     const candidate = path.join(root, entry.name);
     if (entry.isDirectory()) {
@@ -102,29 +109,36 @@ function requireUnique(files, description) {
   return candidates[0];
 }
 
-export function resolveClaudeSession(sessionId, env = process.env) {
+export function resolveClaudeSession(sessionId, env = process.env, options = {}) {
   const identity = safeIdentity(sessionId, "Claude session id");
   const matches = [];
+  const state = {
+    files: 0,
+    exhausted: false,
+    maxFiles: options.maxFiles ?? MAX_DISCOVERY_FILES,
+  };
   walkJsonl(
     claudeProjectsRoot(env),
     (name) => name === `${identity}.jsonl`,
-    { files: 0 },
+    state,
     matches,
   );
+  if (state.exhausted) throw new Error("Claude session discovery exceeded its file limit");
   return { file: requireUnique(matches, "Claude session"), source: "claude", identity };
 }
 
-export function resolveCodexSession(threadId, env = process.env) {
+export function resolveCodexSession(threadId, env = process.env, options = {}) {
   const identity = safeIdentity(threadId, "Codex thread id");
   const matches = [];
+  const state = {
+    files: 0,
+    exhausted: false,
+    maxFiles: options.maxFiles ?? MAX_DISCOVERY_FILES,
+  };
   for (const root of codexRoots(env)) {
-    walkJsonl(
-      root,
-      (name) => name.includes(identity),
-      { files: 0 },
-      matches,
-    );
+    walkJsonl(root, (name) => name.includes(identity), state, matches);
   }
+  if (state.exhausted) throw new Error("Codex session discovery exceeded its file limit");
   const verified = uniqueRealFiles(matches).filter((file) => codexMetadataId(file) === identity);
   return { file: requireUnique(verified, "Codex thread"), source: "codex", identity };
 }
@@ -250,7 +264,7 @@ function redactLocalPaths(text, stats) {
   let next = text;
   next = replaceTracked(
     next,
-    /(["'])(?:file:(?:\/\/)?|\/(?!\/)|[A-Za-z]:[\\/]|\\\\)[^"'\r\n]+\1/gi,
+    /(["'])(?:file:(?:\/\/)?|\.\.?[\\/]|\/(?!\/)|[A-Za-z]:[\\/]|\\\\)[^"'\r\n]+\1/gi,
     "[LOCAL_PATH]",
     stats,
   );
@@ -262,6 +276,12 @@ function redactLocalPaths(text, stats) {
   );
   next = transformWithoutHttpUrls(next, (value) => {
     let transformed = value;
+    transformed = replaceTracked(
+      transformed,
+      /(^|[\s:`"'(=,>|;&])(\.\.?[\\/][^\s`"'<>),;]+)/gm,
+      "$1[LOCAL_PATH]",
+      stats,
+    );
     transformed = replaceTracked(
       transformed,
       /(^|[\s:`"'(=,>|;&])([A-Za-z]:[\\/](?:(?:[^\\/\r\n,;`"'<>]+[\\/])+[^\\/\s\r\n,;`"'<>]+|[^\\/\s\r\n,;`"'<>]+))/gm,
@@ -376,7 +396,7 @@ function redactSecretBearingLines(text, stats) {
     const indent = /^\s*/.exec(line)?.[0] ?? "";
     output.push(`${indent}[REDACTED_SECRET_LINE]`);
 
-    const expectsContinuation = /[:=]\s*(?:[\[{])?\s*,?\s*$/.test(line);
+    const expectsContinuation = /[:=]\s*\\?\s*(?:[\[{])?\s*,?\s*$/.test(line);
     if (!expectsContinuation) continue;
     let removedValue = false;
     while (index + 1 < lines.length) {
@@ -400,6 +420,12 @@ function redact(input, stats) {
   const fixedRules = [
     [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED_PRIVATE_KEY]"],
     [/\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\b/g, "[REDACTED_API_KEY]"],
+    [/\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b/g, "[REDACTED_API_KEY]"],
+    [/\b(?:whsec|npm)_[A-Za-z0-9_-]{16,}\b/g, "[REDACTED_API_KEY]"],
+    [/\bAIza[0-9A-Za-z_-]{20,}\b/g, "[REDACTED_API_KEY]"],
+    [/\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b/g, "[REDACTED_API_KEY]"],
+    [/\b[A-Fa-f0-9]{32,}\b/g, "[REDACTED_OPAQUE_VALUE]"],
+    [/\b[A-Za-z0-9_+/=-]{40,}\b/g, "[REDACTED_OPAQUE_VALUE]"],
     [/\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]"],
     [/\bxox[baprs]-[A-Za-z0-9-]{16,}\b/g, "[REDACTED_SLACK_TOKEN]"],
     [/\bAKIA[0-9A-Z]{16}\b/g, "[REDACTED_AWS_KEY]"],
@@ -420,8 +446,9 @@ function redact(input, stats) {
 
 function hasLocalPath(text) {
   const pathPatterns = [
-    /(["'])(?:file:(?:\/\/)?|\/(?!\/)|[A-Za-z]:[\\/]|\\\\)[^"'\r\n]+\1/i,
+    /(["'])(?:file:(?:\/\/)?|\.\.?[\\/]|\/(?!\/)|[A-Za-z]:[\\/]|\\\\)[^"'\r\n]+\1/i,
     /\bfile:(?:\/\/)?[^\s]+/i,
+    /(^|[\s:`"'(=,>|;&])\.\.?[\\/][^\s]+/m,
     /(^|[\s:`"'(=,>|;&])\/(?:(?:[^/\r\n,;`"'<>]+\/)+[^/\s\r\n,;`"'<>]+|[^/\s\r\n,;`"'<>]+)/m,
     /(^|[\s:`"'(=,>|;&])[A-Za-z]:[\\/](?:(?:[^\\/\r\n,;`"'<>]+[\\/])+[^\\/\s\r\n,;`"'<>]+|[^\\/\s\r\n,;`"'<>]+)/m,
     /(^|[\s:`"'(=,>|;&])\\\\[^\\\r\n,;`"'<>]+\\(?:[^\\\r\n,;`"'<>]+\\)*[^\\\s\r\n,;`"'<>]+/m,
@@ -435,6 +462,12 @@ function hasLocalPath(text) {
 function unsafePatterns(text) {
   const patterns = [
     /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+    /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b/,
+    /\b(?:whsec|npm)_[A-Za-z0-9_-]{16,}\b/,
+    /\bAIza[0-9A-Za-z_-]{20,}\b/,
+    /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b/,
+    /\b[A-Fa-f0-9]{32,}\b/,
+    /\b[A-Za-z0-9_+/=-]{40,}\b/,
     /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/i,
     /\b(?:user_session|_gh_sess|__Host-user_session_same_site|GH_SESSION_TOKEN)\b/i,
     /\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b/,
@@ -489,12 +522,64 @@ function pushMessage(items, _seen, type, input, stats, maxChars) {
   if (text) items.push({ type, text });
 }
 
+function activeClaudeRows(rows) {
+  const records = rows.filter(isRecord);
+  const conversational = records.filter((row) => {
+    if (typeof row.uuid !== "string") return false;
+    const message = isRecord(row.message) ? row.message : row;
+    const role = String(message.role || row.type || "").toLowerCase();
+    return role === "user" || role === "assistant";
+  });
+  const hasMainConversation = conversational.some((row) => row.isSidechain !== true);
+  const primary = hasMainConversation
+    ? records.filter((row) => row.isSidechain !== true)
+    : records;
+  const primarySet = new Set(primary);
+  const byUuid = new Map(
+    primary
+      .filter((row) => typeof row.uuid === "string")
+      .map((row) => [row.uuid, row]),
+  );
+  const leaf = conversational.findLast((row) => primarySet.has(row));
+  if (!leaf || typeof leaf.uuid !== "string") return primary;
+
+  const chain = new Set();
+  let current = leaf;
+  while (current && typeof current.uuid === "string" && !chain.has(current.uuid)) {
+    chain.add(current.uuid);
+    if (current.type === "system" && current.subtype === "compact_boundary") {
+      const metadata = isRecord(current.compactMetadata) ? current.compactMetadata : {};
+      const preserved = isRecord(metadata.preservedMessages)
+        ? metadata.preservedMessages
+        : {};
+      const uuids = Array.isArray(preserved.uuids)
+        ? preserved.uuids
+        : Array.isArray(preserved.allUuids)
+          ? preserved.allUuids
+          : [];
+      for (const uuid of uuids) {
+        if (typeof uuid === "string" && byUuid.has(uuid)) chain.add(uuid);
+      }
+    }
+    const parentId =
+      typeof current.parentUuid === "string"
+        ? current.parentUuid
+        : current.type === "system" &&
+            current.subtype === "compact_boundary" &&
+            typeof current.logicalParentUuid === "string"
+          ? current.logicalParentUuid
+          : undefined;
+    current = parentId ? byUuid.get(parentId) : undefined;
+  }
+  return primary.filter((row) => typeof row.uuid === "string" && chain.has(row.uuid));
+}
+
 function parseClaude(rows, options) {
   const items = [];
   const seen = new Set();
   const stats = { redactions: 0, toolCalls: 0, toolOutputsDropped: 0, toolFamilies: {} };
   let identity = null;
-  for (const row of rows) {
+  for (const row of activeClaudeRows(rows)) {
     if (!isRecord(row)) continue;
     if (!identity && typeof row.sessionId === "string") identity = row.sessionId;
     if (row.isMeta === true || row.isCompactSummary === true || row.type === "summary" || row.type === "system") {

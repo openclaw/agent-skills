@@ -57,14 +57,14 @@ function readStdinJson() {
   return value;
 }
 
-function exactFile(candidate, label) {
+function exactFile(candidate, label, disclosePath) {
   if (typeof candidate !== "string" || !candidate.trim()) return null;
   try {
     const file = fs.realpathSync(candidate);
     if (!fs.statSync(file).isFile()) throw new Error();
     return file;
   } catch {
-    throw new Error(`${label} file does not exist: ${candidate}`);
+    throw new Error(disclosePath ? `${label} file does not exist: ${candidate}` : `${label} file does not exist`);
   }
 }
 
@@ -85,17 +85,27 @@ function resolveHookSession(hook) {
     tryResolve(resolveCodexSession, hook.session_id),
   ].filter(Boolean);
   if (candidates.length === 1) return candidates[0];
-  if (candidates.length > 1) throw new Error("hook session id matches both Claude and Codex transcripts");
+  if (candidates.length > 1) {
+    throw new Error("hook session id matches both Claude and Codex transcripts");
+  }
   throw new Error("no exact transcript was found for the hook session id");
 }
 
 function resolveSession(options, hook) {
   if (options.session) {
-    return { file: exactFile(options.session, "session"), source: undefined, identity: undefined };
+    return {
+      file: exactFile(options.session, "session", true),
+      source: undefined,
+      identity: undefined,
+    };
   }
   const hookFile = hook.transcript_path || hook.agent_transcript_path;
   if (hookFile) {
-    return { file: exactFile(hookFile, "hook transcript"), source: undefined, identity: undefined };
+    return {
+      file: exactFile(hookFile, "hook transcript", false),
+      source: undefined,
+      identity: undefined,
+    };
   }
   const explicitThreadId = options["thread-id"] || options.threadId;
   if (explicitThreadId) return resolveCodexSession(explicitThreadId);
@@ -378,9 +388,18 @@ async function main() {
   }
 }
 
+function safeLocalError(error) {
+  const raw = error instanceof Error ? error.message : String(error);
+  try {
+    return sanitizeVisibleText(raw, { maxChars: 240 }) || "Beam failed safely";
+  } catch {
+    return "Beam failed safely";
+  }
+}
+
 try {
   await main();
 } catch (error) {
-  console.error(error instanceof Error ? error.message : String(error));
+  console.error(safeLocalError(error));
   process.exit(1);
 }

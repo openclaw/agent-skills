@@ -76,7 +76,7 @@ test("standalone redaction removes YAML secret block bodies", () => {
 
 test("standalone redaction removes multiline structured values and PASS assignments", () => {
   const value = sanitizeVisibleText(
-    `{"access_token":\n  "multiline-secret-value",\n  "visible": "ok"\n}\nDB_PASS=\n  multiline-pass-value\nDB_PASS_B64=encoded-pass\nDBPASS=joined-pass\nPASS_B64=bare-pass\nPGPASSFILE=pg-pass\nBYPASS_PASS=bypass-secret\nCOMPASS_PASSPHRASE=compass-secret\nMY_APP_PASS=app-value\nSERVICE_ACCOUNT_PASS=service-value\nMYSQL_PASS=mysql-value\nGPG_PASSPHRASE=gpg-value\nMFA_PASSCODE=123456\nSSH_PASS_PHRASE=phrase-value\nSSH_PASSPHRASE_FILE=/root/phrase\nDATABASE_URL=postgres://user:pass@localhost/db\nCookie:[REDACTED] sid=live-cookie`,
+    `{"access_token":\n  "multiline-secret-value",\n  "visible": "ok"\n}\nDB_PASS=\\\n  multiline-pass-value\nDB_PASS_B64=encoded-pass\nDBPASS=joined-pass\nPASS_B64=bare-pass\nPGPASSFILE=pg-pass\nBYPASS_PASS=bypass-secret\nCOMPASS_PASSPHRASE=compass-secret\nMY_APP_PASS=app-value\nSERVICE_ACCOUNT_PASS=service-value\nMYSQL_PASS=mysql-value\nGPG_PASSPHRASE=gpg-value\nMFA_PASSCODE=123456\nSSH_PASS_PHRASE=phrase-value\nSSH_PASSPHRASE_FILE=/root/phrase\nDATABASE_URL=postgres://user:pass@localhost/db\nCookie:[REDACTED] sid=live-cookie`,
   );
   const lines = value.split("\n");
   assert.deepEqual(lines.slice(0, 2), ["[REDACTED_SECRET_LINE]", "}"]);
@@ -135,6 +135,24 @@ test("standalone Claude discovery requires one exact session-id filename", () =>
   assert.equal(resolveClaudeSession(id, { CLAUDE_CONFIG_DIR: configDir }).file, fs.realpathSync(session));
 });
 
+test("standalone discovery fails closed when the file scan is incomplete", () => {
+  const configDir = tempDir();
+  const projectDir = path.join(configDir, "projects", "demo");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const id = "12121212-3434-4567-8899-abcdefabcdef";
+  writeJsonl(path.join(projectDir, `${id}.jsonl`), [
+    { type: "user", sessionId: id, message: { role: "user", content: "candidate" } },
+  ]);
+  writeJsonl(path.join(projectDir, "other.jsonl"), [
+    { type: "user", message: { role: "user", content: "other" } },
+  ]);
+
+  assert.throws(
+    () => resolveClaudeSession(id, { CLAUDE_CONFIG_DIR: configDir }, { maxFiles: 1 }),
+    /discovery exceeded its file limit/,
+  );
+});
+
 test("standalone Codex discovery verifies metadata across active and archived rollouts", () => {
   const codexHome = tempDir();
   const activeDir = path.join(codexHome, "sessions", "2026", "07", "21");
@@ -163,6 +181,8 @@ test("standalone Claude parser omits wrappers, thinking, and tool output", () =>
     },
     {
       type: "user",
+      uuid: "root-user",
+      parentUuid: null,
       sessionId: "44444444-5555-4666-8777-888888888888",
       message: {
         role: "user",
@@ -174,6 +194,21 @@ test("standalone Claude parser omits wrappers, thinking, and tool output", () =>
     },
     {
       type: "assistant",
+      uuid: "sidechain-message",
+      parentUuid: "root-user",
+      isSidechain: true,
+      message: { role: "assistant", content: "hidden sidechain response" },
+    },
+    {
+      type: "assistant",
+      uuid: "abandoned-branch",
+      parentUuid: "root-user",
+      message: { role: "assistant", content: "hidden abandoned response" },
+    },
+    {
+      type: "assistant",
+      uuid: "active-response",
+      parentUuid: "root-user",
       message: {
         role: "assistant",
         content: [
@@ -196,8 +231,56 @@ test("standalone Claude parser omits wrappers, thinking, and tool output", () =>
   });
   assert.doesNotMatch(
     JSON.stringify(rendered),
-    /hidden skill expansion metadata|private policy|raw private result|private chain/,
+    /hidden skill expansion metadata|hidden sidechain response|hidden abandoned response|private policy|raw private result|private chain/,
   );
+});
+
+test("standalone Claude parser supports dedicated sidechain transcript files", () => {
+  const session = path.join(tempDir(), "agent-sidechain.jsonl");
+  writeJsonl(session, [
+    { type: "system", subtype: "metadata", content: "unflagged metadata" },
+    { type: "user", uuid: "agent-user", parentUuid: null, isSidechain: true, message: { role: "user", content: "Subagent task" } },
+    { type: "assistant", uuid: "agent-reply", parentUuid: "agent-user", isSidechain: true, message: { role: "assistant", content: "Subagent result" } },
+  ]);
+
+  assert.deepEqual(renderSession(session, { source: "claude" }).items, [
+    { type: "userMessage", text: "Subagent task" },
+    { type: "agentMessage", text: "Subagent result" },
+  ]);
+});
+
+test("standalone Claude parser follows logical parents across compaction", () => {
+  const session = path.join(tempDir(), "compacted.jsonl");
+  writeJsonl(session, [
+    { type: "user", uuid: "before-user", parentUuid: null, message: { role: "user", content: "Before compact" } },
+    { type: "assistant", uuid: "before-assistant", parentUuid: "before-user", message: { role: "assistant", content: "Earlier answer" } },
+    { type: "user", uuid: "preserved-sibling", parentUuid: "unrelated-old-parent", message: { role: "user", content: "Preserved sibling" } },
+    {
+      type: "system",
+      subtype: "compact_boundary",
+      uuid: "boundary",
+      parentUuid: null,
+      logicalParentUuid: "before-assistant",
+      compactMetadata: {
+        preservedMessages: { uuids: ["preserved-sibling"] },
+        preservedSegment: {
+          headUuid: "preserved-sibling",
+          anchorUuid: "compact-summary",
+          tailUuid: "preserved-sibling",
+        },
+      },
+    },
+    { type: "user", uuid: "compact-summary", parentUuid: "boundary", isCompactSummary: true, message: { role: "user", content: "hidden compact summary" } },
+    { type: "user", uuid: "after-user", parentUuid: "compact-summary", message: { role: "user", content: "After compact" } },
+    { type: "progress", uuid: "dangling-progress", parentUuid: "before-assistant", content: "stale progress" },
+  ]);
+
+  assert.deepEqual(renderSession(session, { source: "claude" }).items, [
+    { type: "userMessage", text: "Before compact" },
+    { type: "agentMessage", text: "Earlier answer" },
+    { type: "userMessage", text: "Preserved sibling" },
+    { type: "userMessage", text: "After compact" },
+  ]);
 });
 
 test("standalone parser preserves legitimately repeated turns", () => {
@@ -298,8 +381,8 @@ test("publish bounds transcript item count for the receiver schema", async () =>
 test("publish honors the total max-chars disclosure limit", async () => {
   const session = path.join(tempDir(), "limited.jsonl");
   writeJsonl(session, [
-    { type: "user", message: { role: "user", content: "A".repeat(80) } },
-    { type: "assistant", message: { role: "assistant", content: "B".repeat(80) } },
+    { type: "user", message: { role: "user", content: "alpha ".repeat(16) } },
+    { type: "assistant", message: { role: "assistant", content: "bravo ".repeat(16) } },
   ]);
   const result = await run([
     "publish",
@@ -319,7 +402,7 @@ test("publish honors the total max-chars disclosure limit", async () => {
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.truncated, true);
   assert.ok(payload.items.reduce((sum, item) => sum + item.text.length, 0) <= 50);
-  assert.doesNotMatch(payload.title, /^A/);
+  assert.doesNotMatch(payload.title, /^alpha/);
 });
 
 test("publish preserves a visible message when byte trimming drops tool summaries", async () => {
@@ -475,6 +558,20 @@ test("publish rejects a missing explicit session path instead of discovering ano
   assert.equal(result.stdout, "");
 });
 
+test("hook file failures do not print the local path", async () => {
+  const missing = path.join(tempDir(), "private", "missing.jsonl");
+  const result = await run(
+    ["hook", "--endpoint", "http://127.0.0.1:9/api/v1/beam/sessions", "--dry-run", "--quiet"],
+    {
+      stdin: JSON.stringify({ transcript_path: missing, hook_event_name: "Stop" }),
+    },
+  );
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /hook transcript file does not exist/);
+  assert.doesNotMatch(result.stderr, new RegExp(missing.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
 test("hook identifiers override stale ambient session variables", async () => {
   const configDir = tempDir();
   const projectDir = path.join(configDir, "projects", "demo");
@@ -490,7 +587,7 @@ test("hook identifiers override stale ambient session variables", async () => {
   const result = await run(
     ["hook", "--endpoint", "http://127.0.0.1:9/api/v1/beam/sessions", "--dry-run", "--quiet"],
     {
-      env: { CLAUDE_CONFIG_DIR: configDir, CLAUDE_SESSION_ID: staleId, CODEX_THREAD_ID: "" },
+      env: { CLAUDE_CONFIG_DIR: configDir, CODEX_HOME: tempDir(), CLAUDE_SESSION_ID: staleId, CODEX_THREAD_ID: "" },
       stdin: JSON.stringify({ session_id: hookId, hook_event_name: "Stop" }),
     },
   );
@@ -498,6 +595,34 @@ test("hook identifiers override stale ambient session variables", async () => {
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /Authoritative hook session/);
   assert.doesNotMatch(result.stdout, /Stale ambient session/);
+});
+
+test("hook identifiers fail closed when both native stores contain the same id", async () => {
+  const configDir = tempDir();
+  const codexHome = tempDir();
+  const claudeDir = path.join(configDir, "projects", "demo");
+  const codexDir = path.join(codexHome, "sessions", "2026", "07", "22");
+  fs.mkdirSync(claudeDir, { recursive: true });
+  fs.mkdirSync(codexDir, { recursive: true });
+  const id = "abababab-cdcd-4efe-8aaa-bcbcbcbcbcbc";
+  writeJsonl(path.join(claudeDir, `${id}.jsonl`), [
+    { type: "user", sessionId: id, message: { role: "user", content: "Claude copy" } },
+  ]);
+  writeJsonl(path.join(codexDir, `rollout-${id}.jsonl`), [
+    { type: "session_meta", payload: { id } },
+    { type: "event_msg", payload: { type: "user_message", message: "Codex copy" } },
+  ]);
+  const result = await run(
+    ["hook", "--endpoint", "http://127.0.0.1:9/api/v1/beam/sessions", "--dry-run", "--quiet"],
+    {
+      env: { CLAUDE_CONFIG_DIR: configDir, CODEX_HOME: codexHome, CLAUDE_SESSION_ID: "", CODEX_THREAD_ID: "" },
+      stdin: JSON.stringify({ session_id: id, hook_event_name: "Stop" }),
+    },
+  );
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /matches both Claude and Codex transcripts/);
+  assert.equal(result.stdout, "");
 });
 
 test("unresolved hook identifiers fail closed instead of using ambient sessions", async () => {
@@ -511,7 +636,7 @@ test("unresolved hook identifiers fail closed instead of using ambient sessions"
   const result = await run(
     ["hook", "--endpoint", "http://127.0.0.1:9/api/v1/beam/sessions", "--dry-run", "--quiet"],
     {
-      env: { CLAUDE_CONFIG_DIR: configDir, CLAUDE_SESSION_ID: staleId, CODEX_THREAD_ID: "" },
+      env: { CLAUDE_CONFIG_DIR: configDir, CODEX_HOME: tempDir(), CLAUDE_SESSION_ID: staleId, CODEX_THREAD_ID: "" },
       stdin: JSON.stringify({
         session_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
         hook_event_name: "Stop",
@@ -558,7 +683,7 @@ test("hook resolves an exact Claude session from session_id when no path is supp
   const result = await run(
     ["hook", "--endpoint", "http://127.0.0.1:9/api/v1/beam/sessions", "--dry-run", "--quiet"],
     {
-      env: { CLAUDE_CONFIG_DIR: configDir, CLAUDE_SESSION_ID: "", CODEX_THREAD_ID: "" },
+      env: { CLAUDE_CONFIG_DIR: configDir, CODEX_HOME: tempDir(), CLAUDE_SESSION_ID: "", CODEX_THREAD_ID: "" },
       stdin: JSON.stringify({ session_id: sessionId, hook_event_name: "Stop" }),
     },
   );
