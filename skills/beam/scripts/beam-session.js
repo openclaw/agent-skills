@@ -223,8 +223,7 @@ function isSetupText(text) {
 }
 
 const SECRET_FIELD =
-  "(?:[a-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|dsn)[a-z0-9_-]*|authorization|proxy-authorization|cookie|set-cookie)";
-const SECRET_VALUE = '(?:"[^"\\r\\n]*"|\'[^\'\\r\\n]*\'|`[^`\\r\\n]*`|[^\\s,}"\'`\\r\\n]+)';
+  "(?:[a-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|dsn)[a-z0-9_-]*|pass|passcode|passphrase|pass[_-]phrase|(?:db|ssh|mfa|otp|auth|login|sudo|proxy|app|service|account|user|admin)[_-](?:pass|passcode|passphrase|pass[_-]phrase)(?:[_-](?:b64|file|path|value|secret))?|database[_-]?url|redis[_-]?url|authorization|proxy-authorization|cookie|set-cookie)";
 
 function replaceTracked(text, pattern, replacement, stats) {
   const next = text.replace(pattern, replacement);
@@ -334,6 +333,68 @@ function redactYamlSecretBlocks(text, stats) {
   return output.join("\n");
 }
 
+function secretBearingPattern() {
+  return new RegExp(
+    `(?:(?<![a-z0-9_-])["']?${SECRET_FIELD}["']?(?![a-z0-9_-])\\s*:\\s*|` +
+      `(?<![a-z0-9_-])["']?${SECRET_FIELD}["']?(?![a-z0-9_-])\\s*=\\s*|` +
+      `--${SECRET_FIELD}(?:=|\\s+))`,
+    "i",
+  );
+}
+
+function uppercasePassAssignmentName(line) {
+  return /(?<![A-Z0-9_])([A-Z][A-Z0-9_]*PASS[A-Z0-9_]*|PASS[A-Z0-9_]*)\s*=\s*/.exec(
+    line,
+  )?.[1];
+}
+
+function hasUppercasePassSecret(line) {
+  const name = uppercasePassAssignmentName(line);
+  if (!name) return false;
+  for (const benignRoot of ["BYPASS", "COMPASS", "PASSED", "PASSENGERS"]) {
+    if (name === benignRoot) return false;
+    if (!name.startsWith(`${benignRoot}_`)) continue;
+    const suffix = name.slice(benignRoot.length + 1);
+    return /(?:^|_)(?:PASS|PASSCODE|PASSPHRASE|PASS_PHRASE|PASSWORD|PASSWD)(?:_|$)/.test(
+      suffix,
+    );
+  }
+  return true;
+}
+
+function redactSecretBearingLines(text, stats) {
+  const lines = text.split(/\r?\n/);
+  const output = [];
+  let changed = false;
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    if (!secretBearingPattern().test(line) && !hasUppercasePassSecret(line)) {
+      output.push(line);
+      continue;
+    }
+    changed = true;
+    const indent = /^\s*/.exec(line)?.[0] ?? "";
+    output.push(`${indent}[REDACTED_SECRET_LINE]`);
+
+    const expectsContinuation = /[:=]\s*(?:[\[{])?\s*,?\s*$/.test(line);
+    if (!expectsContinuation) continue;
+    let removedValue = false;
+    while (index + 1 < lines.length) {
+      const next = lines[index + 1];
+      if (!next.trim()) {
+        index++;
+        continue;
+      }
+      const nextIndentation = /^\s*/.exec(next)?.[0].length ?? 0;
+      if (removedValue && nextIndentation <= indent.length) break;
+      index++;
+      removedValue = true;
+    }
+  }
+  if (changed) stats.redactions++;
+  return output.join("\n");
+}
+
 function redact(input, stats) {
   let text = redactYamlSecretBlocks(stripInternalWrappers(input), stats);
   const fixedRules = [
@@ -353,63 +414,7 @@ function redact(input, stats) {
     text = replaceTracked(text, pattern, replacement, stats);
   }
 
-  const quotedHeaderPattern =
-    /(["'`])(authorization|proxy-authorization|cookie|set-cookie|x-api-key)\s*:[^"'`\r\n]*\1/gi;
-  text = replaceTracked(
-    text,
-    quotedHeaderPattern,
-    (_match, quote, name) => `${quote}${name}: [REDACTED]${quote}`,
-    stats,
-  );
-
-  const headerPattern =
-    /(^|\n)([ \t]*)(authorization|proxy-authorization|cookie|set-cookie|x-api-key)\s*:(?!\s*\[REDACTED\])[^\r\n]*/gi;
-  text = replaceTracked(
-    text,
-    headerPattern,
-    (_match, lineStart, indent, name) => `${lineStart}${indent}${name}: [REDACTED]`,
-    stats,
-  );
-
-  const structuredPattern = new RegExp(
-    `(["']?)(${SECRET_FIELD})\\1\\s*:\\s*${SECRET_VALUE}`,
-    "gi",
-  );
-  text = replaceTracked(
-    text,
-    structuredPattern,
-    (_match, quote, name) => `${quote}${name}${quote}: [REDACTED]`,
-    stats,
-  );
-
-  const cliPattern = new RegExp(`--(${SECRET_FIELD})(?:=|\\s+)${SECRET_VALUE}`, "gi");
-  text = replaceTracked(
-    text,
-    cliPattern,
-    (_match, name) => `--${name}=[REDACTED]`,
-    stats,
-  );
-
-  const assignmentPattern = new RegExp(
-    `\\b(${SECRET_FIELD})\\s*=\\s*${SECRET_VALUE}`,
-    "gi",
-  );
-  text = replaceTracked(
-    text,
-    assignmentPattern,
-    (_match, name) => `${name}=[REDACTED]`,
-    stats,
-  );
-
-  const envPattern =
-    /\b([A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASS|API_KEY|DSN)[A-Z0-9_]*|DATABASE_URL|REDIS_URL)\s*=\s*(?!\[REDACTED\])(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s`"',;]+)/g;
-  text = replaceTracked(
-    text,
-    envPattern,
-    (_match, name) => `${name}=[REDACTED]`,
-    stats,
-  );
-
+  text = redactSecretBearingLines(text, stats);
   return redactLocalPaths(text, stats);
 }
 
@@ -441,23 +446,9 @@ function unsafePatterns(text) {
     return ["unsafe"];
   }
 
-  const headerPattern =
-    /\b(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key)[ \t]*:(?:(?![ \t]*\[REDACTED\])[^\r\n]*|[ \t]*\[REDACTED\][ \t]+[^,;'"`\r\n]+)/i;
-  const structuredPattern = new RegExp(
-    `(["']?)${SECRET_FIELD}\\1\\s*:\\s*(?!\\[REDACTED\\])${SECRET_VALUE}`,
-    "i",
-  );
-  const cliPattern = new RegExp(
-    `--${SECRET_FIELD}(?:=|\\s+)(?!\\[REDACTED\\])${SECRET_VALUE}`,
-    "i",
-  );
-  const assignmentPattern = new RegExp(
-    `\\b${SECRET_FIELD}\\s*=\\s*(?!\\[REDACTED\\])${SECRET_VALUE}`,
-    "i",
-  );
-  return [headerPattern, structuredPattern, cliPattern, assignmentPattern].filter(
-    (pattern) => pattern.test(text),
-  );
+  return secretBearingPattern().test(text) || text.split(/\r?\n/).some(hasUppercasePassSecret)
+    ? ["unsafe"]
+    : [];
 }
 
 export function sanitizeVisibleText(input, options = {}) {
@@ -493,13 +484,9 @@ function addTool(stats, name) {
   stats.toolCalls++;
 }
 
-function pushMessage(items, seen, type, input, stats, maxChars) {
+function pushMessage(items, _seen, type, input, stats, maxChars) {
   const text = sanitizeVisibleText(input, { stats, maxChars });
-  if (!text) return;
-  const key = `${type}\0${text.replace(/\s+/g, " ")}`;
-  if (seen.has(key)) return;
-  seen.add(key);
-  items.push({ type, text });
+  if (text) items.push({ type, text });
 }
 
 function parseClaude(rows, options) {

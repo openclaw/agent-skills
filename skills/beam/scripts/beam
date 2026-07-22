@@ -266,29 +266,35 @@ function cloudflaredToken(origin) {
   }).trim();
 }
 
-function authHeaders(url, allowInteractiveLogin) {
+function authContext(url, allowInteractiveLogin) {
   const accessToken = process.env.BEAM_ACCESS_TOKEN?.trim();
-  if (accessToken) return { "cf-access-token": accessToken };
+  if (accessToken) {
+    return { headers: { "cf-access-token": accessToken }, secrets: [accessToken] };
+  }
   const bearer = process.env.BEAM_AUTH_TOKEN?.trim();
-  if (bearer) return { authorization: `Bearer ${bearer}` };
-  if (isLoopbackUrl(url)) return {};
+  if (bearer) {
+    return { headers: { authorization: `Bearer ${bearer}` }, secrets: [bearer] };
+  }
+  if (isLoopbackUrl(url)) return { headers: {}, secrets: [] };
   if (!allowInteractiveLogin) {
     throw new Error("no Beam credentials configured for non-interactive hook publishing");
   }
   const token = cloudflaredToken(url.origin);
   if (!token) throw new Error("Cloudflare Access login did not return a token");
-  return { "cf-access-token": token };
+  return { headers: { "cf-access-token": token }, secrets: [token] };
 }
 
-function safeReceiverMessage(value, fallback) {
-  if (typeof value !== "string") return fallback;
+function printableReceiverText(value) {
   const ansiEscape = new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`, "g");
-  const sanitized = value
+  return String(value)
     .replace(ansiEscape, "")
-    .replace(/[\x00-\x1f\x7f-\x9f]/g, " ")
-    .trim()
-    .slice(0, 240);
-  return sanitized || fallback;
+    .replace(/[\x00-\x1f\x7f-\x9f\u200B-\u200D\u2060\uFEFF]/g, " ")
+    .trim();
+}
+
+function safeReceiverMessage(value, fallback, secrets) {
+  if (typeof value !== "string" || secrets.length > 0) return fallback;
+  return printableReceiverText(value).slice(0, 240) || fallback;
 }
 
 async function publish(payload, options) {
@@ -297,12 +303,13 @@ async function publish(payload, options) {
     process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
     return { ok: true, beamId: payload.beamId, dryRun: true };
   }
+  const auth = authContext(url, options.hookMode !== true);
   const response = await fetch(url, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       "user-agent": "openclaw-agent-skills-beam/1",
-      ...authHeaders(url, options.hookMode !== true),
+      ...auth.headers,
     },
     body: JSON.stringify(payload),
     redirect: "error",
@@ -316,12 +323,28 @@ async function publish(payload, options) {
     throw new Error(`Beam receiver returned invalid JSON (HTTP ${response.status})`);
   }
   if (!response.ok || result?.ok === false) {
-    const message = safeReceiverMessage(result?.error, `HTTP ${response.status}`);
+    const message = safeReceiverMessage(result?.error, `HTTP ${response.status}`, auth.secrets);
     throw new Error(`Beam upload failed: ${message}`);
   }
   if (typeof result.url === "string") {
-    const resultUrl = new URL(result.url, url);
-    if (!["http:", "https:"].includes(resultUrl.protocol) || resultUrl.origin !== url.origin) {
+    const printableUrl = printableReceiverText(result.url);
+    if (printableUrl !== result.url) {
+      throw new Error("Beam receiver returned an unsafe session URL");
+    }
+    const resultUrl = new URL(printableUrl, url);
+    const expectedSession = `catalog:beam:gateway:${payload.beamId}`;
+    const entries = [...resultUrl.searchParams.entries()];
+    if (
+      !["http:", "https:"].includes(resultUrl.protocol) ||
+      resultUrl.origin !== url.origin ||
+      resultUrl.pathname !== "/chat" ||
+      resultUrl.hash ||
+      resultUrl.username ||
+      resultUrl.password ||
+      entries.length !== 1 ||
+      entries[0]?.[0] !== "session" ||
+      resultUrl.searchParams.get("session") !== expectedSession
+    ) {
       throw new Error("Beam receiver returned an unsafe session URL");
     }
     result.url = resultUrl.toString();

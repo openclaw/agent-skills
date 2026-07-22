@@ -60,7 +60,7 @@ test("standalone redaction strips internal wrappers, credentials, and local path
   );
   assert.equal(
     value,
-    'Use [LOCAL_PATH], [LOCAL_PATH], [LOCAL_PATH], [LOCAL_PATH], and [LOCAL_PATH] with [REDACTED_AUTH_HEADER], [REDACTED_GITHUB_TOKEN], BEAM_AUTH_TOKEN=[REDACTED], DATABASE_URL=[REDACTED], {"access_token": [REDACTED]}, X-API-Key: [REDACTED], and https://example.test/callback#access_token=[REDACTED]',
+    "[REDACTED_SECRET_LINE]",
   );
 });
 
@@ -70,7 +70,21 @@ test("standalone redaction removes YAML secret block bodies", () => {
   );
   assert.equal(
     value,
-    "password: [REDACTED]\nnext: visible\nclient_secret: [REDACTED]",
+    "[REDACTED_SECRET_LINE]\nnext: visible\n[REDACTED_SECRET_LINE]",
+  );
+});
+
+test("standalone redaction removes multiline structured values and PASS assignments", () => {
+  const value = sanitizeVisibleText(
+    `{"access_token":\n  "multiline-secret-value",\n  "visible": "ok"\n}\nDB_PASS=\n  multiline-pass-value\nDB_PASS_B64=encoded-pass\nDBPASS=joined-pass\nPASS_B64=bare-pass\nPGPASSFILE=pg-pass\nBYPASS_PASS=bypass-secret\nCOMPASS_PASSPHRASE=compass-secret\nMY_APP_PASS=app-value\nSERVICE_ACCOUNT_PASS=service-value\nMYSQL_PASS=mysql-value\nGPG_PASSPHRASE=gpg-value\nMFA_PASSCODE=123456\nSSH_PASS_PHRASE=phrase-value\nSSH_PASSPHRASE_FILE=/root/phrase\nDATABASE_URL=postgres://user:pass@localhost/db\nCookie:[REDACTED] sid=live-cookie`,
+  );
+  const lines = value.split("\n");
+  assert.deepEqual(lines.slice(0, 2), ["[REDACTED_SECRET_LINE]", "}"]);
+  assert.equal(lines.length, 18);
+  assert.equal(lines.slice(2).every((line) => line === "[REDACTED_SECRET_LINE]"), true);
+  assert.doesNotMatch(
+    value,
+    /multiline-secret-value|multiline-pass-value|encoded-pass|joined-pass|bare-pass|pg-pass|bypass-secret|compass-secret|app-value|service-value|mysql-value|gpg-value|123456|phrase-value|\/root\/phrase|user:pass|live-cookie/,
   );
 });
 
@@ -80,7 +94,24 @@ test("standalone redaction removes full header, CLI, assignment, and quoted path
   );
   assert.equal(
     value,
-    "Authorization: [REDACTED]\nCookie: [REDACTED]\ncurl -H 'Authorization: [REDACTED]' https://example.test\ndeploy --password=[REDACTED] --api-key=[REDACTED] password=[REDACTED] cwd:[LOCAL_PATH] source=[LOCAL_PATH]; cat >[LOCAL_PATH]",
+    "[REDACTED_SECRET_LINE]\n[REDACTED_SECRET_LINE]\n[REDACTED_SECRET_LINE]\n[REDACTED_SECRET_LINE]",
+  );
+});
+
+test("standalone redaction handles root, spaced, file URL, and shell-adjacent paths", () => {
+  const value = sanitizeVisibleText(
+    `Use /root, /customer-secret.db, /Users/alice/Client Secret/file.js, D:/src/private, file:///Users/tester/project, and run cat >/Users/alice/private/output.txt`,
+  );
+  assert.equal(
+    value,
+    "Use [LOCAL_PATH], [LOCAL_PATH], [LOCAL_PATH], [LOCAL_PATH], [LOCAL_PATH], and run cat >[LOCAL_PATH]",
+  );
+});
+
+test("standalone sanitizer keeps ordinary pass-related fields", () => {
+  assert.equal(
+    sanitizeVisibleText('{"passed":true,"bypass":"enabled","compass":"north","passengers":3,"first-pass":true,"pass-through":"open"}\nBYPASS_MODE=on\nCOMPASS_HEADING=north\nPASSED_TESTS=3\nPASSENGERS=4'),
+    '{"passed":true,"bypass":"enabled","compass":"north","passengers":3,"first-pass":true,"pass-through":"open"}\nBYPASS_MODE=on\nCOMPASS_HEADING=north\nPASSED_TESTS=3\nPASSENGERS=4',
   );
 });
 
@@ -167,6 +198,23 @@ test("standalone Claude parser omits wrappers, thinking, and tool output", () =>
     JSON.stringify(rendered),
     /hidden skill expansion metadata|private policy|raw private result|private chain/,
   );
+});
+
+test("standalone parser preserves legitimately repeated turns", () => {
+  const session = path.join(tempDir(), "repeated.jsonl");
+  writeJsonl(session, [
+    { type: "user", message: { role: "user", content: "continue" } },
+    { type: "assistant", message: { role: "assistant", content: "working" } },
+    { type: "user", message: { role: "user", content: "continue" } },
+    { type: "assistant", message: { role: "assistant", content: "working" } },
+  ]);
+
+  assert.deepEqual(renderSession(session, { source: "claude" }).items, [
+    { type: "userMessage", text: "continue" },
+    { type: "agentMessage", text: "working" },
+    { type: "userMessage", text: "continue" },
+    { type: "agentMessage", text: "working" },
+  ]);
 });
 
 test("standalone parser handles modern Codex items without reasoning or raw output", () => {
@@ -660,8 +708,10 @@ test("publish sends Cloudflare Access auth and normalized session JSON", async (
       requestBody += chunk;
     });
     request.on("end", () => {
+      const received = JSON.parse(requestBody);
+      const sessionKey = encodeURIComponent(`catalog:beam:gateway:${received.beamId}`);
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ ok: true, url: "/chat?session=catalog%3Abeam%3Agateway%3Ademo" }));
+      response.end(JSON.stringify({ ok: true, url: `/chat?session=${sessionKey}` }));
     });
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -750,12 +800,74 @@ test("publish ignores unvalidated legacy sessionUrl response fields", async (t) 
   assert.doesNotMatch(result.stdout, /0123456789abcdef0123456789abcdef|javascript:/);
 });
 
+test("publish rejects receiver URLs containing reflected credentials", async (t) => {
+  const session = claudeSession();
+  const server = http.createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify({ ok: true, url: "/chat?note=100%&credential=%74est-access-token" }),
+    );
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const address = server.address();
+
+  const result = await run(
+    ["publish", "--endpoint", `http://127.0.0.1:${address.port}/api/v1/beam/sessions`, "--session", session],
+    { env: { BEAM_ACCESS_TOKEN: "test-access-token" } },
+  );
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /unsafe session URL/);
+  assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /test-access-token/);
+});
+
+test("publish rejects duplicate session parameters and receiver-controlled chat prefixes", async (t) => {
+  const session = claudeSession();
+  for (const mode of ["duplicate", "prefix"]) {
+    let body = "";
+    const server = http.createServer((request, response) => {
+      request.setEncoding("utf8");
+      request.on("data", (chunk) => {
+        body += chunk;
+      });
+      request.on("end", () => {
+        const payload = JSON.parse(body);
+        const key = encodeURIComponent(`catalog:beam:gateway:${payload.beamId}`);
+        const url =
+          mode === "duplicate"
+            ? `/chat?session=${key}&session=extra`
+            : `/secret-prefix/chat?session=${key}`;
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: true, url }));
+      });
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    t.after(() => server.close());
+    const address = server.address();
+    const result = await run([
+      "publish",
+      "--endpoint",
+      `http://127.0.0.1:${address.port}/api/v1/beam/sessions`,
+      "--session",
+      session,
+    ]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /unsafe session URL/);
+  }
+});
+
 test("publish never prints access tokens on receiver errors", async (t) => {
   const session = claudeSession();
   const server = http.createServer((_request, response) => {
     response.writeHead(401, { "content-type": "application/json" });
     const escape = String.fromCharCode(27);
-    response.end(JSON.stringify({ ok: false, error: `${escape}[31mnot authorized\nforged${escape}[0m` }));
+    response.end(
+      JSON.stringify({
+        ok: false,
+        error: `not authorized super-secret-\n${escape}[31maccess-token\nforged${escape}[0m`,
+      }),
+    );
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => server.close());
@@ -767,7 +879,7 @@ test("publish never prints access tokens on receiver errors", async (t) => {
   );
 
   assert.equal(result.code, 1);
-  assert.match(result.stderr, /Beam upload failed: not authorized forged/);
+  assert.match(result.stderr, /Beam upload failed: HTTP 401/);
   assert.equal(result.stderr.includes(String.fromCharCode(27)), false);
   assert.doesNotMatch(result.stderr, /\nforged/);
   assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /super-secret-access-token/);

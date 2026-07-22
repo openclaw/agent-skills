@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node /absolute/path/to/agent-skills/skills/beam/scripts/beam hook --endpoint \"$BEAM_ENDPOINT\" --quiet",
+            "command": "node \"/absolute/path/to/agent-skills/skills/beam/scripts/beam\" hook --endpoint \"$BEAM_ENDPOINT\" --quiet",
             "timeout": 15
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node /absolute/path/to/agent-skills/skills/beam/scripts/beam hook --endpoint \"$BEAM_ENDPOINT\" --quiet",
+            "command": "node \"/absolute/path/to/agent-skills/skills/beam/scripts/beam\" hook --endpoint \"$BEAM_ENDPOINT\" --quiet",
             "timeout": 15
           }
         ]
