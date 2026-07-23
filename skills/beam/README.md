@@ -110,8 +110,8 @@ token variables before enabling live hooks.
 
 ## Live updates
 
-Beam accepts the snake_case JSON emitted on stdin by Claude Code and Codex
-`Stop`, `SessionEnd`, and `SubagentStop` command hooks:
+Beam accepts the snake_case JSON emitted on stdin by root Claude Code and Codex
+`Stop` hooks, plus Claude Code `SessionEnd` hooks. Subagent hooks are ignored:
 
 ```sh
 node "$BEAM_SKILL_DIR/scripts/beam" hook \
@@ -124,8 +124,11 @@ Templates:
 - [`references/claude-code-hooks.json`](references/claude-code-hooks.json)
 - [`references/codex-hooks.toml`](references/codex-hooks.toml)
 
-`Stop` refreshes the snapshot after a completed turn. `SessionEnd` marks it
-complete. Hook failures exit nonzero but do not emit a blocking hook decision.
+`Stop` refreshes the snapshot after a completed root turn. Claude Code
+`SessionEnd` marks it complete. Codex users can publish a final snapshot with
+`publish --complete`; the public Codex template intentionally does not claim an
+automatic completion hook. Hook failures exit nonzero but do not emit a blocking
+hook decision.
 
 ## Receiver contract
 

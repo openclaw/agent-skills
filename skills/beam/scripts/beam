@@ -247,6 +247,14 @@ function isLoopbackUrl(url) {
   return ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
 }
 
+function expectedChatPath(endpoint) {
+  const suffix = "/api/v1/beam/sessions";
+  const basePath = endpoint.pathname.endsWith(suffix)
+    ? endpoint.pathname.slice(0, -suffix.length)
+    : "";
+  return `${basePath}/chat`;
+}
+
 function endpointUrl(options) {
   const raw = options.endpoint || process.env.BEAM_ENDPOINT;
   if (!raw) throw new Error("--endpoint or BEAM_ENDPOINT is required");
@@ -347,7 +355,7 @@ async function publish(payload, options) {
     if (
       !["http:", "https:"].includes(resultUrl.protocol) ||
       resultUrl.origin !== url.origin ||
-      resultUrl.pathname !== "/chat" ||
+      resultUrl.pathname !== expectedChatPath(url) ||
       resultUrl.hash ||
       resultUrl.username ||
       resultUrl.password ||
@@ -377,7 +385,11 @@ async function main() {
   const hook = command === "hook" ? readStdinJson() : {};
   options.hookMode = command === "hook";
   const event = hook.hook_event_name;
-  if (command === "hook" && event && !["Stop", "SessionEnd", "SubagentStop"].includes(event)) {
+  const isSubagentHook = event === "SubagentStop" || typeof hook.agent_id === "string";
+  if (
+    command === "hook" &&
+    (isSubagentHook || (event && !["Stop", "SessionEnd"].includes(event)))
+  ) {
     return;
   }
   const payload = buildPayload(options, hook);

@@ -64,6 +64,17 @@ test("standalone redaction strips internal wrappers, credentials, and local path
   );
 });
 
+test("standalone redaction covers GitLab tokens and session-cookie assignments", () => {
+  const value = sanitizeVisibleText(
+    `token glpat-abcdefghijklmnopqrstuvwx\ndeploy gldt-abcdefghijklmnopqrstuvwx\nfeed glft-abcdefghijklmnopqrstuvwx\nlabel global-navigation-component\nPHPSESSID=abcdefghijklmnopqrstuvwx12`,
+  );
+  assert.equal(
+    value,
+    "token [REDACTED_API_KEY]\ndeploy [REDACTED_API_KEY]\nfeed [REDACTED_API_KEY]\nlabel global-navigation-component\n[REDACTED_SECRET_LINE]",
+  );
+  assert.doesNotMatch(value, /glpat-|gldt-|glft-|PHPSESSID|abcdefghijklmnopqrstuvwx/);
+});
+
 test("standalone redaction removes YAML secret block bodies", () => {
   const value = sanitizeVisibleText(
     `password: |\n  correct horse battery\n  second secret line\nnext: visible\nclient_secret: correct horse battery staple`,
@@ -110,8 +121,30 @@ test("standalone redaction handles root, spaced, file URL, and shell-adjacent pa
 
 test("standalone sanitizer keeps ordinary pass-related fields", () => {
   assert.equal(
-    sanitizeVisibleText('{"passed":true,"bypass":"enabled","compass":"north","passengers":3,"first-pass":true,"pass-through":"open"}\nBYPASS_MODE=on\nCOMPASS_HEADING=north\nPASSED_TESTS=3\nPASSENGERS=4'),
-    '{"passed":true,"bypass":"enabled","compass":"north","passengers":3,"first-pass":true,"pass-through":"open"}\nBYPASS_MODE=on\nCOMPASS_HEADING=north\nPASSED_TESTS=3\nPASSENGERS=4',
+    sanitizeVisibleText('{"passed":true,"bypass":"enabled","compass":"north","passengers":3,"first-pass":true,"pass-through":"open","slug":"session-cookie-assignments"}\nBYPASS_MODE=on\nCOMPASS_HEADING=north\nPASSED_TESTS=3\nPASSENGERS=4'),
+    '{"passed":true,"bypass":"enabled","compass":"north","passengers":3,"first-pass":true,"pass-through":"open","slug":"session-cookie-assignments"}\nBYPASS_MODE=on\nCOMPASS_HEADING=north\nPASSED_TESTS=3\nPASSENGERS=4',
+  );
+});
+
+test("standalone redaction inspects local paths inside network URL parameters", () => {
+  const value = sanitizeVisibleText(
+    "Open https://example.test/report?file=%252525252FUsers%252525252Falice%252525252Fprivate#cwd=%2Ftmp%2Fwork and https://example.test/#/Users/alice/a=b?view=1 and https://example.test/open?note=see%20%2FUsers%2Falice%2Fprivate&redirect=https%3A%2F%2Fother.test%2F%3Ffile%3Dfile%253A%252F%252F%252Ftmp%252Fx and https://example.test/?files=%5B%2FUsers%2Falice%2Fprivate%5D and https://example.test/?meta=path%3D~%2F.private%2Fcredentials and https://example.test/?=/Users/alice/private&=/tmp/work and [report](https://example.test/?file=/Users/alice/private),",
+  );
+  assert.equal(
+    value,
+    "Open https://example.test/report?file=[LOCAL_PATH]#cwd=[LOCAL_PATH] and https://example.test/#[LOCAL_PATH] and https://example.test/open?note=[LOCAL_PATH]&redirect=[LOCAL_PATH] and https://example.test/?files=[LOCAL_PATH] and https://example.test/?meta=[LOCAL_PATH] and https://example.test/?=[LOCAL_PATH]&=[LOCAL_PATH] and [report](https://example.test/?file=[LOCAL_PATH]),",
+  );
+});
+
+test("standalone URL redaction fails closed on encoded keys, invalid UTF-8, and excess nesting", () => {
+  let deeplyEncoded = "/Users/alice/private";
+  for (let index = 0; index < 10; index++) deeplyEncoded = encodeURIComponent(deeplyEncoded);
+  const value = sanitizeVisibleText(
+    `Open https://example.test/?%2FUsers%2Falice%2Fprivate=1 and https://example.test/?broken=%FF%2FUsers%2Falice and https://example.test/?malformed=%ZZ/Users/alice/private and https://example.test/?deep=${deeplyEncoded} and https://example.test/search?q=100%25`,
+  );
+  assert.equal(
+    value,
+    "Open https://example.test/?[LOCAL_PATH] and https://example.test/?broken=[LOCAL_PATH] and https://example.test/?malformed=[LOCAL_PATH] and https://example.test/?deep=[LOCAL_PATH] and https://example.test/search?q=100%25",
   );
 });
 
@@ -558,6 +591,39 @@ test("publish rejects a missing explicit session path instead of discovering ano
   assert.equal(result.stdout, "");
 });
 
+test("root live hooks ignore subagent Stop events", async () => {
+  const session = claudeSession();
+  const result = await run(
+    ["hook", "--endpoint", "http://127.0.0.1:9/api/v1/beam/sessions", "--dry-run", "--quiet"],
+    {
+      stdin: JSON.stringify({
+        transcript_path: session,
+        hook_event_name: "Stop",
+        agent_id: "child-agent",
+      }),
+    },
+  );
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stdout, "");
+});
+
+test("root hooks publish even when the configured path contains subagents", async () => {
+  const dir = path.join(tempDir(), "subagents", "custom-root");
+  fs.mkdirSync(dir, { recursive: true });
+  const session = path.join(dir, "root.jsonl");
+  writeJsonl(session, [
+    { type: "user", message: { role: "user", content: "Root hook under custom path" } },
+  ]);
+  const result = await run(
+    ["hook", "--endpoint", "http://127.0.0.1:9/api/v1/beam/sessions", "--dry-run", "--quiet"],
+    { stdin: JSON.stringify({ transcript_path: session, hook_event_name: "Stop" }) },
+  );
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /Root hook under custom path/);
+});
+
 test("hook file failures do not print the local path", async () => {
   const missing = path.join(tempDir(), "private", "missing.jsonl");
   const result = await run(
@@ -945,6 +1011,36 @@ test("publish rejects receiver URLs containing reflected credentials", async (t)
   assert.equal(result.code, 1);
   assert.match(result.stderr, /unsafe session URL/);
   assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /test-access-token/);
+});
+
+test("publish accepts the endpoint-derived Control UI base path", async (t) => {
+  const session = claudeSession();
+  let body = "";
+  const server = http.createServer((request, response) => {
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => {
+      body += chunk;
+    });
+    request.on("end", () => {
+      const payload = JSON.parse(body);
+      const key = encodeURIComponent(`catalog:beam:gateway:${payload.beamId}`);
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ ok: true, url: `/openclaw/chat?session=${key}` }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const address = server.address();
+  const result = await run([
+    "publish",
+    "--endpoint",
+    `http://127.0.0.1:${address.port}/openclaw/api/v1/beam/sessions`,
+    "--session",
+    session,
+  ]);
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /\/openclaw\/chat\?session=/);
 });
 
 test("publish rejects duplicate session parameters and receiver-controlled chat prefixes", async (t) => {

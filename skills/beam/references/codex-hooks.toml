@@ -8,10 +8,3 @@ type = "command"
 command = "node \"/absolute/path/to/agent-skills/skills/beam/scripts/beam\" hook --endpoint \"$BEAM_ENDPOINT\" --quiet"
 timeout = 15
 statusMessage = "Updating Beam session"
-
-[[hooks.SessionEnd]]
-
-[[hooks.SessionEnd.hooks]]
-type = "command"
-command = "node \"/absolute/path/to/agent-skills/skills/beam/scripts/beam\" hook --endpoint \"$BEAM_ENDPOINT\" --quiet"
-timeout = 3

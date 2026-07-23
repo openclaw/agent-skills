@@ -237,7 +237,7 @@ function isSetupText(text) {
 }
 
 const SECRET_FIELD =
-  "(?:[a-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|dsn)[a-z0-9_-]*|pass|passcode|passphrase|pass[_-]phrase|(?:db|ssh|mfa|otp|auth|login|sudo|proxy|app|service|account|user|admin)[_-](?:pass|passcode|passphrase|pass[_-]phrase)(?:[_-](?:b64|file|path|value|secret))?|database[_-]?url|redis[_-]?url|authorization|proxy-authorization|cookie|set-cookie)";
+  "(?:[a-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|dsn)[a-z0-9_-]*|pass|passcode|passphrase|pass[_-]phrase|(?:db|ssh|mfa|otp|auth|login|sudo|proxy|app|service|account|user|admin)[_-](?:pass|passcode|passphrase|pass[_-]phrase)(?:[_-](?:b64|file|path|value|secret))?|database[_-]?url|redis[_-]?url|sid|session[_-]?id|phpsessid|jsessionid|csrf[_-]?token|xsrf[_-]?token|authorization|proxy-authorization|cookie|set-cookie)";
 
 function replaceTracked(text, pattern, replacement, stats) {
   const next = text.replace(pattern, replacement);
@@ -245,11 +245,83 @@ function replaceTracked(text, pattern, replacement, stats) {
   return next;
 }
 
-function transformWithoutHttpUrls(text, transform) {
+function decodePercentRuns(value) {
+  let current = String(value).replaceAll("+", " ");
+  for (let depth = 0; depth < 8; depth++) {
+    const malformed =
+      depth === 0
+        ? /%(?![0-9A-Fa-f]{2})/.test(current)
+        : /%(?=[A-Za-z0-9]{2})/.test(current);
+    if (malformed) return { value: current, complete: false };
+    if (!/%[0-9A-Fa-f]{2}/.test(current)) {
+      return { value: current, complete: true };
+    }
+    let invalid = false;
+    const decoded = current.replace(/(?:%[0-9A-Fa-f]{2})+/g, (encoded) => {
+      try {
+        return decodeURIComponent(encoded);
+      } catch {
+        invalid = true;
+        return encoded;
+      }
+    });
+    if (invalid) return { value: current, complete: false };
+    if (decoded === current) return { value: current, complete: true };
+    current = decoded.replaceAll("+", " ");
+  }
+  return { value: current, complete: false };
+}
+
+function isLocalPathText(value) {
+  const decoded = String(value).trim();
+  return /^(?:file:(?:\/\/)?|~\/|\.\.?[\\/]|\/(?!\/)|[A-Za-z]:[\\/]|\\\\)/i.test(
+    decoded,
+  );
+}
+
+function containsLocalPathValue(value) {
+  const decoded = decodePercentRuns(value);
+  if (!decoded.complete) return true;
+  if (isLocalPathText(decoded.value)) return true;
+  return (
+    /\bfile:(?:\/\/)?[^\s]+/i.test(decoded.value) ||
+    /(^|[\s\[\{:`"'(=,>|;&])\.\.?[\\/][^\s]+/m.test(decoded.value) ||
+    /(^|[\s\[\{:`"'(=,>|;&])[A-Za-z]:[\\/][^\s]+/m.test(decoded.value) ||
+    /(^|[\s\[\{:`"'(=,>|;&])\/(?!\/)[^\s]+/m.test(decoded.value) ||
+    /(^|[\s\[\{:`"'(=,>|;&])\\\\[^\\\s]+\\[^\s]+/m.test(decoded.value) ||
+    /(^|[\s\[\{:`"'(=,>|;&])~\/[^\s]+/m.test(decoded.value)
+  );
+}
+
+function sanitizeNetworkUrl(url, stats) {
+  let changed = false;
+  const sanitized = url.replace(
+    /([?&#])(?:([^=&#\s]*)=([^&#\s]*)|([^=&#\s]+))/g,
+    (whole, delimiter, assignedKey, value, flagKey) => {
+      const key = assignedKey ?? flagKey;
+      if (containsLocalPathValue(key)) {
+        changed = true;
+        return `${delimiter}[LOCAL_PATH]`;
+      }
+      if (assignedKey !== undefined && containsLocalPathValue(value)) {
+        changed = true;
+        return `${delimiter}${key}=[LOCAL_PATH]`;
+      }
+      return whole;
+    },
+  );
+  if (changed) stats.redactions++;
+  return sanitized;
+}
+
+function transformWithoutHttpUrls(text, transform, stats) {
   const urls = [];
   const protectedText = text.replace(/\bhttps?:\/\/[^\s`"'<>]+/gi, (url) => {
+    const punctuation = /[\])},.;!?]+$/.exec(url)?.[0] ?? "";
+    const coreUrl = punctuation ? url.slice(0, -punctuation.length) : url;
     const key = `BEAMNETWORKURL${urls.length}END`;
-    urls.push(url);
+    const sanitized = stats ? sanitizeNetworkUrl(coreUrl, stats) : coreUrl;
+    urls.push(`${sanitized}${punctuation}`);
     return key;
   });
   const transformed = transform(protectedText);
@@ -278,25 +350,25 @@ function redactLocalPaths(text, stats) {
     let transformed = value;
     transformed = replaceTracked(
       transformed,
-      /(^|[\s:`"'(=,>|;&])(\.\.?[\\/][^\s`"'<>),;]+)/gm,
+      /(^|[\s\[\{:`"'(=,>|;&])(\.\.?[\\/][^\s`"'<>),;]+)/gm,
       "$1[LOCAL_PATH]",
       stats,
     );
     transformed = replaceTracked(
       transformed,
-      /(^|[\s:`"'(=,>|;&])([A-Za-z]:[\\/](?:(?:[^\\/\r\n,;`"'<>]+[\\/])+[^\\/\s\r\n,;`"'<>]+|[^\\/\s\r\n,;`"'<>]+))/gm,
+      /(^|[\s\[\{:`"'(=,>|;&])([A-Za-z]:[\\/](?:(?:[^\\/\r\n,;`"'<>]+[\\/])+[^\\/\s\r\n,;`"'<>]+|[^\\/\s\r\n,;`"'<>]+))/gm,
       "$1[LOCAL_PATH]",
       stats,
     );
     transformed = replaceTracked(
       transformed,
-      /(^|[\s:`"'(=,>|;&])(\/(?:(?:[^/\r\n,;`"'<>]+\/)+[^/\s\r\n,;`"'<>]+|[^/\s\r\n,;`"'<>]+))/gm,
+      /(^|[\s\[\{:`"'(=,>|;&])(\/(?:(?:[^/\r\n,;`"'<>]+\/)+[^/\s\r\n,;`"'<>]+|[^/\s\r\n,;`"'<>]+))/gm,
       "$1[LOCAL_PATH]",
       stats,
     );
     transformed = replaceTracked(
       transformed,
-      /(^|[\s:`"'(=,>|;&])(\\\\[^\\\r\n,;`"'<>]+\\(?:[^\\\r\n,;`"'<>]+\\)*[^\\\s\r\n,;`"'<>]+)/gm,
+      /(^|[\s\[\{:`"'(=,>|;&])(\\\\[^\\\r\n,;`"'<>]+\\(?:[^\\\r\n,;`"'<>]+\\)*[^\\\s\r\n,;`"'<>]+)/gm,
       "$1[LOCAL_PATH]",
       stats,
     );
@@ -307,7 +379,7 @@ function redactLocalPaths(text, stats) {
       stats,
     );
     return transformed;
-  });
+  }, stats);
   return next;
 }
 
@@ -422,10 +494,9 @@ function redact(input, stats) {
     [/\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\b/g, "[REDACTED_API_KEY]"],
     [/\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b/g, "[REDACTED_API_KEY]"],
     [/\b(?:whsec|npm)_[A-Za-z0-9_-]{16,}\b/g, "[REDACTED_API_KEY]"],
+    [/\b(?:glpat|gldt|glft|glrt|glcbt|glptt|glsoat|gloas|glrtr|glimt|glagent|glwt|glffct)-[A-Za-z0-9_-]{16,}\b/g, "[REDACTED_API_KEY]"],
     [/\bAIza[0-9A-Za-z_-]{20,}\b/g, "[REDACTED_API_KEY]"],
     [/\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b/g, "[REDACTED_API_KEY]"],
-    [/\b[A-Fa-f0-9]{32,}\b/g, "[REDACTED_OPAQUE_VALUE]"],
-    [/\b[A-Za-z0-9_+/=-]{40,}\b/g, "[REDACTED_OPAQUE_VALUE]"],
     [/\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]"],
     [/\bxox[baprs]-[A-Za-z0-9-]{16,}\b/g, "[REDACTED_SLACK_TOKEN]"],
     [/\bAKIA[0-9A-Z]{16}\b/g, "[REDACTED_AWS_KEY]"],
@@ -441,17 +512,28 @@ function redact(input, stats) {
   }
 
   text = redactSecretBearingLines(text, stats);
+  text = replaceTracked(text, /\b[A-Fa-f0-9]{32,}\b/g, "[REDACTED_OPAQUE_VALUE]", stats);
+  text = replaceTracked(
+    text,
+    /\b[A-Za-z0-9_+/=-]{40,}\b/g,
+    "[REDACTED_OPAQUE_VALUE]",
+    stats,
+  );
   return redactLocalPaths(text, stats);
 }
 
 function hasLocalPath(text) {
+  const urlHasLocalPath = [...text.matchAll(/\bhttps?:\/\/[^\s`"'<>]+/gi)].some(
+    ([url]) => sanitizeNetworkUrl(url, { redactions: 0 }) !== url,
+  );
+  if (urlHasLocalPath) return true;
   const pathPatterns = [
     /(["'])(?:file:(?:\/\/)?|\.\.?[\\/]|\/(?!\/)|[A-Za-z]:[\\/]|\\\\)[^"'\r\n]+\1/i,
     /\bfile:(?:\/\/)?[^\s]+/i,
-    /(^|[\s:`"'(=,>|;&])\.\.?[\\/][^\s]+/m,
-    /(^|[\s:`"'(=,>|;&])\/(?:(?:[^/\r\n,;`"'<>]+\/)+[^/\s\r\n,;`"'<>]+|[^/\s\r\n,;`"'<>]+)/m,
-    /(^|[\s:`"'(=,>|;&])[A-Za-z]:[\\/](?:(?:[^\\/\r\n,;`"'<>]+[\\/])+[^\\/\s\r\n,;`"'<>]+|[^\\/\s\r\n,;`"'<>]+)/m,
-    /(^|[\s:`"'(=,>|;&])\\\\[^\\\r\n,;`"'<>]+\\(?:[^\\\r\n,;`"'<>]+\\)*[^\\\s\r\n,;`"'<>]+/m,
+    /(^|[\s\[\{:`"'(=,>|;&])\.\.?[\\/][^\s]+/m,
+    /(^|[\s\[\{:`"'(=,>|;&])\/(?:(?:[^/\r\n,;`"'<>]+\/)+[^/\s\r\n,;`"'<>]+|[^/\s\r\n,;`"'<>]+)/m,
+    /(^|[\s\[\{:`"'(=,>|;&])[A-Za-z]:[\\/](?:(?:[^\\/\r\n,;`"'<>]+[\\/])+[^\\/\s\r\n,;`"'<>]+|[^\\/\s\r\n,;`"'<>]+)/m,
+    /(^|[\s\[\{:`"'(=,>|;&])\\\\[^\\\r\n,;`"'<>]+\\(?:[^\\\r\n,;`"'<>]+\\)*[^\\\s\r\n,;`"'<>]+/m,
     /~\/[^\s]+/,
   ];
   return transformWithoutHttpUrls(text, (value) =>
@@ -471,6 +553,7 @@ function unsafePatterns(text) {
     /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/i,
     /\b(?:user_session|_gh_sess|__Host-user_session_same_site|GH_SESSION_TOKEN)\b/i,
     /\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b/,
+    /\b(?:glpat|gldt|glft|glrt|glcbt|glptt|glsoat|gloas|glrtr|glimt|glagent|glwt|glffct)-[A-Za-z0-9_-]{16,}\b/,
     /\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/i,
     /[?&#](?:token|key|secret|signature|sig|access_token|auth|password|passwd|api_key|client_secret)=(?!\[REDACTED\])[^\s&#]+/i,
     /\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\b/,

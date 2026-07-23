@@ -71,7 +71,7 @@ The helper accepts the snake_case JSON emitted by both Claude Code and Codex lif
 node "$BEAM_SKILL_DIR/scripts/beam" hook --endpoint "$BEAM_ENDPOINT" --quiet
 ```
 
-Configure `Stop` for turn-by-turn updates and `SessionEnd` for finalization. See:
+Configure root `Stop` hooks for turn-by-turn updates. Claude Code can also use `SessionEnd` for finalization; Codex finalization uses an explicit `publish --complete`. See:
 
 - `references/claude-code-hooks.json`
 - `references/codex-hooks.toml`
