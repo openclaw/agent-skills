@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import os
@@ -100,6 +101,20 @@ class AutoreviewCursorTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as exc_info:
             AUTOREVIEW.extract_json(stream)
         self.assertIn("review engine result was not structured JSON", str(exc_info.exception))
+
+
+class AutoreviewPriorityTests(unittest.TestCase):
+    def test_default_priority_is_p0(self) -> None:
+        with mock.patch.object(sys, "argv", ["autoreview"]):
+            args = AUTOREVIEW.parse_args()
+        self.assertEqual(args.max_priority, "P0")
+
+    def test_priority_filter_omits_lower_findings_and_cleans_verdict(self) -> None:
+        report = copy.deepcopy(DRAFT_REPORT)
+        AUTOREVIEW.filter_findings_by_priority(report, "P0")
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(report["overall_correctness"], "patch is correct")
+        self.assertIn("below the requested P0", report["overall_explanation"])
 
 
 class AutoreviewSecretScannerTests(unittest.TestCase):

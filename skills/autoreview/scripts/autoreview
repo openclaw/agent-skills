@@ -11442,6 +11442,34 @@ def validate_report(
         raise
 
 
+def filter_findings_by_priority(
+    report: dict[str, Any],
+    max_priority: str,
+) -> None:
+    order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+    limit = order[max_priority]
+    original = report["findings"]
+    kept = [
+        finding
+        for finding in original
+        if order[finding["priority"]] <= limit
+    ]
+    removed = len(original) - len(kept)
+    if not removed:
+        return
+    report["findings"] = kept
+    if not kept and report["overall_correctness"] == "patch is incorrect":
+        report["overall_correctness"] = "patch is correct"
+    note = (
+        f"Omitted {removed} finding(s) below the requested "
+        f"{max_priority} priority threshold."
+    )
+    report["overall_explanation"] = bounded_field(
+        report["overall_explanation"].rstrip() + "\n\n" + note,
+        3000,
+    )
+
+
 def number_in_range(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1
 
@@ -11630,6 +11658,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", action="append", help="Additional review instruction text.")
     parser.add_argument("--prompt-file", action="append", help="Additional review instruction file.")
     parser.add_argument("--dataset", action="append", help="Extra evidence file to include in the review bundle.")
+    parser.add_argument(
+        "--max-priority",
+        choices=["P0", "P1", "P2", "P3"],
+        default=os.environ.get("AUTOREVIEW_MAX_PRIORITY", "P0"),
+        help="Widest finding priority to report. Default: P0.",
+    )
     parser.add_argument("--output", help="Write human output to a file as well as stdout.")
     parser.add_argument("--json-output", help="Write validated structured review JSON.")
     parser.add_argument(
@@ -11865,6 +11899,7 @@ def run_reviewer(
         try:
             report = extract_json(raw)
             validate_report(report, repo, changed_paths, required)
+            filter_findings_by_priority(report, args.max_priority)
             return report
         except SystemExit as exc:
             if attempt >= attempts or not is_structured_output_failure(str(exc)):
@@ -12362,6 +12397,20 @@ def main() -> int:
         )
         target_ref = args.commit
     extra_prompt, prompt_truncated = load_extra_prompt(args, repo)
+    included_priorities = ", ".join(
+        priority
+        for priority in ("P0", "P1", "P2", "P3")
+        if int(priority[1]) <= int(args.max_priority[1])
+    )
+    threshold_prompt = (
+        f"Finding threshold: report only {included_priorities}. "
+        "Omit all lower-priority observations, polish, speculative risks, and "
+        "follow-up ideas outside that threshold. Do not mark the patch incorrect "
+        "solely for an omitted lower-priority issue."
+    )
+    extra_prompt = (
+        threshold_prompt + ("\n\n" + extra_prompt if extra_prompt.strip() else "")
+    )
     datasets, datasets_truncated = load_datasets(args, repo)
     input_truncated = bundle_truncated or prompt_truncated or datasets_truncated
     prompts = build_review_prompts(
