@@ -793,7 +793,14 @@ DEFAULT_MODEL_BY_ENGINE = {
 }
 DEFAULT_CODEX_ACCESS_FALLBACK_MODEL = "gpt-5.6-terra"
 DEFAULT_CODEX_SPEED = "fast"
-DEFAULT_CLAUDE_BEDROCK_MODEL = "global.anthropic.claude-opus-4-8"
+# `[1m]` is a Claude Code HARNESS token, not a Bedrock model id: the CLI parses
+# it off and sets the 1M-context beta, then calls Bedrock with the bare id.
+# Verified 2026-07-24 — passing `[1m]` straight to the Bedrock SDK fails with
+# "ValidationException: not authorized", while `claude --model` REQUIRES it for
+# a >200k prompt ("Prompt is too long" without it). autoreview shells out to
+# `claude --model`, so it is on the harness side and must keep the suffix or
+# large-diff reviews silently cap at 200k.
+DEFAULT_CLAUDE_BEDROCK_MODEL = "global.anthropic.claude-opus-5[1m]"
 DEFAULT_CLAUDE_BEDROCK_THINKING = "xhigh"
 DEFAULT_THINKING_BY_ENGINE = {
     "codex": "high",
@@ -10582,12 +10589,29 @@ def claude_uses_fable_model(model: str | None) -> bool:
 
 def claude_refusal_fallback_model(args: argparse.Namespace) -> str:
     if claude_auth_mode(args) != "bedrock":
-        return "claude-opus-4-8"
+        return "claude-opus-5"
     model = args.model or ""
+    # Preserve the caller's routing prefix when swapping Fable -> Opus, and
+    # handle the optional `[1m]` harness suffix (the configured Fable default
+    # carries it: global.anthropic.claude-fable-5[1m]). Without stripping the
+    # suffix first, the endswith() check misses and the prefix is dropped.
+    bare, brk, tail = model.partition("[")
     suffix = "anthropic.claude-fable-5"
-    if model.endswith(suffix):
-        return f"{model[:-len(suffix)]}anthropic.claude-opus-4-8"
-    return "global.anthropic.claude-opus-4-8"
+    if bare.endswith(suffix):
+        scope = bare[: -len(suffix)]
+        # GovCloud has NO Opus 5 — us-gov-east-1 lists only
+        # us-gov.anthropic.claude-opus-4-8 as its newest Opus (verified
+        # 2026-07-24; gov's Claude catalog is opus-4-8, sonnet-5, sonnet-4-5,
+        # 3-7-sonnet, 3-5-sonnet, 3-haiku). Emitting us-gov.…claude-opus-5
+        # would be an invalid model id, so gov scope stays on 4.8.
+        #
+        # This gov branch is defensive and currently UNREACHABLE: gov has no
+        # Fable either, so a gov caller can never request the Fable model that
+        # this refusal fallback triggers on. Kept so the mapping stays correct
+        # if gov ever gains Fable.
+        target = "claude-opus-4-8" if scope.startswith("us-gov.") else "claude-opus-5"
+        return f"{scope}anthropic.{target}{brk}{tail}"
+    return "global.anthropic.claude-opus-5[1m]"
 
 
 def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
@@ -10672,7 +10696,7 @@ def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     )
     if fallback_refused:
         raise SystemExit(
-            "claude engine fallback claude-opus-4-8 also refused the review"
+            f"claude engine fallback {fallback_args.model} also refused the review"
         )
     if fallback_result.returncode != 0:
         raise SystemExit(
@@ -12445,7 +12469,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         action="append",
-        help="Model for all reviewers or engine=model. Repeatable. Defaults: codex=gpt-5.6-sol/high with an access-only gpt-5.6-terra retry; Claude subscription/default auth=claude-fable-5/high; Claude Bedrock auth=global.anthropic.claude-opus-4-8/xhigh.",
+        help="Model for all reviewers or engine=model. Repeatable. Defaults: codex=gpt-5.6-sol/high with an access-only gpt-5.6-terra retry; Claude subscription/default auth=claude-fable-5/high; Claude Bedrock auth=global.anthropic.claude-opus-5[1m]/xhigh.",
     )
     parser.add_argument("--thinking", action="append", help="Thinking/effort for all reviewers or engine=level. Repeatable. Codex: none, minimal, low, medium, high, xhigh, max. Claude: low, medium, high, xhigh, max. Droid: off, none, low, medium, high. Pi: off, minimal, low, medium, high, xhigh. OpenCode: minimal, low, medium, high, max. Cursor: none.")
     parser.add_argument(
@@ -12784,7 +12808,7 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
         if (
             engine == "claude"
             and claude_auth == "bedrock"
-            and model in {"claude-fable-5", "claude-opus-4-8"}
+            and model in {"claude-fable-5", "claude-opus-4-8", "claude-opus-5"}
         ):
             model = f"global.anthropic.{model}"
         thinking = (

@@ -5373,10 +5373,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
         invoked_thinking = [call.args[0].thinking for call in run_once.call_args_list]
         self.assertEqual(
             invoked_models,
-            ["claude-fable-5", "claude-fable-5", "claude-opus-4-8"],
+            ["claude-fable-5", "claude-fable-5", "claude-opus-5"],
         )
         self.assertEqual(invoked_thinking, ["max", "max", "max"])
-        self.assertEqual(args.actual_model, "claude-opus-4-8")
+        self.assertEqual(args.actual_model, "claude-opus-5")
         self.assertEqual(args.actual_thinking, "max")
 
     def test_claude_retries_fable_once_without_opus_when_retry_succeeds(self) -> None:
@@ -5425,8 +5425,20 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     model="global.anthropic.claude-fable-5",
                 )
             ),
-            "global.anthropic.claude-opus-4-8",
+            "global.anthropic.claude-opus-5",
         )
+        # The `[1m]` harness suffix must survive the swap, not defeat the
+        # prefix-preserving branch — the configured Fable default carries it.
+        self.assertEqual(
+            fallback_model(
+                argparse.Namespace(
+                    claude_auth="bedrock",
+                    model="global.anthropic.claude-fable-5[1m]",
+                )
+            ),
+            "global.anthropic.claude-opus-5[1m]",
+        )
+        # GovCloud has no Opus 5 — gov scope must stay on 4.8.
         self.assertEqual(
             fallback_model(
                 argparse.Namespace(
@@ -5435,6 +5447,15 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 )
             ),
             "us-gov.anthropic.claude-opus-4-8",
+        )
+        self.assertEqual(
+            fallback_model(
+                argparse.Namespace(
+                    claude_auth="bedrock",
+                    model="us-gov.anthropic.claude-fable-5[1m]",
+                )
+            ),
+            "us-gov.anthropic.claude-opus-4-8[1m]",
         )
 
     def test_reviewer_label_reports_only_effective_refusal_fallback(self) -> None:

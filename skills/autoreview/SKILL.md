@@ -7,7 +7,7 @@ description: "Pre-commit/ship code review: Codex default; optional Claude or Pi.
 
 Run the bundled structured review helper as a closeout check. This is code review, not Guardian `auto_review` approval routing.
 
-Codex review is the default when no engine is set. It uses `gpt-5.6-sol` with `high` reasoning by default, selects the `fast` service tier when `--codex-auth chatgpt` or `AUTOREVIEW_CODEX_AUTH=chatgpt` is set, then retries once with `gpt-5.6-terra` only when the account cannot access Sol. Default/provider auth is never guessed, and provider profiles stay on their configured tier. Claude review is optional. Subscription/default auth uses `claude-fable-5` with `high` effort; Bedrock auth uses `global.anthropic.claude-opus-4-8` with `xhigh` effort.
+Codex review is the default when no engine is set. It uses `gpt-5.6-sol` with `high` reasoning by default, selects the `fast` service tier when `--codex-auth chatgpt` or `AUTOREVIEW_CODEX_AUTH=chatgpt` is set, then retries once with `gpt-5.6-terra` only when the account cannot access Sol. Default/provider auth is never guessed, and provider profiles stay on their configured tier. Claude review is optional. Subscription/default auth uses `claude-fable-5` with `high` effort; Bedrock auth uses `global.anthropic.claude-opus-5[1m]` with `xhigh` effort.
 
 For user-visible behavior, pair autoreview with `behavior-validator`. Autoreview is source-aware and judges the change bundle; behavior validation is source-blind and judges the running product or tool against a behavior contract. A clean autoreview is not proof that a UI, CLI, API, or generated artifact works from the user's perspective.
 
@@ -36,7 +36,7 @@ Do not require autoreview for a change whose entire diff is prose-only internal 
 - If a review-triggered fix changes code, rerun focused tests and rerun the structured review helper.
 - For security-audit suppression changes, verify accepted findings remain auditable: suppressed findings stay in structured output, active output keeps an unsuppressible suppression notice, and aggregate findings cannot hide unrelated active risk.
 - Never switch or override the requested review engine/model except for the documented Codex Sol-to-Terra account-access fallback. Capacity, rate-limit, and unrelated failures keep the same engine/model.
-- Claude's implicit refusal-based model switching is disabled for review. If Fable refuses the bundle, retry Fable once in a fresh session, then explicitly retry with `claude-opus-4-8` at `max` effort after the second refusal. Other selected Claude models fail on refusal.
+- Claude's implicit refusal-based model switching is disabled for review. If Fable refuses the bundle, retry Fable once in a fresh session, then explicitly retry with `claude-opus-5` at `max` effort after the second refusal. Other selected Claude models fail on refusal.
 - Be patient with large bundles. Structured review can take up to 30 minutes while the model call is active, especially with Codex tools or web search.
 - Treat heartbeat lines like `review still running: ... elapsed=... pid=...` as healthy progress, not a hang. Let the helper continue while heartbeats are advancing. Pass `--stream-engine-output` when live engine text is useful; Codex and Claude filter tool/file chatter, other runnable engines pass raw output through.
 - Do not kill a review just because it has been quiet for 2-5 minutes, or because it is still running under the 30-minute window. Inspect the process only after missing multiple expected heartbeats, after 30 minutes, or after an obviously failed subprocess; prefer letting the same helper command finish.
@@ -301,14 +301,14 @@ Recommended model defaults:
 | Engine              | Default model                                      | Source note                                           |
 | ------------------- | -------------------------------------------------- | ----------------------------------------------------- |
 | **codex** (default) | `gpt-5.6-sol` -> `gpt-5.6-terra` on access failure | High reasoning; ChatGPT auth uses fast tier          |
-| **claude**          | `claude-fable-5`; Bedrock: `global.anthropic.claude-opus-4-8` | Auth-aware defaults: Fable/high for subscription, Opus/xhigh for Bedrock |
+| **claude**          | `claude-fable-5`; Bedrock: `global.anthropic.claude-opus-5[1m]` | Auth-aware defaults: Fable/high for subscription, Opus/xhigh for Bedrock |
 
 CLI flags and environment variables override these defaults. Pi does not get a built-in model default because its provider catalog may vary by installation. Droid, Copilot, Cursor, and OpenCode are currently refused.
 
 | Engine              | Model flag                 | Example model IDs                                                            | Thinking flag                 | Accepted levels                                            |
 | ------------------- | -------------------------- | ---------------------------------------------------------------------------- | ----------------------------- | ---------------------------------------------------------- |
 | **codex** (default) | `codex --model X exec ...` | `gpt-5.6-sol`, then `gpt-5.6-terra` on Sol access failure                    | `-c model_reasoning_effort=Y` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
-| **claude**          | `claude --model X`         | `claude-fable-5`, `claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5` | `--effort Y`                  | `low`, `medium`, `high`, `xhigh`, `max`                    |
+| **claude**          | `claude --model X`         | `claude-fable-5`, `claude-opus-5`, `claude-sonnet-4-6`, `claude-haiku-4-5` | `--effort Y`                  | `low`, `medium`, `high`, `xhigh`, `max`                    |
 | **droid**           | currently refused          | Factory model IDs                                                            | `-r, --reasoning-effort Y`    | `off`, `none`, `low`, `medium`, `high`, `xhigh`, `max`     |
 | **copilot**         | currently refused          | Copilot model aliases                                                        | not supported                 | n/a                                                        |
 | **pi**              | `pi --model X`             | `anthropic/claude-sonnet-4`, `openai/gpt-4o`                                 | `--thinking Y`                | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`         |
@@ -319,7 +319,7 @@ Claude also supports `--fallback-model a,b` for availability-based fallback chai
 
 Claude's CLI reference warns that `--help` does not list every supported flag. The helper capability-checks isolation through empty-print validation with the exact review flags, and verifies the same parser rejects an unknown control flag; it does not infer support from help text or early-exit version behavior.
 
-[Anthropic's Fable model-switching guidance](https://support.claude.com/en/articles/15363606-why-claude-switched-models-in-your-conversation-with-fable-5) explains that flagged Fable requests normally rerun on Opus. Autoreview disables the implicit switch so it can retry Fable once first; only a second refusal triggers the explicit `claude-opus-4-8`/`max` fallback, which is reported in the reviewer label.
+[Anthropic's Fable model-switching guidance](https://support.claude.com/en/articles/15363606-why-claude-switched-models-in-your-conversation-with-fable-5) explains that flagged Fable requests normally rerun on Opus. Autoreview disables the implicit switch so it can retry Fable once first; only a second refusal triggers the explicit `claude-opus-5`/`max` fallback, which is reported in the reviewer label.
 
 [OpenAI's model guidance](https://developers.openai.com/api/docs/guides/latest-model) identifies Sol as the GPT-5.6 frontier-capability route and documents `max` support. Autoreview keeps `high` as its default; use `max` only for the hardest quality-first reviews after comparing its latency and cost with `xhigh` on representative changes.
 
@@ -338,10 +338,10 @@ Examples matching current `main` behavior:
 
 # Claude Code aliases or full model names, with optional availability fallback
 "$AUTOREVIEW" --engine claude --model claude-fable-5 --thinking high
-"$AUTOREVIEW" --engine claude --model claude-fable-5 --fallback-model claude-opus-4-8,claude-sonnet-4-6
+"$AUTOREVIEW" --engine claude --model claude-fable-5 --fallback-model claude-opus-5,claude-sonnet-4-6
 
 # Mixed auth: Codex uses its stored ChatGPT login while Claude uses Amazon Bedrock.
-# Bedrock defaults to global.anthropic.claude-opus-4-8 at xhigh effort;
+# Bedrock defaults to global.anthropic.claude-opus-5[1m] at xhigh effort;
 # explicit --model and --thinking values still win (including Fable when requested).
 "$AUTOREVIEW" --panel --codex-auth chatgpt --claude-auth bedrock --claude-bedrock-region us-east-1
 
@@ -468,9 +468,9 @@ The helper:
 - supports `--dry-run`, `--parallel-tests`, `--parallel-tests-shell`, `--prompt`, repo-relative `--prompt-file`, repo-relative `--dataset`, `--no-tools`, `--no-web-search`, repeatable Codex-only safe model/response tuning with `--codex-config key=value`, Codex-only `--codex-speed fast|flex|default`, run-history controls, and commit refs
 - supports `--stream-engine-output` or `AUTOREVIEW_STREAM_ENGINE_OUTPUT=1` for live engine text while preserving structured validation; Codex and Claude hide tool/file event details, emit compact activity summaries, and report usage at turn completion
 - supports opt-in review panels with `--panel` / `--reviewers`, an `AUTOREVIEW_REVIEWERS` personal default, per-engine `--model` / `--thinking`, and Claude `--fallback-model`
-- uses built-in defaults `codex=gpt-5.6-sol` with `high` reasoning, conditional ChatGPT `fast` service, and an access-only `gpt-5.6-terra` retry, plus auth-aware Claude defaults: `claude-fable-5`/`high` for subscription or default auth and `global.anthropic.claude-opus-4-8`/`xhigh` for Bedrock; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
+- uses built-in defaults `codex=gpt-5.6-sol` with `high` reasoning, conditional ChatGPT `fast` service, and an access-only `gpt-5.6-terra` retry, plus auth-aware Claude defaults: `claude-fable-5`/`high` for subscription or default auth and `global.anthropic.claude-opus-5[1m]`/`xhigh` for Bedrock; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
 - supports isolated `--codex-profile` / `AUTOREVIEW_CODEX_PROFILE` routing for sanitized built-in Amazon Bedrock profiles, automatically drops Codex CLI schema enforcement for those non-OpenAI runs, and disables model-controlled process tools so provider credentials remain outside the model-visible tool boundary
-- supports `--codex-auth chatgpt` to force stored ChatGPT auth independently of Claude, plus `--claude-auth subscription|bedrock` to force Claude Code login or AWS Bedrock routing independently of Codex; Fable refusal handling is a transparent Fable retry followed by an explicit `claude-opus-4-8`/`max` fallback after the second refusal
+- supports `--codex-auth chatgpt` to force stored ChatGPT auth independently of Claude, plus `--claude-auth subscription|bedrock` to force Claude Code login or AWS Bedrock routing independently of Codex; Fable refusal handling is a transparent Fable retry followed by an explicit `claude-opus-5`/`max` fallback after the second refusal
 - gives Codex the bundle in an empty workspace with web search available; Claude receives the bundle plus WebSearch by default and optional domain-constrained WebFetch, and Pi receives the bundle with no tools
 - runs Claude with `--safe-mode` (`v2.1.169+`), user-only settings for default auth or no settings for explicit subscription/Bedrock auth, MCP and auto-memory disabled, no filesystem/shell tools, an empty external workspace, and `--fallback-model` when set
 - refuses Droid, Copilot, Cursor, and OpenCode reviews until their CLIs expose the required project, filesystem, and network isolation
