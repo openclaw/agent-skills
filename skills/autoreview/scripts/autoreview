@@ -6382,16 +6382,6 @@ def boolean_declaration_initializer_spans(
     return top_level_fallback_value_spans(text, start, end)
 
 
-def secret_text_risk(
-    text: str,
-    *,
-    javascript_dialect: str | None = None,
-) -> bool:
-    if DIFF_HUNK_CONTENT_BOUNDARY in text:
-        return any(
-            secret_text_risk(segment, javascript_dialect=javascript_dialect)
-            for segment in text.split(DIFF_HUNK_CONTENT_BOUNDARY)
-        )
 def sensitive_mapping_comment_risk(comment: str) -> bool:
     if secret_literal_risk(comment, minimum_length=12):
         return True
@@ -6471,7 +6461,16 @@ def nested_file_reference_mapping_safety(
     return True
 
 
-def secret_text_risk(text: str) -> bool:
+def secret_text_risk(
+    text: str,
+    *,
+    javascript_dialect: str | None = None,
+) -> bool:
+    if DIFF_HUNK_CONTENT_BOUNDARY in text:
+        return any(
+            secret_text_risk(segment, javascript_dialect=javascript_dialect)
+            for segment in text.split(DIFF_HUNK_CONTENT_BOUNDARY)
+        )
     uri_authorities = uri_authority_ranges(text)
     if credentialed_uri_risk(text, uri_authorities) or basic_authorization_risk(text) or any(
         pattern.search(text) for pattern in SECRET_VALUE_PATTERNS
@@ -6505,12 +6504,12 @@ def secret_text_risk(text: str) -> bool:
         text,
         {prefix.start() for prefix in assignment_prefixes},
     )
+    safe_nested_file_references: set[int] = set()
     source_reference_spans = (
         javascript_reference_spans(text)
         if javascript_dialect is not None
         else frozenset()
     )
-    safe_nested_file_references: set[int] = set()
     for prefix in assignment_prefixes:
         if prefix.start() in boolean_declaration_positions:
             continue
