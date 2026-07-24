@@ -3288,6 +3288,51 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
         self.assertEqual(len(spans), regex_count)
 
+    def test_review_secret_fragments_handles_large_regex_heavy_diff(self) -> None:
+        value = realistic_secret_value()
+        hunk_count = 5_000
+        segment = (
+            "if (ready) /fixture-token/.test(value);\n"
+            f'const apiKey = "{value}";'
+        )
+        source = self.helper["DIFF_HUNK_CONTENT_BOUNDARY"].join(
+            segment for _ in range(hunk_count)
+        )
+
+        fragments = self.helper["review_secret_fragments"](
+            source,
+            javascript_dialect="typescript",
+        )
+
+        self.assertEqual(fragments, {value})
+
+    def test_review_secret_fragments_fails_closed_on_lexer_recursion(self) -> None:
+        def recursive_lexer(
+            text: str,
+            *,
+            javascript_dialect: str | None = None,
+        ) -> list[tuple[int, int]]:
+            return recursive_lexer(
+                text,
+                javascript_dialect=javascript_dialect,
+            )
+
+        scanner_globals = self.helper["review_secret_fragments"].__globals__
+        with (
+            mock.patch.dict(
+                scanner_globals,
+                {"review_repeatable_secret_spans": recursive_lexer},
+            ),
+            self.assertRaisesRegex(
+                SystemExit,
+                "secret scanning exceeded its safe recursion limit",
+            ),
+        ):
+            self.helper["review_secret_fragments"](
+                "if (ready) /fixture-token/.test(value);",
+                javascript_dialect="typescript",
+            )
+
     def test_lifecycle_reference_scan_is_bounded_for_non_matching_identifier(self) -> None:
         source = "const value = resolved" + "A" * 100_000 + "X;"
 

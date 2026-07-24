@@ -7350,30 +7350,33 @@ def review_secret_fragments(
     *,
     javascript_dialect: str | None = None,
 ) -> set[str]:
-    if DIFF_HUNK_CONTENT_BOUNDARY in text:
-        return set().union(
-            *(
-                review_secret_fragments(
+    fragments: set[str] = set()
+    segments = (
+        text.split(DIFF_HUNK_CONTENT_BOUNDARY)
+        if DIFF_HUNK_CONTENT_BOUNDARY in text
+        else (text,)
+    )
+    try:
+        for segment in segments:
+            fragments.update(
+                segment[start:end]
+                for start, end in review_repeatable_secret_spans(
                     segment,
                     javascript_dialect=javascript_dialect,
                 )
-                for segment in text.split(DIFF_HUNK_CONTENT_BOUNDARY)
+                if segment[start:end]
+                and segment[start:end].casefold() not in SECRET_PLACEHOLDER_VALUES
             )
-        )
-    fragments = {
-        text[start:end]
-        for start, end in review_repeatable_secret_spans(
-            text,
-            javascript_dialect=javascript_dialect,
-        )
-        if text[start:end]
-        and text[start:end].casefold() not in SECRET_PLACEHOLDER_VALUES
-    }
-    fragments.update(
-        fragment
-        for fragment in private_key_body_fragments(text)
-        if fragment.casefold() not in SECRET_PLACEHOLDER_VALUES
-    )
+            fragments.update(
+                fragment
+                for fragment in private_key_body_fragments(segment)
+                if fragment.casefold() not in SECRET_PLACEHOLDER_VALUES
+            )
+    except RecursionError:
+        raise SystemExit(
+            "refusing review bundle because secret scanning exceeded its safe "
+            "recursion limit; split the review target or simplify pathological syntax"
+        ) from None
     return fragments
 
 
