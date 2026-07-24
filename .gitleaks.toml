@@ -1,0 +1,27 @@
+# gitleaks configuration for agent-skills.
+#
+# The default ruleset is kept in full; this file only narrows it for the two
+# test files whose entire PURPOSE is to carry secret-shaped strings so the
+# redaction/detection code under test has something to detect. Both are
+# fixtures, verified by inspection 2026-07-24:
+#
+#   skills/beam/scripts/beam.test.mjs
+#     Test "standalone redaction covers GitLab tokens and session-cookie
+#     assignments" uses sequential-alphabet dummies (glpat-abcdefghijklmnopqrstuvwx).
+#
+#   skills/autoreview/tests/test_autoreview_hardening.py
+#     Synthetic values deliberately split across concatenation
+#     ("N7xQ2mP9vK4r" + "T8wZ") to exercise the bundle scanner.
+#
+# Scope is deliberately path-pinned to those two files. Do NOT widen this to
+# directories or globs: everything else, including all non-test source, stays
+# fully scanned and the pre-push hook keeps failing closed.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Secret-shaped fixtures in scanner/redaction test files only"
+paths = [
+  '''^skills/beam/scripts/beam\.test\.mjs$''',
+  '''^skills/autoreview/tests/test_autoreview_hardening\.py$''',
+]
