@@ -2247,7 +2247,20 @@ def copy_worktree_file(repo: Path, root: Path, rel: str) -> bool:
             "changed content is not a regular file; remove it or resolve the repository state before rerunning autoreview"
         )
     content = source.read_bytes()
-    if source.lstat() != source_stat:
+    after = source.lstat()
+    if (
+        source_stat.st_dev,
+        source_stat.st_ino,
+        source_stat.st_mode,
+        source_stat.st_size,
+        source_stat.st_mtime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
         raise SystemExit(
             "unable to snapshot changed content for the TruffleHog scan: file changed while reading"
         )
@@ -2535,7 +2548,7 @@ def run_trufflehog_preflight(
             [
                 trufflehog_bin,
                 "git",
-                scan_repo.resolve().as_uri(),
+                "file://.",
                 "--since-commit",
                 base_commit,
                 "--branch",
@@ -2548,7 +2561,7 @@ def run_trufflehog_preflight(
                 "--fail",
                 "--fail-on-scan-errors",
             ],
-            repo,
+            scan_repo,
             check=False,
             env=safe_trufflehog_env(repo),
         )

@@ -153,6 +153,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 )
                 self.assertEqual(command[3], "--since-commit")
                 self.assertEqual(command[5:7], ["--branch", "HEAD"])
+                self.assertEqual(command[2], "file://.")
                 self.assertEqual(
                     command[7:],
                     [
@@ -163,10 +164,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                         "--fail-on-scan-errors",
                     ],
                 )
-                scan_path = command[2].removeprefix("file://")
-                if os.name == "nt":
-                    scan_path = scan_path.lstrip("/")
-                scan_repo = Path(scan_path)
+                scan_repo = cwd
                 commits = git(
                     scan_repo,
                     "log",
@@ -639,6 +637,35 @@ class AutoreviewHardeningTests(unittest.TestCase):
                         git(scan_repo, "show", f"{commits[2]}:{expected_path}"),
                         expected_content,
                     )
+
+    def test_worktree_snapshot_ignores_access_time_changes_caused_by_read(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as tempdir,
+            tempfile.TemporaryDirectory() as snapshot_dir,
+        ):
+            repo = Path(tempdir)
+            source = repo / "review.txt"
+            source.write_text("review\n", encoding="utf-8")
+            source_stat = source.stat()
+            os.utime(
+                source,
+                ns=(
+                    source_stat.st_atime_ns - 3_000_000_000,
+                    source_stat.st_mtime_ns,
+                ),
+            )
+
+            copied = self.helper["copy_worktree_file"](
+                repo,
+                Path(snapshot_dir),
+                "review.txt",
+            )
+
+            self.assertTrue(copied)
+            self.assertEqual(
+                (Path(snapshot_dir) / "review.txt").read_text(encoding="utf-8"),
+                "review\n",
+            )
 
     def test_trufflehog_findings_and_errors_do_not_leak_scanner_output(self) -> None:
         for returncode, expected in (
@@ -4260,10 +4287,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ) -> subprocess.CompletedProcess[str]:
                 if command[0] != "/trusted/trufflehog":
                     return original_run(command, cwd, **_kwargs)
-                scan_path = command[2].removeprefix("file://")
-                if os.name == "nt":
-                    scan_path = scan_path.lstrip("/")
-                scan_repo = Path(scan_path)
+                self.assertEqual(command[2], "file://.")
+                scan_repo = cwd
                 commits = git(
                     scan_repo,
                     "log",
