@@ -638,6 +638,42 @@ class AutoreviewHardeningTests(unittest.TestCase):
                         expected_content,
                     )
 
+    def test_snapshot_stat_signature_ignores_access_time_but_retains_change_time(
+        self,
+    ) -> None:
+        before = mock.Mock(
+            st_dev=1,
+            st_ino=2,
+            st_mode=stat.S_IFREG,
+            st_size=4,
+            st_atime_ns=10,
+            st_mtime_ns=20,
+            st_ctime_ns=30,
+        )
+        after_read = mock.Mock(
+            st_dev=1,
+            st_ino=2,
+            st_mode=stat.S_IFREG,
+            st_size=4,
+            st_atime_ns=11,
+            st_mtime_ns=20,
+            st_ctime_ns=30,
+        )
+        after_mutation = mock.Mock(
+            st_dev=1,
+            st_ino=2,
+            st_mode=stat.S_IFREG,
+            st_size=4,
+            st_atime_ns=11,
+            st_mtime_ns=20,
+            st_ctime_ns=31,
+        )
+
+        signature = self.helper["snapshot_stat_signature"]
+
+        self.assertEqual(signature(before), signature(after_read))
+        self.assertNotEqual(signature(before), signature(after_mutation))
+
     def test_worktree_snapshot_ignores_access_time_changes_caused_by_read(self) -> None:
         with (
             tempfile.TemporaryDirectory() as tempdir,

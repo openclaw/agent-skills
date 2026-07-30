@@ -2124,6 +2124,18 @@ def open_worktree_parent(repo: Path, rel_path: Path) -> int | bool | None:
         ) from exc
 
 
+def snapshot_stat_signature(metadata: os.stat_result) -> tuple[int, ...]:
+    """Return mutation-relevant metadata without read-side access time."""
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
 def copy_worktree_file(repo: Path, root: Path, rel: str) -> bool:
     rel_path = Path(*PurePosixPath(rel).parts)
     parent_descriptor = open_worktree_parent(repo, rel_path)
@@ -2205,15 +2217,7 @@ def copy_worktree_file(repo: Path, root: Path, rel: str) -> bool:
                 while chunk := os.read(descriptor, 1024 * 1024):
                     output.write(chunk)
             after = os.fstat(descriptor)
-            if (
-                opened.st_mode,
-                opened.st_size,
-                opened.st_mtime_ns,
-            ) != (
-                after.st_mode,
-                after.st_size,
-                after.st_mtime_ns,
-            ):
+            if snapshot_stat_signature(opened) != snapshot_stat_signature(after):
                 raise OSError("file changed while reading")
         except OSError as exc:
             destination.unlink(missing_ok=True)
@@ -2248,19 +2252,7 @@ def copy_worktree_file(repo: Path, root: Path, rel: str) -> bool:
         )
     content = source.read_bytes()
     after = source.lstat()
-    if (
-        source_stat.st_dev,
-        source_stat.st_ino,
-        source_stat.st_mode,
-        source_stat.st_size,
-        source_stat.st_mtime_ns,
-    ) != (
-        after.st_dev,
-        after.st_ino,
-        after.st_mode,
-        after.st_size,
-        after.st_mtime_ns,
-    ):
+    if snapshot_stat_signature(source_stat) != snapshot_stat_signature(after):
         raise SystemExit(
             "unable to snapshot changed content for the TruffleHog scan: file changed while reading"
         )
