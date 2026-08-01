@@ -2124,8 +2124,8 @@ def open_worktree_parent(repo: Path, rel_path: Path) -> int | bool | None:
         ) from exc
 
 
-def snapshot_stat_signature(metadata: os.stat_result) -> tuple[int, ...]:
-    """Return mutation-relevant metadata without read-side access time."""
+def posix_snapshot_stat_signature(metadata: os.stat_result) -> tuple[int, ...]:
+    """Return POSIX mutation-relevant metadata without read-side access time."""
     return (
         metadata.st_dev,
         metadata.st_ino,
@@ -2134,6 +2134,52 @@ def snapshot_stat_signature(metadata: os.stat_result) -> tuple[int, ...]:
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
     )
+
+
+def open_windows_snapshot_file(source: Path) -> io.BufferedReader:
+    """Open a Windows snapshot source while denying concurrent writes or deletes."""
+    if os.name != "nt":
+        raise OSError("Windows snapshot handles are only available on Windows")
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    generic_read = 0x80000000
+    file_share_read = 0x00000001
+    open_existing = 3
+    file_attribute_normal = 0x00000080
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(source),
+        generic_read,
+        file_share_read,
+        None,
+        open_existing,
+        file_attribute_normal,
+        None,
+    )
+    if handle == invalid_handle_value:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    try:
+        return os.fdopen(descriptor, "rb")
+    except OSError:
+        os.close(descriptor)
+        raise
 
 
 def copy_worktree_file(repo: Path, root: Path, rel: str) -> bool:
@@ -2217,7 +2263,7 @@ def copy_worktree_file(repo: Path, root: Path, rel: str) -> bool:
                 while chunk := os.read(descriptor, 1024 * 1024):
                     output.write(chunk)
             after = os.fstat(descriptor)
-            if snapshot_stat_signature(opened) != snapshot_stat_signature(after):
+            if posix_snapshot_stat_signature(opened) != posix_snapshot_stat_signature(after):
                 raise OSError("file changed while reading")
         except OSError as exc:
             destination.unlink(missing_ok=True)
@@ -2250,12 +2296,22 @@ def copy_worktree_file(repo: Path, root: Path, rel: str) -> bool:
         raise SystemExit(
             "changed content is not a regular file; remove it or resolve the repository state before rerunning autoreview"
         )
-    content = source.read_bytes()
-    after = source.lstat()
-    if snapshot_stat_signature(source_stat) != snapshot_stat_signature(after):
-        raise SystemExit(
-            "unable to snapshot changed content for the TruffleHog scan: file changed while reading"
-        )
+    if os.name == "nt":
+        try:
+            with open_windows_snapshot_file(source) as snapshot_source:
+                content = snapshot_source.read()
+        except OSError as exc:
+            raise SystemExit(
+                "unable to snapshot changed content for the TruffleHog scan: "
+                f"{display_escape(exc, 500)}"
+            ) from exc
+    else:
+        content = source.read_bytes()
+        after = source.lstat()
+        if posix_snapshot_stat_signature(source_stat) != posix_snapshot_stat_signature(after):
+            raise SystemExit(
+                "unable to snapshot changed content for the TruffleHog scan: file changed while reading"
+            )
     write_snapshot_blob(root, rel, content)
     return True
 

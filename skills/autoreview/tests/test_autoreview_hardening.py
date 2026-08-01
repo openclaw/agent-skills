@@ -638,7 +638,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
                         expected_content,
                     )
 
-    def test_snapshot_stat_signature_ignores_access_time_but_retains_change_time(
+    @unittest.skipIf(os.name == "nt", "Windows uses an exclusive snapshot handle")
+    def test_posix_snapshot_stat_signature_ignores_access_time_but_retains_change_time(
         self,
     ) -> None:
         before = mock.Mock(
@@ -669,10 +670,36 @@ class AutoreviewHardeningTests(unittest.TestCase):
             st_ctime_ns=31,
         )
 
-        signature = self.helper["snapshot_stat_signature"]
+        signature = self.helper["posix_snapshot_stat_signature"]
 
         self.assertEqual(signature(before), signature(after_read))
         self.assertNotEqual(signature(before), signature(after_mutation))
+
+    @unittest.skipUnless(os.name == "nt", "Windows handle sharing is required")
+    def test_windows_snapshot_reader_denies_a_same_size_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            source = Path(tempdir) / "review.txt"
+            original = b"review\n"
+            source.write_bytes(original)
+            writer_result: dict[str, OSError | None] = {"error": None}
+
+            with self.helper["open_windows_snapshot_file"](source) as reader:
+                def write_same_size_content() -> None:
+                    try:
+                        with source.open("r+b", buffering=0) as writer:
+                            writer.write(b"changed\n")
+                            writer.flush()
+                            os.fsync(writer.fileno())
+                    except OSError as exc:
+                        writer_result["error"] = exc
+
+                writer = threading.Thread(target=write_same_size_content)
+                writer.start()
+                writer.join(timeout=5)
+                self.assertFalse(writer.is_alive(), "writer did not complete")
+
+                self.assertIsInstance(writer_result["error"], PermissionError)
+                self.assertEqual(reader.read(), original)
 
     def test_worktree_snapshot_ignores_access_time_changes_caused_by_read(self) -> None:
         with (
