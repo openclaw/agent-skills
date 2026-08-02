@@ -4610,50 +4610,49 @@ class AutoreviewHardeningTests(unittest.TestCase):
             repo = init_repo(root)
             share = root / "kimi-home"
             share.mkdir()
-            (share / "config.json").write_text(
-                json.dumps(
-                    {
-                        "default_model": "review-model",
-                        "models": {
-                            "review-model": {
-                                "provider": "review-provider",
-                                "model": "kimi-k2",
-                                "max_context_size": 100000,
-                            }
-                        },
-                        "providers": {
-                            "review-provider": {
-                                "type": "kimi",
-                                "base_url": "https://api.example.invalid",
-                                "api_key": "test-token",
-                            }
-                        },
-                        "hooks": [{"matcher": "SessionStart", "hooks": []}],
-                        "extra_skill_dirs": ["/tmp/unsafe-skills"],
-                        "services": {"moonshot_search": {"base_url": "http://localhost"}},
-                        "telemetry": True,
-                        "default_yolo": True,
-                        "default_plan_mode": True,
-                    }
+            (share / "config.toml").write_text(
+                "\n".join(
+                    [
+                        'default_model = "review-model"',
+                        'extra_skill_dirs = ["/tmp/unsafe-skills"]',
+                        "",
+                        "[models.review-model]",
+                        'provider = "review-provider"',
+                        'model = "kimi-k2"',
+                        "max_context_size = 100000",
+                        "",
+                        "[providers.review-provider]",
+                        'type = "kimi"',
+                        'base_url = "https://api.example.invalid"',
+                        'api_key = "test-token"',
+                        "",
+                        "[services.moonshot_search]",
+                        'base_url = "http://localhost"',
+                        "",
+                        "[thinking]",
+                        "enabled = false",
+                        "",
+                    ]
                 ),
                 encoding="utf-8",
             )
             with mock.patch.dict(
                 os.environ,
-                {"KIMI_SHARE_DIR": str(share)},
+                {"KIMI_CODE_HOME": str(share)},
                 clear=False,
             ):
                 config, source_share = self.helper["load_kimi_review_config"](repo)
 
         self.assertEqual(source_share, share.resolve())
         self.assertEqual(config["default_model"], "review-model")
-        self.assertEqual(config["providers"]["review-provider"]["api_key"], "test-token")
-        self.assertEqual(config["hooks"], [])
-        self.assertEqual(config["extra_skill_dirs"], [])
-        self.assertEqual(config["services"], {})
-        self.assertFalse(config["telemetry"])
-        self.assertFalse(config["default_yolo"])
-        self.assertFalse(config["default_plan_mode"])
+        self.assertEqual(
+            config["providers"]["review-provider"]["api_key"],
+            "test-token",
+        )
+        self.assertNotIn("services", config)
+        self.assertNotIn("extra_skill_dirs", config)
+        self.assertNotIn("thinking", config)
+        self.assertNotIn("hooks", config)
 
     def test_kimi_oauth_credentials_are_linked_outside_runtime_state(self) -> None:
         if os.name == "nt":
@@ -4689,15 +4688,15 @@ class AutoreviewHardeningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             repo = init_repo(root)
-            hostile_config = repo / "kimi-config.json"
-            hostile_config.write_text("{}", encoding="utf-8")
+            hostile_config = repo / "kimi-config.toml"
+            hostile_config.write_text("default_model = \"x\"\n", encoding="utf-8")
             share = root / "kimi-home"
             share.mkdir()
-            (share / "config.json").symlink_to(hostile_config)
+            (share / "config.toml").symlink_to(hostile_config)
 
             with mock.patch.dict(
                 os.environ,
-                {"KIMI_SHARE_DIR": str(share)},
+                {"KIMI_CODE_HOME": str(share)},
                 clear=False,
             ), self.assertRaisesRegex(
                 SystemExit,
@@ -4714,7 +4713,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     "KIMI_API_KEY": "test-token",
                     "KIMI_BASE_URL": "https://api.example.invalid",
                     "KIMI_MODEL_NAME": "kimi-model",
-                    "KIMI_SHARE_DIR": str(repo / ".hostile-kimi"),
+                    "KIMI_CODE_HOME": str(repo / ".hostile-kimi"),
                     "PYTHONPATH": "/tmp/hostile-python",
                 },
                 clear=False,
@@ -4724,7 +4723,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertEqual(env["KIMI_API_KEY"], "test-token")
         self.assertEqual(env["KIMI_BASE_URL"], "https://api.example.invalid")
         self.assertEqual(env["KIMI_MODEL_NAME"], "kimi-model")
-        self.assertNotIn("KIMI_SHARE_DIR", env)
+        self.assertNotIn("KIMI_CODE_HOME", env)
         self.assertNotIn("PYTHONPATH", env)
 
     def test_safe_git_env_preserves_trusted_platform_and_helper_paths(self) -> None:
