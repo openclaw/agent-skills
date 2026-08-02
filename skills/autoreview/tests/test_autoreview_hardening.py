@@ -1316,6 +1316,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertTrue(all("Oversized review bundle chunk:" in prompt for prompt in prompts))
 
     def test_kimi_prompt_budget_partitions_before_argv_limits(self) -> None:
+        if os.name == "nt":
+            self.skipTest("the 30 KiB Windows argv budget cannot fit the chunk-context reservation")
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
             prompts = self.helper["build_review_prompts"](
