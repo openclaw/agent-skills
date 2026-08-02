@@ -305,6 +305,145 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             (None, {"cursor": "auto"}),
         )
 
+    def test_kimi_bin_cli_option(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["autoreview", "--kimi-bin", "/tmp/trusted-kimi"],
+        ):
+            args = AUTOREVIEW.parse_args()
+        self.assertEqual(args.kimi_bin, "/tmp/trusted-kimi")
+
+    def test_kimi_reviewer_always_disables_tools(self) -> None:
+        args = AUTOREVIEW.reviewer_test_args(
+            engine="kimi",
+            thinking=["on"],
+        )
+
+        reviewer = AUTOREVIEW.reviewer_args(args)[0]
+
+        self.assertEqual(reviewer.engine, "kimi")
+        self.assertEqual(reviewer.thinking, "on")
+        self.assertFalse(reviewer.tools)
+
+    def test_all_reviewers_includes_kimi(self) -> None:
+        args = AUTOREVIEW.reviewer_test_args(reviewers="all")
+
+        reviewers = AUTOREVIEW.reviewer_args(args)
+
+        self.assertEqual(
+            [reviewer.engine for reviewer in reviewers],
+            ["codex", "claude", "pi", "kimi"],
+        )
+
+    def test_kimi_isolation_requires_current_cli_contract(self) -> None:
+        args = argparse.Namespace(kimi_bin="kimi")
+        required_flags = " ".join(
+            [
+                "--quiet",
+                "--work-dir",
+                "--config-file",
+                "--agent-file",
+                "--mcp-config-file",
+                "--skills-dir",
+                "--model",
+                "--thinking",
+                "--no-thinking",
+            ]
+        )
+
+        def fake_run(command: list[str], *_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            if "--version" in command:
+                return subprocess.CompletedProcess(command, 0, "kimi, version 1.49.0", "")
+            return subprocess.CompletedProcess(command, 0, required_flags, "")
+
+        with tempfile.TemporaryDirectory(prefix="autoreview-kimi-probe-test.") as tmpdir, mock.patch.object(
+            AUTOREVIEW,
+            "resolve_command",
+            return_value="/usr/bin/kimi",
+        ), mock.patch.object(
+            AUTOREVIEW,
+            "safe_engine_env",
+            return_value={},
+        ), mock.patch.object(
+            AUTOREVIEW,
+            "safe_temp_root",
+            return_value=Path(tmpdir),
+        ), mock.patch.object(
+            AUTOREVIEW,
+            "run",
+            side_effect=fake_run,
+        ):
+            self.assertEqual(
+                AUTOREVIEW.ensure_kimi_isolation_supported(args, Path(tmpdir)),
+                "/usr/bin/kimi",
+            )
+
+    def test_kimi_runs_with_empty_tools_skills_and_mcp(self) -> None:
+        args = argparse.Namespace(
+            kimi_bin="kimi",
+            model="kimi-model",
+            stream_engine_output=False,
+            thinking="on",
+        )
+        observed: dict[str, object] = {}
+
+        def fake_run(
+            command: list[str],
+            cwd: Path,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            observed["command"] = command
+            observed["cwd"] = cwd
+            observed["env"] = kwargs["env"]
+            agent_path = Path(command[command.index("--agent-file") + 1])
+            config_path = Path(command[command.index("--config-file") + 1])
+            mcp_path = Path(command[command.index("--mcp-config-file") + 1])
+            skills_path = Path(command[command.index("--skills-dir") + 1])
+            observed["agent"] = json.loads(agent_path.read_text(encoding="utf-8"))
+            observed["config"] = json.loads(config_path.read_text(encoding="utf-8"))
+            observed["mcp"] = json.loads(mcp_path.read_text(encoding="utf-8"))
+            observed["skills"] = list(skills_path.iterdir())
+            observed["workspace"] = list(cwd.iterdir())
+            return subprocess.CompletedProcess(command, 0, json.dumps(FINAL_REPORT), "")
+
+        with tempfile.TemporaryDirectory(prefix="autoreview-kimi-run-test.") as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            repo.mkdir()
+            with mock.patch.object(
+                AUTOREVIEW,
+                "ensure_kimi_isolation_supported",
+                return_value="/usr/bin/kimi",
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "load_kimi_review_config",
+                return_value=({"telemetry": False}, None),
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "run_with_heartbeat",
+                side_effect=fake_run,
+            ):
+                output = AUTOREVIEW.run_kimi(args, repo, "review prompt")
+
+        self.assertEqual(json.loads(output), FINAL_REPORT)
+        command = observed["command"]
+        self.assertIsInstance(command, list)
+        assert isinstance(command, list)
+        self.assertIn("--quiet", command)
+        self.assertIn("--thinking", command)
+        self.assertEqual(command[command.index("--model") + 1], "kimi-model")
+        self.assertEqual(observed["agent"]["agent"]["tools"], [])
+        self.assertEqual(observed["agent"]["agent"]["subagents"], {})
+        self.assertEqual(observed["mcp"], {"mcpServers": {}})
+        self.assertEqual(observed["skills"], [])
+        self.assertEqual(observed["workspace"], [])
+        env = observed["env"]
+        self.assertIsInstance(env, dict)
+        assert isinstance(env, dict)
+        self.assertEqual(env["KIMI_DISABLE_TELEMETRY"], "1")
+        self.assertEqual(env["KIMI_CLI_NO_AUTO_UPDATE"], "1")
+        self.assertNotEqual(Path(env["KIMI_SHARE_DIR"]), repo)
+
     def test_codex_config_status_exposes_keys_only(self) -> None:
         args = argparse.Namespace(codex_config=['model_verbosity="low"'])
         self.assertEqual(AUTOREVIEW.codex_config_keys(args), ["model_verbosity"])

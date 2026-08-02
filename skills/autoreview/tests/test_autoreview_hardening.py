@@ -701,7 +701,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_powershell_harness_exposes_runnable_engines_only(self) -> None:
         harness = SCRIPT.with_name("test-review-harness.ps1").read_text(encoding="utf-8")
 
-        self.assertIn("[ValidateSet('codex', 'claude', 'pi')]", harness)
+        self.assertIn("[ValidateSet('codex', 'claude', 'pi', 'kimi')]", harness)
         for disabled_engine in ("droid", "copilot", "opencode", "cursor"):
             self.assertNotIn(f"'{disabled_engine}'", harness)
 
@@ -4598,6 +4598,134 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 argparse.Namespace(engine="droid", tools=False),
                 True,
             )
+        with self.assertRaisesRegex(SystemExit, "kimi engine refused truncated review input"):
+            self.helper["ensure_reviewer_input_complete"](
+                argparse.Namespace(engine="kimi", tools=False),
+                True,
+            )
+
+    def test_kimi_config_is_sanitized_without_losing_model_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            share = root / "kimi-home"
+            share.mkdir()
+            (share / "config.json").write_text(
+                json.dumps(
+                    {
+                        "default_model": "review-model",
+                        "models": {
+                            "review-model": {
+                                "provider": "review-provider",
+                                "model": "kimi-k2",
+                                "max_context_size": 100000,
+                            }
+                        },
+                        "providers": {
+                            "review-provider": {
+                                "type": "kimi",
+                                "base_url": "https://api.example.invalid",
+                                "api_key": "test-token",
+                            }
+                        },
+                        "hooks": [{"matcher": "SessionStart", "hooks": []}],
+                        "extra_skill_dirs": ["/tmp/unsafe-skills"],
+                        "services": {"moonshot_search": {"base_url": "http://localhost"}},
+                        "telemetry": True,
+                        "default_yolo": True,
+                        "default_plan_mode": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"KIMI_SHARE_DIR": str(share)},
+                clear=False,
+            ):
+                config, source_share = self.helper["load_kimi_review_config"](repo)
+
+        self.assertEqual(source_share, share.resolve())
+        self.assertEqual(config["default_model"], "review-model")
+        self.assertEqual(config["providers"]["review-provider"]["api_key"], "test-token")
+        self.assertEqual(config["hooks"], [])
+        self.assertEqual(config["extra_skill_dirs"], [])
+        self.assertEqual(config["services"], {})
+        self.assertFalse(config["telemetry"])
+        self.assertFalse(config["default_yolo"])
+        self.assertFalse(config["default_plan_mode"])
+
+    def test_kimi_oauth_credentials_are_linked_outside_runtime_state(self) -> None:
+        if os.name == "nt":
+            self.skipTest("directory symlink privileges vary on Windows")
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source_share = root / "source-kimi"
+            credentials = source_share / "credentials"
+            credentials.mkdir(parents=True)
+            device_id = "0123456789abcdef0123456789abcdef"
+            (source_share / "device_id").write_text(device_id, encoding="utf-8")
+            runtime_share = root / "runtime-kimi"
+            runtime_share.mkdir()
+
+            self.helper["prepare_kimi_runtime_auth"](
+                repo,
+                source_share,
+                runtime_share,
+            )
+
+            linked = runtime_share / "credentials"
+            self.assertTrue(linked.is_symlink())
+            self.assertEqual(linked.resolve(), credentials.resolve())
+            self.assertEqual(
+                (runtime_share / "device_id").read_text(encoding="utf-8"),
+                device_id,
+            )
+
+    def test_kimi_rejects_repo_controlled_config_symlink(self) -> None:
+        if os.name == "nt":
+            self.skipTest("directory symlink privileges vary on Windows")
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            hostile_config = repo / "kimi-config.json"
+            hostile_config.write_text("{}", encoding="utf-8")
+            share = root / "kimi-home"
+            share.mkdir()
+            (share / "config.json").symlink_to(hostile_config)
+
+            with mock.patch.dict(
+                os.environ,
+                {"KIMI_SHARE_DIR": str(share)},
+                clear=False,
+            ), self.assertRaisesRegex(
+                SystemExit,
+                "must resolve outside",
+            ):
+                self.helper["load_kimi_review_config"](repo)
+
+    def test_kimi_engine_env_preserves_only_supported_runtime_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "KIMI_API_KEY": "test-token",
+                    "KIMI_BASE_URL": "https://api.example.invalid",
+                    "KIMI_MODEL_NAME": "kimi-model",
+                    "KIMI_SHARE_DIR": str(repo / ".hostile-kimi"),
+                    "PYTHONPATH": "/tmp/hostile-python",
+                },
+                clear=False,
+            ):
+                env = self.helper["safe_engine_env"](repo, engine="kimi")
+
+        self.assertEqual(env["KIMI_API_KEY"], "test-token")
+        self.assertEqual(env["KIMI_BASE_URL"], "https://api.example.invalid")
+        self.assertEqual(env["KIMI_MODEL_NAME"], "kimi-model")
+        self.assertNotIn("KIMI_SHARE_DIR", env)
+        self.assertNotIn("PYTHONPATH", env)
 
     def test_safe_git_env_preserves_trusted_platform_and_helper_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -4637,7 +4765,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 SystemExit,
-                r"droid engine is unavailable.*use codex, claude, or pi",
+                r"droid engine is unavailable.*use codex, claude, pi, or kimi",
             ) as error:
                 self.helper["run_droid"](argparse.Namespace(), repo, "prompt")
             self.assertNotIn("opencode", str(error.exception))
@@ -6600,7 +6728,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             repo = init_repo(Path(tempdir))
             with self.assertRaisesRegex(
                 SystemExit,
-                r"ignored repository secrets; use codex, claude, or pi",
+                r"ignored repository secrets; use codex, claude, pi, or kimi",
             ) as error:
                 self.helper["run_copilot"](
                     args,
