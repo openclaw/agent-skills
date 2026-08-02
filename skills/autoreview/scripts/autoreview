@@ -2299,6 +2299,15 @@ def copy_worktree_file(repo: Path, root: Path, rel: str) -> bool:
     if os.name == "nt":
         try:
             with open_windows_snapshot_file(source) as snapshot_source:
+                opened = os.fstat(snapshot_source.fileno())
+                if not stat.S_ISREG(opened.st_mode) or (
+                    source_stat.st_dev,
+                    source_stat.st_ino,
+                ) != (
+                    opened.st_dev,
+                    opened.st_ino,
+                ):
+                    raise OSError("file changed while opening")
                 content = snapshot_source.read()
         except OSError as exc:
             raise SystemExit(

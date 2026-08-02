@@ -701,6 +701,38 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertIsInstance(writer_result["error"], PermissionError)
                 self.assertEqual(reader.read(), original)
 
+    @unittest.skipUnless(os.name == "nt", "Windows handle identity is required")
+    def test_worktree_snapshot_rejects_file_replaced_before_windows_open(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as tempdir,
+            tempfile.TemporaryDirectory() as snapshot_dir,
+        ):
+            repo = Path(tempdir)
+            source = repo / "review.txt"
+            replacement = repo / "replacement.txt"
+            source.write_bytes(b"trusted\n")
+            replacement.write_bytes(b"changed\n")
+            original_open = self.helper["open_windows_snapshot_file"]
+
+            def replace_then_open(path: Path) -> io.BufferedReader:
+                replacement.replace(source)
+                return original_open(path)
+
+            with (
+                mock.patch.dict(
+                    self.helper["copy_worktree_file"].__globals__,
+                    {"open_windows_snapshot_file": replace_then_open},
+                ),
+                self.assertRaisesRegex(SystemExit, "file changed while opening"),
+            ):
+                self.helper["copy_worktree_file"](
+                    repo,
+                    Path(snapshot_dir),
+                    "review.txt",
+                )
+
+            self.assertFalse((Path(snapshot_dir) / "review.txt").exists())
+
     def test_worktree_snapshot_ignores_access_time_changes_caused_by_read(self) -> None:
         with (
             tempfile.TemporaryDirectory() as tempdir,
