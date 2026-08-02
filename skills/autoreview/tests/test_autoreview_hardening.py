@@ -1315,6 +1315,27 @@ class AutoreviewHardeningTests(unittest.TestCase):
         )
         self.assertTrue(all("Oversized review bundle chunk:" in prompt for prompt in prompts))
 
+    def test_kimi_prompt_budget_partitions_before_argv_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            prompts = self.helper["build_review_prompts"](
+                repo,
+                "commit",
+                "HEAD",
+                "# Commit Diff\n" + "safe review content\n" * 12_000,
+                "",
+                "",
+                self.helper["KIMI_MAX_PROMPT_BYTES"],
+            )
+
+        self.assertGreater(len(prompts), 1)
+        self.assertTrue(
+            all(
+                len(prompt.encode("utf-8")) <= self.helper["KIMI_MAX_PROMPT_BYTES"]
+                for prompt in prompts
+            )
+        )
+
     def test_review_prompt_preserves_bundle_ending_whitespace(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))

@@ -327,6 +327,11 @@ POWERSHELL_ENV_REFERENCE_PATTERN = re.compile(
 )
 MAX_BUNDLE_TEXT_BYTES = 180_000
 MAX_REVIEW_PROMPT_BYTES = 512_000
+# Kimi takes the prompt as a single `--prompt` argv element (no stdin mode),
+# so its per-pass ceiling must respect platform argv limits: Linux caps one
+# argument at MAX_ARG_STRLEN (131,072 bytes) and Windows caps the whole
+# command line at ~32,767 characters.
+KIMI_MAX_PROMPT_BYTES = 30_000 if os.name == "nt" else 120_000
 MAX_REVIEW_CHUNK_CONTEXT_BYTES = 64_000
 MAX_REVIEW_PASSES = 8
 MAX_DELETION_SECRET_FRAGMENTS = 256
@@ -9311,6 +9316,7 @@ def build_review_prompts(
     bundle: str,
     extra_prompt: str,
     datasets: str,
+    max_prompt_bytes: int = MAX_REVIEW_PROMPT_BYTES,
 ) -> list[str]:
     full_prompt = render_review_prompt(
         repo,
@@ -9320,7 +9326,7 @@ def build_review_prompts(
         extra_prompt,
         datasets,
     )
-    if utf8_size(full_prompt) <= MAX_REVIEW_PROMPT_BYTES:
+    if utf8_size(full_prompt) <= max_prompt_bytes:
         return [full_prompt]
 
     empty_chunk_prompt = render_review_prompt(
@@ -9333,7 +9339,7 @@ def build_review_prompts(
         (999_999, 999_999),
     )
     content_limit = (
-        MAX_REVIEW_PROMPT_BYTES
+        max_prompt_bytes
         - utf8_size(empty_chunk_prompt)
         - MAX_REVIEW_CHUNK_CONTEXT_BYTES
         - 4_096
@@ -9369,9 +9375,9 @@ def build_review_prompts(
             for index, chunk in enumerate(chunks, start=1)
         ]
         largest = max(utf8_size(prompt) for prompt in prompts)
-        if largest <= MAX_REVIEW_PROMPT_BYTES:
+        if largest <= max_prompt_bytes:
             return prompts
-        content_limit -= largest - MAX_REVIEW_PROMPT_BYTES + 1_024
+        content_limit -= largest - max_prompt_bytes + 1_024
         if content_limit < 16_000:
             break
     raise SystemExit(
@@ -10487,10 +10493,10 @@ def run_kimi(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     config, source_share = load_kimi_review_config(repo)
     if args.thinking in {"on", "off"}:
         config["thinking"] = {"enabled": args.thinking == "on"}
-    if len(prompt) > 400_000:
+    if len(prompt.encode("utf-8")) > KIMI_MAX_PROMPT_BYTES:
         raise SystemExit(
-            "kimi engine prompt exceeds the safe argv budget for `kimi -p`; "
-            "split the review into smaller targets"
+            "kimi engine prompt exceeds the safe argv budget for `kimi -p` "
+            f"({KIMI_MAX_PROMPT_BYTES} bytes); split the review into smaller targets"
         )
     temp_root = safe_temp_root(repo)
     with tempfile.TemporaryDirectory(
@@ -12851,6 +12857,9 @@ def main() -> int:
     )
     datasets, datasets_truncated = load_datasets(args, repo)
     input_truncated = bundle_truncated or prompt_truncated or datasets_truncated
+    max_prompt_bytes = MAX_REVIEW_PROMPT_BYTES
+    if any(reviewer.engine == "kimi" for reviewer in reviewers):
+        max_prompt_bytes = min(max_prompt_bytes, KIMI_MAX_PROMPT_BYTES)
     prompts = build_review_prompts(
         repo,
         target,
@@ -12858,6 +12867,7 @@ def main() -> int:
         bundle,
         extra_prompt,
         datasets,
+        max_prompt_bytes,
     )
     for prompt in prompts:
         require_no_known_secret_fragments(
