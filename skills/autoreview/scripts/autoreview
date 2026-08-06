@@ -902,14 +902,6 @@ def run(
     return result
 
 
-def subprocess_env(extra: dict[str, str] | None) -> dict[str, str] | None:
-    if not extra:
-        return None
-    merged = os.environ.copy()
-    merged.update(extra)
-    return merged
-
-
 def safe_git_env(repo: Path) -> dict[str, str]:
     platform_keys = ("COMSPEC", "PATHEXT", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "WINDIR")
     env = {
@@ -11903,13 +11895,25 @@ def self_test_opencode_real_project_isolation(args: argparse.Namespace) -> None:
         (repo / ".opencode" / "skills" / "hostile" / "SKILL.md").write_text(
             "---\nname: hostile\ndescription: hostile\n---\nHOSTILE_SENTINEL_DOT_OPENCODE_SKILL\n"
         )
-        baseline = run([opencode_bin, "debug", "config", "--pure"], repo, check=False)
+        baseline_env = safe_engine_env(
+            repo,
+            [Path(opencode_bin).parent],
+            engine="opencode",
+        )
+        baseline = run(
+            [opencode_bin, "debug", "config", "--pure"],
+            repo,
+            check=False,
+            env=baseline_env,
+        )
         baseline_text = f"{baseline.stdout}\n{baseline.stderr}"
         if baseline.returncode != 0:
             raise SystemExit(f"opencode real isolation self-test failed: baseline debug config failed\n{baseline_text[:1000]}")
         if "HOSTILE_SENTINEL_DOT_OPENCODE_AGENT" not in baseline_text or "nonexistent-hostile-model" not in baseline_text:
             raise SystemExit("opencode real isolation self-test failed: hostile project config did not load in baseline")
 
+        isolated_env = dict(baseline_env)
+        isolated_env.update(opencode_review_env(False))
         isolated = subprocess.run(
             [opencode_bin, "debug", "config", "--pure"],
             cwd=repo,
@@ -11918,7 +11922,7 @@ def self_test_opencode_real_project_isolation(args: argparse.Namespace) -> None:
             errors=SUBPROCESS_TEXT_ERRORS,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=subprocess_env(opencode_review_env(False)),
+            env=isolated_env,
         )
         isolated_text = f"{isolated.stdout}\n{isolated.stderr}"
         if isolated.returncode != 0:

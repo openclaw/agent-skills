@@ -6450,6 +6450,27 @@ class AutoreviewHardeningTests(unittest.TestCase):
             os.environ.clear()
             os.environ.update(old)
 
+    def test_opencode_isolation_self_test_does_not_forward_unrelated_secret(self) -> None:
+        self_test = self.helper["self_test_opencode_real_project_isolation"]
+        with tempfile.TemporaryDirectory() as tempdir:
+            fake = Path(tempdir) / "opencode"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "if 'UNRELATED_CREDENTIAL_SENTINEL' in os.environ:\n"
+                "    raise SystemExit(86)\n"
+                "if os.environ.get('OPENCODE_DISABLE_PROJECT_CONFIG') == '1':\n"
+                "    print('{}')\n"
+                "else:\n"
+                "    print('HOSTILE_SENTINEL_DOT_OPENCODE_AGENT nonexistent-hostile-model')\n"
+            )
+            fake.chmod(0o755)
+            with mock.patch.dict(
+                os.environ,
+                {"UNRELATED_CREDENTIAL_SENTINEL": realistic_secret_value()},
+            ):
+                self_test(argparse.Namespace(opencode_bin=str(fake)))
+
     def test_codex_isolation_restricts_tool_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
