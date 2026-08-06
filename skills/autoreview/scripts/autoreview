@@ -12565,6 +12565,80 @@ def reviewer_label(args: argparse.Namespace) -> str:
     return " ".join(parts)
 
 
+# Engines whose run_* implementation refuses unconditionally today; see
+# run_droid/run_copilot/run_opencode/run_cursor for the exact reason each
+# one fails closed.
+ALWAYS_UNAVAILABLE_ENGINES = frozenset({"droid", "copilot", "opencode", "cursor"})
+
+
+def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[bool, str | None]:
+    """Best-effort check of whether a reviewer's engine can plausibly run.
+
+    Mirrors run_engine()'s dispatch without shelling out to the CLI or
+    contacting any provider: engines that fail closed unconditionally are
+    reported unavailable directly, and the rest are checked for a
+    resolvable CLI binary on PATH.
+    """
+    engine = reviewer.engine
+    if engine in ALWAYS_UNAVAILABLE_ENGINES:
+        return False, f"{engine} engine is currently unavailable; run without --dry-run for the exact reason"
+    bin_by_engine = {
+        "codex": getattr(reviewer, "codex_bin", None),
+        "claude": getattr(reviewer, "claude_bin", None),
+        "pi": getattr(reviewer, "pi_bin", None),
+        "kimi": getattr(reviewer, "kimi_bin", None),
+    }
+    bin_name = bin_by_engine.get(engine)
+    if bin_name is None:
+        return False, f"unsupported engine: {engine}"
+    if find_command(bin_name, repo) is None:
+        return False, f"executable not found: {bin_name}"
+    return True, None
+
+
+def dry_run_preflight(
+    args: argparse.Namespace,
+    reviewers: list[argparse.Namespace],
+    repo: Path,
+    target: str,
+    target_ref: str | None,
+) -> int:
+    """Validate what upstream can check before a real run without
+    contacting any review engine: that the review bundle can be built for
+    the chosen target, and that each configured reviewer's CLI binary
+    resolves. Returns the process exit status: 0 when every check passes,
+    1 otherwise.
+    """
+    ok = True
+    known_secret_fragments: set[str] = set()
+    try:
+        if target == "local":
+            local_bundle(repo, known_secret_fragments)
+        elif target == "branch":
+            assert target_ref
+            branch_bundle(repo, target_ref, known_secret_fragments)
+        else:
+            commit_bundle(repo, args.commit, known_secret_fragments)
+        print("bundle: constructible")
+    except SystemExit as exc:
+        ok = False
+        print(f"bundle: FAILED ({exc.code})")
+    except Exception as exc:
+        ok = False
+        print(f"bundle: FAILED ({exc})")
+
+    for reviewer in reviewers:
+        available, reason = resolve_engine_binary(reviewer, repo)
+        label = reviewer_label(reviewer)
+        if available:
+            print(f"engine check: {label} OK")
+        else:
+            ok = False
+            print(f"engine check: {label} UNAVAILABLE ({reason})")
+
+    return 0 if ok else 1
+
+
 def run_reviewer(
     args: argparse.Namespace,
     repo: Path,
@@ -13053,7 +13127,7 @@ def main() -> int:
     if display_ref:
         print(f"ref: {display_ref}")
     if args.dry_run:
-        return 0
+        return dry_run_preflight(args, reviewers, repo, target, target_ref)
 
     review_source_snapshot = source_tree_snapshot(repo)
     run_trufflehog_preflight(repo, target, target_ref, args.commit)

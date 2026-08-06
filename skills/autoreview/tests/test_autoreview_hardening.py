@@ -7713,6 +7713,144 @@ class AutoreviewHardeningTests(unittest.TestCase):
             {content[start:end] for start, end in spans},
         )
 
+    def test_resolve_engine_binary_reports_hardcoded_unavailable_engines(self) -> None:
+        resolve_engine_binary = self.helper["resolve_engine_binary"]
+        for engine in ("droid", "copilot", "opencode", "cursor"):
+            reviewer = argparse.Namespace(engine=engine)
+            available, reason = resolve_engine_binary(reviewer, Path("."))
+            self.assertFalse(available)
+            self.assertIn(engine, reason)
+
+    def test_resolve_engine_binary_checks_path_resolution(self) -> None:
+        resolve_engine_binary = self.helper["resolve_engine_binary"]
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            fake_bin_dir = root / "bin"
+            fake_bin_dir.mkdir()
+            self.helper["write_executable"](
+                fake_bin_dir / "codex",
+                "#!/usr/bin/env python3\nraise SystemExit(0)\n",
+            )
+            found = argparse.Namespace(engine="codex", codex_bin="codex")
+            with mock.patch.dict(
+                os.environ,
+                {"PATH": f"{fake_bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"},
+            ):
+                available, reason = resolve_engine_binary(found, repo)
+            self.assertTrue(available, reason)
+            self.assertIsNone(reason)
+
+            missing = argparse.Namespace(
+                engine="claude",
+                claude_bin="definitely-not-a-real-claude-binary",
+            )
+            available, reason = resolve_engine_binary(missing, repo)
+            self.assertFalse(available)
+            self.assertIn("executable not found", reason)
+
+    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
+    def test_dry_run_flag_exits_zero_when_bundle_and_engine_resolve(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / "source.txt"
+            source.write_text("staged\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            codex_bin = self.helper["write_executable"](
+                root / "codex",
+                self.helper["fake_codex_script"](),
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--engine",
+                    "codex",
+                    "--codex-bin",
+                    str(codex_bin),
+                    "--dry-run",
+                ],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("bundle: constructible", result.stdout)
+            self.assertIn("OK", result.stdout)
+
+    def test_dry_run_flag_exits_nonzero_when_engine_binary_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--engine",
+                    "claude",
+                    "--claude-bin",
+                    "definitely-not-a-real-claude-binary",
+                    "--dry-run",
+                ],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("UNAVAILABLE", result.stdout)
+
+    def test_dry_run_flag_exits_nonzero_for_always_unavailable_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--mode", "local", "--engine", "droid", "--dry-run"],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("droid", result.stdout)
+            self.assertIn("UNAVAILABLE", result.stdout)
+
+    def test_dry_run_flag_exits_nonzero_when_bundle_construction_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "commit",
+                    "--commit",
+                    "no-such-ref-xyz",
+                    "--dry-run",
+                ],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("bundle: FAILED", result.stdout)
+
     def test_self_test_shortcut_runs_deterministic_checks(self) -> None:
         command = [str(SCRIPT), "--self-test"]
         if os.name == "nt":
