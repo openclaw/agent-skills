@@ -93,6 +93,21 @@ def add_fake_trufflehog(
     env["PATH"] = f"{root}{os.pathsep}{env.get('PATH', '')}"
 
 
+def path_excluding_command(name: str) -> str:
+    """Build a PATH value with every directory that resolves ``name``
+    removed, so a subprocess launched with it cannot find that command
+    even when it is genuinely installed on the host running the tests.
+    """
+    kept = []
+    for part in os.environ.get("PATH", "").split(os.pathsep):
+        if not part:
+            continue
+        if (Path(part) / name).is_file():
+            continue
+        kept.append(part)
+    return os.pathsep.join(kept)
+
+
 class AutoreviewHardeningTests(unittest.TestCase):
     def setUp(self) -> None:
         self.helper = load_helper()
@@ -7721,6 +7736,17 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.assertFalse(available)
             self.assertIn(engine, reason)
 
+    def test_resolve_engine_binary_rejects_codex_no_tools(self) -> None:
+        # run_codex() unconditionally refuses --no-tools (see line ~10318);
+        # the preflight must report that same rejection instead of reporting
+        # codex available just because its binary resolves.
+        resolve_engine_binary = self.helper["resolve_engine_binary"]
+        reviewer = argparse.Namespace(engine="codex", tools=False, codex_bin="codex")
+        available, reason = resolve_engine_binary(reviewer, Path("."))
+        self.assertFalse(available)
+        self.assertIn("--no-tools", reason)
+        self.assertIn("not supported by the Codex engine", reason)
+
     def test_resolve_engine_binary_checks_path_resolution(self) -> None:
         resolve_engine_binary = self.helper["resolve_engine_binary"]
         with tempfile.TemporaryDirectory() as tempdir:
@@ -7761,6 +7787,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 root / "codex",
                 self.helper["fake_codex_script"](),
             )
+            # The dry-run OK path now also requires trufflehog to resolve
+            # (see run_trufflehog_preflight), so stage a fake one instead
+            # of relying on the host actually having it installed.
+            env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
 
             result = subprocess.run(
                 [
@@ -7775,6 +7806,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     "--dry-run",
                 ],
                 cwd=repo,
+                env=env,
                 text=True,
                 capture_output=True,
                 check=False,
@@ -7782,7 +7814,80 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("bundle: constructible", result.stdout)
+            self.assertIn("trufflehog: OK", result.stdout)
             self.assertIn("OK", result.stdout)
+
+    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
+    def test_dry_run_flag_exits_nonzero_when_trufflehog_missing(self) -> None:
+        # Every real run invokes run_trufflehog_preflight before contacting
+        # any reviewer and exits if trufflehog is absent; --dry-run must
+        # fail the same way instead of reporting success because the
+        # reviewer CLI alone resolved.
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / "source.txt"
+            source.write_text("staged\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            codex_bin = self.helper["write_executable"](
+                root / "codex",
+                self.helper["fake_codex_script"](),
+            )
+            env = os.environ.copy()
+            env["PATH"] = path_excluding_command("trufflehog")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--engine",
+                    "codex",
+                    "--codex-bin",
+                    str(codex_bin),
+                    "--dry-run",
+                ],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("trufflehog: UNAVAILABLE", result.stdout)
+            self.assertIn(self.helper["TRUFFLEHOG_INSTALL_URL"], result.stdout)
+            # The engine itself still resolves; only trufflehog should fail.
+            self.assertRegex(result.stdout, r"engine check: codex[^\n]* OK\b")
+
+    def test_dry_run_flag_exits_nonzero_when_codex_no_tools(self) -> None:
+        # run_codex() unconditionally refuses --no-tools; --dry-run must
+        # not report codex available just because its binary resolves.
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--engine",
+                    "codex",
+                    "--no-tools",
+                    "--dry-run",
+                ],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("UNAVAILABLE", result.stdout)
+            self.assertIn("--no-tools", result.stdout)
 
     def test_dry_run_flag_exits_nonzero_when_engine_binary_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

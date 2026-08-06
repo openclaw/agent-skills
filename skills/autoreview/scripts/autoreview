@@ -12576,12 +12576,19 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
 
     Mirrors run_engine()'s dispatch without shelling out to the CLI or
     contacting any provider: engines that fail closed unconditionally are
-    reported unavailable directly, and the rest are checked for a
-    resolvable CLI binary on PATH.
+    reported unavailable directly, configurations that a real run rejects
+    before invoking the CLI (e.g. Codex with --no-tools, see run_codex)
+    are reported unavailable with that same reason, and the rest are
+    checked for a resolvable CLI binary on PATH.
     """
     engine = reviewer.engine
     if engine in ALWAYS_UNAVAILABLE_ENGINES:
         return False, f"{engine} engine is currently unavailable; run without --dry-run for the exact reason"
+    if engine == "codex" and not getattr(reviewer, "tools", True):
+        return (
+            False,
+            "--no-tools is not supported by the Codex engine; use --engine claude --no-tools for a no-tools run",
+        )
     bin_by_engine = {
         "codex": getattr(reviewer, "codex_bin", None),
         "claude": getattr(reviewer, "claude_bin", None),
@@ -12605,9 +12612,11 @@ def dry_run_preflight(
 ) -> int:
     """Validate what upstream can check before a real run without
     contacting any review engine: that the review bundle can be built for
-    the chosen target, and that each configured reviewer's CLI binary
-    resolves. Returns the process exit status: 0 when every check passes,
-    1 otherwise.
+    the chosen target, that the trufflehog binary a real run always
+    requires (see run_trufflehog_preflight) resolves, and that each
+    configured reviewer's CLI binary resolves and its configuration is
+    one a real run would actually accept. Returns the process exit
+    status: 0 when every check passes, 1 otherwise.
     """
     ok = True
     known_secret_fragments: set[str] = set()
@@ -12626,6 +12635,15 @@ def dry_run_preflight(
     except Exception as exc:
         ok = False
         print(f"bundle: FAILED ({exc})")
+
+    if find_command("trufflehog", repo) is None:
+        ok = False
+        print(
+            "trufflehog: UNAVAILABLE (TruffleHog is required but was not found. Install it using "
+            f"the official instructions, then rerun autoreview: {TRUFFLEHOG_INSTALL_URL})"
+        )
+    else:
+        print("trufflehog: OK")
 
     for reviewer in reviewers:
         available, reason = resolve_engine_binary(reviewer, repo)
