@@ -17,6 +17,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -1478,6 +1479,115 @@ def safe_test_env(repo: Path, isolated_home: Path) -> dict[str, str]:
     return env
 
 
+class EngineInterrupted(SystemExit):
+    """Raised after in-flight engine process groups have been terminated."""
+
+
+_OWNED_PROCESS_LOCK = threading.RLock()
+_OWNED_PROCESSES: dict[int, subprocess.Popen[str]] = {}
+
+
+def process_group_popen_kwargs() -> dict[str, Any]:
+    """Popen kwargs that give an engine child (and its descendants) its own process group.
+
+    This lets us terminate the whole group instead of just the immediate
+    child, so wrapper scripts and any processes they spawn do not outlive
+    the parent autoreview invocation.
+    """
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def register_owned_process(proc: subprocess.Popen[str]) -> None:
+    with _OWNED_PROCESS_LOCK:
+        _OWNED_PROCESSES[proc.pid] = proc
+
+
+def unregister_owned_process(proc: subprocess.Popen[str]) -> None:
+    with _OWNED_PROCESS_LOCK:
+        _OWNED_PROCESSES.pop(proc.pid, None)
+
+
+def terminate_owned_processes() -> None:
+    with _OWNED_PROCESS_LOCK:
+        processes = list(_OWNED_PROCESSES.values())
+    for proc in processes:
+        terminate_process_group(proc)
+
+
+def terminate_process_group(proc: subprocess.Popen, grace_seconds: float = 2.0) -> None:
+    """Terminate the process group owned by proc, then enforce bounded cleanup.
+
+    SIGKILL is sent to the group even if the leader has already exited:
+    engines can fork children that outlive the leader but stay in its
+    process group, and those would otherwise be orphaned.
+    """
+    if os.name == "nt":
+        # Windows has no process-group signalling; taskkill /T fells the whole
+        # tree. Fall back to a direct kill if taskkill fails or stalls.
+        try:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=grace_seconds,
+                check=False,
+            )
+            taskkill_failed = bool(result.returncode)
+        except (OSError, subprocess.TimeoutExpired):
+            taskkill_failed = True
+        if taskkill_failed and proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=grace_seconds)
+            except subprocess.TimeoutExpired:
+                pass
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    if proc.poll() is None:
+        try:
+            proc.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            pass
+    else:
+        time.sleep(grace_seconds)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    if proc.poll() is None:
+        try:
+            proc.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def engine_signal_handler(signum: int, _frame: Any) -> None:
+    terminate_owned_processes()
+    raise EngineInterrupted(128 + signum)
+
+
+class OwnedProcessSignalHandlers:
+    """Install process-wide handlers so interrupts clean up owned engine groups."""
+
+    def __enter__(self) -> "OwnedProcessSignalHandlers":
+        handled_signals = [signal.SIGINT, signal.SIGTERM]
+        if hasattr(signal, "SIGHUP"):
+            handled_signals.append(signal.SIGHUP)
+        self.previous = {signum: signal.getsignal(signum) for signum in handled_signals}
+        for signum in self.previous:
+            signal.signal(signum, engine_signal_handler)
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        for signum, handler in self.previous.items():
+            signal.signal(signum, handler)
+
+
 def parse_ps_time(value: str) -> float:
     try:
         day_text, clock = value.strip().split("-", 1) if "-" in value else ("0", value.strip())
@@ -1675,19 +1785,25 @@ def run_with_heartbeat(
         encoding=SUBPROCESS_TEXT_ENCODING,
         errors=SUBPROCESS_TEXT_ERRORS,
         env=env,
+        **process_group_popen_kwargs(),
     )
-    first_communicate = True
-    metrics = sample_process_metrics(resolve_root, proc.pid)
-    while True:
-        try:
-            stdout, stderr = proc.communicate(
-                input=input_text if first_communicate else None,
-                timeout=heartbeat_seconds,
-            )
-            return subprocess.CompletedProcess(args, int(proc.returncode or 0), stdout, stderr)
-        except subprocess.TimeoutExpired:
-            first_communicate = False
-            metrics = emit_heartbeat(label, resolve_root, started, proc, metrics)
+    register_owned_process(proc)
+    try:
+        first_communicate = True
+        metrics = sample_process_metrics(resolve_root, proc.pid)
+        while True:
+            try:
+                stdout, stderr = proc.communicate(
+                    input=input_text if first_communicate else None,
+                    timeout=heartbeat_seconds,
+                )
+                return subprocess.CompletedProcess(args, int(proc.returncode or 0), stdout, stderr)
+            except subprocess.TimeoutExpired:
+                first_communicate = False
+                metrics = emit_heartbeat(label, resolve_root, started, proc, metrics)
+    finally:
+        terminate_process_group(proc)
+        unregister_owned_process(proc)
 
 
 def run_with_stream(
@@ -1701,7 +1817,6 @@ def run_with_stream(
     env: dict[str, str] | None = None,
     resolve_root: Path,
 ) -> subprocess.CompletedProcess[str]:
-    started = time.monotonic()
     proc = subprocess.Popen(
         args,
         cwd=cwd,
@@ -1713,7 +1828,35 @@ def run_with_stream(
         errors=SUBPROCESS_TEXT_ERRORS,
         bufsize=1,
         env=env,
+        **process_group_popen_kwargs(),
     )
+    register_owned_process(proc)
+    try:
+        return collect_streamed_process(
+            proc,
+            args,
+            input_text=input_text,
+            label=label,
+            heartbeat_seconds=heartbeat_seconds,
+            stream_display=stream_display,
+            resolve_root=resolve_root,
+        )
+    finally:
+        terminate_process_group(proc)
+        unregister_owned_process(proc)
+
+
+def collect_streamed_process(
+    proc: subprocess.Popen[str],
+    args: list[str],
+    *,
+    input_text: str | None,
+    label: str,
+    heartbeat_seconds: int,
+    stream_display: Callable[[str, str], str | None] | None,
+    resolve_root: Path,
+) -> subprocess.CompletedProcess[str]:
+    started = time.monotonic()
     events: queue.Queue[tuple[str, str | None]] = queue.Queue()
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
@@ -12201,6 +12344,7 @@ def start_parallel_tests(
             "text": True,
             "encoding": SUBPROCESS_TEXT_ENCODING,
             "errors": SUBPROCESS_TEXT_ERRORS,
+            **process_group_popen_kwargs(),
         }
         if shell_kind == "default" or shell_kind == "cmd":
             proc = subprocess.Popen(command, shell=True, **popen_kwargs)
@@ -12234,6 +12378,7 @@ def start_parallel_tests(
     stderr_thread.start()
     setattr(proc, "_autoreview_test_home", test_home)
     setattr(proc, "_autoreview_stderr_thread", stderr_thread)
+    register_owned_process(proc)
     return proc, time.time()
 
 
@@ -12258,6 +12403,8 @@ def finish_parallel_tests(proc: subprocess.Popen, started: float) -> int:
         print(f"tests exit: {proc.returncode} after {int(time.time() - started)}s")
         return int(proc.returncode or 0)
     finally:
+        terminate_process_group(proc)
+        unregister_owned_process(proc)
         test_home = getattr(proc, "_autoreview_test_home", None)
         if isinstance(test_home, Path):
             shutil.rmtree(test_home, ignore_errors=True)
@@ -12993,6 +13140,11 @@ def atomic_write_text(path: Path, content: str) -> None:
 
 
 def main() -> int:
+    with OwnedProcessSignalHandlers():
+        return main_impl()
+
+
+def main_impl() -> int:
     args = parse_args()
     if args.self_test:
         return self_test()

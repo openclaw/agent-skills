@@ -5059,6 +5059,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
     def test_parallel_tests_use_sanitized_environment_for_every_shell(self) -> None:
         observed: list[dict[str, object]] = []
+        registered: list[object] = []
+        unregistered: list[object] = []
         sanitized_env = {
             "PATH": "/usr/bin",
             "HOME": "/safe/home",
@@ -5070,6 +5072,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             proc = mock.Mock()
             proc.returncode = 0
             proc.stderr = io.StringIO("")
+            proc.poll.return_value = 0
             return proc
 
         with tempfile.TemporaryDirectory() as tempdir:
@@ -5087,6 +5090,9 @@ class AutoreviewHardeningTests(unittest.TestCase):
                         if actual_repo == repo
                         else self.fail("parallel tests resolved a shell for the wrong repository")
                     ),
+                    "register_owned_process": registered.append,
+                    "unregister_owned_process": unregistered.append,
+                    "terminate_process_group": lambda proc: None,
                 },
             ), mock.patch("subprocess.Popen", side_effect=fake_popen):
                 for shell_kind in ("default", "cmd", "powershell", "pwsh"):
@@ -5104,10 +5110,16 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.assertEqual(invocation["env"], sanitized_env)
             self.assertEqual(invocation["stderr"], subprocess.PIPE)
             self.assertTrue(invocation["text"])
+            if os.name == "nt":
+                self.assertEqual(invocation["creationflags"], subprocess.CREATE_NEW_PROCESS_GROUP)
+            else:
+                self.assertTrue(invocation["start_new_session"])
         self.assertTrue(observed[0]["shell"])
         self.assertTrue(observed[1]["shell"])
         self.assertNotIn("shell", observed[2])
         self.assertNotIn("shell", observed[3])
+        self.assertEqual(registered, unregistered)
+        self.assertEqual(len(registered), 4)
 
     def test_parallel_test_finish_does_not_wait_for_inherited_stderr_pipe(
         self,
@@ -5122,12 +5134,20 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 proc = mock.Mock()
                 proc.returncode = 0
                 proc.wait.return_value = 0
+                proc.poll.return_value = 0
                 setattr(proc, "_autoreview_test_home", test_home)
                 setattr(proc, "_autoreview_stderr_thread", stderr_thread)
 
                 started = time.time()
                 before = time.monotonic()
-                result = self.helper["finish_parallel_tests"](proc, started)
+                with mock.patch.dict(
+                    self.helper["finish_parallel_tests"].__globals__,
+                    {
+                        "terminate_process_group": lambda proc: None,
+                        "unregister_owned_process": lambda proc: None,
+                    },
+                ):
+                    result = self.helper["finish_parallel_tests"](proc, started)
                 elapsed = time.monotonic() - before
 
                 self.assertEqual(result, 0)
@@ -5136,6 +5156,59 @@ class AutoreviewHardeningTests(unittest.TestCase):
         finally:
             release.set()
             stderr_thread.join(timeout=1)
+
+    def test_terminate_process_group_uses_windows_process_api(self) -> None:
+        proc = mock.Mock(pid=1234)
+        with mock.patch.object(os, "name", "nt"), mock.patch(
+            "subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0),
+        ) as run:
+            self.helper["terminate_process_group"](proc, grace_seconds=0.01)
+        self.assertEqual(run.call_args.args[0], ["taskkill", "/PID", "1234", "/T", "/F"])
+        proc.kill.assert_not_called()
+
+    def test_terminate_process_group_kills_orphans_after_leader_exit(self) -> None:
+        proc = mock.Mock(pid=1234)
+        proc.poll.return_value = 0
+        with mock.patch("os.killpg") as killpg, mock.patch("time.sleep") as sleep:
+            self.helper["terminate_process_group"](proc, grace_seconds=0.01)
+        self.assertEqual(
+            killpg.call_args_list,
+            [mock.call(1234, self.helper["signal"].SIGTERM), mock.call(1234, self.helper["signal"].SIGKILL)],
+        )
+        sleep.assert_called_once_with(0.01)
+
+    @unittest.skipIf(os.name == "nt", "process groups are POSIX-only")
+    def test_owned_process_handlers_include_sighup(self) -> None:
+        signal_module = self.helper["signal"]
+        installed: list[int] = []
+        with mock.patch.object(
+            signal_module, "getsignal", return_value=signal_module.SIG_DFL
+        ), mock.patch.object(
+            signal_module,
+            "signal",
+            side_effect=lambda signum, _handler: installed.append(signum),
+        ):
+            with self.helper["OwnedProcessSignalHandlers"]():
+                pass
+        self.assertIn(signal_module.SIGHUP, installed)
+
+    def test_owned_process_registry_terminates_all_tracked_groups(self) -> None:
+        terminated: list[object] = []
+        proc_a = mock.Mock(pid=111)
+        proc_b = mock.Mock(pid=222)
+        with mock.patch.dict(
+            self.helper["register_owned_process"].__globals__,
+            {"terminate_process_group": terminated.append},
+        ):
+            self.helper["register_owned_process"](proc_a)
+            self.helper["register_owned_process"](proc_b)
+            try:
+                self.helper["terminate_owned_processes"]()
+            finally:
+                self.helper["unregister_owned_process"](proc_a)
+                self.helper["unregister_owned_process"](proc_b)
+        self.assertEqual(set(terminated), {proc_a, proc_b})
 
     def test_source_tree_snapshot_detects_parallel_test_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
