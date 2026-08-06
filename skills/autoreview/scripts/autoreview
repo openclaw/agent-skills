@@ -2540,7 +2540,6 @@ def run_trufflehog_preflight(
                 base_commit,
                 "--branch",
                 "HEAD",
-                "--no-update",
                 "--no-color",
                 # Match TruffleHog's pre-commit mode. Unverified heuristic
                 # candidates are excluded to avoid restoring false positives.
