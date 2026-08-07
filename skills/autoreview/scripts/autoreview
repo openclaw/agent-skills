@@ -10059,13 +10059,23 @@ def load_kimi_review_config(repo: Path) -> tuple[dict[str, Any], Path | None]:
     return data, source_share
 
 
-def prepare_kimi_runtime_auth(
+def validate_kimi_runtime_auth_sources(
     repo: Path,
     source_share: Path | None,
-    runtime_share: Path,
-) -> None:
+) -> tuple[str, Path | None]:
+    """Non-mutating equivalent of the raising checks in
+    prepare_kimi_runtime_auth(): resolves and validates the Kimi device_id
+    and OAuth credentials sources a real run would stage, without writing
+    or symlinking anything. prepare_kimi_runtime_auth() calls this first so
+    the raising conditions live in exactly one place; a dry run can call it
+    directly to reject the same invalid/missing device_id or credentials
+    path a real run would exit on, without touching disk.
+
+    Returns (device_id, resolved_credentials_dir_or_None) for
+    prepare_kimi_runtime_auth() to reuse when staging.
+    """
     if source_share is None:
-        return
+        return "", None
     source_device_id = source_share / "device_id"
     try:
         resolved_device_id = source_device_id.resolve(strict=True)
@@ -10078,19 +10088,33 @@ def prepare_kimi_runtime_auth(
             or not re.fullmatch(r"[A-Za-z0-9-]{16,128}", device_id)
         ):
             raise SystemExit("Kimi device identity is not safe to stage for review")
-        (runtime_share / "device_id").write_text(device_id, encoding="utf-8")
     source_credentials = source_share / "credentials"
     try:
-        resolved = source_credentials.resolve(strict=True)
+        resolved_credentials = source_credentials.resolve(strict=True)
     except OSError:
-        return
-    if not resolved.is_dir() or is_within(resolved, repo.resolve()):
+        return device_id, None
+    if not resolved_credentials.is_dir() or is_within(resolved_credentials, repo.resolve()):
         raise SystemExit(
             "Kimi OAuth credentials must be an external directory outside the reviewed repository"
         )
+    return device_id, resolved_credentials
+
+
+def prepare_kimi_runtime_auth(
+    repo: Path,
+    source_share: Path | None,
+    runtime_share: Path,
+) -> None:
+    device_id, resolved_credentials = validate_kimi_runtime_auth_sources(repo, source_share)
+    if source_share is None:
+        return
+    if device_id:
+        (runtime_share / "device_id").write_text(device_id, encoding="utf-8")
+    if resolved_credentials is None:
+        return
     target = runtime_share / "credentials"
     try:
-        target.symlink_to(resolved, target_is_directory=True)
+        target.symlink_to(resolved_credentials, target_is_directory=True)
     except OSError as exc:
         raise SystemExit(
             "unable to isolate Kimi OAuth credentials; use KIMI_API_KEY or enable "
@@ -12630,7 +12654,25 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
     before run_kimi() ever invokes the CLI (see run_kimi); that load is a
     local, read-only file resolve + TOML parse with no engine contact, so
     it is replayed here too and can reject a repository-controlled or
-    malformed Kimi setup the same way the real run would.
+    malformed Kimi setup the same way the real run would. run_kimi() then
+    calls prepare_kimi_runtime_auth(), which raises on an unsafe/invalid
+    device_id or a credentials path that is missing, not a directory, or
+    inside the reviewed repo; validate_kimi_runtime_auth_sources() is the
+    non-mutating equivalent of exactly those raising checks (it never
+    stages files) and is replayed here too, so a dry run cannot report
+    kimi OK for an auth source a real run would reject.
+
+    Claude additionally computes its tool inventory via
+    claude_allowed_tools()/claude_tool_inventory() before run_claude() ever
+    invokes the CLI (see run_claude, gated on args.tools); that is a pure,
+    non-mutating computation over --claude-allowed-tools/--no-web-search
+    with no I/O, so it is replayed here too and can reject a non-read-only
+    or malformed tool rule the same way the real run would. pi and other
+    engines have no equivalent raising callable between their isolation
+    probe and engine spawn (see run_pi): pi only builds an argv list, and
+    write_kimi_review_files (kimi's file-write staging step) only fails on
+    tmp-state errors (e.g. disk full), never on user setup, so it is not
+    mirrored here.
     """
     engine = reviewer.engine
     if engine in ALWAYS_UNAVAILABLE_ENGINES:
@@ -12659,7 +12701,13 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
             return False, str(exc.code)
     if engine == "kimi":
         try:
-            load_kimi_review_config(repo)
+            _, source_share = load_kimi_review_config(repo)
+            validate_kimi_runtime_auth_sources(repo, source_share)
+        except SystemExit as exc:
+            return False, str(exc.code)
+    if engine == "claude" and getattr(reviewer, "tools", True):
+        try:
+            claude_tool_inventory(reviewer)
         except SystemExit as exc:
             return False, str(exc.code)
     return True, None
@@ -12716,9 +12764,10 @@ def dry_run_preflight(
     (see main() just after dry_run_preflight returns), that the trufflehog
     binary a real run always requires (see run_trufflehog_preflight)
     resolves, and that each configured reviewer's CLI binary resolves and
-    its configuration (including, for Kimi, load_kimi_review_config) is
-    one a real run would actually accept. Returns the process exit
-    status: 0 when every check passes, 1 otherwise.
+    its configuration (including, for Kimi, load_kimi_review_config and
+    validate_kimi_runtime_auth_sources, and for Claude, the tool
+    inventory) is one a real run would actually accept. Returns the
+    process exit status: 0 when every check passes, 1 otherwise.
     """
     ok = True
     known_secret_fragments: set[str] = set()

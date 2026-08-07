@@ -8173,6 +8173,12 @@ class AutoreviewHardeningTests(unittest.TestCase):
             )
             env = os.environ.copy()
             add_fake_trufflehog(self.helper, root, env)
+            # Isolate KIMI_CODE_HOME to an empty, hermetic directory instead
+            # of leaking the host's real ~/.kimi-code (which may or may not
+            # exist) into this test; an empty source share has no
+            # device_id/credentials to validate and must still report OK.
+            env["KIMI_CODE_HOME"] = str(root / "kimi-empty-home")
+            (root / "kimi-empty-home").mkdir()
 
             result = subprocess.run(
                 [
@@ -8244,6 +8250,207 @@ class AutoreviewHardeningTests(unittest.TestCase):
             )
             # The bundle, inputs, and prompt assembly still resolve; only the
             # Kimi-specific config load fails.
+            self.assertIn("prompt: OK", result.stdout)
+
+    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
+    def test_dry_run_flag_exits_nonzero_when_kimi_device_id_invalid(self) -> None:
+        # run_kimi() calls prepare_kimi_runtime_auth() after
+        # load_kimi_review_config() and before the CLI is ever invoked for
+        # a review; that raises on a device_id that fails the safe-to-stage
+        # format check (see validate_kimi_runtime_auth_sources). --dry-run
+        # must reuse that same non-mutating check rather than reporting
+        # kimi available just because the CLI binary, version, and config
+        # load resolved.
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / "source.txt"
+            source.write_text("staged\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            kimi_bin = self.helper["write_executable"](
+                root / "kimi",
+                self.helper["fake_kimi_script"](),
+            )
+            source_share = root / "kimi-home"
+            source_share.mkdir()
+            (source_share / "device_id").write_text("not-a-valid-id!!", encoding="utf-8")
+            env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
+            env["KIMI_CODE_HOME"] = str(source_share)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--engine",
+                    "kimi",
+                    "--kimi-bin",
+                    str(kimi_bin),
+                    "--dry-run",
+                ],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertRegex(result.stdout, r"engine check: kimi[^\n]* UNAVAILABLE")
+            self.assertIn(
+                "Kimi device identity is not safe to stage for review",
+                result.stdout,
+            )
+            # The bundle, inputs, and prompt assembly still resolve; only the
+            # Kimi-specific auth source check fails.
+            self.assertIn("prompt: OK", result.stdout)
+
+    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
+    def test_dry_run_flag_exits_nonzero_when_kimi_credentials_not_a_directory(self) -> None:
+        # Same raising check as above (see
+        # validate_kimi_runtime_auth_sources), triggered instead by a
+        # credentials path that resolves to a file rather than a directory
+        # -- the same shape of error a real run's prepare_kimi_runtime_auth()
+        # would raise on before ever invoking the CLI.
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / "source.txt"
+            source.write_text("staged\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            kimi_bin = self.helper["write_executable"](
+                root / "kimi",
+                self.helper["fake_kimi_script"](),
+            )
+            source_share = root / "kimi-home"
+            source_share.mkdir()
+            (source_share / "credentials").write_text("not-a-directory", encoding="utf-8")
+            env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
+            env["KIMI_CODE_HOME"] = str(source_share)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--engine",
+                    "kimi",
+                    "--kimi-bin",
+                    str(kimi_bin),
+                    "--dry-run",
+                ],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertRegex(result.stdout, r"engine check: kimi[^\n]* UNAVAILABLE")
+            self.assertIn(
+                "Kimi OAuth credentials must be an external directory outside the reviewed repository",
+                result.stdout,
+            )
+            self.assertIn("prompt: OK", result.stdout)
+
+    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
+    def test_dry_run_flag_exits_zero_when_kimi_auth_sources_valid(self) -> None:
+        # A validly staged device_id and OAuth credentials directory (the
+        # shape prepare_kimi_runtime_auth() accepts and stages for a real
+        # run) must still report kimi OK under --dry-run.
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / "source.txt"
+            source.write_text("staged\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            kimi_bin = self.helper["write_executable"](
+                root / "kimi",
+                self.helper["fake_kimi_script"](),
+            )
+            source_share = root / "kimi-home"
+            source_share.mkdir()
+            (source_share / "device_id").write_text(
+                "0123456789abcdef0123456789abcdef", encoding="utf-8"
+            )
+            (source_share / "credentials").mkdir()
+            env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
+            env["KIMI_CODE_HOME"] = str(source_share)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--engine",
+                    "kimi",
+                    "--kimi-bin",
+                    str(kimi_bin),
+                    "--dry-run",
+                ],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertRegex(result.stdout, r"engine check: kimi[^\n]* OK\b")
+
+    def test_dry_run_flag_exits_nonzero_when_claude_tool_not_read_only(self) -> None:
+        # run_claude() computes its --tools inventory via
+        # claude_allowed_tools()/claude_tool_inventory() before the CLI is
+        # ever invoked for a review, and that raises when a configured
+        # --claude-allowed-tools rule is not one of the read-only tools
+        # (see claude_tool_inventory); --dry-run must reuse that same
+        # pure, non-mutating computation rather than reporting claude
+        # available just because the CLI binary, version, and isolation
+        # flags resolved.
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / "source.txt"
+            source.write_text("staged\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            claude_bin = self.helper["write_executable"](
+                root / "claude",
+                self.helper["fake_claude_script"](),
+            )
+            env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--engine",
+                    "claude",
+                    "--claude-bin",
+                    str(claude_bin),
+                    "--claude-allowed-tools",
+                    "Bash",
+                    "--dry-run",
+                ],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertRegex(result.stdout, r"engine check: claude[^\n]* UNAVAILABLE")
+            self.assertIn("Claude review tool is not read-only: Bash", result.stdout)
             self.assertIn("prompt: OK", result.stdout)
 
     @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
