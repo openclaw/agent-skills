@@ -11359,6 +11359,33 @@ print(json.dumps(report))
 	'''
 
 
+def fake_kimi_script() -> str:
+    return r'''#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+if "--version" in args or "-v" in args:
+    print(os.environ.get("AUTOREVIEW_FAKE_KIMI_VERSION", "0.30.0"))
+    raise SystemExit(0)
+if "--help" in args or "-h" in args:
+    print(os.environ.get("AUTOREVIEW_FAKE_KIMI_HELP", "--agent-file\n--skills-dir\n--prompt\n--output-format\n--model"))
+    raise SystemExit(0)
+record = os.environ.get("AUTOREVIEW_FAKE_RECORD")
+if record:
+    Path(record).write_text(json.dumps({"argv": args, "cwd": os.getcwd(), "stdin": sys.stdin.read()}))
+report = {
+    "findings": [],
+    "overall_correctness": "patch is correct",
+    "overall_explanation": "fake kimi clean",
+    "overall_confidence": 0.99,
+}
+print(json.dumps(report))
+'''
+
+
 def fake_opencode_script() -> str:
     return r'''#!/usr/bin/env python3
 import json
@@ -12571,6 +12598,13 @@ def reviewer_label(args: argparse.Namespace) -> str:
 ALWAYS_UNAVAILABLE_ENGINES = frozenset({"droid", "copilot", "opencode", "cursor"})
 
 
+ENGINE_ISOLATION_PROBES: dict[str, Callable[[argparse.Namespace, Path], object]] = {
+    "claude": ensure_claude_isolation_supported,
+    "pi": ensure_pi_isolation_supported,
+    "kimi": ensure_kimi_isolation_supported,
+}
+
+
 def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[bool, str | None]:
     """Best-effort check of whether a reviewer's engine can plausibly run.
 
@@ -12580,6 +12614,17 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
     before invoking the CLI (e.g. Codex with --no-tools, see run_codex)
     are reported unavailable with that same reason, and the rest are
     checked for a resolvable CLI binary on PATH.
+
+    Once a binary resolves, claude/pi/kimi are also put through the same
+    local version and required-flag probes their real runners perform
+    before contacting the engine (ensure_claude_isolation_supported,
+    ensure_pi_isolation_supported, ensure_kimi_isolation_supported), so a
+    dry run cannot report OK for a configuration a real run would reject
+    immediately (unsupported CLI version, missing required flag). Those
+    probes only invoke the resolved binary locally with --version/--help;
+    they never contact a provider. Codex has its own unconditional
+    --no-tools rejection above and no local version gate, so it is left
+    alone here.
     """
     engine = reviewer.engine
     if engine in ALWAYS_UNAVAILABLE_ENGINES:
@@ -12600,6 +12645,12 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
         return False, f"unsupported engine: {engine}"
     if find_command(bin_name, repo) is None:
         return False, f"executable not found: {bin_name}"
+    probe = ENGINE_ISOLATION_PROBES.get(engine)
+    if probe is not None:
+        try:
+            probe(reviewer, repo)
+        except SystemExit as exc:
+            return False, str(exc.code)
     return True, None
 
 

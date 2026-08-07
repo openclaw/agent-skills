@@ -7956,6 +7956,162 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("bundle: FAILED", result.stdout)
 
+    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
+    def test_dry_run_flag_exits_nonzero_when_pi_version_unsupported(self) -> None:
+        # run_pi() calls ensure_pi_isolation_supported(), which requires
+        # Pi >= 0.79.0 for --no-approve trust isolation before the CLI is
+        # ever invoked for a review; --dry-run must reuse that same local
+        # --version probe rather than reporting pi available just because
+        # the binary resolves on PATH.
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            pi_bin = self.helper["write_executable"](
+                root / "pi",
+                self.helper["fake_pi_script"](),
+            )
+            env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
+            env["AUTOREVIEW_FAKE_PI_VERSION"] = "0.50.0"
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--engine",
+                    "pi",
+                    "--pi-bin",
+                    str(pi_bin),
+                    "--dry-run",
+                ],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertRegex(result.stdout, r"engine check: pi[^\n]* UNAVAILABLE")
+            self.assertIn("0.79.0", result.stdout)
+
+    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
+    def test_dry_run_flag_exits_zero_when_pi_version_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / "source.txt"
+            source.write_text("staged\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            pi_bin = self.helper["write_executable"](
+                root / "pi",
+                self.helper["fake_pi_script"](),
+            )
+            env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--engine",
+                    "pi",
+                    "--pi-bin",
+                    str(pi_bin),
+                    "--dry-run",
+                ],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertRegex(result.stdout, r"engine check: pi[^\n]* OK\b")
+
+    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
+    def test_dry_run_flag_exits_nonzero_when_kimi_version_unsupported(self) -> None:
+        # run_kimi() calls ensure_kimi_isolation_supported(), which requires
+        # Kimi Code CLI >= 0.30.0 before the CLI is ever invoked for a
+        # review; --dry-run must reuse that same local --version probe
+        # rather than reporting kimi available just because the binary
+        # resolves on PATH.
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            kimi_bin = self.helper["write_executable"](
+                root / "kimi",
+                self.helper["fake_kimi_script"](),
+            )
+            env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
+            env["AUTOREVIEW_FAKE_KIMI_VERSION"] = "0.10.0"
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--engine",
+                    "kimi",
+                    "--kimi-bin",
+                    str(kimi_bin),
+                    "--dry-run",
+                ],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertRegex(result.stdout, r"engine check: kimi[^\n]* UNAVAILABLE")
+            self.assertIn("0.30.0", result.stdout)
+
+    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
+    def test_dry_run_flag_exits_zero_when_kimi_version_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / "source.txt"
+            source.write_text("staged\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            kimi_bin = self.helper["write_executable"](
+                root / "kimi",
+                self.helper["fake_kimi_script"](),
+            )
+            env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--engine",
+                    "kimi",
+                    "--kimi-bin",
+                    str(kimi_bin),
+                    "--dry-run",
+                ],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertRegex(result.stdout, r"engine check: kimi[^\n]* OK\b")
+
     def test_self_test_shortcut_runs_deterministic_checks(self) -> None:
         command = [str(SCRIPT), "--self-test"]
         if os.name == "nt":
