@@ -12663,11 +12663,14 @@ def dry_run_preflight(
 ) -> int:
     """Validate what upstream can check before a real run without
     contacting any review engine: that the review bundle can be built for
-    the chosen target, that the trufflehog binary a real run always
-    requires (see run_trufflehog_preflight) resolves, and that each
-    configured reviewer's CLI binary resolves and its configuration is
-    one a real run would actually accept. Returns the process exit
-    status: 0 when every check passes, 1 otherwise.
+    the chosen target, that --prompt-file and --dataset inputs resolve
+    and pass the same repo-relative/existence/final-prompt checks the
+    real run applies via load_extra_prompt/load_datasets (see main_impl
+    just after dry_run_preflight returns), that the trufflehog binary a
+    real run always requires (see run_trufflehog_preflight) resolves,
+    and that each configured reviewer's CLI binary resolves and its
+    configuration is one a real run would actually accept. Returns the
+    process exit status: 0 when every check passes, 1 otherwise.
     """
     ok = True
     known_secret_fragments: set[str] = set()
@@ -12686,6 +12689,17 @@ def dry_run_preflight(
     except Exception as exc:
         ok = False
         print(f"bundle: FAILED ({exc})")
+
+    try:
+        load_extra_prompt(args, repo)
+        load_datasets(args, repo)
+        print("inputs: OK")
+    except SystemExit as exc:
+        ok = False
+        print(f"inputs: FAILED ({exc.code})")
+    except Exception as exc:
+        ok = False
+        print(f"inputs: FAILED ({exc})")
 
     if find_command("trufflehog", repo) is None:
         ok = False
