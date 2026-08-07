@@ -17,7 +17,7 @@ import threading
 import time
 import unittest
 from unittest import mock
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "autoreview"
@@ -5159,12 +5159,53 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
     def test_terminate_process_group_uses_windows_process_api(self) -> None:
         proc = mock.Mock(pid=1234)
-        with mock.patch.object(os, "name", "nt"), mock.patch(
+        fake_taskkill = r"C:\Windows\System32\taskkill.exe"
+        with mock.patch.object(os, "name", "nt"), mock.patch.dict(
+            self.helper["terminate_process_group"].__globals__,
+            {"_resolve_windows_taskkill": lambda: fake_taskkill},
+        ), mock.patch(
             "subprocess.run",
             return_value=subprocess.CompletedProcess([], 0),
         ) as run:
             self.helper["terminate_process_group"](proc, grace_seconds=0.01)
-        self.assertEqual(run.call_args.args[0], ["taskkill", "/PID", "1234", "/T", "/F"])
+        argv = run.call_args.args[0]
+        self.assertEqual(argv, [fake_taskkill, "/PID", "1234", "/T", "/F"])
+        # A repo-local taskkill.exe on PATH/CWD must never be reachable here:
+        # the resolved argv[0] has to be an absolute path, never the bare name.
+        self.assertTrue(PureWindowsPath(argv[0]).is_absolute())
+        self.assertNotEqual(argv[0], "taskkill")
+        proc.kill.assert_not_called()
+
+    def test_terminate_process_group_skips_taskkill_when_unresolved(self) -> None:
+        proc = mock.Mock(pid=1234)
+        proc.poll.return_value = None
+        with mock.patch.object(os, "name", "nt"), mock.patch.dict(
+            self.helper["terminate_process_group"].__globals__,
+            {"_resolve_windows_taskkill": lambda: None},
+        ), mock.patch("subprocess.run") as run:
+            self.helper["terminate_process_group"](proc, grace_seconds=0.01)
+        run.assert_not_called()
+        proc.kill.assert_called_once()
+
+    def test_terminate_process_group_attempts_taskkill_when_leader_already_exited(
+        self,
+    ) -> None:
+        # Regression for detached descendants leaking: taskkill /T is still
+        # worth attempting even once the leader PID has exited (it can still
+        # fell the tree while the PID is valid), but the direct-kill fallback
+        # only ever makes sense for a leader that is still alive.
+        proc = mock.Mock(pid=1234)
+        proc.poll.return_value = 0
+        fake_taskkill = r"C:\Windows\System32\taskkill.exe"
+        with mock.patch.object(os, "name", "nt"), mock.patch.dict(
+            self.helper["terminate_process_group"].__globals__,
+            {"_resolve_windows_taskkill": lambda: fake_taskkill},
+        ), mock.patch(
+            "subprocess.run",
+            return_value=subprocess.CompletedProcess([], 1),
+        ) as run:
+            self.helper["terminate_process_group"](proc, grace_seconds=0.01)
+        self.assertEqual(run.call_args.args[0][0], fake_taskkill)
         proc.kill.assert_not_called()
 
     def test_terminate_process_group_kills_orphans_after_leader_exit(self) -> None:
@@ -5199,7 +5240,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
         proc_b = mock.Mock(pid=222)
         with mock.patch.dict(
             self.helper["register_owned_process"].__globals__,
-            {"terminate_process_group": terminated.append},
+            {
+                "_signal_owned_process_group": lambda proc: (terminated.append(proc), True)[1],
+                "_await_owned_process_groups": lambda procs, grace: None,
+                "_enforce_owned_process_group": lambda proc, grace: None,
+            },
         ):
             self.helper["register_owned_process"](proc_a)
             self.helper["register_owned_process"](proc_b)
@@ -5209,6 +5254,127 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.helper["unregister_owned_process"](proc_a)
                 self.helper["unregister_owned_process"](proc_b)
         self.assertEqual(set(terminated), {proc_a, proc_b})
+
+    def test_terminate_owned_processes_signals_all_groups_before_grace_wait(
+        self,
+    ) -> None:
+        # Regression: interrupt handling used to run each group's full
+        # terminate-wait-kill sequence serially, so N owned engines cost
+        # grace_seconds * N. Phase 1 (signal) must complete for every
+        # group before phase 2 (the shared grace wait) starts for any of
+        # them.
+        order: list[str] = []
+        proc_a = mock.Mock(pid=111)
+        proc_b = mock.Mock(pid=222)
+        proc_gone = mock.Mock(pid=333)
+
+        def fake_signal(proc: object) -> bool:
+            order.append(f"signal:{proc.pid}")  # type: ignore[attr-defined]
+            return proc is not proc_gone
+
+        def fake_await(procs: list[object], grace_seconds: float) -> None:
+            order.append("await:" + ",".join(str(p.pid) for p in procs))  # type: ignore[attr-defined]
+
+        def fake_enforce(proc: object, grace_seconds: float) -> None:
+            order.append(f"enforce:{proc.pid}")  # type: ignore[attr-defined]
+
+        with mock.patch.dict(
+            self.helper["register_owned_process"].__globals__,
+            {
+                "_signal_owned_process_group": fake_signal,
+                "_await_owned_process_groups": fake_await,
+                "_enforce_owned_process_group": fake_enforce,
+            },
+        ):
+            self.helper["register_owned_process"](proc_a)
+            self.helper["register_owned_process"](proc_gone)
+            self.helper["register_owned_process"](proc_b)
+            try:
+                self.helper["terminate_owned_processes"]()
+            finally:
+                self.helper["unregister_owned_process"](proc_a)
+                self.helper["unregister_owned_process"](proc_gone)
+                self.helper["unregister_owned_process"](proc_b)
+
+        self.assertEqual(
+            order,
+            [
+                "signal:111",
+                "signal:333",
+                "signal:222",
+                "await:111,222",
+                "enforce:111",
+                "enforce:222",
+            ],
+        )
+
+    @unittest.skipIf(os.name == "nt", "signal.signal swapping is POSIX-tested here")
+    def test_deferred_owned_process_signals_terminates_proc_registered_during_window(
+        self,
+    ) -> None:
+        # Regression: a signal delivered between Popen() and
+        # register_owned_process() used to orphan the just-spawned group,
+        # because the real handler couldn't terminate a process it didn't
+        # know about yet. Simulate that race by invoking the collector
+        # (the handler installed for the critical section) manually while
+        # still inside the `with` block.
+        signal_module = self.helper["signal"]
+        proc = mock.Mock(pid=4321)
+        signaled: list[object] = []
+        with mock.patch.dict(
+            self.helper["register_owned_process"].__globals__,
+            {
+                "_signal_owned_process_group": lambda p: (signaled.append(p), False)[1],
+                "_await_owned_process_groups": lambda procs, grace: None,
+                "_enforce_owned_process_group": lambda p, grace: None,
+            },
+        ):
+            try:
+                with self.assertRaises(self.helper["EngineInterrupted"]) as ctx:
+                    with self.helper["deferred_owned_process_signals"]():
+                        self.helper["register_owned_process"](proc)
+                        handler = signal_module.getsignal(signal_module.SIGTERM)
+                        handler(signal_module.SIGTERM, None)
+                        # Deferred: still inside the critical section, so the
+                        # real handler (and thus termination) must not have
+                        # run yet.
+                        self.assertEqual(signaled, [])
+            finally:
+                self.helper["unregister_owned_process"](proc)
+        self.assertEqual(signaled, [proc])
+        self.assertEqual(ctx.exception.code, 128 + signal_module.SIGTERM)
+
+    @unittest.skipIf(os.name == "nt", "signal.signal swapping is POSIX-tested here")
+    def test_deferred_owned_process_signals_restores_handlers_without_signal(
+        self,
+    ) -> None:
+        signal_module = self.helper["signal"]
+        before = signal_module.getsignal(signal_module.SIGTERM)
+        with self.helper["deferred_owned_process_signals"]():
+            during = signal_module.getsignal(signal_module.SIGTERM)
+            self.assertIsNot(during, before)
+        after = signal_module.getsignal(signal_module.SIGTERM)
+        self.assertIs(after, before)
+
+    def test_engine_interrupted_is_not_swallowed_by_except_system_exit(self) -> None:
+        # Regression: EngineInterrupted used to subclass SystemExit, so
+        # internal `except SystemExit` guards like read_text_with_status's
+        # converted an in-flight interrupt into an unreadable-file result
+        # and kept going instead of unwinding.
+        with mock.patch.dict(
+            self.helper["read_text_with_status"].__globals__,
+            {"read_prefix": mock.Mock(side_effect=self.helper["EngineInterrupted"](130))},
+        ):
+            with self.assertRaises(self.helper["EngineInterrupted"]) as ctx:
+                self.helper["read_text_with_status"](Path("irrelevant"))
+        self.assertEqual(ctx.exception.code, 130)
+
+    def test_main_converts_engine_interrupted_to_exit_code(self) -> None:
+        with mock.patch.dict(
+            self.helper["main"].__globals__,
+            {"main_impl": mock.Mock(side_effect=self.helper["EngineInterrupted"](130))},
+        ):
+            self.assertEqual(self.helper["main"](), 130)
 
     def test_source_tree_snapshot_detects_parallel_test_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

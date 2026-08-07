@@ -7,6 +7,7 @@ import base64
 import binascii
 import bisect
 import concurrent.futures
+import contextlib
 import copy
 import functools
 import hashlib
@@ -1479,12 +1480,24 @@ def safe_test_env(repo: Path, isolated_home: Path) -> dict[str, str]:
     return env
 
 
-class EngineInterrupted(SystemExit):
-    """Raised after in-flight engine process groups have been terminated."""
+class EngineInterrupted(BaseException):
+    """Raised after in-flight engine process groups have been terminated.
+
+    Subclasses BaseException directly (not SystemExit): internal
+    ``except SystemExit`` guards scattered through this script (parser
+    self-tests, secret-redaction fallbacks, file-read status helpers)
+    would otherwise catch and swallow the interrupt, letting the run
+    continue instead of unwinding.
+    """
+
+    def __init__(self, code: int) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 _OWNED_PROCESS_LOCK = threading.RLock()
 _OWNED_PROCESSES: dict[int, subprocess.Popen[str]] = {}
+_OWNED_PROCESS_GRACE_SECONDS = 2.0
 
 
 def process_group_popen_kwargs() -> dict[str, Any]:
@@ -1512,49 +1525,97 @@ def unregister_owned_process(proc: subprocess.Popen[str]) -> None:
 def terminate_owned_processes() -> None:
     with _OWNED_PROCESS_LOCK:
         processes = list(_OWNED_PROCESSES.values())
-    for proc in processes:
-        terminate_process_group(proc)
+    # Phase 1: signal every owned group up front. Phase 2/3 then pay one
+    # shared grace window for the whole batch instead of one grace window
+    # per registered engine process, which used to make interrupt handling
+    # take grace_seconds * len(processes).
+    survivors = [proc for proc in processes if _signal_owned_process_group(proc)]
+    if not survivors:
+        return
+    _await_owned_process_groups(survivors, _OWNED_PROCESS_GRACE_SECONDS)
+    for proc in survivors:
+        _enforce_owned_process_group(proc, _OWNED_PROCESS_GRACE_SECONDS)
 
 
-def terminate_process_group(proc: subprocess.Popen, grace_seconds: float = 2.0) -> None:
-    """Terminate the process group owned by proc, then enforce bounded cleanup.
+def _resolve_windows_taskkill() -> str | None:
+    """Resolve taskkill.exe via an absolute path under %SystemRoot%\\System32.
 
-    SIGKILL is sent to the group even if the leader has already exited:
-    engines can fork children that outlive the leader but stay in its
-    process group, and those would otherwise be orphaned.
+    Windows' executable search order checks the current working directory
+    before System32, and that CWD can be the untrusted reviewed checkout --
+    a repo-local taskkill.exe there would otherwise run during cleanup.
+    find_command's PATH-based resolution needs a repo handle to exclude the
+    checkout, which signal-handler cleanup paths do not have, so resolve
+    the trusted system binary directly instead.
+    """
+    system_root = os.environ.get("SystemRoot") or r"C:\Windows"
+    taskkill = Path(system_root) / "System32" / "taskkill.exe"
+    return str(taskkill) if taskkill.is_file() else None
+
+
+def _signal_owned_process_group(proc: subprocess.Popen) -> bool:
+    """Phase 1: send the initial termination attempt to one owned group.
+
+    Returns True if phase 2/3 enforcement may still be needed. The
+    taskkill attempt is made even if the leader has already exited:
+    it can still fell descendants while the PID is valid, and skipping
+    it would leave live descendants of an already-reaped leader running.
     """
     if os.name == "nt":
-        # Windows has no process-group signalling; taskkill /T fells the whole
-        # tree. Fall back to a direct kill if taskkill fails or stalls.
+        taskkill = _resolve_windows_taskkill()
+        if taskkill is None:
+            return True
         try:
             result = subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                [taskkill, "/PID", str(proc.pid), "/T", "/F"],
                 capture_output=True,
                 text=True,
-                timeout=grace_seconds,
+                timeout=_OWNED_PROCESS_GRACE_SECONDS,
                 check=False,
             )
-            taskkill_failed = bool(result.returncode)
+            return bool(result.returncode)
         except (OSError, subprocess.TimeoutExpired):
-            taskkill_failed = True
-        if taskkill_failed and proc.poll() is None:
+            return True
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def _await_owned_process_groups(procs: list[subprocess.Popen], grace_seconds: float) -> None:
+    """Phase 2: the shared grace window for a batch of already-signaled groups.
+
+    Runs after phase 1 has signaled every group in the batch, so waiting
+    on one group's exit never delays signaling another.
+    """
+    for proc in procs:
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=grace_seconds)
+            except subprocess.TimeoutExpired:
+                pass
+        elif os.name != "nt":
+            # POSIX: the leader may already be reaped while orphaned
+            # descendants remain in its process group; give them the
+            # same grace window before phase 3 enforces SIGKILL.
+            time.sleep(grace_seconds)
+
+
+def _enforce_owned_process_group(proc: subprocess.Popen, grace_seconds: float) -> None:
+    """Phase 3: force-kill survivors of the phase-1 termination attempt."""
+    if os.name == "nt":
+        # No durable process-group boundary on Windows: taskkill /T can
+        # only walk the tree from a still-resolvable PID, so descendants
+        # that outlive the leader are not guaranteed to be owned (a
+        # durable Job-Object boundary is future work). The direct kill
+        # here only ever targets a still-live leader.
+        if proc.poll() is None:
             proc.kill()
             try:
                 proc.wait(timeout=grace_seconds)
             except subprocess.TimeoutExpired:
                 pass
         return
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    if proc.poll() is None:
-        try:
-            proc.wait(timeout=grace_seconds)
-        except subprocess.TimeoutExpired:
-            pass
-    else:
-        time.sleep(grace_seconds)
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -1566,19 +1627,42 @@ def terminate_process_group(proc: subprocess.Popen, grace_seconds: float = 2.0) 
             pass
 
 
+def terminate_process_group(
+    proc: subprocess.Popen, grace_seconds: float = _OWNED_PROCESS_GRACE_SECONDS
+) -> None:
+    """Terminate the process group owned by proc, then enforce bounded cleanup.
+
+    Composes the same phase-1/2/3 helpers used by the multi-process
+    ``terminate_owned_processes`` sweep. On POSIX, SIGKILL is sent to the
+    group even if the leader has already exited: engines can fork
+    children that outlive the leader but stay in its process group, and
+    those would otherwise be orphaned. On Windows there is no equivalent
+    process-group boundary -- descendants that outlive the leader are
+    not guaranteed to be owned (see ``_enforce_owned_process_group``).
+    """
+    if not _signal_owned_process_group(proc):
+        return
+    _await_owned_process_groups([proc], grace_seconds)
+    _enforce_owned_process_group(proc, grace_seconds)
+
+
 def engine_signal_handler(signum: int, _frame: Any) -> None:
     terminate_owned_processes()
     raise EngineInterrupted(128 + signum)
+
+
+def _handled_signal_numbers() -> list[int]:
+    handled_signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        handled_signals.append(signal.SIGHUP)
+    return handled_signals
 
 
 class OwnedProcessSignalHandlers:
     """Install process-wide handlers so interrupts clean up owned engine groups."""
 
     def __enter__(self) -> "OwnedProcessSignalHandlers":
-        handled_signals = [signal.SIGINT, signal.SIGTERM]
-        if hasattr(signal, "SIGHUP"):
-            handled_signals.append(signal.SIGHUP)
-        self.previous = {signum: signal.getsignal(signum) for signum in handled_signals}
+        self.previous = {signum: signal.getsignal(signum) for signum in _handled_signal_numbers()}
         for signum in self.previous:
             signal.signal(signum, engine_signal_handler)
         return self
@@ -1586,6 +1670,39 @@ class OwnedProcessSignalHandlers:
     def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
         for signum, handler in self.previous.items():
             signal.signal(signum, handler)
+
+
+@contextlib.contextmanager
+def deferred_owned_process_signals():
+    """Defer handled-signal delivery across a spawn+register critical section.
+
+    A signal arriving between Popen() and register_owned_process() would
+    orphan the just-spawned group: the signal handler cannot terminate a
+    process it does not know about yet. For the duration of the wrapped
+    critical section, swap the handled signals (the same set
+    OwnedProcessSignalHandlers installs) to a collector that just records
+    the signal number. On exit, restore the previous handlers and, if a
+    signal was collected, run the real handler logic -- by then the
+    child is registered, so cleanup includes it.
+
+    Only the main thread spawns/registers engine processes, so swapping
+    signal.signal handlers here is safe (signal.signal is main-thread-only).
+    """
+    collected: list[int] = []
+
+    def _collect(signum: int, _frame: Any) -> None:
+        collected.append(signum)
+
+    previous = {signum: signal.getsignal(signum) for signum in _handled_signal_numbers()}
+    for signum in previous:
+        signal.signal(signum, _collect)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+        if collected:
+            engine_signal_handler(collected[0], None)
 
 
 def parse_ps_time(value: str) -> float:
@@ -1775,19 +1892,20 @@ def run_with_heartbeat(
             resolve_root=resolve_root,
         )
     started = time.monotonic()
-    proc = subprocess.Popen(
-        args,
-        cwd=cwd,
-        stdin=subprocess.PIPE if input_text is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding=SUBPROCESS_TEXT_ENCODING,
-        errors=SUBPROCESS_TEXT_ERRORS,
-        env=env,
-        **process_group_popen_kwargs(),
-    )
-    register_owned_process(proc)
+    with deferred_owned_process_signals():
+        proc = subprocess.Popen(
+            args,
+            cwd=cwd,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding=SUBPROCESS_TEXT_ENCODING,
+            errors=SUBPROCESS_TEXT_ERRORS,
+            env=env,
+            **process_group_popen_kwargs(),
+        )
+        register_owned_process(proc)
     try:
         first_communicate = True
         metrics = sample_process_metrics(resolve_root, proc.pid)
@@ -1817,20 +1935,21 @@ def run_with_stream(
     env: dict[str, str] | None = None,
     resolve_root: Path,
 ) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.Popen(
-        args,
-        cwd=cwd,
-        stdin=subprocess.PIPE if input_text is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding=SUBPROCESS_TEXT_ENCODING,
-        errors=SUBPROCESS_TEXT_ERRORS,
-        bufsize=1,
-        env=env,
-        **process_group_popen_kwargs(),
-    )
-    register_owned_process(proc)
+    with deferred_owned_process_signals():
+        proc = subprocess.Popen(
+            args,
+            cwd=cwd,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding=SUBPROCESS_TEXT_ENCODING,
+            errors=SUBPROCESS_TEXT_ERRORS,
+            bufsize=1,
+            env=env,
+            **process_group_popen_kwargs(),
+        )
+        register_owned_process(proc)
     try:
         return collect_streamed_process(
             proc,
@@ -12346,28 +12465,32 @@ def start_parallel_tests(
             "errors": SUBPROCESS_TEXT_ERRORS,
             **process_group_popen_kwargs(),
         }
-        if shell_kind == "default" or shell_kind == "cmd":
-            proc = subprocess.Popen(command, shell=True, **popen_kwargs)
-        elif shell_kind == "powershell":
-            powershell = resolve_command("powershell", repo)
-            proc = subprocess.Popen(
-                [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
-                **popen_kwargs,
-            )
-        elif shell_kind == "pwsh":
-            pwsh = resolve_command("pwsh", repo)
-            proc = subprocess.Popen(
-                [pwsh, "-NoProfile", "-Command", command],
-                **popen_kwargs,
-            )
-        else:
-            raise SystemExit(
-                f"invalid --parallel-tests-shell/AUTOREVIEW_PARALLEL_TESTS_SHELL: {shell_kind}"
-            )
+        with deferred_owned_process_signals():
+            if shell_kind == "default" or shell_kind == "cmd":
+                proc = subprocess.Popen(command, shell=True, **popen_kwargs)
+            elif shell_kind == "powershell":
+                powershell = resolve_command("powershell", repo)
+                proc = subprocess.Popen(
+                    [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                    **popen_kwargs,
+                )
+            elif shell_kind == "pwsh":
+                pwsh = resolve_command("pwsh", repo)
+                proc = subprocess.Popen(
+                    [pwsh, "-NoProfile", "-Command", command],
+                    **popen_kwargs,
+                )
+            else:
+                raise SystemExit(
+                    f"invalid --parallel-tests-shell/AUTOREVIEW_PARALLEL_TESTS_SHELL: {shell_kind}"
+                )
+            register_owned_process(proc)
     except BaseException:
         shutil.rmtree(test_home, ignore_errors=True)
         raise
     if proc.stderr is None:
+        terminate_process_group(proc)
+        unregister_owned_process(proc)
         shutil.rmtree(test_home, ignore_errors=True)
         raise SystemExit("parallel test stderr pipe was not created")
     stderr_thread = threading.Thread(
@@ -12378,7 +12501,6 @@ def start_parallel_tests(
     stderr_thread.start()
     setattr(proc, "_autoreview_test_home", test_home)
     setattr(proc, "_autoreview_stderr_thread", stderr_thread)
-    register_owned_process(proc)
     return proc, time.time()
 
 
@@ -13141,7 +13263,13 @@ def atomic_write_text(path: Path, content: str) -> None:
 
 def main() -> int:
     with OwnedProcessSignalHandlers():
-        return main_impl()
+        try:
+            return main_impl()
+        except EngineInterrupted as exc:
+            # No longer a SystemExit subclass (see EngineInterrupted), so it
+            # is not caught by internal `except SystemExit` guards on the
+            # way up -- convert it to a plain exit code here instead.
+            return exc.code
 
 
 def main_impl() -> int:
