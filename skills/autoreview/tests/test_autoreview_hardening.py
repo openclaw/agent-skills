@@ -7958,6 +7958,88 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("bundle: FAILED", result.stdout)
 
+    def test_dry_run_commit_mode_passes_commit_ref_to_prompt_construction(self) -> None:
+        # choose_target() always returns target_ref=None for commit mode
+        # (see choose_target()); main() derives the real ref by assigning
+        # target_ref = args.commit right after commit_bundle() (see main(),
+        # just below its commit_bundle() call) before build_review_prompts()
+        # runs. dry_run_preflight() must mirror that same assignment so the
+        # prompt it validates matches the one a real run would build,
+        # instead of validating a prompt with the ref omitted (and
+        # potentially under the real byte budget only because of that
+        # omission).
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            (repo / "source.txt").write_text("staged\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            git(repo, "commit", "-q", "-m", "seed")
+            commit = git(repo, "rev-parse", "HEAD").strip()
+
+            preflight = self.helper["dry_run_preflight"]
+            original = preflight.__globals__["build_review_prompts"]
+            captured: dict[str, object] = {}
+
+            def capturing(repo_arg, target, target_ref, *rest, **kwargs):
+                captured["target_ref"] = target_ref
+                return original(repo_arg, target, target_ref, *rest, **kwargs)
+
+            args = argparse.Namespace(
+                commit=commit,
+                prompt=[],
+                prompt_file=[],
+                dataset=[],
+                max_priority="P0",
+            )
+            stdout = io.StringIO()
+            with mock.patch.dict(preflight.__globals__, {"build_review_prompts": capturing}):
+                with contextlib.redirect_stdout(stdout):
+                    preflight(args, [], repo, "commit", None)
+
+            self.assertEqual(captured.get("target_ref"), commit)
+            self.assertIn("prompt: OK", stdout.getvalue())
+
+    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
+    def test_dry_run_flag_exits_zero_for_plain_commit_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / "source.txt"
+            source.write_text("staged\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            git(repo, "commit", "-q", "-m", "seed")
+            codex_bin = self.helper["write_executable"](
+                root / "codex",
+                self.helper["fake_codex_script"](),
+            )
+            env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "commit",
+                    "--commit",
+                    "HEAD",
+                    "--engine",
+                    "codex",
+                    "--codex-bin",
+                    str(codex_bin),
+                    "--dry-run",
+                ],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("bundle: constructible", result.stdout)
+            self.assertIn("prompt: OK", result.stdout)
+
     @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
     def test_dry_run_flag_exits_nonzero_when_pi_version_unsupported(self) -> None:
         # run_pi() calls ensure_pi_isolation_supported(), which requires

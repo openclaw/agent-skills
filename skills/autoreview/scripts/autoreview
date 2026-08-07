@@ -12733,6 +12733,10 @@ def dry_run_preflight(
             bundle, bundle_truncated = branch_bundle(repo, target_ref, known_secret_fragments)
         else:
             bundle, bundle_truncated = commit_bundle(repo, args.commit, known_secret_fragments)
+            # Mirror main()'s post-commit_bundle() assignment (see main() just
+            # after the commit_bundle() call above) so the prompt built below
+            # includes the commit reference the real run would include.
+            target_ref = args.commit
         print("bundle: constructible")
     except SystemExit as exc:
         ok = False
