@@ -12647,8 +12647,22 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
     immediately (unsupported CLI version, missing required flag). Those
     probes only invoke the resolved binary locally with --version/--help;
     they never contact a provider. Codex has its own unconditional
-    --no-tools rejection above and no local version gate, so it is left
-    alone here.
+    --no-tools rejection above and no local version gate.
+
+    Codex additionally validates --codex-config/--codex-speed (and their
+    AUTOREVIEW_CODEX_CONFIG/AUTOREVIEW_CODEX_SPEED env equivalents) via
+    codex_config_keys()/codex_speed_override() before run_codex() ever
+    builds its command (see codex_command, which calls
+    codex_config_overrides()/codex_speed_override() while assembling the
+    `-c` flags); those are pure, non-mutating parses over the reviewer
+    namespace with no I/O, so replaying them here means a dry run cannot
+    report codex OK for an unsafe config override or an invalid speed
+    value a real run would reject. This applies to every reviewer in a
+    --panel/--reviewers list, not just a single --engine codex run: the
+    single-engine summary printed by main() calls the same two functions
+    for display purposes, but that display code only runs when exactly
+    one reviewer is selected via --engine, so multi-reviewer dry runs
+    depended solely on this function to catch the same rejection.
 
     Kimi additionally loads its review config via load_kimi_review_config()
     before run_kimi() ever invokes the CLI (see run_kimi); that load is a
@@ -12703,6 +12717,12 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
         try:
             _, source_share = load_kimi_review_config(repo)
             validate_kimi_runtime_auth_sources(repo, source_share)
+        except SystemExit as exc:
+            return False, str(exc.code)
+    if engine == "codex":
+        try:
+            codex_config_keys(reviewer)
+            codex_speed_override(reviewer)
         except SystemExit as exc:
             return False, str(exc.code)
     if engine == "claude" and getattr(reviewer, "tools", True):

@@ -7891,6 +7891,162 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.assertIn("UNAVAILABLE", result.stdout)
             self.assertIn("--no-tools", result.stdout)
 
+    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
+    def test_dry_run_flag_exits_nonzero_for_unsafe_codex_config_in_reviewer_list(self) -> None:
+        # codex_config_overrides() refuses capability-bearing --codex-config
+        # keys before run_codex() ever builds its command (see
+        # codex_command); resolve_engine_binary() must replay that same
+        # check for every reviewer in a --reviewers/--panel list, not just
+        # a single --engine codex run, so a dry run cannot report codex OK
+        # for a config override the real run would reject.
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / "source.txt"
+            source.write_text("staged\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            codex_bin = self.helper["write_executable"](
+                root / "codex",
+                self.helper["fake_codex_script"](),
+            )
+            claude_bin = self.helper["write_executable"](
+                root / "claude",
+                self.helper["fake_claude_script"](),
+            )
+            env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--reviewers",
+                    "codex,claude",
+                    "--codex-bin",
+                    str(codex_bin),
+                    "--claude-bin",
+                    str(claude_bin),
+                    "--codex-config",
+                    'mcp_servers.review.command="touch /tmp/owned"',
+                    "--dry-run",
+                ],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertRegex(result.stdout, r"engine check: codex[^\n]* UNAVAILABLE")
+            self.assertIn("unsafe Codex config override refused", result.stdout)
+            self.assertIn("mcp_servers.review.command", result.stdout)
+            # The rest of the panel is unaffected: claude must still report OK.
+            self.assertRegex(result.stdout, r"engine check: claude[^\n]* OK\b")
+
+    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
+    def test_dry_run_flag_exits_nonzero_for_invalid_codex_speed_in_reviewer_list(self) -> None:
+        # codex_speed_override() refuses an unrecognized AUTOREVIEW_CODEX_SPEED
+        # value before run_codex() ever builds its command; --codex-speed
+        # itself is argparse-choice-constrained, so the env var is the only
+        # way an invalid value reaches this check. resolve_engine_binary()
+        # must replay that same rejection for every reviewer in a
+        # --reviewers/--panel list.
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / "source.txt"
+            source.write_text("staged\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            codex_bin = self.helper["write_executable"](
+                root / "codex",
+                self.helper["fake_codex_script"](),
+            )
+            claude_bin = self.helper["write_executable"](
+                root / "claude",
+                self.helper["fake_claude_script"](),
+            )
+            env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
+            env["AUTOREVIEW_CODEX_SPEED"] = "warp"
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--reviewers",
+                    "codex,claude",
+                    "--codex-bin",
+                    str(codex_bin),
+                    "--claude-bin",
+                    str(claude_bin),
+                    "--dry-run",
+                ],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertRegex(result.stdout, r"engine check: codex[^\n]* UNAVAILABLE")
+            self.assertIn("invalid Codex speed: warp", result.stdout)
+            self.assertRegex(result.stdout, r"engine check: claude[^\n]* OK\b")
+
+    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
+    def test_dry_run_flag_exits_zero_for_valid_codex_config_in_reviewer_list(self) -> None:
+        # A safe --codex-config override must not be rejected by the same
+        # replayed check; the panel/reviewer-list dry-run path must keep
+        # reporting OK for configurations a real run would accept.
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / "source.txt"
+            source.write_text("staged\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            codex_bin = self.helper["write_executable"](
+                root / "codex",
+                self.helper["fake_codex_script"](),
+            )
+            claude_bin = self.helper["write_executable"](
+                root / "claude",
+                self.helper["fake_claude_script"](),
+            )
+            env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--reviewers",
+                    "codex,claude",
+                    "--codex-bin",
+                    str(codex_bin),
+                    "--claude-bin",
+                    str(claude_bin),
+                    "--codex-config",
+                    'service_tier="fast"',
+                    "--dry-run",
+                ],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertRegex(result.stdout, r"engine check: codex[^\n]* OK\b")
+            self.assertRegex(result.stdout, r"engine check: claude[^\n]* OK\b")
+
     def test_dry_run_flag_exits_nonzero_when_engine_binary_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
