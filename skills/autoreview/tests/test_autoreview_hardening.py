@@ -7814,6 +7814,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("bundle: constructible", result.stdout)
+            self.assertIn("inputs: OK", result.stdout)
+            self.assertIn("prompt: OK", result.stdout)
             self.assertIn("trufflehog: OK", result.stdout)
             self.assertIn("OK", result.stdout)
 
@@ -8110,6 +8112,116 @@ class AutoreviewHardeningTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertRegex(result.stdout, r"engine check: kimi[^\n]* OK\b")
+
+    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
+    def test_dry_run_flag_exits_nonzero_when_kimi_config_repo_controlled(self) -> None:
+        # run_kimi() calls load_kimi_review_config() before the CLI is ever
+        # invoked for a review, and that rejects a KIMI_CODE_HOME pointed
+        # inside the reviewed repository (see kimi_source_share); --dry-run
+        # must reuse that same local config load rather than reporting kimi
+        # available just because the CLI binary and version resolved.
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / "source.txt"
+            source.write_text("staged\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            kimi_bin = self.helper["write_executable"](
+                root / "kimi",
+                self.helper["fake_kimi_script"](),
+            )
+            env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
+            env["KIMI_CODE_HOME"] = str(repo / ".kimi-code")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--engine",
+                    "kimi",
+                    "--kimi-bin",
+                    str(kimi_bin),
+                    "--dry-run",
+                ],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertRegex(result.stdout, r"engine check: kimi[^\n]* UNAVAILABLE")
+            self.assertIn(
+                "Kimi configuration must be outside the reviewed repository",
+                result.stdout,
+            )
+            # The bundle, inputs, and prompt assembly still resolve; only the
+            # Kimi-specific config load fails.
+            self.assertIn("prompt: OK", result.stdout)
+
+    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
+    def test_dry_run_flag_exits_nonzero_when_prompt_unpartitionable(self) -> None:
+        # The real run does not stop at load_extra_prompt()'s per-file
+        # checks: main() also builds the final prompt(s) via
+        # build_review_prompts() and rejects context that cannot fit the
+        # aggregate prompt budget even after partitioning (see
+        # build_review_prompts's "leave too little room for change chunks"
+        # branch). Use the Kimi engine's smaller aggregate budget
+        # (KIMI_MAX_PROMPT_BYTES) so a single --prompt-file well under the
+        # per-file 180000-byte scan cap (MAX_BUNDLE_TEXT_BYTES) still blows
+        # the aggregate limit; --dry-run must reuse that same check instead
+        # of reporting readiness for a prompt the real run would refuse.
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / "source.txt"
+            source.write_text("staged\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            kimi_bin = self.helper["write_executable"](
+                root / "kimi",
+                self.helper["fake_kimi_script"](),
+            )
+            env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
+            prompt_file = repo / "big-prompt.md"
+            prompt_file.write_text(
+                "context line filler text here\n" * 5_000,
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--engine",
+                    "kimi",
+                    "--kimi-bin",
+                    str(kimi_bin),
+                    "--prompt-file",
+                    "big-prompt.md",
+                    "--dry-run",
+                ],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("prompt: FAILED", result.stdout)
+            self.assertIn("too little room", result.stdout)
+            # The bundle, inputs, and engine still resolve; only the
+            # assembled-prompt aggregate check fails.
+            self.assertIn("bundle: constructible", result.stdout)
+            self.assertIn("inputs: OK", result.stdout)
             self.assertRegex(result.stdout, r"engine check: kimi[^\n]* OK\b")
 
     @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")

@@ -12625,6 +12625,12 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
     they never contact a provider. Codex has its own unconditional
     --no-tools rejection above and no local version gate, so it is left
     alone here.
+
+    Kimi additionally loads its review config via load_kimi_review_config()
+    before run_kimi() ever invokes the CLI (see run_kimi); that load is a
+    local, read-only file resolve + TOML parse with no engine contact, so
+    it is replayed here too and can reject a repository-controlled or
+    malformed Kimi setup the same way the real run would.
     """
     engine = reviewer.engine
     if engine in ALWAYS_UNAVAILABLE_ENGINES:
@@ -12651,7 +12657,45 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
             probe(reviewer, repo)
         except SystemExit as exc:
             return False, str(exc.code)
+    if engine == "kimi":
+        try:
+            load_kimi_review_config(repo)
+        except SystemExit as exc:
+            return False, str(exc.code)
     return True, None
+
+
+def max_prompt_bytes_for_reviewers(reviewers: list[argparse.Namespace]) -> int:
+    """Aggregate review-prompt byte budget for a reviewer set: the shared
+    limit, tightened to Kimi's smaller `kimi -p` argv budget when any
+    reviewer uses Kimi. Shared by main() (building the real prompts) and
+    dry_run_preflight() (validating the same budget without contacting an
+    engine) so the two never diverge.
+    """
+    max_prompt_bytes = MAX_REVIEW_PROMPT_BYTES
+    if any(reviewer.engine == "kimi" for reviewer in reviewers):
+        max_prompt_bytes = min(max_prompt_bytes, KIMI_MAX_PROMPT_BYTES)
+    return max_prompt_bytes
+
+
+def apply_finding_threshold_prompt(args: argparse.Namespace, extra_prompt: str) -> str:
+    """Prepend the priority-threshold instructions main() always adds to
+    the extra prompt before building the final review prompt(s). Shared by
+    main() and dry_run_preflight() so the aggregate-size/partition check in
+    the latter sees the same prompt bytes the real run would build.
+    """
+    included_priorities = ", ".join(
+        priority
+        for priority in ("P0", "P1", "P2", "P3")
+        if int(priority[1]) <= int(args.max_priority[1])
+    )
+    threshold_prompt = (
+        f"Finding threshold: report only {included_priorities}. "
+        "Omit all lower-priority observations, polish, speculative risks, and "
+        "follow-up ideas outside that threshold. Do not mark the patch incorrect "
+        "solely for an omitted lower-priority issue."
+    )
+    return threshold_prompt + ("\n\n" + extra_prompt if extra_prompt.strip() else "")
 
 
 def dry_run_preflight(
@@ -12664,42 +12708,93 @@ def dry_run_preflight(
     """Validate what upstream can check before a real run without
     contacting any review engine: that the review bundle can be built for
     the chosen target, that --prompt-file and --dataset inputs resolve
-    and pass the same repo-relative/existence/final-prompt checks the
-    real run applies via load_extra_prompt/load_datasets (see main_impl
-    just after dry_run_preflight returns), that the trufflehog binary a
-    real run always requires (see run_trufflehog_preflight) resolves,
-    and that each configured reviewer's CLI binary resolves and its
-    configuration is one a real run would actually accept. Returns the
-    process exit status: 0 when every check passes, 1 otherwise.
+    and pass the same repo-relative/existence checks the real run applies
+    via load_extra_prompt/load_datasets, that the assembled prompt(s) pass
+    the same aggregate-size/partition and truncation-refusal checks the
+    real run applies via build_review_prompts/ensure_reviewer_input_complete
+    and the same known-secret-fragment check applied to the final prompt
+    (see main() just after dry_run_preflight returns), that the trufflehog
+    binary a real run always requires (see run_trufflehog_preflight)
+    resolves, and that each configured reviewer's CLI binary resolves and
+    its configuration (including, for Kimi, load_kimi_review_config) is
+    one a real run would actually accept. Returns the process exit
+    status: 0 when every check passes, 1 otherwise.
     """
     ok = True
     known_secret_fragments: set[str] = set()
+    bundle = ""
+    bundle_truncated = False
+    bundle_ok = True
     try:
         if target == "local":
-            local_bundle(repo, known_secret_fragments)
+            bundle, bundle_truncated = local_bundle(repo, known_secret_fragments)
         elif target == "branch":
             assert target_ref
-            branch_bundle(repo, target_ref, known_secret_fragments)
+            bundle, bundle_truncated = branch_bundle(repo, target_ref, known_secret_fragments)
         else:
-            commit_bundle(repo, args.commit, known_secret_fragments)
+            bundle, bundle_truncated = commit_bundle(repo, args.commit, known_secret_fragments)
         print("bundle: constructible")
     except SystemExit as exc:
         ok = False
+        bundle_ok = False
         print(f"bundle: FAILED ({exc.code})")
     except Exception as exc:
         ok = False
+        bundle_ok = False
         print(f"bundle: FAILED ({exc})")
 
+    extra_prompt = ""
+    datasets = ""
+    prompt_truncated = False
+    datasets_truncated = False
+    inputs_ok = True
     try:
-        load_extra_prompt(args, repo)
-        load_datasets(args, repo)
+        extra_prompt, prompt_truncated = load_extra_prompt(args, repo)
+        datasets, datasets_truncated = load_datasets(args, repo)
         print("inputs: OK")
     except SystemExit as exc:
         ok = False
+        inputs_ok = False
         print(f"inputs: FAILED ({exc.code})")
     except Exception as exc:
         ok = False
+        inputs_ok = False
         print(f"inputs: FAILED ({exc})")
+
+    # The normal path (see main() below) does not stop at per-file
+    # validation: it also assembles the final prompt(s) and enforces the
+    # aggregate-size/partition limits and truncated-input refusal that
+    # build_review_prompts()/ensure_reviewer_input_complete() apply before
+    # any engine call. A dry run that skipped those would report OK for
+    # inputs a real run rejects once combined.
+    if bundle_ok and inputs_ok:
+        try:
+            input_truncated = bundle_truncated or prompt_truncated or datasets_truncated
+            if reviewers:
+                ensure_reviewer_input_complete(reviewers[0], input_truncated)
+            threshold_extra_prompt = apply_finding_threshold_prompt(args, extra_prompt)
+            prompts = build_review_prompts(
+                repo,
+                target,
+                target_ref,
+                bundle,
+                threshold_extra_prompt,
+                datasets,
+                max_prompt_bytes_for_reviewers(reviewers),
+            )
+            for prompt in prompts:
+                require_no_known_secret_fragments(
+                    "final review prompt", prompt, known_secret_fragments
+                )
+            print("prompt: OK")
+        except SystemExit as exc:
+            ok = False
+            print(f"prompt: FAILED ({exc.code})")
+        except Exception as exc:
+            ok = False
+            print(f"prompt: FAILED ({exc})")
+    else:
+        print("prompt: SKIPPED (bundle or inputs failed above)")
 
     if find_command("trufflehog", repo) is None:
         ok = False
@@ -13235,25 +13330,10 @@ def main() -> int:
         )
         target_ref = args.commit
     extra_prompt, prompt_truncated = load_extra_prompt(args, repo)
-    included_priorities = ", ".join(
-        priority
-        for priority in ("P0", "P1", "P2", "P3")
-        if int(priority[1]) <= int(args.max_priority[1])
-    )
-    threshold_prompt = (
-        f"Finding threshold: report only {included_priorities}. "
-        "Omit all lower-priority observations, polish, speculative risks, and "
-        "follow-up ideas outside that threshold. Do not mark the patch incorrect "
-        "solely for an omitted lower-priority issue."
-    )
-    extra_prompt = (
-        threshold_prompt + ("\n\n" + extra_prompt if extra_prompt.strip() else "")
-    )
+    extra_prompt = apply_finding_threshold_prompt(args, extra_prompt)
     datasets, datasets_truncated = load_datasets(args, repo)
     input_truncated = bundle_truncated or prompt_truncated or datasets_truncated
-    max_prompt_bytes = MAX_REVIEW_PROMPT_BYTES
-    if any(reviewer.engine == "kimi" for reviewer in reviewers):
-        max_prompt_bytes = min(max_prompt_bytes, KIMI_MAX_PROMPT_BYTES)
+    max_prompt_bytes = max_prompt_bytes_for_reviewers(reviewers)
     prompts = build_review_prompts(
         repo,
         target,
