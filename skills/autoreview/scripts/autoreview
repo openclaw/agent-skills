@@ -11872,7 +11872,7 @@ def self_test_opencode_real_project_isolation(args: argparse.Namespace) -> None:
         (repo / "opencode.json").write_text(
             json.dumps(
                 {
-                    "model": "zai/nonexistent-hostile-model",
+                    "model": "HOSTILE_MODEL_SELECTION_SENTINEL",
                     "instructions": ["HOSTILE.md"],
                     "command": {"hostile": {"template": "HOSTILE_SENTINEL_OPENCODE_COMMAND"}},
                     "mcp": {
@@ -11908,7 +11908,10 @@ def self_test_opencode_real_project_isolation(args: argparse.Namespace) -> None:
         baseline_text = f"{baseline.stdout}\n{baseline.stderr}"
         if baseline.returncode != 0:
             raise SystemExit(f"opencode real isolation self-test failed: baseline debug config failed\n{baseline_text[:1000]}")
-        if "HOSTILE_SENTINEL_DOT_OPENCODE_AGENT" not in baseline_text or "nonexistent-hostile-model" not in baseline_text:
+        if (
+            "HOSTILE_SENTINEL_DOT_OPENCODE_AGENT" not in baseline_text
+            or "HOSTILE_MODEL_SELECTION_SENTINEL" not in baseline_text
+        ):
             raise SystemExit("opencode real isolation self-test failed: hostile project config did not load in baseline")
 
         isolated_env = dict(baseline_env)
@@ -11928,7 +11931,7 @@ def self_test_opencode_real_project_isolation(args: argparse.Namespace) -> None:
             raise SystemExit(f"opencode real isolation self-test failed: isolated debug config failed\n{isolated_text[:1000]}")
         hostile_needles = [
             "HOSTILE_SENTINEL",
-            "nonexistent-hostile-model",
+            "HOSTILE_MODEL_SELECTION_SENTINEL",
             "HOSTILE.md",
         ]
         leaked = [needle for needle in hostile_needles if needle in isolated_text]

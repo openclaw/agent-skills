@@ -6452,17 +6452,29 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_opencode_isolation_self_test_does_not_forward_unrelated_secret(self) -> None:
         self_test = self.helper["self_test_opencode_real_project_isolation"]
         with tempfile.TemporaryDirectory() as tempdir:
-            fake = Path(tempdir) / "opencode"
-            fake.write_text(
-                "#!/usr/bin/env python3\n"
-                "import os, sys\n"
-                "if 'UNRELATED_CREDENTIAL_SENTINEL' in os.environ:\n"
-                "    raise SystemExit(86)\n"
-                "if os.environ.get('OPENCODE_DISABLE_PROJECT_CONFIG') == '1':\n"
-                "    print('{}')\n"
-                "else:\n"
-                "    print('HOSTILE_SENTINEL_DOT_OPENCODE_AGENT nonexistent-hostile-model')\n"
-            )
+            if os.name == "nt":
+                fake = Path(tempdir) / "opencode.cmd"
+                fake.write_text(
+                    "@echo off\r\n"
+                    "if defined UNRELATED_CREDENTIAL_SENTINEL exit /b 86\r\n"
+                    'if "%OPENCODE_DISABLE_PROJECT_CONFIG%"=="1" (\r\n'
+                    "  echo {}\r\n"
+                    ") else (\r\n"
+                    "  echo HOSTILE_SENTINEL_DOT_OPENCODE_AGENT HOSTILE_MODEL_SELECTION_SENTINEL\r\n"
+                    ")\r\n"
+                )
+            else:
+                fake = Path(tempdir) / "opencode"
+                fake.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import os\n"
+                    "if 'UNRELATED_CREDENTIAL_SENTINEL' in os.environ:\n"
+                    "    raise SystemExit(86)\n"
+                    "if os.environ.get('OPENCODE_DISABLE_PROJECT_CONFIG') == '1':\n"
+                    "    print('{}')\n"
+                    "else:\n"
+                    "    print('HOSTILE_SENTINEL_DOT_OPENCODE_AGENT HOSTILE_MODEL_SELECTION_SENTINEL')\n"
+                )
             fake.chmod(0o755)
             with mock.patch.dict(
                 os.environ,
