@@ -5342,6 +5342,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][0], fake_taskkill)
         proc.kill.assert_not_called()
 
+    @unittest.skipIf(os.name == "nt", "process groups are POSIX-only")
     def test_terminate_process_group_kills_orphans_after_leader_exit(self) -> None:
         proc = mock.Mock(pid=1234)
         proc.poll.return_value = 0
