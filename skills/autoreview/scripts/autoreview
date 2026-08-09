@@ -1580,17 +1580,27 @@ def _await_owned_process_groups(procs: list[subprocess.Popen], grace_seconds: fl
     Runs after phase 1 has signaled every group in the batch, so waiting
     on one group's exit never delays signaling another.
     """
+    deadline = time.monotonic() + grace_seconds
+    reaped_posix_leader = False
     for proc in procs:
         if proc.poll() is None:
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining == 0:
+                continue
             try:
-                proc.wait(timeout=grace_seconds)
+                proc.wait(timeout=remaining)
             except subprocess.TimeoutExpired:
                 pass
         elif os.name != "nt":
             # POSIX: the leader may already be reaped while orphaned
-            # descendants remain in its process group; give them the
-            # same grace window before phase 3 enforces SIGKILL.
-            time.sleep(grace_seconds)
+            # descendants remain in its process group. Preserve one shared
+            # grace deadline for those descendants before phase 3 enforces
+            # SIGKILL, rather than sleeping once per reaped leader.
+            reaped_posix_leader = True
+    if reaped_posix_leader:
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining:
+            time.sleep(remaining)
 
 
 def _enforce_owned_process_group(proc: subprocess.Popen, grace_seconds: float) -> None:
@@ -1677,9 +1687,18 @@ def deferred_owned_process_signals():
     signal was collected, run the real handler logic -- by then the
     child is registered, so cleanup includes it.
 
-    Only the main thread spawns/registers engine processes, so swapping
-    signal.signal handlers here is safe (signal.signal is main-thread-only).
+    Panel reviewers spawn engines from worker threads, where signal.signal
+    is forbidden. Those threads instead hold the registry lock across the
+    spawn+register window: the main-thread signal handler blocks on that
+    lock until the new child is registered, then includes it in cleanup.
+    Main-thread spawns keep the explicit signal deferral below so a handler
+    cannot interrupt the same thread before registration.
     """
+    if threading.current_thread() is not threading.main_thread():
+        with _OWNED_PROCESS_LOCK:
+            yield
+        return
+
     collected: list[int] = []
 
     def _collect(signum: int, _frame: Any) -> None:

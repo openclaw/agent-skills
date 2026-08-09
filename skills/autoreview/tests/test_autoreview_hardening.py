@@ -5351,7 +5351,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             killpg.call_args_list,
             [mock.call(1234, self.helper["signal"].SIGTERM), mock.call(1234, self.helper["signal"].SIGKILL)],
         )
-        sleep.assert_called_once_with(0.01)
+        sleep.assert_called_once()
+        self.assertAlmostEqual(sleep.call_args.args[0], 0.01, places=3)
 
     @unittest.skipIf(os.name == "nt", "process groups are POSIX-only")
     def test_owned_process_handlers_include_sighup(self) -> None:
@@ -5442,6 +5443,26 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ],
         )
 
+    def test_owned_process_grace_deadline_is_shared_across_groups(self) -> None:
+        proc_a = mock.Mock()
+        proc_b = mock.Mock()
+        proc_a.poll.return_value = None
+        proc_b.poll.return_value = None
+        proc_a.wait.side_effect = subprocess.TimeoutExpired("a", 1.5)
+        proc_b.wait.side_effect = subprocess.TimeoutExpired("b", 0.5)
+
+        with mock.patch(
+            "time.monotonic",
+            side_effect=[10.0, 10.5, 11.5],
+        ):
+            self.helper["_await_owned_process_groups"](
+                [proc_a, proc_b],
+                grace_seconds=2.0,
+            )
+
+        proc_a.wait.assert_called_once_with(timeout=1.5)
+        proc_b.wait.assert_called_once_with(timeout=0.5)
+
     @unittest.skipIf(os.name == "nt", "signal.signal swapping is POSIX-tested here")
     def test_deferred_owned_process_signals_terminates_proc_registered_during_window(
         self,
@@ -5489,6 +5510,33 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.assertIsNot(during, before)
         after = signal_module.getsignal(signal_module.SIGTERM)
         self.assertIs(after, before)
+
+    def test_deferred_owned_process_signals_supports_panel_worker_threads(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                with self.helper["deferred_owned_process_signals"]():
+                    entered.set()
+                    release.wait(timeout=2)
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        self.assertTrue(entered.wait(timeout=2))
+        registry_lock = self.helper["_OWNED_PROCESS_LOCK"]
+        acquired = registry_lock.acquire(blocking=False)
+        if acquired:
+            registry_lock.release()
+        release.set()
+        thread.join(timeout=2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(acquired, "worker did not guard the spawn/register window")
+        self.assertEqual(errors, [])
 
     def test_engine_interrupted_is_not_swallowed_by_except_system_exit(self) -> None:
         # Regression: EngineInterrupted used to subclass SystemExit, so
