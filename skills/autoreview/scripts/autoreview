@@ -902,14 +902,6 @@ def run(
     return result
 
 
-def subprocess_env(extra: dict[str, str] | None) -> dict[str, str] | None:
-    if not extra:
-        return None
-    merged = os.environ.copy()
-    merged.update(extra)
-    return merged
-
-
 def safe_git_env(repo: Path) -> dict[str, str]:
     platform_keys = ("COMSPEC", "PATHEXT", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "WINDIR")
     env = {
@@ -2124,6 +2116,64 @@ def open_worktree_parent(repo: Path, rel_path: Path) -> int | bool | None:
         ) from exc
 
 
+def posix_snapshot_stat_signature(metadata: os.stat_result) -> tuple[int, ...]:
+    """Return POSIX mutation-relevant metadata without read-side access time."""
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def open_windows_snapshot_file(source: Path) -> io.BufferedReader:
+    """Open a Windows snapshot source while denying concurrent writes or deletes."""
+    if os.name != "nt":
+        raise OSError("Windows snapshot handles are only available on Windows")
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    generic_read = 0x80000000
+    file_share_read = 0x00000001
+    open_existing = 3
+    file_attribute_normal = 0x00000080
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(source),
+        generic_read,
+        file_share_read,
+        None,
+        open_existing,
+        file_attribute_normal,
+        None,
+    )
+    if handle == invalid_handle_value:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    try:
+        return os.fdopen(descriptor, "rb")
+    except OSError:
+        os.close(descriptor)
+        raise
+
+
 def copy_worktree_file(repo: Path, root: Path, rel: str) -> bool:
     rel_path = Path(*PurePosixPath(rel).parts)
     parent_descriptor = open_worktree_parent(repo, rel_path)
@@ -2205,15 +2255,7 @@ def copy_worktree_file(repo: Path, root: Path, rel: str) -> bool:
                 while chunk := os.read(descriptor, 1024 * 1024):
                     output.write(chunk)
             after = os.fstat(descriptor)
-            if (
-                opened.st_mode,
-                opened.st_size,
-                opened.st_mtime_ns,
-            ) != (
-                after.st_mode,
-                after.st_size,
-                after.st_mtime_ns,
-            ):
+            if posix_snapshot_stat_signature(opened) != posix_snapshot_stat_signature(after):
                 raise OSError("file changed while reading")
         except OSError as exc:
             destination.unlink(missing_ok=True)
@@ -2246,11 +2288,31 @@ def copy_worktree_file(repo: Path, root: Path, rel: str) -> bool:
         raise SystemExit(
             "changed content is not a regular file; remove it or resolve the repository state before rerunning autoreview"
         )
-    content = source.read_bytes()
-    if source.lstat() != source_stat:
-        raise SystemExit(
-            "unable to snapshot changed content for the TruffleHog scan: file changed while reading"
-        )
+    if os.name == "nt":
+        try:
+            with open_windows_snapshot_file(source) as snapshot_source:
+                opened = os.fstat(snapshot_source.fileno())
+                if not stat.S_ISREG(opened.st_mode) or (
+                    source_stat.st_dev,
+                    source_stat.st_ino,
+                ) != (
+                    opened.st_dev,
+                    opened.st_ino,
+                ):
+                    raise OSError("file changed while opening")
+                content = snapshot_source.read()
+        except OSError as exc:
+            raise SystemExit(
+                "unable to snapshot changed content for the TruffleHog scan: "
+                f"{display_escape(exc, 500)}"
+            ) from exc
+    else:
+        content = source.read_bytes()
+        after = source.lstat()
+        if posix_snapshot_stat_signature(source_stat) != posix_snapshot_stat_signature(after):
+            raise SystemExit(
+                "unable to snapshot changed content for the TruffleHog scan: file changed while reading"
+            )
     write_snapshot_blob(root, rel, content)
     return True
 
@@ -2535,12 +2597,11 @@ def run_trufflehog_preflight(
             [
                 trufflehog_bin,
                 "git",
-                scan_repo.resolve().as_uri(),
+                "file://.",
                 "--since-commit",
                 base_commit,
                 "--branch",
                 "HEAD",
-                "--no-update",
                 "--no-color",
                 # Match TruffleHog's pre-commit mode. Unverified heuristic
                 # candidates are excluded to avoid restoring false positives.
@@ -2548,7 +2609,7 @@ def run_trufflehog_preflight(
                 "--fail",
                 "--fail-on-scan-errors",
             ],
-            repo,
+            scan_repo,
             check=False,
             env=safe_trufflehog_env(repo),
         )
@@ -11932,7 +11993,7 @@ def self_test_opencode_real_project_isolation(args: argparse.Namespace) -> None:
         (repo / "opencode.json").write_text(
             json.dumps(
                 {
-                    "model": "zai/nonexistent-hostile-model",
+                    "model": "HOSTILE_MODEL_SELECTION_SENTINEL",
                     "instructions": ["HOSTILE.md"],
                     "command": {"hostile": {"template": "HOSTILE_SENTINEL_OPENCODE_COMMAND"}},
                     "mcp": {
@@ -11954,13 +12015,28 @@ def self_test_opencode_real_project_isolation(args: argparse.Namespace) -> None:
         (repo / ".opencode" / "skills" / "hostile" / "SKILL.md").write_text(
             "---\nname: hostile\ndescription: hostile\n---\nHOSTILE_SENTINEL_DOT_OPENCODE_SKILL\n"
         )
-        baseline = run([opencode_bin, "debug", "config", "--pure"], repo, check=False)
+        baseline_env = safe_engine_env(
+            repo,
+            [Path(opencode_bin).parent],
+            engine="opencode",
+        )
+        baseline = run(
+            [opencode_bin, "debug", "config", "--pure"],
+            repo,
+            check=False,
+            env=baseline_env,
+        )
         baseline_text = f"{baseline.stdout}\n{baseline.stderr}"
         if baseline.returncode != 0:
             raise SystemExit(f"opencode real isolation self-test failed: baseline debug config failed\n{baseline_text[:1000]}")
-        if "HOSTILE_SENTINEL_DOT_OPENCODE_AGENT" not in baseline_text or "nonexistent-hostile-model" not in baseline_text:
+        if (
+            "HOSTILE_SENTINEL_DOT_OPENCODE_AGENT" not in baseline_text
+            or "HOSTILE_MODEL_SELECTION_SENTINEL" not in baseline_text
+        ):
             raise SystemExit("opencode real isolation self-test failed: hostile project config did not load in baseline")
 
+        isolated_env = dict(baseline_env)
+        isolated_env.update(opencode_review_env(False))
         isolated = subprocess.run(
             [opencode_bin, "debug", "config", "--pure"],
             cwd=repo,
@@ -11969,14 +12045,14 @@ def self_test_opencode_real_project_isolation(args: argparse.Namespace) -> None:
             errors=SUBPROCESS_TEXT_ERRORS,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=subprocess_env(opencode_review_env(False)),
+            env=isolated_env,
         )
         isolated_text = f"{isolated.stdout}\n{isolated.stderr}"
         if isolated.returncode != 0:
             raise SystemExit(f"opencode real isolation self-test failed: isolated debug config failed\n{isolated_text[:1000]}")
         hostile_needles = [
             "HOSTILE_SENTINEL",
-            "nonexistent-hostile-model",
+            "HOSTILE_MODEL_SELECTION_SENTINEL",
             "HOSTILE.md",
         ]
         leaked = [needle for needle in hostile_needles if needle in isolated_text]

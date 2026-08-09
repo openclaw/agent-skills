@@ -533,7 +533,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="autoreview-codex-workspace-test.") as tmpdir:
             repo = Path(tmpdir)
-            (repo / ".env").write_text("OPENAI_API_KEY=ignored-secret\n")
+            (repo / ".env").write_text("ignored environment fixture\n")
             with mock.patch.dict(
                 os.environ,
                 {"CODEX_HOME": ""},

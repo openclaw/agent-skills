@@ -4,6 +4,7 @@ import {
   imageAttachmentsFromContent,
   isImageSource,
   isRecord,
+  numberValue,
   pretty,
   stringValue,
   textFromContentBlocks,
@@ -16,6 +17,15 @@ import type {
   SessionImporter,
 } from "../core/types.ts";
 
+function isoFromEpochMillis(value: unknown): string | undefined {
+  const millis = numberValue(value);
+  if (millis === undefined) {
+    return undefined;
+  }
+  const date = new Date(millis);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
 function timestampOf(
   entry: Record<string, unknown>,
   message?: Record<string, unknown>,
@@ -24,9 +34,7 @@ function timestampOf(
     stringValue(entry.timestamp) ??
     stringValue(entry.createdAt) ??
     stringValue(entry.updatedAt) ??
-    (typeof message?.timestamp === "number"
-      ? new Date(message.timestamp).toISOString()
-      : undefined);
+    isoFromEpochMillis(message?.timestamp);
   return raw;
 }
 
