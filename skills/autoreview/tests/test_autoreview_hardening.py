@@ -7969,7 +7969,56 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.assertIn("inputs: OK", result.stdout)
             self.assertIn("prompt: OK", result.stdout)
             self.assertIn("trufflehog: OK", result.stdout)
+            self.assertIn("temporary root: OK", result.stdout)
             self.assertIn("OK", result.stdout)
+
+    @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
+    def test_dry_run_flag_rejects_temporary_root_inside_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / "source.txt"
+            source.write_text("staged\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            codex_bin = self.helper["write_executable"](
+                root / "codex",
+                self.helper["fake_codex_script"](),
+            )
+            env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
+            repo_temp = repo / "tmp"
+            repo_temp.mkdir()
+            env.update(
+                {
+                    "TMPDIR": str(repo_temp),
+                    "TEMP": str(repo_temp),
+                    "TMP": str(repo_temp),
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "local",
+                    "--engine",
+                    "codex",
+                    "--codex-bin",
+                    str(codex_bin),
+                    "--dry-run",
+                ],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("temporary root: FAILED", result.stdout)
+            self.assertIn("must be outside the reviewed repository", result.stdout)
+            self.assertRegex(result.stdout, r"engine check: codex[^\n]* OK\b")
 
     @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")
     def test_dry_run_flag_exits_nonzero_when_trufflehog_missing(self) -> None:
