@@ -576,6 +576,10 @@ SOURCE_CODE_REFERENCE_PATTERN = re.compile(
         for value in sorted(SOURCE_CODE_REFERENCE_VALUES, key=len, reverse=True)
     ) + r")(?![A-Za-z0-9_$])"
 )
+SIMPLE_JAVASCRIPT_REFERENCE_PATTERN = re.compile(
+    r"[a-z_$][A-Za-z0-9_$]*"
+    r"(?:(?:\?\.|\.)[a-z_$][A-Za-z0-9_$]*)*"
+)
 SOURCE_CODE_SECRET_REFERENCE_TERM_PATTERN = (
     r"(?:apiKey|ApiKey|key|Key|credential|Credential|credentials|Credentials"
     r"|password|Password|secret|Secret|token|Token)"
@@ -6942,6 +6946,24 @@ def secret_text_risk(
         ):
             continue
         if not quoted:
+            # In a known JS/TS file, an ordinary lower-case-rooted identifier or
+            # member expression is executable syntax, not an inline credential.
+            # Keep secret-shaped names and non-code inputs fail-closed, and let
+            # the suffix scan catch literal fallbacks.
+            if (
+                javascript_dialect is not None
+                and (
+                    match.group("reference_value") is not None
+                    or match.group("bare_value") is not None
+                )
+                and SIMPLE_JAVASCRIPT_REFERENCE_PATTERN.fullmatch(value)
+                and safe_javascript_reference_suffix(
+                    text,
+                    match.end(),
+                    typescript=javascript_dialect == "typescript",
+                )
+            ):
+                continue
             source_start = match.end() - len(value)
             source_end = match.end() - (1 if value.endswith("!") else 0)
             if (

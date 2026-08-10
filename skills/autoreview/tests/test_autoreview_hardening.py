@@ -3181,18 +3181,54 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertTrue(
             self.helper["secret_text_risk"](declared_identifier_value)
         )
-        self.assertTrue(
+        self.assertFalse(
             self.helper["secret_text_risk"](
                 suffixed_reference,
                 javascript_dialect="typescript",
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             self.helper["secret_text_risk"](
                 prefixed_reference,
                 javascript_dialect="typescript",
             )
         )
+
+    def test_secret_detector_allows_simple_javascript_secret_references(self) -> None:
+        secret_key = "api" + "Secret"
+        key_key = "api" + "Key"
+        references = (
+            f"signCloudinaryUploadParams({{ {secret_key}: signingPhrase }});",
+            f"return {{ {key_key}: ctx.cloudinary.{key_key} }};",
+            f"cloudinary: {{ {secret_key}: environment.cloudinaryApiSecret }}",
+        )
+
+        for dialect in ("javascript", "typescript"):
+            for content in references:
+                with self.subTest(dialect=dialect, content=content):
+                    self.assertFalse(
+                        self.helper["secret_text_risk"](
+                            content,
+                            javascript_dialect=dialect,
+                        )
+                    )
+
+        for content in references:
+            with self.subTest(non_code_content=content):
+                self.assertTrue(self.helper["secret_text_risk"](content))
+
+        synthetic_literal = realistic_secret_value()
+        for content in (
+            f'return {{ {secret_key}: "{synthetic_literal}" }};',
+            f'return {{ {secret_key}: ctx.cloudinary.{secret_key} ?? "{synthetic_literal}" }};',
+        ):
+            with self.subTest(literal_content=content):
+                self.assertTrue(
+                    self.helper["secret_text_risk"](
+                        content,
+                        javascript_dialect="typescript",
+                    )
+                )
 
     def test_secret_detector_allows_lifecycle_named_typescript_references(self) -> None:
         key_term = "Api" + "Key"
