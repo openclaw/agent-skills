@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import importlib.util
 import json
@@ -262,6 +263,7 @@ class AutoreviewAmpTests(unittest.TestCase):
         self.assertEqual(reviewer.thinking, "high")
         self.assertFalse(reviewer.tools)
 
+    @unittest.skipIf(os.name == "nt", "Amp runtime is unsupported on native Windows")
     def test_amp_isolation_probe_requires_api_key_and_flags(self) -> None:
         args = argparse.Namespace(amp_bin="amp")
         required_flags = " ".join(
@@ -308,11 +310,19 @@ class AutoreviewAmpTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "requires AMP_API_KEY"):
                 AUTOREVIEW.ensure_amp_isolation_supported(args, Path("/tmp/repo"))
 
+    def test_amp_isolation_probe_rejects_native_windows(self) -> None:
+        args = argparse.Namespace(amp_bin="amp")
         repo = Path("/tmp/repo")
-        with mock.patch.object(AUTOREVIEW.os, "name", "nt"):
+        context = (
+            contextlib.nullcontext()
+            if os.name == "nt"
+            else mock.patch.object(AUTOREVIEW.os, "name", "nt")
+        )
+        with context:
             with self.assertRaisesRegex(SystemExit, "native Windows"):
                 AUTOREVIEW.ensure_amp_isolation_supported(args, repo)
 
+    @unittest.skipIf(os.name == "nt", "Amp runtime is unsupported on native Windows")
     def test_amp_run_keeps_review_prompt_out_of_outer_agent(self) -> None:
         args = argparse.Namespace(
             amp_bin="amp",
@@ -531,6 +541,7 @@ class AutoreviewAmpTests(unittest.TestCase):
             ):
                 AUTOREVIEW.attest_amp_plugin_inventory(output, plugin_path, cwd)
 
+    @unittest.skipIf(os.name == "nt", "Amp runtime is unsupported on native Windows")
     def test_amp_run_surfaces_direct_generation_failure(self) -> None:
         args = argparse.Namespace(
             amp_bin="amp",
