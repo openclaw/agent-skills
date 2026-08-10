@@ -11371,6 +11371,7 @@ def run_amp(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             runtime_root,
             engine_env,
         )
+        print("amp isolation: MCP command/URL denial verified (spawn probe clean)")
         preflight_cmd = [
             amp_bin,
             "--settings-file",
@@ -11391,6 +11392,7 @@ def run_amp(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                 + display_escape(detail, 4000, multiline=True)
             )
         attest_amp_plugin_inventory(preflight.stdout, plugin_path, review_root)
+        print("amp isolation: complete plugin inventory contains only the generated adapter")
 
         # Do not materialize the private prompt until the authenticated complete
         # plugin inventory has proved that Amp loaded only the generated adapter.
