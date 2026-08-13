@@ -338,11 +338,22 @@ KIMI_MAX_PROMPT_BYTES = 30_000 if os.name == "nt" else 120_000
 MAX_REVIEW_CHUNK_CONTEXT_BYTES = 64_000
 MAX_REVIEW_PASSES = 8
 MAX_DELETION_SECRET_FRAGMENTS = 256
+REVIEW_RUN_SCHEMA_VERSION = 1
+REVIEW_RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+MAX_REVIEW_RUN_RECORD_BYTES = 1_000_000
 
 
 class ReviewChunk(NamedTuple):
     content: str
     context: str = ""
+
+
+class ReviewRunStore(NamedTuple):
+    path: Path
+    identity: str
+    prompt_hashes: tuple[str, ...]
+
+
 SECRET_PLACEHOLDER_VALUES = {
     "__openclaw_redacted__",
     "changeme",
@@ -13376,6 +13387,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", help="Write human output to a file as well as stdout.")
     parser.add_argument("--json-output", help="Write validated structured review JSON.")
     parser.add_argument(
+        "--run-id",
+        help="Explicit checkpoint identifier for resumable review passes; requires --run-root.",
+    )
+    parser.add_argument(
+        "--run-root",
+        help="Caller-owned checkpoint directory outside the reviewed repository; requires --run-id.",
+    )
+    parser.add_argument(
         "--stream-engine-output",
         action="store_true",
         default=os.environ.get("AUTOREVIEW_STREAM_ENGINE_OUTPUT") == "1",
@@ -13410,6 +13429,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--self-test-json-array-parser", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--self-test-heartbeat-metrics", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if bool(args.run_id) != bool(args.run_root):
+        raise SystemExit("--run-id and --run-root must be provided together")
+    if args.run_id and (
+        not REVIEW_RUN_ID_PATTERN.fullmatch(args.run_id)
+        or args.run_id in {".", ".."}
+    ):
+        raise SystemExit(
+            "--run-id must be 1-128 characters using letters, numbers, dot, underscore, or hyphen"
+        )
     args.engine = normalize_engine(args.engine)
     if args.cursor_allow_workspace_instructions is None:
         args.cursor_allow_workspace_instructions = env_truthy("AUTOREVIEW_CURSOR_ALLOW_WORKSPACE_INSTRUCTIONS")
@@ -13954,6 +13982,324 @@ def merge_chunk_reports(reports: list[tuple[str, dict[str, Any]]]) -> dict[str, 
     return report
 
 
+def canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def review_run_config(reviewers: list[argparse.Namespace]) -> list[dict[str, Any]]:
+    configs: list[dict[str, Any]] = []
+    binary_option = {
+        "codex": "codex_bin",
+        "claude": "claude_bin",
+        "amp": "amp_bin",
+        "droid": "droid_bin",
+        "copilot": "copilot_bin",
+        "pi": "pi_bin",
+        "kimi": "kimi_bin",
+        "opencode": "opencode_bin",
+        "cursor": "cursor_bin",
+    }
+    for reviewer in reviewers:
+        config: dict[str, Any] = {
+            "engine": reviewer.engine,
+            "model": reviewer.model,
+            "fallback_model": getattr(reviewer, "fallback_model", None),
+            "thinking": reviewer.thinking,
+            "tools": reviewer.tools,
+            "web_search": reviewer.web_search,
+            "binary": getattr(reviewer, binary_option[reviewer.engine]),
+        }
+        if reviewer.engine == "codex":
+            config["codex_config"] = codex_config_overrides(reviewer)
+            config["codex_speed"] = codex_speed_override(reviewer)
+        elif reviewer.engine == "claude":
+            config["claude_allowed_tools"] = claude_allowed_tools(reviewer)
+        configs.append(config)
+    return configs
+
+
+def review_run_identity(
+    args: argparse.Namespace,
+    reviewers: list[argparse.Namespace],
+    prompts: list[str],
+    changed_paths: set[str],
+) -> tuple[str, tuple[str, ...]]:
+    prompt_hashes = tuple(
+        hashlib.sha256(prompt.encode("utf-8")).hexdigest() for prompt in prompts
+    )
+    identity_input = {
+        "schema_version": REVIEW_RUN_SCHEMA_VERSION,
+        "prompt_sha256": prompt_hashes,
+        "changed_paths": sorted(changed_paths),
+        "reviewers": review_run_config(reviewers),
+        "allow_partial_panel": args.allow_partial_panel,
+    }
+    identity = hashlib.sha256(canonical_json_bytes(identity_input)).hexdigest()
+    return identity, prompt_hashes
+
+
+def require_private_review_run_path(path: Path, *, directory: bool) -> None:
+    try:
+        path_stat = path.lstat()
+    except OSError as exc:
+        raise SystemExit(
+            f"unable to inspect review checkpoint path {display_escape(path, 500)}: {exc}"
+        ) from exc
+    expected = stat.S_ISDIR(path_stat.st_mode) if directory else stat.S_ISREG(path_stat.st_mode)
+    if not expected or stat.S_ISLNK(path_stat.st_mode):
+        kind = "directory" if directory else "file"
+        raise SystemExit(
+            f"review checkpoint path must be a regular {kind}: {display_escape(path, 500)}"
+        )
+    if os.name != "nt":
+        if hasattr(os, "getuid") and path_stat.st_uid != os.getuid():
+            raise SystemExit(
+                f"review checkpoint path must be owned by the current user: {display_escape(path, 500)}"
+            )
+        if path_stat.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+            raise SystemExit(
+                f"review checkpoint path must be owner-only: {display_escape(path, 500)}"
+            )
+
+
+def atomic_write_private_json(path: Path, value: Any) -> None:
+    descriptor, temporary = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+    )
+    temporary_path = Path(temporary)
+    try:
+        if os.name != "nt":
+            os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(canonical_json_bytes(value) + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        if os.name != "nt":
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def read_review_run_json(path: Path) -> dict[str, Any]:
+    require_private_review_run_path(path, directory=False)
+    try:
+        if path.stat().st_size > MAX_REVIEW_RUN_RECORD_BYTES:
+            raise SystemExit(
+                f"review checkpoint record is too large: {display_escape(path, 500)}"
+            )
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(
+            f"unable to read review checkpoint record {display_escape(path, 500)}: {exc}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise SystemExit(
+            f"review checkpoint record must contain a JSON object: {display_escape(path, 500)}"
+        )
+    return value
+
+
+def open_review_run_store(
+    args: argparse.Namespace,
+    repo: Path,
+    reviewers: list[argparse.Namespace],
+    prompts: list[str],
+    changed_paths: set[str],
+) -> ReviewRunStore | None:
+    if not args.run_id:
+        return None
+    root = Path(args.run_root).expanduser()
+    root = (root if root.is_absolute() else Path.cwd() / root).resolve()
+    if is_within(root, repo.resolve()):
+        raise SystemExit("--run-root must point outside the reviewed repository")
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SystemExit(f"unable to create --run-root: {exc}") from exc
+    try:
+        root_stat = root.lstat()
+    except OSError as exc:
+        raise SystemExit(f"unable to inspect --run-root: {exc}") from exc
+    if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode):
+        raise SystemExit("--run-root must be a regular directory")
+
+    run_path = root / args.run_id
+    try:
+        if run_path.exists() or run_path.is_symlink():
+            require_private_review_run_path(run_path, directory=True)
+        else:
+            run_path.mkdir(mode=0o700)
+        if os.name != "nt":
+            run_path.chmod(0o700)
+    except OSError as exc:
+        raise SystemExit(f"unable to create review checkpoint directory: {exc}") from exc
+    require_private_review_run_path(run_path, directory=True)
+
+    identity, prompt_hashes = review_run_identity(
+        args,
+        reviewers,
+        prompts,
+        changed_paths,
+    )
+    manifest = {
+        "schema_version": REVIEW_RUN_SCHEMA_VERSION,
+        "identity": identity,
+        "pass_count": len(prompts),
+        "prompt_sha256": list(prompt_hashes),
+    }
+    manifest_path = run_path / "manifest.json"
+    if manifest_path.exists():
+        existing = read_review_run_json(manifest_path)
+        if existing != manifest:
+            raise SystemExit(
+                "review checkpoint identity does not match the current input and reviewer configuration; "
+                "use a new --run-id"
+            )
+    else:
+        atomic_write_private_json(manifest_path, manifest)
+    return ReviewRunStore(run_path, identity, prompt_hashes)
+
+
+def review_run_pass_path(store: ReviewRunStore, index: int) -> Path:
+    return store.path / f"pass-{index:04d}.json"
+
+
+def save_review_run_pass(
+    store: ReviewRunStore,
+    index: int,
+    report: dict[str, Any],
+) -> None:
+    record = {
+        "schema_version": REVIEW_RUN_SCHEMA_VERSION,
+        "identity": store.identity,
+        "pass_index": index,
+        "pass_count": len(store.prompt_hashes),
+        "prompt_sha256": store.prompt_hashes[index - 1],
+        "report_sha256": hashlib.sha256(canonical_json_bytes(report)).hexdigest(),
+        "report": report,
+    }
+    path = review_run_pass_path(store, index)
+    if path.exists():
+        if read_review_run_json(path) != record:
+            raise SystemExit(
+                f"review checkpoint pass {index} already exists with different content"
+            )
+        return
+    atomic_write_private_json(path, record)
+
+
+def load_review_run_passes(
+    store: ReviewRunStore,
+    repo: Path,
+    changed_paths: set[str],
+) -> dict[int, dict[str, Any]]:
+    completed: dict[int, dict[str, Any]] = {}
+    missing_seen = False
+    for index, prompt_hash in enumerate(store.prompt_hashes, start=1):
+        path = review_run_pass_path(store, index)
+        if not path.exists():
+            missing_seen = True
+            continue
+        if missing_seen:
+            raise SystemExit(
+                "review checkpoint passes must form a contiguous completed prefix"
+            )
+        record = read_review_run_json(path)
+        report = record.get("report")
+        expected = {
+            "schema_version": REVIEW_RUN_SCHEMA_VERSION,
+            "identity": store.identity,
+            "pass_index": index,
+            "pass_count": len(store.prompt_hashes),
+            "prompt_sha256": prompt_hash,
+            "report_sha256": (
+                hashlib.sha256(canonical_json_bytes(report)).hexdigest()
+                if isinstance(report, dict)
+                else None
+            ),
+            "report": report,
+        }
+        if record != expected or not isinstance(report, dict):
+            raise SystemExit(f"review checkpoint pass {index} failed integrity validation")
+        validate_report(report, repo, changed_paths, [])
+        completed[index] = report
+
+    expected_names = {
+        review_run_pass_path(store, index).name
+        for index in range(1, len(store.prompt_hashes) + 1)
+    }
+    unexpected = sorted(
+        path.name
+        for path in store.path.glob("pass-*.json")
+        if path.name not in expected_names
+    )
+    if unexpected:
+        raise SystemExit(
+            "review checkpoint contains unexpected pass records: "
+            + ", ".join(display_escape(name, 200) for name in unexpected)
+        )
+    return completed
+
+
+def run_review_passes(
+    args: argparse.Namespace,
+    reviewers: list[argparse.Namespace],
+    repo: Path,
+    prompts: list[str],
+    changed_paths: set[str],
+    input_truncated: bool,
+    store: ReviewRunStore | None,
+) -> list[tuple[str, dict[str, Any]]]:
+    resumed = load_review_run_passes(store, repo, changed_paths) if store else {}
+    if resumed:
+        print(
+            f"review resume: {len(resumed)}/{len(prompts)} completed passes loaded"
+        )
+    chunk_reports: list[tuple[str, dict[str, Any]]] = []
+    for index, prompt in enumerate(prompts, start=1):
+        if len(prompts) > 1:
+            state = "resumed" if index in resumed else f"{utf8_size(prompt)} prompt bytes"
+            print(f"review pass: {index}/{len(prompts)} ({state})")
+        required = args.require_finding if len(prompts) == 1 else []
+        if index in resumed:
+            chunk_report = resumed[index]
+            validate_report(chunk_report, repo, changed_paths, required)
+        elif len(reviewers) == 1:
+            chunk_report = run_reviewer(
+                reviewers[0],
+                repo,
+                prompt,
+                changed_paths,
+                required,
+                input_truncated,
+            )
+        else:
+            chunk_report = run_panel(
+                args,
+                reviewers,
+                repo,
+                prompt,
+                changed_paths,
+                input_truncated,
+                required,
+            )
+        if store and index not in resumed:
+            save_review_run_pass(store, index, chunk_report)
+        chunk_reports.append((f"chunk {index}/{len(prompts)}", chunk_report))
+    return chunk_reports
+
+
 def run_panel(
     args: argparse.Namespace,
     reviewers: list[argparse.Namespace],
@@ -14276,8 +14622,9 @@ def self_test() -> int:
 def reject_repo_output_paths(args: argparse.Namespace, repo: Path) -> None:
     repo_root_path = repo.resolve()
     for option, value in (
-        ("--json-output", args.json_output),
-        ("--output", args.output),
+        ("--json-output", getattr(args, "json_output", None)),
+        ("--output", getattr(args, "output", None)),
+        ("--run-root", getattr(args, "run_root", None)),
     ):
         if not value:
             continue
@@ -14440,39 +14787,27 @@ def main_impl() -> int:
             "source changed while the review bundle was being created; "
             "rerun autoreview against the updated tree"
         )
+    run_store = open_review_run_store(
+        args,
+        repo,
+        reviewers,
+        prompts,
+        changed_paths,
+    )
 
     tests_proc: tuple[subprocess.Popen, float] | None = None
     if args.parallel_tests:
         tests_proc = start_parallel_tests(args.parallel_tests, repo, args.parallel_tests_shell)
     try:
-        chunk_reports: list[tuple[str, dict[str, Any]]] = []
-        for index, prompt in enumerate(prompts, start=1):
-            if len(prompts) > 1:
-                print(
-                    f"review pass: {index}/{len(prompts)} "
-                    f"({utf8_size(prompt)} prompt bytes)"
-                )
-            required = args.require_finding if len(prompts) == 1 else []
-            if len(reviewers) == 1:
-                chunk_report = run_reviewer(
-                    reviewers[0],
-                    repo,
-                    prompt,
-                    changed_paths,
-                    required,
-                    input_truncated,
-                )
-            else:
-                chunk_report = run_panel(
-                    args,
-                    reviewers,
-                    repo,
-                    prompt,
-                    changed_paths,
-                    input_truncated,
-                    required,
-                )
-            chunk_reports.append((f"chunk {index}/{len(prompts)}", chunk_report))
+        chunk_reports = run_review_passes(
+            args,
+            reviewers,
+            repo,
+            prompts,
+            changed_paths,
+            input_truncated,
+            run_store,
+        )
         if len(chunk_reports) == 1:
             report = chunk_reports[0][1]
         else:

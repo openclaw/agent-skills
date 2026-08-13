@@ -1504,6 +1504,170 @@ class AutoreviewHardeningTests(unittest.TestCase):
                         "",
                     )
 
+    def test_interrupted_review_resumes_after_last_completed_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            prompts = ["review pass one", "review pass two", "review pass three"]
+            report = {
+                "findings": [],
+                "overall_correctness": "patch is correct",
+                "overall_explanation": "clean",
+                "overall_confidence": 0.9,
+            }
+            args = argparse.Namespace(
+                run_id="resume-test",
+                run_root=str(root / "runs"),
+                allow_partial_panel=False,
+                require_finding=[],
+            )
+            reviewer = argparse.Namespace(
+                engine="pi",
+                model="test-model",
+                fallback_model=None,
+                thinking="high",
+                tools=False,
+                web_search=False,
+                pi_bin="/outside/fake-pi",
+            )
+            reviewers = [reviewer]
+            store = self.helper["open_review_run_store"](
+                args,
+                repo,
+                reviewers,
+                prompts,
+                set(),
+            )
+            calls: list[str] = []
+
+            def interrupted(_reviewer, _repo, prompt, *_args):
+                calls.append(prompt)
+                if prompt == prompts[1]:
+                    raise self.helper["EngineInterrupted"](130)
+                return report
+
+            runner = self.helper["run_review_passes"]
+            with mock.patch.dict(
+                runner.__globals__,
+                {"run_reviewer": interrupted},
+            ):
+                with self.assertRaises(self.helper["EngineInterrupted"]):
+                    runner(args, reviewers, repo, prompts, set(), False, store)
+
+            self.assertEqual(calls, prompts[:2])
+            self.assertTrue((store.path / "pass-0001.json").is_file())
+            self.assertFalse((store.path / "pass-0002.json").exists())
+
+            calls.clear()
+
+            def resumed(_reviewer, _repo, prompt, *_args):
+                calls.append(prompt)
+                return report
+
+            reopened = self.helper["open_review_run_store"](
+                args,
+                repo,
+                reviewers,
+                prompts,
+                set(),
+            )
+            stdout = io.StringIO()
+            with (
+                mock.patch.dict(runner.__globals__, {"run_reviewer": resumed}),
+                contextlib.redirect_stdout(stdout),
+            ):
+                reports = runner(
+                    args,
+                    reviewers,
+                    repo,
+                    prompts,
+                    set(),
+                    False,
+                    reopened,
+                )
+
+            self.assertEqual(calls, prompts[1:])
+            self.assertEqual(len(reports), 3)
+            self.assertIn("1/3 completed passes loaded", stdout.getvalue())
+            self.assertIn("review pass: 1/3 (resumed)", stdout.getvalue())
+            self.assertTrue((store.path / "pass-0003.json").is_file())
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(store.path.stat().st_mode), 0o700)
+                self.assertEqual(
+                    stat.S_IMODE((store.path / "pass-0001.json").stat().st_mode),
+                    0o600,
+                )
+
+    def test_review_resume_refuses_changed_input_or_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            args = argparse.Namespace(
+                run_id="identity-test",
+                run_root=str(root / "runs"),
+                allow_partial_panel=False,
+            )
+            reviewer = argparse.Namespace(
+                engine="pi",
+                model="model-a",
+                fallback_model=None,
+                thinking="high",
+                tools=False,
+                web_search=False,
+                pi_bin="/outside/fake-pi",
+            )
+            opener = self.helper["open_review_run_store"]
+            opener(args, repo, [reviewer], ["first prompt"], {"one.txt"})
+
+            with self.assertRaisesRegex(SystemExit, "identity does not match"):
+                opener(args, repo, [reviewer], ["changed prompt"], {"one.txt"})
+
+            reviewer.model = "model-b"
+            with self.assertRaisesRegex(SystemExit, "identity does not match"):
+                opener(args, repo, [reviewer], ["first prompt"], {"one.txt"})
+
+    def test_review_resume_rejects_tampered_or_noncontiguous_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            args = argparse.Namespace(
+                run_id="integrity-test",
+                run_root=str(root / "runs"),
+                allow_partial_panel=False,
+            )
+            reviewer = argparse.Namespace(
+                engine="pi",
+                model="test-model",
+                fallback_model=None,
+                thinking="high",
+                tools=False,
+                web_search=False,
+                pi_bin="/outside/fake-pi",
+            )
+            store = self.helper["open_review_run_store"](
+                args, repo, [reviewer], ["one", "two"], set()
+            )
+            report = {
+                "findings": [],
+                "overall_correctness": "patch is correct",
+                "overall_explanation": "clean",
+                "overall_confidence": 0.9,
+            }
+            self.helper["save_review_run_pass"](store, 2, report)
+            with self.assertRaisesRegex(SystemExit, "contiguous completed prefix"):
+                self.helper["load_review_run_passes"](store, repo, set())
+
+            (store.path / "pass-0002.json").unlink()
+            self.helper["save_review_run_pass"](store, 1, report)
+            record_path = store.path / "pass-0001.json"
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            record["report"]["overall_explanation"] = "tampered"
+            record_path.write_text(json.dumps(record), encoding="utf-8")
+            if os.name != "nt":
+                record_path.chmod(0o600)
+            with self.assertRaisesRegex(SystemExit, "integrity validation"):
+                self.helper["load_review_run_passes"](store, repo, set())
+
     def test_review_patch_does_not_disclose_controls_in_omitted_paths(self) -> None:
         path = ".env.\x1b]52;c;VEVTVA==\x07\udc9b"
 

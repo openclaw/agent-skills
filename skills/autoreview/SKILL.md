@@ -218,6 +218,29 @@ Removing verified non-authoritative generated noise remains useful, but never
 drop lockfiles, generated clients, policies, manifests, schemas, or other
 independently semantic artifacts merely to shrink the review.
 
+### Resume interrupted passes
+
+Checkpointing is explicit and caller-owned. For a review that may need several
+passes, choose a run id and a storage directory outside the reviewed repository:
+
+```bash
+"$AUTOREVIEW" --mode branch --base origin/main \
+  --run-id issue-123-review-1 \
+  --run-root /tmp/autoreview-runs
+```
+
+If the run is interrupted, rerun the exact command. Each validated pass is
+written atomically with owner-only permissions, and the helper resumes after
+the last contiguous completed pass. The checkpoint identity binds the exact
+review prompts, changed paths, reviewer set, models, thinking levels, tool and
+web-search settings, engine binaries, and panel failure policy. A changed diff
+or reviewer configuration fails closed; use a new run id for the new review.
+
+Both flags are required together. There is no default checkpoint directory and
+no implicit reuse. Checkpoints can contain review findings and remain on disk
+after success, so choose a private caller-managed location and apply its normal
+retention policy.
+
 ## Parallel Closeout
 
 Format first if formatting can change line locations. Then it is OK to run tests and review in parallel:
@@ -442,7 +465,7 @@ The helper:
 - scans safe Git patches in full, recognizes synthetic fixture values tied to their credential field, reviews them in one pass up to the aggregate prompt limit, and automatically uses complete bounded passes above it
 - should be left in `--mode auto` or forced to `--mode branch` for PR/branch work; do not force `--mode local` after committing
 - writes only to stdout unless `--output`, `--json-output`, or live streamed engine stderr is set
-- supports `--dry-run` (validates bundle construction and reviewer CLI binary resolution without contacting any engine; exits nonzero if either check fails), `--parallel-tests`, `--parallel-tests-shell`, `--prompt`, repo-relative `--prompt-file`, repo-relative `--dataset`, `--no-tools`, `--no-web-search`, repeatable Codex-only safe model/response tuning with `--codex-config key=value`, Codex-only `--codex-speed fast|flex|default`, and commit refs
+- supports `--dry-run` (validates bundle construction and reviewer CLI binary resolution without contacting any engine; exits nonzero if either check fails), explicit resumable pass checkpoints with `--run-id` plus `--run-root`, `--parallel-tests`, `--parallel-tests-shell`, `--prompt`, repo-relative `--prompt-file`, repo-relative `--dataset`, `--no-tools`, `--no-web-search`, repeatable Codex-only safe model/response tuning with `--codex-config key=value`, Codex-only `--codex-speed fast|flex|default`, and commit refs
 - supports `--stream-engine-output` or `AUTOREVIEW_STREAM_ENGINE_OUTPUT=1` for live engine text while preserving structured validation; Codex and Claude hide tool/file event details, emit compact activity summaries, and report usage at turn completion
 - supports opt-in review panels with `--panel` / `--reviewers`, plus per-engine `--model`, `--thinking`, and Claude `--fallback-model`
 - uses built-in defaults `codex=gpt-5.6-sol` with `high` reasoning and an access-only `gpt-5.6-terra` retry, `claude=claude-fable-5`, and `amp=openai/gpt-5.6-sol` with `high` reasoning; honors `AUTOREVIEW_MODEL`, `AUTOREVIEW_THINKING`, `AUTOREVIEW_FALLBACK_MODEL`, and per-engine `AUTOREVIEW_<ENGINE>_MODEL` / `AUTOREVIEW_<ENGINE>_THINKING` environment overrides when CLI flags are omitted
