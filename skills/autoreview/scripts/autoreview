@@ -13576,6 +13576,16 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
         if thinking and thinking not in THINKING_LEVELS_BY_ENGINE[engine]:
             valid = ", ".join(sorted(THINKING_LEVELS_BY_ENGINE[engine])) or "none"
             raise SystemExit(f"invalid thinking level for {engine}: {thinking} (valid: {valid})")
+        if engine == "codex" and thinking == "high":
+            # The governed GPT-5.6 Sol launch gate certifies only medium/xhigh,
+            # so translate the public Codex high tier to xhigh before launch;
+            # model_reasoning_effort="high" would otherwise be gate-denied
+            # (sol_effort_unapproved).
+            print(
+                "autoreview: codex thinking high maps to xhigh (governed Sol gate certifies only medium/xhigh)",
+                file=sys.stderr,
+            )
+            thinking = "xhigh"
         clone = copy.copy(args)
         clone.engine = engine
         clone.model = model
@@ -14067,7 +14077,7 @@ def self_test_config_defaults() -> None:
             raise SystemExit(
                 f"self-test config defaults failed: explicit Sol access fallback={explicit_sol.fallback_model!r}"
             )
-        if default_codex.thinking != "high":
+        if default_codex.thinking != "xhigh":
             raise SystemExit(f"self-test config defaults failed: default codex thinking={default_codex.thinking!r}")
         max_effort = reviewer_args(reviewer_test_args(engine="codex", thinking=["max"]))[0]
         if max_effort.thinking != "max":
@@ -14088,7 +14098,7 @@ def self_test_config_defaults() -> None:
         codex = reviewer_args(reviewer_test_args(engine="codex"))[0]
         if codex.model != "env-codex-model":
             raise SystemExit(f"self-test config defaults failed: model={codex.model!r}")
-        if codex.thinking != "high":
+        if codex.thinking != "xhigh":
             raise SystemExit(f"self-test config defaults failed: thinking={codex.thinking!r}")
         os.environ.pop("AUTOREVIEW_CODEX_MODEL")
         os.environ.pop("AUTOREVIEW_CODEX_THINKING")

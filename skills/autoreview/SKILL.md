@@ -317,14 +317,28 @@ CLI flags and environment variables override these defaults. Amp model IDs must 
 | **cursor**          | currently refused          | Cursor model aliases                                                         | not supported                 | n/a                                                        |
 | **opencode**        | currently refused          | OpenCode provider/model IDs                                                  | not supported                 | n/a                                                        |
 
+### Governed Codex effort mapping
+
+The governed GPT-5.6 Sol launch gate certifies only `medium` and `xhigh` as Sol
+reasoning efforts, so raw Codex `high` would be gate-denied
+(`sol_effort_unapproved`). To keep `--thinking high` valid as the normal Codex
+review tier, the helper translates Codex `high` to `xhigh` before launch: global
+`--thinking high`, keyed `--thinking codex=high`, inline `codex:<model>:high`,
+the `AUTOREVIEW_THINKING` / `AUTOREVIEW_CODEX_THINKING` environment defaults,
+and the built-in Codex `high` default all launch as
+`model_reasoning_effort="xhigh"`, never `"high"`, and one stderr note is emitted
+when the translation happens. Codex `medium` and `xhigh` pass through unchanged;
+Claude, Amp, Pi, and Kimi are untouched. The launch gate itself is unchanged and
+still rejects raw Sol `high`.
+
 Claude also supports `--fallback-model a,b` for availability-based fallback chains ([model-config](https://code.claude.com/docs/en/model-config)). Current Claude docs note that auth, billing, rate-limit, request-size, and transport errors do not trigger fallback, and the changelog documents interactive-session support in `v2.1.166`.
 
-[OpenAI's model guidance](https://developers.openai.com/api/docs/guides/latest-model) identifies Sol as the GPT-5.6 frontier-capability route and documents `max` support. Autoreview keeps `high` as its default; use `max` only for the hardest quality-first reviews after comparing its latency and cost with `xhigh` on representative changes.
+[OpenAI's model guidance](https://developers.openai.com/api/docs/guides/latest-model) identifies Sol as the GPT-5.6 frontier-capability route and documents `max` support. Autoreview keeps `high` as its default, which the governed mapping above launches as `xhigh` for Codex; use `max` only for the hardest quality-first reviews after comparing its latency and cost with `xhigh` on representative changes.
 
 Examples matching current `main` behavior:
 
 ```bash
-# Codex with explicit model and reasoning
+# Codex with explicit model and reasoning (high is launched as xhigh under the governed mapping above)
 "$AUTOREVIEW" --engine codex --model gpt-5.6-sol --thinking high
 
 # Codex fast mode (priority service tier); needs a model whose catalog lists the tier, silently standard otherwise
