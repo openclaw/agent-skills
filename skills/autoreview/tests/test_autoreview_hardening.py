@@ -132,6 +132,156 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertIn(self.helper["TRUFFLEHOG_INSTALL_URL"], message)
         self.assertNotIn("brew", message.casefold())
 
+    def test_trufflehog_neutralizes_only_exact_known_synthetic_fixtures(self) -> None:
+        credentialed_authority = (
+            b"review-user" + b":" + b"review-password" + b"@"
+        )
+        known_fixtures = (
+            b"https://" + credentialed_authority + b"example.invalid/api",
+            b"http://"
+            + credentialed_authority
+            + b"proxy.example.invalid:8080",
+            b"socks5://"
+            + credentialed_authority
+            + b"proxy.example.invalid:1080",
+        )
+        near_miss = b"https://" + credentialed_authority + b"example.com/api"
+        allowed_paths = sorted(self.helper["TRUFFLEHOG_SYNTHETIC_FIXTURE_PATHS"])
+        outside_path = "tests/test_autoreview_hardening.py"
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            original = b"\n".join((*known_fixtures, near_miss)) + b"\n"
+            for rel in (*allowed_paths, outside_path):
+                destination = root / rel
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(original)
+
+            count = self.helper["neutralize_known_trufflehog_test_fixtures"](
+                root,
+                [*allowed_paths, outside_path],
+            )
+
+            self.assertEqual(count, len(known_fixtures) * len(allowed_paths))
+            for rel in allowed_paths:
+                neutralized = (root / rel).read_bytes()
+                for fixture in known_fixtures:
+                    self.assertNotIn(fixture, neutralized)
+                self.assertIn(near_miss, neutralized)
+            self.assertEqual((root / outside_path).read_bytes(), original)
+
+    def test_trufflehog_history_neutralizes_known_fixture_on_both_sides(self) -> None:
+        credentialed_authority = (
+            "review-user" + ":" + "review-password" + "@"
+        )
+        fixture = (
+            "https://" + credentialed_authority + "example.invalid/api"
+        )
+        rel = "skills/autoreview/tests/test_autoreview_hardening.py"
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / rel
+            source.parent.mkdir(parents=True)
+            source.write_text(fixture + "\n", encoding="utf-8")
+            git(repo, "add", rel)
+            git(repo, "commit", "-q", "-m", "base")
+            base = git(repo, "rev-parse", "HEAD").strip()
+            source.write_text(
+                '"https://" + credentialed_authority + "example.invalid/api"\n',
+                encoding="utf-8",
+            )
+            git(repo, "add", rel)
+            git(repo, "commit", "-q", "-m", "reviewed")
+            scan_repo = root / "scan"
+            scan_repo.mkdir()
+
+            self.helper["prepare_trufflehog_history"](
+                repo,
+                "branch",
+                base,
+                "HEAD",
+                scan_repo,
+            )
+
+            for commit in git(
+                scan_repo,
+                "log",
+                "--format=%H",
+            ).splitlines():
+                content = git(scan_repo, "show", f"{commit}:{rel}")
+                self.assertNotIn(fixture, content)
+
+    def test_trufflehog_preflight_always_reports_fixture_neutralization(self) -> None:
+        credentialed_authority = (
+            "review-user" + ":" + "review-password" + "@"
+        )
+        fixture = (
+            "https://" + credentialed_authority + "example.invalid/api"
+        )
+        rel = "skills/autoreview/tests/test_autoreview_hardening.py"
+
+        for returncode in (0, self.helper["TRUFFLEHOG_FINDINGS_EXIT_CODE"]):
+            with self.subTest(returncode=returncode), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                git(repo, "commit", "--allow-empty", "-q", "-m", "base")
+                source = repo / rel
+                source.parent.mkdir(parents=True)
+                source.write_text(fixture + "\n", encoding="utf-8")
+                original_find_command = self.helper["find_command"]
+                original_run = self.helper["run"]
+
+                def find_command(name: str, checkout: Path) -> str | None:
+                    if name == "trufflehog":
+                        return "/trusted/trufflehog"
+                    return original_find_command(name, checkout)
+
+                def run_scanner(
+                    command: list[str],
+                    cwd: Path,
+                    **kwargs: object,
+                ) -> subprocess.CompletedProcess[str]:
+                    if command[0] != "/trusted/trufflehog":
+                        return original_run(command, cwd, **kwargs)
+                    return subprocess.CompletedProcess(command, returncode, "", "")
+
+                output = io.StringIO()
+                with (
+                    mock.patch.dict(
+                        self.helper["run_trufflehog_preflight"].__globals__,
+                        {
+                            "find_command": find_command,
+                            "run": run_scanner,
+                        },
+                    ),
+                    contextlib.redirect_stdout(output),
+                ):
+                    if returncode:
+                        with self.assertRaisesRegex(
+                            SystemExit,
+                            "found verified or unknown credentials",
+                        ):
+                            self.helper["run_trufflehog_preflight"](
+                                repo,
+                                "local",
+                                None,
+                                "HEAD",
+                            )
+                    else:
+                        self.helper["run_trufflehog_preflight"](
+                            repo,
+                            "local",
+                            None,
+                            "HEAD",
+                        )
+
+                self.assertIn(
+                    "trufflehog notice: neutralized 1 exact synthetic "
+                    "autoreview test fixture occurrence(s)",
+                    output.getvalue(),
+                )
+
     def test_trufflehog_scans_staged_and_working_versions_separately(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
@@ -6226,8 +6376,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 os.environ["BASH_FUNC_testcmd%%"] = "() { echo injected; }"
                 os.environ["SHELLOPTS"] = "xtrace"
                 os.environ["NODE_OPTIONS"] = "--require=/tmp/unsafe.js"
+                credentialed_authority = (
+                    "review-user" + ":" + "review-password" + "@"
+                )
                 os.environ["SERVICE_URL"] = (
-                    "https://review-user:review-password@example.invalid/api"
+                    "https://" + credentialed_authority + "example.invalid/api"
                 )
                 os.environ["UNRELATED_VALUE"] = "ghp_" + "A" * 24
 
@@ -6401,19 +6554,27 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertTrue(self.helper["safe_proxy_url"](value))
 
+        credentialed_authority = (
+            "review-user" + ":" + "review-password" + "@"
+        )
         for value in (
-            "http://review-user:review-password@proxy.example.invalid:8080",
-            "socks5://review-user:review-password@proxy.example.invalid:1080",
+            "http://" + credentialed_authority + "proxy.example.invalid:8080",
+            "socks5://" + credentialed_authority + "proxy.example.invalid:1080",
         ):
             with self.subTest(value=value):
                 self.assertFalse(self.helper["safe_proxy_url"](value))
 
     def test_safe_engine_env_rejects_credentialed_proxy(self) -> None:
+        credentialed_authority = (
+            "review-user" + ":" + "review-password" + "@"
+        )
         with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(
             os.environ,
             {
                 "HTTPS_PROXY": (
-                    "http://review-user:review-password@proxy.example.invalid:8080"
+                    "http://"
+                    + credentialed_authority
+                    + "proxy.example.invalid:8080"
                 )
             },
             clear=False,

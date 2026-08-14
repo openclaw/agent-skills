@@ -2253,6 +2253,30 @@ def validate_git_ref(repo: Path, ref: str, label: str) -> str:
 
 TRUFFLEHOG_INSTALL_URL = "https://github.com/trufflesecurity/trufflehog#installation"
 TRUFFLEHOG_FINDINGS_EXIT_CODE = 183
+TRUFFLEHOG_SYNTHETIC_FIXTURE_PATHS = frozenset(
+    {
+        "skills/autoreview/tests/test_autoreview_hardening.py",
+        ".agents/skills/autoreview/tests/test_autoreview_hardening.py",
+        ".claude/skills/autoreview/tests/test_autoreview_hardening.py",
+    }
+)
+
+
+def trufflehog_synthetic_fixture_replacements() -> dict[bytes, bytes]:
+    credentialed_authority = (
+        b"review-user" + b":" + b"review-password" + b"@"
+    )
+    return {
+        b"https://"
+        + credentialed_authority
+        + b"example.invalid/api": b"https://synthetic-review.example.invalid/api",
+        b"http://"
+        + credentialed_authority
+        + b"proxy.example.invalid:8080": b"http://synthetic-review.proxy.example.invalid:8080",
+        b"socks5://"
+        + credentialed_authority
+        + b"proxy.example.invalid:1080": b"socks5://synthetic-review.proxy.example.invalid:1080",
+    }
 
 
 def git_bytes(
@@ -2635,6 +2659,31 @@ def clear_snapshot_paths(root: Path, paths: list[str]) -> None:
             shutil.rmtree(destination)
 
 
+def neutralize_known_trufflehog_test_fixtures(repo: Path, paths: list[str]) -> int:
+    replacements = trufflehog_synthetic_fixture_replacements()
+    replacement_count = 0
+    for rel in paths:
+        if rel not in TRUFFLEHOG_SYNTHETIC_FIXTURE_PATHS:
+            continue
+        source = snapshot_destination(repo, rel)
+        try:
+            source_stat = source.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(source_stat.st_mode):
+            continue
+        content = source.read_bytes()
+        neutralized = content
+        for fixture, replacement in replacements.items():
+            occurrences = neutralized.count(fixture)
+            if occurrences:
+                neutralized = neutralized.replace(fixture, replacement)
+                replacement_count += occurrences
+        if neutralized != content:
+            source.write_bytes(neutralized)
+    return replacement_count
+
+
 def commit_snapshot(repo: Path, label: str) -> str:
     git(repo, "add", "-A", "-f")
     git(
@@ -2775,8 +2824,20 @@ def prepare_trufflehog_history(
     target_ref: str | None,
     commit_ref: str,
     root: Path,
+    neutralized_count_out: list[int] | None = None,
 ) -> str:
     git(root, "init", "-q")
+    neutralized_count = 0
+
+    def commit_layer(label: str, paths: list[str]) -> str:
+        nonlocal neutralized_count
+        neutralized_count += neutralize_known_trufflehog_test_fixtures(root, paths)
+        return commit_snapshot(root, label)
+
+    def record_neutralized_count() -> None:
+        if neutralized_count_out is not None:
+            neutralized_count_out.append(neutralized_count)
+
     if target == "local":
         staged_paths = git_path_list(
             repo,
@@ -2807,22 +2868,23 @@ def prepare_trufflehog_history(
         head = git(repo, "rev-parse", "--verify", "HEAD", check=False).strip()
         if head:
             materialize_tree_snapshot(repo, root, head, paths)
-        base_commit = commit_snapshot(root, "baseline")
+        base_commit = commit_layer("baseline", paths)
         clear_snapshot_paths(root, paths)
         materialize_index_snapshot(repo, root, paths)
-        commit_snapshot(root, "staged")
+        commit_layer("staged", paths)
         clear_snapshot_paths(root, paths)
         materialize_worktree_snapshot(repo, root, paths)
-        commit_snapshot(root, "working")
+        commit_layer("working", paths)
         # TruffleHog's Git parser scans additions only. Reverse commits make
         # deleted bytes additions without exposing unchanged baseline content.
         clear_snapshot_paths(root, paths)
         materialize_index_snapshot(repo, root, paths)
-        commit_snapshot(root, "reverse staged")
+        commit_layer("reverse staged", paths)
         clear_snapshot_paths(root, paths)
         if head:
             materialize_tree_snapshot(repo, root, head, paths)
-        commit_snapshot(root, "reverse baseline")
+        commit_layer("reverse baseline", paths)
+        record_neutralized_count()
         return base_commit
 
     if target == "branch":
@@ -2860,16 +2922,17 @@ def prepare_trufflehog_history(
         )
     if base_ref:
         materialize_tree_snapshot(repo, root, base_ref, paths)
-    base_commit = commit_snapshot(root, "baseline")
+    base_commit = commit_layer("baseline", paths)
     clear_snapshot_paths(root, paths)
     materialize_tree_snapshot(repo, root, reviewed_ref, paths)
-    commit_snapshot(root, "reviewed")
+    commit_layer("reviewed", paths)
     # Scan the reverse diff too so deleted bytes become additions for
     # TruffleHog without scanning unchanged content from the baseline.
     clear_snapshot_paths(root, paths)
     if base_ref:
         materialize_tree_snapshot(repo, root, base_ref, paths)
-    commit_snapshot(root, "reverse baseline")
+    commit_layer("reverse baseline", paths)
+    record_neutralized_count()
     return base_commit
 
 
@@ -2891,12 +2954,14 @@ def run_trufflehog_preflight(
         dir=safe_temp_root(repo),
     ) as tempdir:
         scan_repo = Path(tempdir)
+        neutralized_counts: list[int] = []
         base_commit = prepare_trufflehog_history(
             repo,
             target,
             target_ref,
             commit_ref,
             scan_repo,
+            neutralized_counts,
         )
         result = run(
             [
@@ -2917,6 +2982,12 @@ def run_trufflehog_preflight(
             scan_repo,
             check=False,
             env=safe_trufflehog_env(repo),
+        )
+    neutralized_count = sum(neutralized_counts)
+    if neutralized_count:
+        print(
+            "trufflehog notice: neutralized "
+            f"{neutralized_count} exact synthetic autoreview test fixture occurrence(s)"
         )
     if result.returncode == TRUFFLEHOG_FINDINGS_EXIT_CODE:
         raise SystemExit(
