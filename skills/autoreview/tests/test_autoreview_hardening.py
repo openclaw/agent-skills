@@ -4478,6 +4478,34 @@ class AutoreviewHardeningTests(unittest.TestCase):
             )
         )
 
+    def test_branch_bundle_preserves_deleted_jinja_pem_marker_regex(self) -> None:
+        # Generic template regex delimiters are not private-key material. The
+        # branch boundary must keep a deleted template reviewable as-is.
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            template = repo / "origin-pem.j2"
+            template.write_text(
+                "-----BEGIN [A-Z ]+-----\n"
+                "{{ _body }}\n"
+                "-----END [A-Z ]+-----\n",
+                encoding="utf-8",
+            )
+            git(repo, "add", template.name)
+            git(repo, "commit", "-q", "-m", "add template")
+            base = git(repo, "rev-parse", "HEAD").strip()
+
+            template.unlink()
+            git(repo, "add", "-u")
+            git(repo, "commit", "-q", "-m", "delete template")
+
+            bundle, truncated = self.helper["branch_bundle"](repo, base)
+
+            self.assertIn("deleted file mode 100644", bundle)
+            self.assertIn("------BEGIN [A-Z ]+-----", bundle)
+            self.assertIn("-{{ _body }}", bundle)
+            self.assertIn("------END [A-Z ]+-----", bundle)
+            self.assertFalse(truncated)
+
     def test_review_patch_redacts_secret_only_in_entirely_deleted_file(self) -> None:
         value = realistic_secret_value()
         known_fragments: set[str] = set()
