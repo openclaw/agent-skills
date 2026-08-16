@@ -1514,6 +1514,7 @@ class EngineInterrupted(BaseException):
 _OWNED_PROCESS_LOCK = threading.RLock()
 _OWNED_PROCESSES: dict[int, subprocess.Popen[str]] = {}
 _OWNED_PROCESS_GRACE_SECONDS = 2.0
+_TIMED_OUT_STREAM_DRAIN_SECONDS = 1.0
 
 
 def process_group_popen_kwargs() -> dict[str, Any]:
@@ -1857,6 +1858,64 @@ def emit_heartbeat(
     return next_metrics or metrics
 
 
+class EngineRuntimeDeadline:
+    """One absolute wall-clock deadline for an owned reviewer process."""
+
+    def __init__(self, label: str, max_runtime_seconds: float | None) -> None:
+        self.label = label
+        self.max_runtime_seconds = max_runtime_seconds
+        self.expires_at = (
+            time.monotonic() + max_runtime_seconds
+            if max_runtime_seconds is not None
+            else None
+        )
+        self.terminated = False
+        self.drain_expires_at: float | None = None
+
+    def wait_seconds(self, heartbeat_seconds: float) -> float:
+        wait_until = self.drain_expires_at if self.terminated else self.expires_at
+        if wait_until is None:
+            return heartbeat_seconds
+        return max(0.0, min(heartbeat_seconds, wait_until - time.monotonic()))
+
+    def expired(self) -> bool:
+        return self.expires_at is not None and time.monotonic() >= self.expires_at
+
+    def terminate(self, proc: subprocess.Popen[str]) -> None:
+        if self.terminated:
+            return
+        self.terminated = True
+        terminate_process_group(proc)
+        self.drain_expires_at = time.monotonic() + _TIMED_OUT_STREAM_DRAIN_SECONDS
+
+    def drain_expired(self) -> bool:
+        return (
+            self.drain_expires_at is not None
+            and time.monotonic() >= self.drain_expires_at
+        )
+
+    def completed_process(
+        self,
+        args: list[str],
+        stdout: str,
+        stderr: str,
+    ) -> subprocess.CompletedProcess[str]:
+        assert self.max_runtime_seconds is not None
+        detail = f"{self.label} engine timed out after {self.max_runtime_seconds:g}s"
+        return subprocess.CompletedProcess(
+            args,
+            124,
+            stdout,
+            f"{stderr.rstrip()}\n{detail}".lstrip(),
+        )
+
+
+def timeout_output_text(value: str | bytes | None) -> str:
+    if isinstance(value, bytes):
+        return value.decode(SUBPROCESS_TEXT_ENCODING, errors=SUBPROCESS_TEXT_ERRORS)
+    return value or ""
+
+
 def opencode_review_config(web_search: bool = True) -> dict[str, Any]:
     permission: dict[str, Any] = {
         "*": "deny",
@@ -1908,13 +1967,15 @@ def run_with_heartbeat(
     *,
     input_text: str | None = None,
     label: str,
-    heartbeat_seconds: int = 60,
+    heartbeat_seconds: float = 60,
+    max_runtime_seconds: float | None = None,
     stream_output: bool = False,
     stream_display: Callable[[str, str], str | None] | None = None,
     env: dict[str, str] | None = None,
     resolve_root: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     resolve_root = resolve_root or cwd
+    deadline = EngineRuntimeDeadline(label, max_runtime_seconds)
     if stream_output:
         return run_with_stream(
             args,
@@ -1922,6 +1983,7 @@ def run_with_heartbeat(
             input_text=input_text,
             label=label,
             heartbeat_seconds=heartbeat_seconds,
+            deadline=deadline,
             stream_display=stream_display,
             env=env,
             resolve_root=resolve_root,
@@ -1948,14 +2010,30 @@ def run_with_heartbeat(
             try:
                 stdout, stderr = proc.communicate(
                     input=input_text if first_communicate else None,
-                    timeout=heartbeat_seconds,
+                    timeout=deadline.wait_seconds(heartbeat_seconds),
                 )
                 return subprocess.CompletedProcess(args, int(proc.returncode or 0), stdout, stderr)
             except subprocess.TimeoutExpired:
                 first_communicate = False
+                if deadline.expired():
+                    deadline.terminate(proc)
+                    try:
+                        stdout, stderr = proc.communicate(
+                            timeout=deadline.wait_seconds(
+                                _TIMED_OUT_STREAM_DRAIN_SECONDS
+                            )
+                        )
+                    except subprocess.TimeoutExpired as drain_timeout:
+                        stdout = timeout_output_text(drain_timeout.output)
+                        stderr = timeout_output_text(drain_timeout.stderr)
+                    return deadline.completed_process(args, stdout, stderr)
                 metrics = emit_heartbeat(label, resolve_root, started, proc, metrics)
     finally:
-        terminate_process_group(proc)
+        if not deadline.terminated:
+            terminate_process_group(proc)
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
         unregister_owned_process(proc)
 
 
@@ -1965,11 +2043,13 @@ def run_with_stream(
     *,
     input_text: str | None,
     label: str,
-    heartbeat_seconds: int,
+    heartbeat_seconds: float,
+    deadline: EngineRuntimeDeadline | None = None,
     stream_display: Callable[[str, str], str | None] | None,
     env: dict[str, str] | None = None,
     resolve_root: Path,
 ) -> subprocess.CompletedProcess[str]:
+    deadline = deadline or EngineRuntimeDeadline(label, None)
     with deferred_owned_process_signals():
         proc = subprocess.Popen(
             args,
@@ -1992,11 +2072,13 @@ def run_with_stream(
             input_text=input_text,
             label=label,
             heartbeat_seconds=heartbeat_seconds,
+            deadline=deadline,
             stream_display=stream_display,
             resolve_root=resolve_root,
         )
     finally:
-        terminate_process_group(proc)
+        if not deadline.terminated:
+            terminate_process_group(proc)
         unregister_owned_process(proc)
 
 
@@ -2006,7 +2088,8 @@ def collect_streamed_process(
     *,
     input_text: str | None,
     label: str,
-    heartbeat_seconds: int,
+    heartbeat_seconds: float,
+    deadline: EngineRuntimeDeadline,
     stream_display: Callable[[str, str], str | None] | None,
     resolve_root: Path,
 ) -> subprocess.CompletedProcess[str]:
@@ -2020,6 +2103,7 @@ def collect_streamed_process(
             for line in iter(stream.readline, ""):
                 events.put((name, line))
         finally:
+            stream.close()
             events.put((name, None))
 
     def write_stdin() -> None:
@@ -2027,9 +2111,10 @@ def collect_streamed_process(
             return
         try:
             proc.stdin.write(input_text)
-            proc.stdin.close()
         except BrokenPipeError:
-            return
+            pass
+        finally:
+            proc.stdin.close()
 
     threads = [
         threading.Thread(target=read_stream, args=("stdout", proc.stdout), daemon=True),
@@ -2043,9 +2128,15 @@ def collect_streamed_process(
 
     open_streams = 2
     while open_streams:
+        if deadline.expired():
+            deadline.terminate(proc)
+        if deadline.drain_expired():
+            break
         try:
-            name, line = events.get(timeout=heartbeat_seconds)
+            name, line = events.get(timeout=deadline.wait_seconds(heartbeat_seconds))
         except queue.Empty:
+            if deadline.terminated or deadline.expired():
+                continue
             metrics = emit_heartbeat(label, resolve_root, started, proc, metrics)
             continue
         if line is None:
@@ -2061,11 +2152,16 @@ def collect_streamed_process(
             target.write(stream_display_escape(display))
             target.flush()
 
-    for thread in threads:
-        thread.join()
-    stdin_thread.join(timeout=1)
-    returncode = proc.wait()
-    return subprocess.CompletedProcess(args, returncode, "".join(stdout_parts), "".join(stderr_parts))
+    if not deadline.terminated:
+        for thread in threads:
+            thread.join()
+        stdin_thread.join(timeout=1)
+    returncode = int(proc.poll() or 0) if deadline.terminated else proc.wait()
+    stdout = "".join(stdout_parts)
+    stderr = "".join(stderr_parts)
+    if deadline.terminated:
+        return deadline.completed_process(args, stdout, stderr)
+    return subprocess.CompletedProcess(args, returncode, stdout, stderr)
 
 
 def git_result(
@@ -10838,6 +10934,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                     review_root,
                     input_text=prompt,
                     label="codex",
+                    max_runtime_seconds=getattr(args, "engine_timeout_seconds", None),
                     stream_output=args.stream_engine_output,
                     stream_display=CodexStreamDisplay() if args.stream_engine_output else None,
                     env=safe_engine_env(
@@ -10922,6 +11019,7 @@ def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             Path(tempdir),
             input_text=prompt,
             label="claude",
+            max_runtime_seconds=getattr(args, "engine_timeout_seconds", None),
             stream_output=args.stream_engine_output,
             stream_display=ClaudeStreamDisplay() if args.stream_engine_output else None,
             env=safe_engine_env(
@@ -11440,10 +11538,17 @@ def run_amp(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             review_root,
             input_text=trigger,
             label="amp",
+            max_runtime_seconds=getattr(args, "engine_timeout_seconds", None),
             stream_output=args.stream_engine_output,
             env=engine_env,
             resolve_root=repo,
         )
+        if result.returncode == 124:
+            detail = result.stderr or result.stdout
+            raise SystemExit(
+                f"amp engine failed ({result.returncode})\n"
+                + display_escape(detail, 4000, multiline=True)
+            )
         if len(result.stdout) > AMP_MAX_OUTPUT_CHARS:
             raise SystemExit("amp engine stream exceeds the output limit")
         tool_succeeded = attest_amp_stream(result.stdout, review_root)
@@ -11703,6 +11808,7 @@ def run_pi(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             Path(tempdir),
             input_text=prompt,
             label="pi",
+            max_runtime_seconds=getattr(args, "engine_timeout_seconds", None),
             stream_output=args.stream_engine_output,
             resolve_root=repo,
             env=safe_engine_env(
@@ -11762,6 +11868,7 @@ def run_kimi(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             cmd,
             review_root,
             label="kimi",
+            max_runtime_seconds=getattr(args, "engine_timeout_seconds", None),
             stream_output=args.stream_engine_output,
             resolve_root=repo,
             env=safe_engine_env(
@@ -13315,6 +13422,16 @@ def env_truthy(name: str) -> bool:
     raise SystemExit(f"invalid boolean environment value for {name}: {value}")
 
 
+def positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive number") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive number")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Bundle-driven AI code review.")
     parser.add_argument("--mode", choices=["auto", "local", "uncommitted", "branch", "commit"], default="auto")
@@ -13335,6 +13452,12 @@ def parse_args() -> argparse.Namespace:
         help="Claude fallback model chain for all reviewers or claude=a,b. Repeatable.",
     )
     parser.add_argument("--allow-partial-panel", action="store_true", help="Continue panel output when one reviewer fails.")
+    parser.add_argument(
+        "--engine-timeout-seconds",
+        type=positive_float,
+        default=os.environ.get("AUTOREVIEW_ENGINE_TIMEOUT_SECONDS"),
+        help="Optional wall-clock limit for each reviewer process. Disabled by default. Env: AUTOREVIEW_ENGINE_TIMEOUT_SECONDS.",
+    )
     parser.add_argument("--codex-bin", default=os.environ.get("CODEX_BIN", "codex"))
     parser.add_argument(
         "--codex-config",

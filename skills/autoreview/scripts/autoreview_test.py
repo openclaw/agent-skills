@@ -517,6 +517,76 @@ class AutoreviewAmpTests(unittest.TestCase):
             AUTOREVIEW.attest_amp_stream(amp_test_stream(cwd, tool_error=True), cwd)
         )
 
+    @unittest.skipIf(os.name == "nt", "Amp runtime is unsupported on native Windows")
+    def test_amp_run_reports_timeout_before_stream_attestation(self) -> None:
+        args = argparse.Namespace(
+            amp_bin="amp",
+            engine_timeout_seconds=0.01,
+            max_output_chars=2_000_000,
+            model="openai/gpt-5.6-sol",
+            stream_engine_output=False,
+            thinking="high",
+        )
+
+        def fake_preflight(
+            command: list[str],
+            cwd: Path,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            env = kwargs["env"]
+            assert isinstance(env, dict)
+            if command[-2:] == ["tools", "list"]:
+                return amp_test_mcp_denial_result(command, env)
+            plugin_root = Path(str(env["XDG_CONFIG_HOME"])) / "amp" / "plugins"
+            plugin_path = next(plugin_root.glob("autoreview-*.ts"))
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                amp_test_plugin_list(plugin_path),
+                "",
+            )
+
+        def fake_execute(
+            command: list[str],
+            cwd: Path,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(kwargs["max_runtime_seconds"], 0.01)
+            return subprocess.CompletedProcess(
+                command,
+                124,
+                '{"type":"system","subtype":"init"}\n',
+                "amp engine timed out after 0.01s",
+            )
+
+        with tempfile.TemporaryDirectory(prefix="autoreview-amp-timeout-test.") as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            repo.mkdir()
+            with mock.patch.object(
+                AUTOREVIEW,
+                "ensure_amp_isolation_supported",
+                return_value="/usr/bin/amp",
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "run",
+                side_effect=fake_preflight,
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "run_with_heartbeat",
+                side_effect=fake_execute,
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "attest_amp_stream",
+                side_effect=AssertionError("timeout stream must not be attested"),
+            ) as attest:
+                with self.assertRaises(SystemExit) as exc_info:
+                    AUTOREVIEW.run_amp(args, repo, "review")
+
+        message = str(exc_info.exception)
+        self.assertIn("amp engine failed (124)", message)
+        self.assertIn("amp engine timed out after 0.01s", message)
+        attest.assert_not_called()
+
     def test_amp_plugin_inventory_attestation_fails_closed(self) -> None:
         cwd = Path("/tmp/amp-review-empty")
         plugin_path = cwd.parent / "config" / "amp" / "plugins" / "autoreview-token.ts"
