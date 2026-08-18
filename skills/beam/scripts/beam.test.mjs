@@ -43,6 +43,28 @@ function run(args, options = {}) {
   });
 }
 
+async function beamReceiverEndpoint(t, urlForPayload, basePath = "") {
+  const server = http.createServer((request, response) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => {
+      body += chunk;
+    });
+    request.on("end", () => {
+      const payload = JSON.parse(body);
+      response.writeHead(200, {
+        "content-type": "application/json",
+        connection: "close",
+      });
+      response.end(JSON.stringify({ ok: true, url: urlForPayload(payload, request) }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const address = server.address();
+  return `http://127.0.0.1:${address.port}${basePath}/api/v1/beam/sessions`;
+}
+
 function claudeSession() {
   const dir = tempDir();
   const session = path.join(dir, "11111111-2222-4333-8444-555555555555.jsonl");
@@ -900,9 +922,13 @@ test("publish sends Cloudflare Access auth and normalized session JSON", async (
     });
     request.on("end", () => {
       const received = JSON.parse(requestBody);
-      const sessionKey = encodeURIComponent(`catalog:beam:gateway:${received.beamId}`);
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ ok: true, url: `/chat?session=${sessionKey}` }));
+      response.end(
+        JSON.stringify({
+          ok: true,
+          url: `/beam/${received.beamId.slice(0, 12)}`,
+        }),
+      );
     });
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -916,7 +942,10 @@ test("publish sends Cloudflare Access auth and normalized session JSON", async (
   );
 
   assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stdout, new RegExp(`http://127\\.0\\.0\\.1:${address.port}/chat\\?session=`));
+  assert.match(
+    result.stdout,
+    new RegExp(`http://127\\.0\\.0\\.1:${address.port}/beam/[a-f0-9]{12}`),
+  );
   assert.equal(accessToken, "test-access-token");
   const payload = JSON.parse(requestBody);
   assert.equal(payload.version, 1);
@@ -1015,66 +1044,157 @@ test("publish rejects receiver URLs containing reflected credentials", async (t)
 
 test("publish accepts the endpoint-derived Control UI base path", async (t) => {
   const session = claudeSession();
-  let body = "";
-  const server = http.createServer((request, response) => {
-    request.setEncoding("utf8");
-    request.on("data", (chunk) => {
-      body += chunk;
-    });
-    request.on("end", () => {
-      const payload = JSON.parse(body);
-      const key = encodeURIComponent(`catalog:beam:gateway:${payload.beamId}`);
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ ok: true, url: `/openclaw/chat?session=${key}` }));
-    });
-  });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  t.after(() => server.close());
-  const address = server.address();
+  const endpoint = await beamReceiverEndpoint(
+    t,
+    (payload) => `/openclaw/beam/${payload.beamId.slice(0, 12)}`,
+    "/openclaw",
+  );
   const result = await run([
     "publish",
     "--endpoint",
-    `http://127.0.0.1:${address.port}/openclaw/api/v1/beam/sessions`,
+    endpoint,
     "--session",
     session,
   ]);
 
   assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stdout, /\/openclaw\/chat\?session=/);
+  assert.match(result.stdout, /\/openclaw\/beam\/[a-f0-9]{12}/);
 });
 
-test("publish rejects duplicate session parameters and receiver-controlled chat prefixes", async (t) => {
+test("publish accepts a full-id pretty URL for collision fallback", async (t) => {
   const session = claudeSession();
-  for (const mode of ["duplicate", "prefix"]) {
-    let body = "";
-    const server = http.createServer((request, response) => {
-      request.setEncoding("utf8");
-      request.on("data", (chunk) => {
-        body += chunk;
-      });
-      request.on("end", () => {
-        const payload = JSON.parse(body);
-        const key = encodeURIComponent(`catalog:beam:gateway:${payload.beamId}`);
-        const url =
-          mode === "duplicate"
-            ? `/chat?session=${key}&session=extra`
-            : `/secret-prefix/chat?session=${key}`;
-        response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({ ok: true, url }));
-      });
-    });
-    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-    t.after(() => server.close());
-    const address = server.address();
+  const endpoint = await beamReceiverEndpoint(t, (payload) => `/beam/${payload.beamId}`);
+  const result = await run([
+    "publish",
+    "--endpoint",
+    endpoint,
+    "--session",
+    session,
+  ]);
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /\/beam\/[a-f0-9]{32}/);
+});
+
+test("publish accepts the current canonical catalog URL during rollout", async (t) => {
+  const session = claudeSession();
+  const endpoint = await beamReceiverEndpoint(
+    t,
+    (payload) =>
+      `/chat/roboclaw?catalog=beam&host=gateway&thread=${payload.beamId}`,
+  );
+  const result = await run([
+    "publish",
+    "--endpoint",
+    endpoint,
+    "--session",
+    session,
+  ]);
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(
+    result.stdout,
+    /\/chat\/roboclaw\?catalog=beam&host=gateway&thread=[a-f0-9]{32}/,
+  );
+});
+
+test("publish rejects malformed pretty Beam URLs", async (t) => {
+  const session = claudeSession();
+  let makeUrl;
+  const endpoint = await beamReceiverEndpoint(t, (payload, request) =>
+    makeUrl(payload, request),
+  );
+  const cases = [
+    ["short id", ({ beamId }) => `/beam/${beamId.slice(0, 11)}`],
+    ["uppercase id", ({ beamId }) => `/beam/${beamId.slice(0, 12).toUpperCase()}`],
+    ["nonhex id", ({ beamId }) => `/beam/${beamId.slice(0, 11)}g`],
+    ["long id", ({ beamId }) => `/beam/${beamId}0`],
+    [
+      "wrong prefix",
+      ({ beamId }) => `/beam/${beamId[0] === "0" ? "1" : "0"}${beamId.slice(1, 12)}`,
+    ],
+    ["extra segment", ({ beamId }) => `/beam/${beamId.slice(0, 12)}/extra`],
+    ["query", ({ beamId }) => `/beam/${beamId.slice(0, 12)}?view=debug`],
+    [
+      "duplicate query",
+      ({ beamId }) => `/beam/${beamId.slice(0, 12)}?thread=${beamId}&thread=${beamId}`,
+    ],
+    ["wrong base path", ({ beamId }) => `/secret-prefix/beam/${beamId.slice(0, 12)}`],
+    ["foreign origin", ({ beamId }) => `https://example.test/beam/${beamId.slice(0, 12)}`],
+    [
+      "credentials",
+      ({ beamId }, request) =>
+        `http://user@${request.headers.host}/beam/${beamId.slice(0, 12)}`,
+    ],
+    ["hash", ({ beamId }) => `/beam/${beamId.slice(0, 12)}#fragment`],
+    ["control", ({ beamId }) => `/beam/${beamId.slice(0, 12)}\n`],
+    ["non-http", ({ beamId }) => `ftp://example.test/beam/${beamId.slice(0, 12)}`],
+  ];
+
+  for (const [label, urlFactory] of cases) {
+    makeUrl = urlFactory;
     const result = await run([
       "publish",
       "--endpoint",
-      `http://127.0.0.1:${address.port}/api/v1/beam/sessions`,
+      endpoint,
       "--session",
       session,
     ]);
-    assert.equal(result.code, 1);
-    assert.match(result.stderr, /unsafe session URL/);
+    assert.equal(result.code, 1, label);
+    assert.match(result.stderr, /unsafe session URL/, label);
+  }
+});
+
+test("publish rejects malformed rollout catalog URLs", async (t) => {
+  const session = claudeSession();
+  let makeUrl;
+  const endpoint = await beamReceiverEndpoint(t, (payload) => makeUrl(payload));
+  const canonical = (beamId) =>
+    `/chat/roboclaw?catalog=beam&host=gateway&thread=${beamId}`;
+  const cases = [
+    ["duplicate thread", ({ beamId }) => `${canonical(beamId)}&thread=extra`],
+    ["extra query", ({ beamId }) => `${canonical(beamId)}&view=debug`],
+    ["wrong base path", ({ beamId }) => `/secret-prefix${canonical(beamId)}`],
+    [
+      "missing agent",
+      ({ beamId }) => `/chat?catalog=beam&host=gateway&thread=${beamId}`,
+    ],
+    [
+      "extra segment",
+      ({ beamId }) =>
+        `/chat/roboclaw/extra?catalog=beam&host=gateway&thread=${beamId}`,
+    ],
+    [
+      "legacy beta session",
+      ({ beamId }) =>
+        `/chat?session=${encodeURIComponent(`catalog:beam:gateway:${beamId}`)}`,
+    ],
+    [
+      "wrong catalog",
+      ({ beamId }) => `/chat/roboclaw?catalog=other&host=gateway&thread=${beamId}`,
+    ],
+    [
+      "wrong host",
+      ({ beamId }) => `/chat/roboclaw?catalog=beam&host=other&thread=${beamId}`,
+    ],
+    ["wrong thread", () => "/chat/roboclaw?catalog=beam&host=gateway&thread=other"],
+    [
+      "invalid agent",
+      ({ beamId }) => `/chat/Bad.Agent?catalog=beam&host=gateway&thread=${beamId}`,
+    ],
+  ];
+
+  for (const [label, urlFactory] of cases) {
+    makeUrl = urlFactory;
+    const result = await run([
+      "publish",
+      "--endpoint",
+      endpoint,
+      "--session",
+      session,
+    ]);
+    assert.equal(result.code, 1, label);
+    assert.match(result.stderr, /unsafe session URL/, label);
   }
 });
 

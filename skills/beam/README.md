@@ -70,6 +70,16 @@ node "$BEAM_SKILL_DIR/scripts/beam" publish \
   --thread-id "$CODEX_THREAD_ID"
 ```
 
+On success, Beam prints the endpoint-derived Control UI URL in its short share
+form, for example:
+
+```text
+Beamed session: https://gateway.example.com/beam/0123456789ab
+```
+
+A Gateway mounted below a base path returns that same base path, such as
+`https://gateway.example.com/openclaw/beam/0123456789ab`.
+
 Explicit transcript:
 
 ```sh
@@ -138,6 +148,11 @@ Gateway HTTP authentication. Uploads require `operator.write` or
 catalog, so a separate Gateway remains the isolation boundary between teams.
 
 The catalog has no continue, archive, terminal, tool, or node capability.
+
+For rollout compatibility, the helper also accepts the current server's exact
+`/chat/<agent>?catalog=beam&host=gateway&thread=<full-beam-id>` URL. This is a
+narrow transition path: the obsolete `?session=catalog:...` beta URL remains
+rejected.
 
 OpenClaw plugin documentation:
 https://docs.openclaw.ai/plugins/beam

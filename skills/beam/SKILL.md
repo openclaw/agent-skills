@@ -61,7 +61,9 @@ node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --dry-ru
 
 `--dry-run` prints the sanitized payload locally and performs no network request.
 
-On success, return only the Beam URL and a short disclosure summary: source harness, shared message count, whether older entries were truncated, and whether the beam is complete.
+On success, return only the Beam URL and a short disclosure summary: source harness, shared message count, whether older entries were truncated, and whether the beam is complete. The URL uses the endpoint-derived Control UI base path followed by `/beam/<12-character lowercase hex prefix>`, for example `https://gateway.example.com/beam/0123456789ab`.
+
+During rollout, the helper also accepts the current server's exact `/chat/<agent>?catalog=beam&host=gateway&thread=<full-beam-id>` response. It still rejects the obsolete `?session=catalog:...` beta form.
 
 ## Live Hooks
 
