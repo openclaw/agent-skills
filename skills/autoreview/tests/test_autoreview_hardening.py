@@ -3778,7 +3778,13 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 max_priority="P0",
             )
             stdout = io.StringIO()
-            with mock.patch.dict(preflight.__globals__, {"build_review_prompts": capturing}):
+            with mock.patch.dict(
+                preflight.__globals__,
+                {
+                    "build_review_prompts": capturing,
+                    "scan_outgoing_review_pack": lambda _repo, _prompt: None,
+                },
+            ):
                 with contextlib.redirect_stdout(stdout):
                     preflight(args, [], repo, "commit", None)
 

@@ -676,131 +676,111 @@ class AutoreviewAmpTests(unittest.TestCase):
                     AUTOREVIEW.run_amp(args, repo, "review")
 
 
-class AutoreviewSecretScannerTests(unittest.TestCase):
-    def test_typescript_type_annotations_are_not_credential_material(self) -> None:
-        source = "\n".join(
+class AutoreviewTruffleHogTests(unittest.TestCase):
+    def test_findings_map_to_prompt_dataset_untracked_and_diff_paths(self) -> None:
+        prompt = "\n".join(
             (
-                "export function modelRuntime(",
-                "  env: NodeJS.ProcessEnv = process.env,",
-                "): ModelRuntime {",
-                "  return env.MODEL_RUNTIME;",
-                "}",
-                "",
-                "export function modelRuntimeCredentials(",
-                "  env: NodeJS.ProcessEnv,",
-                "): NodeJS.ProcessEnv {",
-                "  const credentials: NodeJS.ProcessEnv = {};",
-                "  return credentials;",
-                "}",
+                "# Prompt file: review-notes.md",
+                "prompt body",
+                "# Dataset: evidence.json",
+                "dataset body",
+                "# Untracked File",
+                'path: "new/config.ts"',
+                "source-line 1: redacted example",
+                "diff --git a/old.ts b/new.ts",
+                "--- a/old.ts",
+                "+++ b/new.ts",
+                "@@ -1 +1 @@",
+                "+redacted example",
             )
+        )
+        output = "\n".join(
+            json.dumps(
+                {
+                    "SourceMetadata": {
+                        "Data": {"Filesystem": {"line": line_number}}
+                    }
+                }
+            )
+            for line_number in (2, 4, 7, 12)
         )
 
-        self.assertFalse(
-            AUTOREVIEW.secret_text_risk(
-                source,
-                javascript_dialect="typescript",
-            )
-        )
         self.assertEqual(
-            AUTOREVIEW.review_secret_fragments(
-                source,
-                javascript_dialect="typescript",
-            ),
-            set(),
+            AUTOREVIEW.trufflehog_review_pack_paths(prompt, output),
+            ["evidence.json", "new.ts", "new/config.ts", "review-notes.md"],
         )
 
-    def test_typescript_typed_declaration_still_scans_initializer(self) -> None:
-        literal_value = "actual-production-" + "secret"
-        source = (
-            "const credentials: NodeJS.ProcessEnv = "
-            f'"{literal_value}";'
-        )
-
-        self.assertTrue(
-            AUTOREVIEW.secret_text_risk(
-                source,
-                javascript_dialect="typescript",
-            )
-        )
-        self.assertEqual(
-            AUTOREVIEW.review_secret_fragments(
-                source,
-                javascript_dialect="typescript",
-            ),
-            {literal_value},
-        )
-
-    def test_boolean_declarations_are_not_credential_material(self) -> None:
-        secret_field = "is" + "Secret"
-        client_secret_field = "hasClient" + "Secret"
-        cases = (
-            (f"val {secret_field}: Boolean? = null,", None),
-            (f"var {client_secret_field}: Boolean = false", None),
-            (f"abstract val {secret_field}: Boolean?", None),
-            (f"val {secret_field}: Boolean?", None),
-            (f"const {client_secret_field}: boolean = true;", "typescript"),
-            (f"declare const {client_secret_field}: boolean;", "typescript"),
-            (f"let {secret_field}: Bool? = nil", None),
-            (f"let {secret_field}: Bool?", None),
-        )
-
-        for content, javascript_dialect in cases:
-            with self.subTest(content=content):
-                self.assertFalse(
-                    AUTOREVIEW.secret_text_risk(
-                        content,
-                        javascript_dialect=javascript_dialect,
-                    )
-                )
-
-    def test_boolean_and_null_literal_values_are_not_credentials(self) -> None:
-        cases = (
-            ("is" + "Secret", "true"),
-            ("requires" + "Password", "false"),
-            ("access" + "Token", "null"),
-        )
-        for field_name, literal in cases:
-            content = f"{field_name} = {literal}"
-            with self.subTest(content=content):
-                self.assertFalse(AUTOREVIEW.secret_text_risk(content))
-
-    def test_boolean_annotation_does_not_hide_real_credential_literal(self) -> None:
-        literal_value = "actual-production-" + "secret"
-        secret_field = "is" + "Secret"
-        client_secret_field = "hasClient" + "Secret"
-        cases = (
-            (f'val {secret_field}: Boolean? = "{literal_value}",', None),
-            (f'var {client_secret_field}: Boolean = "{literal_value}"', None),
+    def test_deleted_diff_finding_maps_to_original_path(self) -> None:
+        prompt = "\n".join(
             (
-                f'const {client_secret_field}: boolean = "{literal_value}";',
-                "typescript",
-            ),
-            (f'let {secret_field}: Bool? = "{literal_value}"', None),
+                "# Change Bundle",
+                "diff --git a/config.ts b/config.ts",
+                "deleted file mode 100644",
+                "--- a/config.ts",
+                "+++ /dev/null",
+                "@@ -1 +0,0 @@",
+                "-redacted example",
+            )
+        )
+        output = json.dumps(
+            {
+                "SourceMetadata": {
+                    "Data": {"Filesystem": {"Line": 7}}
+                }
+            }
         )
 
-        for content, javascript_dialect in cases:
-            with self.subTest(content=content):
-                self.assertTrue(
-                    AUTOREVIEW.secret_text_risk(
-                        content,
-                        javascript_dialect=javascript_dialect,
-                    )
+        self.assertEqual(
+            AUTOREVIEW.trufflehog_review_pack_paths(prompt, output),
+            ["config.ts"],
+        )
+
+    def test_unusable_scanner_output_falls_back_without_echoing_it(self) -> None:
+        output = "not-json\n" + json.dumps(
+            {
+                "SourceMetadata": {
+                    "Data": {"Filesystem": {"line": "invalid"}}
+                },
+                "Raw": "must-not-be-returned",
+            }
+        )
+
+        self.assertEqual(
+            AUTOREVIEW.trufflehog_review_pack_paths("prompt", output),
+            ["review pack"],
+        )
+
+    def test_scanner_command_requests_verified_and_unknown_results(self) -> None:
+        prompt = "review pack with redacted examples only"
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = Path(tempdir)
+
+            def run_scanner(
+                command: list[str],
+                cwd: Path,
+                **kwargs: object,
+            ) -> subprocess.CompletedProcess[str]:
+                self.assertEqual(cwd, Path(command[2]).parent)
+                self.assertEqual(Path(command[2]).read_text(encoding="utf-8"), prompt)
+                self.assertEqual(
+                    command[3:],
+                    [
+                        "--json",
+                        "--no-color",
+                        "--results=verified,unknown",
+                        "--fail",
+                        "--fail-on-scan-errors",
+                    ],
                 )
+                self.assertEqual(kwargs["check"], False)
+                return subprocess.CompletedProcess(command, 0, "", "")
 
-    def test_boolean_prefix_values_remain_credentials(self) -> None:
-        field_name = "client" + "Secret"
-        for prefix in ("Boolean", "boolean", "Bool"):
-            literal_value = prefix + "-prod-credential"
-            content = f"{field_name}: {literal_value}"
-            with self.subTest(content=content):
-                self.assertTrue(AUTOREVIEW.secret_text_risk(content))
-
-    def test_boolean_type_tokens_in_config_remain_credentials(self) -> None:
-        field_name = "client" + "Secret"
-        for literal_value in ("Boolean?", "Boolean?=abc1234"):
-            content = f"{field_name}: {literal_value}"
-            with self.subTest(content=content):
-                self.assertTrue(AUTOREVIEW.secret_text_risk(content))
+            with mock.patch.object(
+                AUTOREVIEW,
+                "find_command",
+                return_value="/trusted/trufflehog",
+            ), mock.patch.object(AUTOREVIEW, "run", side_effect=run_scanner):
+                AUTOREVIEW.scan_outgoing_review_pack(repo, prompt)
 
 
 class AutoreviewCompatibilityTests(unittest.TestCase):
