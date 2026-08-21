@@ -11,7 +11,7 @@ const http = require('node:http');
 const https = require('node:https');
 const crypto = require('node:crypto');
 
-const VERSION = '1.2.0';
+const VERSION = '1.4.1';
 const USER_AGENT = `lnurl-auth/${VERSION} (+https://github.com/dyegolara/lnurl-auth-agents)`;
 const DEFAULT_TIMEOUT = 15000;
 const MAX_REDIRECTS = 5;

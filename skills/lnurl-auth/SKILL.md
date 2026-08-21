@@ -1,7 +1,7 @@
 ---
 name: lnurl-auth
 description: "Authenticate to LNURL-auth (LUD-04) services without a wallet, node, or payment. Use when a site provides an lnurl1... challenge for Sign in with Lightning."
-version: 1.2.0
+version: 1.4.1
 homepage: https://github.com/dyegolara/lnurl-auth-agents
 metadata:
   openclaw:
