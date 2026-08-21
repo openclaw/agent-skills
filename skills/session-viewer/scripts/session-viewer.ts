@@ -4,6 +4,7 @@ import path from "node:path";
 import { parseSessionDocument } from "./core/detect.ts";
 import { parseJsonl } from "./core/jsonl.ts";
 import { buildSessionViewerHtml } from "./html.ts";
+import { resolveOpenBrowserCommand } from "./open-browser.ts";
 
 type Options = {
   blank: boolean;
@@ -80,15 +81,8 @@ function defaultOutputPath(inputPath: string | undefined, blank: boolean): strin
 }
 
 async function openBrowser(filePath: string): Promise<void> {
-  if (process.platform === "darwin") {
-    spawn("open", [filePath], { detached: true, stdio: "ignore" }).unref();
-    return;
-  }
-  if (process.platform === "win32") {
-    spawn("cmd", ["/c", "start", "", filePath], { detached: true, stdio: "ignore" }).unref();
-    return;
-  }
-  spawn("xdg-open", [filePath], { detached: true, stdio: "ignore" }).unref();
+  const command = resolveOpenBrowserCommand(process.platform, filePath);
+  spawn(command.executable, command.args, { detached: true, stdio: "ignore" }).unref();
 }
 
 async function main(): Promise<void> {

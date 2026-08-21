@@ -7,6 +7,7 @@ import test from "node:test";
 import { promisify } from "node:util";
 import { parseSessionDocument } from "./core/detect.ts";
 import { parseJsonl } from "./core/jsonl.ts";
+import { resolveOpenBrowserCommand } from "./open-browser.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -14,6 +15,20 @@ function parse(text: string) {
   const { records } = parseJsonl(text);
   return parseSessionDocument(records, "fixture.jsonl");
 }
+
+test("opens hostile Windows paths without a command shell", () => {
+  for (const filePath of [
+    "C:\\Reports\\session & calc.exe.html",
+    "C:\\Reports\\session | whoami.html",
+    "C:\\Reports\\%COMSPEC%.html",
+    "C:\\Reports\\session ^& echo injected.html",
+  ]) {
+    assert.deepEqual(resolveOpenBrowserCommand("win32", filePath), {
+      executable: "explorer.exe",
+      args: [filePath],
+    });
+  }
+});
 
 test("parses Codex rollout tool calls and outputs", () => {
   const doc = parse(
