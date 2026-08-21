@@ -187,10 +187,6 @@ def init_repo(tempdir: Path) -> Path:
     return repo
 
 
-def realistic_secret_value() -> str:
-    return "A7f9K2m4Q8v6" + "N3x5R1p0T9z8"
-
-
 def installed_java() -> str | None:
     java = shutil.which("java")
     if java is None:
@@ -583,8 +579,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_oversized_text_is_rejected_without_scanning_binary_tail(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
-            tail_secret = "\ntoken=" + "A" * 24 + "\n"
-            content = "x" * (64_000 * 3 - 4) + tail_secret
+            detector_tail = "\ntoken=" + "A" * 24 + "\n"
+            content = "x" * (64_000 * 3 - 4) + detector_tail
 
             untracked = repo / "untracked.txt"
             untracked.write_text(content, encoding="utf-8")
