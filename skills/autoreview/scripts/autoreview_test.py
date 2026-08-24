@@ -110,16 +110,16 @@ class AutoreviewPriorityTests(unittest.TestCase):
             args = AUTOREVIEW.parse_args()
         self.assertEqual(args.max_priority, "P0")
 
-    def test_engine_timeout_defaults_to_thirty_minutes(self) -> None:
+    def test_engine_timeout_is_disabled_by_default(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             sys,
             "argv",
             ["autoreview"],
         ):
             args = AUTOREVIEW.parse_args()
-        self.assertEqual(args.engine_timeout_seconds, 1800)
+        self.assertIsNone(args.engine_timeout_seconds)
 
-    def test_engine_timeout_environment_overrides_default(self) -> None:
+    def test_engine_timeout_environment_enables_deadline(self) -> None:
         with mock.patch.dict(
             os.environ,
             {"AUTOREVIEW_ENGINE_TIMEOUT_SECONDS": "45"},

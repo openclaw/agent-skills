@@ -274,7 +274,6 @@ DEFAULT_MODEL_BY_ENGINE = {
     "claude": "claude-fable-5",
 }
 DEFAULT_CODEX_ACCESS_FALLBACK_MODEL = "gpt-5.6-terra"
-DEFAULT_ENGINE_TIMEOUT_SECONDS = 1800.0
 AMP_THINKING_VALUES = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
 DEFAULT_THINKING_BY_ENGINE = {
     "amp": "high",
@@ -5535,11 +5534,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--engine-timeout-seconds",
         type=positive_float,
-        default=os.environ.get(
-            "AUTOREVIEW_ENGINE_TIMEOUT_SECONDS",
-            DEFAULT_ENGINE_TIMEOUT_SECONDS,
-        ),
-        help="Wall-clock limit for each reviewer process. Defaults to 1800 seconds. Env: AUTOREVIEW_ENGINE_TIMEOUT_SECONDS.",
+        default=os.environ.get("AUTOREVIEW_ENGINE_TIMEOUT_SECONDS"),
+        help="Optional wall-clock limit for each reviewer process. Disabled by default. Env: AUTOREVIEW_ENGINE_TIMEOUT_SECONDS.",
     )
     parser.add_argument("--codex-bin", default=os.environ.get("CODEX_BIN", "codex"))
     parser.add_argument(
