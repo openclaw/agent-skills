@@ -3680,7 +3680,9 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertFalse(available)
         self.assertIn("experimental_bearer_token", reason)
 
-    def test_resolve_engine_binary_rejects_malformed_codex_config(self) -> None:
+    def test_resolve_engine_binary_ignores_malformed_unselected_codex_config(
+        self,
+    ) -> None:
         resolve_engine_binary = self.helper["resolve_engine_binary"]
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
@@ -3688,7 +3690,45 @@ class AutoreviewHardeningTests(unittest.TestCase):
             source_home = root / "host-home" / ".codex"
             source_home.mkdir(parents=True)
             (source_home / "config.toml").write_text(
-                'model_provider = "unterminated\n',
+                '[unrelated\n',
+                encoding="utf-8",
+            )
+            reviewer = argparse.Namespace(
+                engine="codex",
+                tools=True,
+                codex_bin="codex",
+                codex_config=None,
+                codex_speed=None,
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"CODEX_HOME": str(source_home)},
+                clear=False,
+            ), mock.patch.dict(
+                self.helper["resolve_engine_binary"].__globals__,
+                {"find_command": lambda *_args: "/usr/bin/codex"},
+            ):
+                available, reason = resolve_engine_binary(reviewer, repo)
+
+        self.assertTrue(available, reason)
+        self.assertIsNone(reason)
+
+    def test_resolve_engine_binary_rejects_malformed_selected_codex_config(
+        self,
+    ) -> None:
+        resolve_engine_binary = self.helper["resolve_engine_binary"]
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source_home = root / "host-home" / ".codex"
+            source_home.mkdir(parents=True)
+            (source_home / "config.toml").write_text(
+                'model_provider = "openai-relay"\n'
+                '[model_providers.openai-relay]\n'
+                'name = "OpenAI Relay"\n'
+                'base_url = "https://relay.example/v1"\n'
+                'wire_api = "responses"\n'
+                '[unrelated\n',
                 encoding="utf-8",
             )
             reviewer = argparse.Namespace(

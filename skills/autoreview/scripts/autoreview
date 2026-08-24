@@ -3343,34 +3343,28 @@ def parse_codex_auth_config_fallback(text: str) -> dict[str, Any]:
     return config
 
 
-def load_codex_auth_config(path: Path, *, strict: bool = False) -> dict[str, Any]:
+def load_codex_auth_config(
+    path: Path,
+    *,
+    strict_custom_provider: bool = False,
+) -> dict[str, Any]:
     try:
         text = path.read_text()
     except FileNotFoundError:
         return {}
-    except OSError as exc:
-        if strict:
-            raise SystemExit(
-                "unable to read external Codex config.toml; fix its permissions before autoreview"
-            ) from exc
+    except OSError:
         return {}
     try:
         import tomllib
     except ModuleNotFoundError:
-        config = parse_codex_auth_config_fallback(text)
-        if strict and re.search(r"^\s*model_provider\s*=", text, re.MULTILINE) and not isinstance(
-            config.get("model_provider"),
-            str,
-        ):
-            raise SystemExit(
-                "unable to parse model_provider from external Codex config.toml; "
-                "use simple TOML scalar values or Python 3.11+"
-            )
-        return config
+        return parse_codex_auth_config_fallback(text)
     try:
         config = tomllib.loads(text)
     except ValueError as exc:
-        if strict:
+        provider_id = parse_codex_auth_config_fallback(text).get("model_provider")
+        # Keep ignored user config non-blocking unless it positively selected a custom
+        # provider; silently falling back from that provider could reroute the review.
+        if strict_custom_provider and isinstance(provider_id, str) and provider_id != "openai":
             raise SystemExit(
                 "unable to parse external Codex config.toml; fix the file before autoreview"
             ) from exc
@@ -3476,7 +3470,10 @@ def codex_configured_provider(repo: Path) -> tuple[list[str], dict[str, str]]:
     codex_home = codex_source_home(repo)
     if codex_home is None:
         return [], {}
-    config = load_codex_auth_config(codex_home / "config.toml", strict=True)
+    config = load_codex_auth_config(
+        codex_home / "config.toml",
+        strict_custom_provider=True,
+    )
     provider_id = config.get("model_provider")
     if provider_id in {None, "openai"}:
         return [], {}
