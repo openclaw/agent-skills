@@ -29,7 +29,7 @@ import time
 import unicodedata
 import urllib.parse
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, NamedTuple, NoReturn
 
 
 ENGINES = ("codex", "claude", "amp", "pi", "kimi")
@@ -249,6 +249,15 @@ CODEX_TRUST_PATH_ENV_KEYS = {
     "SSL_CERT_DIR",
     "SSL_CERT_FILE",
 }
+CODEX_DEFAULT_PROVIDER_ENV_KEYS = {
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_ENDPOINT",
+    "CODEX_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_ORGANIZATION",
+    "OPENAI_PROJECT",
+}
 PROVIDER_CREDENTIAL_PATH_ENV_KEYS = {
     "AWS_CONFIG_FILE",
     "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
@@ -265,6 +274,7 @@ DEFAULT_MODEL_BY_ENGINE = {
     "claude": "claude-fable-5",
 }
 DEFAULT_CODEX_ACCESS_FALLBACK_MODEL = "gpt-5.6-terra"
+DEFAULT_ENGINE_TIMEOUT_SECONDS = 1800.0
 AMP_THINKING_VALUES = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
 DEFAULT_THINKING_BY_ENGINE = {
     "amp": "high",
@@ -583,15 +593,7 @@ def safe_engine_env(
         "https_proxy",
         "no_proxy",
     }
-    codex_allowed_exact = {
-        "AZURE_OPENAI_API_KEY",
-        "AZURE_OPENAI_ENDPOINT",
-        "CODEX_API_KEY",
-        "OPENAI_API_KEY",
-        "OPENAI_BASE_URL",
-        "OPENAI_ORGANIZATION",
-        "OPENAI_PROJECT",
-    }
+    codex_allowed_exact = CODEX_DEFAULT_PROVIDER_ENV_KEYS
     claude_allowed_exact = {
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
@@ -3265,6 +3267,9 @@ def codex_config_isolation_flags(repo: Path, runtime_root: Path) -> list[str]:
 
 def parse_codex_auth_config_fallback(text: str) -> dict[str, Any]:
     config: dict[str, Any] = {}
+    provider: dict[str, Any] = {}
+    section = "root"
+    found_provider = False
     pending_key: str | None = None
     pending_value: list[str] = []
     for raw_line in text.splitlines():
@@ -3285,37 +3290,91 @@ def parse_codex_auth_config_fallback(text: str) -> dict[str, Any]:
         if not line or line.startswith("#"):
             continue
         if line.startswith("["):
-            break
-        match = re.fullmatch(
-            r"(cli_auth_credentials_store|forced_login_method|forced_chatgpt_workspace_id)\s*=\s*(.+)",
-            line,
+            header = line.partition("#")[0].strip()
+            provider_id = config.get("model_provider")
+            section = "other"
+            if isinstance(provider_id, str) and re.fullmatch(
+                r"[A-Za-z0-9_-]+",
+                provider_id,
+            ):
+                provider_header = f"[model_providers.{provider_id}]"
+                nested_prefix = f"[model_providers.{provider_id}."
+                if header == provider_header:
+                    section = "provider"
+                    found_provider = True
+                elif header.startswith(nested_prefix) and header.endswith("]"):
+                    nested_key = header[len(nested_prefix) : -1].split(".", 1)[0]
+                    if nested_key:
+                        provider[nested_key] = {}
+            continue
+        if section == "other":
+            continue
+        key_pattern = (
+            r"(cli_auth_credentials_store|forced_login_method|"
+            r"forced_chatgpt_workspace_id|model_provider)"
+            if section == "root"
+            else r"([A-Za-z0-9_-]+)"
         )
+        match = re.fullmatch(rf"{key_pattern}\s*=\s*(.+)", line)
         if not match:
+            if section == "provider":
+                provider["invalid_provider_config"] = None
             continue
         key, value_text = match.groups()
+        target = config if section == "root" else provider
         try:
-            config[key] = ast.literal_eval(value_text)
+            target[key] = ast.literal_eval(value_text)
         except SyntaxError:
-            if value_text.lstrip().startswith("["):
+            if section == "root" and value_text.lstrip().startswith("["):
                 pending_key = key
                 pending_value = [value_text]
+            elif section == "provider":
+                target[key] = None
         except ValueError:
-            continue
+            bare_value = value_text.partition("#")[0].strip()
+            if bare_value in {"true", "false"}:
+                target[key] = bare_value == "true"
+            elif re.fullmatch(r"[+-]?[0-9][0-9_]*", bare_value):
+                target[key] = int(bare_value.replace("_", ""))
+            elif section == "provider":
+                target[key] = None
+    if found_provider:
+        provider_id = config["model_provider"]
+        config["model_providers"] = {provider_id: provider}
     return config
 
 
-def load_codex_auth_config(path: Path) -> dict[str, Any]:
+def load_codex_auth_config(path: Path, *, strict: bool = False) -> dict[str, Any]:
     try:
         text = path.read_text()
-    except OSError:
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        if strict:
+            raise SystemExit(
+                "unable to read external Codex config.toml; fix its permissions before autoreview"
+            ) from exc
         return {}
     try:
         import tomllib
     except ModuleNotFoundError:
-        return parse_codex_auth_config_fallback(text)
+        config = parse_codex_auth_config_fallback(text)
+        if strict and re.search(r"^\s*model_provider\s*=", text, re.MULTILINE) and not isinstance(
+            config.get("model_provider"),
+            str,
+        ):
+            raise SystemExit(
+                "unable to parse model_provider from external Codex config.toml; "
+                "use simple TOML scalar values or Python 3.11+"
+            )
+        return config
     try:
         config = tomllib.loads(text)
-    except ValueError:
+    except ValueError as exc:
+        if strict:
+            raise SystemExit(
+                "unable to parse external Codex config.toml; fix the file before autoreview"
+            ) from exc
         return {}
     return config if isinstance(config, dict) else {}
 
@@ -3366,6 +3425,125 @@ def codex_auth_config_flags(repo: Path, *, force_file: bool = False) -> list[str
         if normalized_workspace_ids:
             flags.extend(["-c", f"forced_chatgpt_workspace_id={json.dumps(normalized_workspace_ids)}"])
     return flags
+
+
+CODEX_PROVIDER_FIELD_TYPES = {
+    "base_url": str,
+    "env_key": str,
+    "env_key_instructions": str,
+    "name": str,
+    "request_max_retries": int,
+    "requires_openai_auth": bool,
+    "stream_idle_timeout_ms": int,
+    "stream_max_retries": int,
+    "supports_standalone_web_search": bool,
+    "supports_websockets": bool,
+    "websocket_connect_timeout_ms": int,
+    "wire_api": str,
+}
+CODEX_PROVIDER_TRANSPORT_FIELDS = tuple(
+    key
+    for key in CODEX_PROVIDER_FIELD_TYPES
+    if key
+    not in {
+        "env_key_instructions",
+        "name",
+        "requires_openai_auth",
+        "supports_standalone_web_search",
+    }
+)
+
+
+def safe_codex_provider_base_url(value: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        _ = parsed.port
+    except ValueError:
+        return False
+    return (
+        value == value.strip()
+        and not any(character.isspace() for character in value)
+        and parsed.scheme.lower() in {"http", "https"}
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def codex_configured_provider(repo: Path) -> tuple[list[str], dict[str, str]]:
+    """Rebuild a selected custom provider without importing its capabilities."""
+    codex_home = codex_source_home(repo)
+    if codex_home is None:
+        return [], {}
+    config = load_codex_auth_config(codex_home / "config.toml", strict=True)
+    provider_id = config.get("model_provider")
+    if provider_id in {None, "openai"}:
+        return [], {}
+    if not isinstance(provider_id, str) or not re.fullmatch(
+        r"[A-Za-z0-9_-]+",
+        provider_id,
+    ):
+        raise SystemExit(
+            "configured Codex model_provider must be a non-empty bare identifier"
+        )
+
+    def reject(detail: str) -> NoReturn:
+        raise SystemExit(
+            f"cannot safely inherit Codex model provider {provider_id!r}; {detail}"
+        )
+
+    providers = config.get("model_providers")
+    provider = providers.get(provider_id) if isinstance(providers, dict) else None
+    if not isinstance(provider, dict):
+        reject(
+            "no custom provider table; autoreview isolation supports openai "
+            "or a custom Responses provider"
+        )
+    unsupported_fields = sorted(set(provider) - set(CODEX_PROVIDER_FIELD_TYPES))
+    if unsupported_fields:
+        reject(f"unsupported fields: {', '.join(unsupported_fields)}")
+    for key, value in provider.items():
+        if type(value) is not CODEX_PROVIDER_FIELD_TYPES[key]:
+            reject(f"invalid {key}")
+    if not provider.get("name") or not provider["name"].strip():
+        reject("must define a non-empty name")
+    if "base_url" not in provider:
+        reject("must define base_url")
+    if provider.get("requires_openai_auth"):
+        reject("custom providers may not receive OpenAI login credentials")
+    if provider.get("supports_standalone_web_search"):
+        reject("standalone web search is an unsupported provider capability")
+
+    flags = [
+        "-c",
+        f"model_provider={json.dumps(provider_id)}",
+        "-c",
+        f"model_providers.{provider_id}.name={json.dumps('Autoreview Custom Provider')}",
+    ]
+    provider_env: dict[str, str] = {}
+    for key in CODEX_PROVIDER_TRANSPORT_FIELDS:
+        if key not in provider:
+            continue
+        value = provider[key]
+        if key == "base_url" and not safe_codex_provider_base_url(value):
+            reject("base_url must be a credential-free http or https URL")
+        if key == "env_key":
+            if not CUSTOM_PROVIDER_ENV_NAME_PATTERN.fullmatch(value):
+                reject("unsafe env_key")
+            secret = os.environ.get(value)
+            if secret is None or not secret.strip():
+                reject(f"requires non-empty {value}")
+            provider_env[value] = secret
+        if key == "wire_api" and value != "responses":
+            reject("must use wire_api responses")
+        if CODEX_PROVIDER_FIELD_TYPES[key] is int and not 0 <= value <= 2**63 - 1:
+            reject(f"invalid {key}")
+        flags.extend(
+            ["-c", f"model_providers.{provider_id}.{key}={json.dumps(value)}"]
+        )
+    return flags, provider_env
 
 
 def prepare_codex_runtime_auth(
@@ -3937,6 +4115,7 @@ def codex_command(
     schema_path: Path,
     output_path: Path,
     model: str | None,
+    provider_flags: list[str] | None = None,
     *,
     force_file_auth: bool = False,
 ) -> list[str]:
@@ -3955,8 +4134,10 @@ def codex_command(
     speed_override = codex_speed_override(args)
     if speed_override is not None:
         cmd.extend(["-c", speed_override])
+    cmd.extend(provider_flags or [])
     cmd.extend(codex_config_isolation_flags(review_root, runtime_root))
-    cmd.extend(codex_auth_config_flags(source_repo, force_file=force_file_auth))
+    if not provider_flags:
+        cmd.extend(codex_auth_config_flags(source_repo, force_file=force_file_auth))
     cmd.append("exec")
     if args.stream_engine_output:
         cmd.append("--json")
@@ -3979,6 +4160,7 @@ def codex_command(
 def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     if not args.tools:
         raise SystemExit("--no-tools is not supported by the Codex engine; use --engine claude --no-tools for a no-tools run")
+    provider_flags, provider_env = codex_configured_provider(repo)
     temp_root = safe_temp_root(repo)
     schema_path = write_json_temp(SCHEMA, temp_root)
     with tempfile.NamedTemporaryFile(
@@ -4021,8 +4203,12 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                 runtime_codex_home,
             ):
                 path.mkdir(parents=True, exist_ok=True)
-            file_auth_linked = prepare_codex_runtime_auth(repo, runtime_codex_home)
-            source_codex_home = codex_source_home(repo)
+            file_auth_linked = (
+                False
+                if provider_flags
+                else prepare_codex_runtime_auth(repo, runtime_codex_home)
+            )
+            source_codex_home = None if provider_flags else codex_source_home(repo)
             active_codex_home = (
                 runtime_codex_home
                 if file_auth_linked or source_codex_home is None
@@ -4038,8 +4224,30 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                     schema_path,
                     output_path,
                     model,
+                    provider_flags,
                     force_file_auth=file_auth_linked,
                 )
+                engine_env = safe_engine_env(
+                    repo,
+                    [Path(cmd[0]).parent],
+                    engine="codex",
+                    extra={
+                        "HOME": str(runtime_home),
+                        "USERPROFILE": str(runtime_home),
+                        "XDG_CACHE_HOME": str(runtime_cache),
+                        "XDG_CONFIG_HOME": str(runtime_config),
+                        "XDG_DATA_HOME": str(runtime_data),
+                        "XDG_STATE_HOME": str(runtime_state),
+                        # Keyring namespaces are derived from canonical CODEX_HOME.
+                        # Linked file auth uses the isolated home; keyring/auto must
+                        # retain the source namespace until Codex supports an auth split.
+                        "CODEX_HOME": str(active_codex_home),
+                    },
+                )
+                if provider_flags:
+                    for key in CODEX_DEFAULT_PROVIDER_ENV_KEYS:
+                        engine_env.pop(key, None)
+                    engine_env.update(provider_env)
                 result = run_with_heartbeat(
                     cmd,
                     review_root,
@@ -4048,23 +4256,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                     max_runtime_seconds=getattr(args, "engine_timeout_seconds", None),
                     stream_output=args.stream_engine_output,
                     stream_display=CodexStreamDisplay() if args.stream_engine_output else None,
-                    env=safe_engine_env(
-                        repo,
-                        [Path(cmd[0]).parent],
-                        engine="codex",
-                        extra={
-                            "HOME": str(runtime_home),
-                            "USERPROFILE": str(runtime_home),
-                            "XDG_CACHE_HOME": str(runtime_cache),
-                            "XDG_CONFIG_HOME": str(runtime_config),
-                            "XDG_DATA_HOME": str(runtime_data),
-                            "XDG_STATE_HOME": str(runtime_state),
-                            # Keyring namespaces are derived from canonical CODEX_HOME.
-                            # Linked file auth uses the isolated home; keyring/auto must
-                            # retain the source namespace until Codex supports an auth split.
-                            "CODEX_HOME": str(active_codex_home),
-                        },
-                    ),
+                    env=engine_env,
                 )
                 output = output_path.read_text()
                 if result.returncode == 0:
@@ -5343,8 +5535,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--engine-timeout-seconds",
         type=positive_float,
-        default=os.environ.get("AUTOREVIEW_ENGINE_TIMEOUT_SECONDS"),
-        help="Optional wall-clock limit for each reviewer process. Disabled by default. Env: AUTOREVIEW_ENGINE_TIMEOUT_SECONDS.",
+        default=os.environ.get(
+            "AUTOREVIEW_ENGINE_TIMEOUT_SECONDS",
+            DEFAULT_ENGINE_TIMEOUT_SECONDS,
+        ),
+        help="Wall-clock limit for each reviewer process. Defaults to 1800 seconds. Env: AUTOREVIEW_ENGINE_TIMEOUT_SECONDS.",
     )
     parser.add_argument("--codex-bin", default=os.environ.get("CODEX_BIN", "codex"))
     parser.add_argument(
@@ -5616,6 +5811,7 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
         try:
             codex_config_keys(reviewer)
             codex_speed_override(reviewer)
+            codex_configured_provider(repo)
         except SystemExit as exc:
             return False, str(exc.code)
     if engine == "claude" and getattr(reviewer, "tools", True):

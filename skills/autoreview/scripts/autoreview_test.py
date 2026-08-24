@@ -110,6 +110,37 @@ class AutoreviewPriorityTests(unittest.TestCase):
             args = AUTOREVIEW.parse_args()
         self.assertEqual(args.max_priority, "P0")
 
+    def test_engine_timeout_defaults_to_thirty_minutes(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            sys,
+            "argv",
+            ["autoreview"],
+        ):
+            args = AUTOREVIEW.parse_args()
+        self.assertEqual(args.engine_timeout_seconds, 1800)
+
+    def test_engine_timeout_environment_overrides_default(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"AUTOREVIEW_ENGINE_TIMEOUT_SECONDS": "45"},
+            clear=True,
+        ), mock.patch.object(sys, "argv", ["autoreview"]):
+            args = AUTOREVIEW.parse_args()
+        self.assertEqual(args.engine_timeout_seconds, 45)
+
+    def test_engine_timeout_cli_overrides_environment(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"AUTOREVIEW_ENGINE_TIMEOUT_SECONDS": "45"},
+            clear=True,
+        ), mock.patch.object(
+            sys,
+            "argv",
+            ["autoreview", "--engine-timeout-seconds", "60"],
+        ):
+            args = AUTOREVIEW.parse_args()
+        self.assertEqual(args.engine_timeout_seconds, 60)
+
     def test_priority_filter_omits_lower_findings_and_cleans_verdict(self) -> None:
         report = copy.deepcopy(DRAFT_REPORT)
         AUTOREVIEW.filter_findings_by_priority(report, "P0")
@@ -1079,6 +1110,101 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             self.assertIn("features.hooks=false", observed["command"])
             self.assertIn("features.plugins=false", observed["command"])
             self.assertIn("skills.include_instructions=false", observed["command"])
+
+    def test_codex_runs_with_configured_provider_flags_and_environment(self) -> None:
+        args = argparse.Namespace(
+            codex_bin="codex",
+            codex_config=None,
+            codex_speed=None,
+            fallback_model=None,
+            model="gpt-5.6-sol",
+            stream_engine_output=False,
+            thinking="high",
+            tools=True,
+            web_search=False,
+        )
+        observed: dict[str, object] = {}
+        provider_overrides = [
+            'model_provider="openai-relay"',
+            'model_providers.openai-relay.name="Autoreview Custom Provider"',
+            'model_providers.openai-relay.base_url="https://relay.example/v1"',
+            'model_providers.openai-relay.env_key="RELAY_API_KEY"',
+            "model_providers.openai-relay.request_max_retries=3",
+            "model_providers.openai-relay.supports_websockets=false",
+            'model_providers.openai-relay.wire_api="responses"',
+        ]
+
+        def fake_run(
+            command: list[str],
+            _cwd: Path,
+            *_args: object,
+            **kwargs: object,
+        ) -> subprocess.CompletedProcess[str]:
+            observed["command"] = command
+            observed["env"] = kwargs["env"]
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.write_text(json.dumps(FINAL_REPORT))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory(
+            prefix="autoreview-codex-provider-test."
+        ) as tmpdir:
+            root = Path(tmpdir)
+            repo = root / "repo"
+            repo.mkdir()
+            source_home = root / "host-home" / ".codex"
+            source_home.mkdir(parents=True)
+            (source_home / "config.toml").write_text(
+                'cli_auth_credentials_store = "file"\n'
+                'forced_login_method = "api"\n'
+                'model_provider = "openai-relay"\n'
+                '[model_providers.openai-relay]\n'
+                'name = "OpenAI Relay"\n'
+                'base_url = "https://relay.example/v1"\n'
+                'env_key = "RELAY_API_KEY"\n'
+                'wire_api = "responses"\n'
+                'request_max_retries = 3\n'
+                'supports_websockets = false\n',
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CODEX_HOME": str(source_home),
+                    "RELAY_API_KEY": "test-relay-token",
+                    "OPENAI_API_KEY": "unrelated-openai-token",
+                    "CODEX_API_KEY": "unrelated-codex-token",
+                    "AZURE_OPENAI_API_KEY": "unrelated-azure-token",
+                },
+                clear=False,
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "resolve_command",
+                return_value="/usr/bin/codex",
+            ), mock.patch.object(
+                AUTOREVIEW,
+                "run_with_heartbeat",
+                side_effect=fake_run,
+            ):
+                output = AUTOREVIEW.run_codex(args, repo, "review")
+
+        self.assertEqual(json.loads(output), FINAL_REPORT)
+        command = observed["command"]
+        env = observed["env"]
+        self.assertIsInstance(command, list)
+        self.assertIsInstance(env, dict)
+        assert isinstance(command, list)
+        assert isinstance(env, dict)
+        for override in provider_overrides:
+            self.assertIn(override, command)
+        self.assertNotIn('cli_auth_credentials_store="file"', command)
+        self.assertNotIn('forced_login_method="api"', command)
+        self.assertIn("--ignore-user-config", command)
+        self.assertEqual(Path(env["CODEX_HOME"]).name, "codex-home")
+        self.assertEqual(env["RELAY_API_KEY"], "test-relay-token")
+        self.assertNotIn("OPENAI_API_KEY", env)
+        self.assertNotIn("CODEX_API_KEY", env)
+        self.assertNotIn("AZURE_OPENAI_API_KEY", env)
 
     def test_codex_does_not_fallback_after_unrelated_failure(self) -> None:
         args = argparse.Namespace(
