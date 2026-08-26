@@ -1317,6 +1317,57 @@ class AutoreviewHardeningTests(unittest.TestCase):
         ):
             self.assertIn(reference, validated)
 
+    def test_review_bundle_preserves_deleted_swift_status_literals(self) -> None:
+        # Regression: a deleted Swift file with status-string cases like
+        # `case "ok-empty", "ok-token":` next to value returns is not a
+        # credential. The retired heuristic scanner flagged the "ok-token"
+        # key shape as secret-like even after value redaction, so the whole
+        # deletion became unreviewable; the bundle must stay byte-identical.
+        source = (FIXTURES / "swift-benign-status-literals.swift").read_text(
+            encoding="utf-8"
+        )
+        patch = (
+            "diff --git a/apps/macos/MenuContentView.swift "
+            "b/apps/macos/MenuContentView.swift\n"
+            "deleted file mode 100644\n"
+            "--- a/apps/macos/MenuContentView.swift\n"
+            "+++ /dev/null\n"
+            f"@@ -1,{len(source.splitlines())} +0,0 @@\n"
+            + "".join(f"-{line}\n" for line in source.splitlines())
+        )
+
+        self.assertEqual(
+            self.helper["validate_review_patch"](
+                "branch diff",
+                ["apps/macos/MenuContentView.swift"],
+                patch,
+            ),
+            patch,
+        )
+
+    @unittest.skipUnless(
+        shutil.which("trufflehog"), "TruffleHog binary not installed"
+    )
+    def test_outgoing_pack_scan_accepts_deleted_swift_status_literals(self) -> None:
+        # Live-scanner companion to the regression above: TruffleHog must not
+        # flag the benign "ok-token" status literal in a deleted-file bundle.
+        source = (FIXTURES / "swift-benign-status-literals.swift").read_text(
+            encoding="utf-8"
+        )
+        prompt = (
+            "# Change Bundle\n"
+            "diff --git a/apps/macos/MenuContentView.swift "
+            "b/apps/macos/MenuContentView.swift\n"
+            "deleted file mode 100644\n"
+            "--- a/apps/macos/MenuContentView.swift\n"
+            "+++ /dev/null\n"
+            f"@@ -1,{len(source.splitlines())} +0,0 @@\n"
+            + "".join(f"-{line}\n" for line in source.splitlines())
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            self.helper["scan_outgoing_review_pack"](repo, prompt)
+
     def test_review_bundle_preserves_typescript_config_paths(self) -> None:
         source = (FIXTURES / "typescript-benign-config-path-references.ts").read_text(
             encoding="utf-8"
