@@ -253,6 +253,45 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def setUp(self) -> None:
         self.helper = load_helper()
 
+    def test_outgoing_pack_scan_disables_installed_scanner_updates(self) -> None:
+        prompt = "harmless review pack\n"
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = root / "repo"
+            repo.mkdir()
+            write_executable(
+                root / "trufflehog",
+                r'''#!/usr/bin/env python3
+import json
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+if "--no-update" not in args:
+    print("updater: cannot move binary: permission denied", file=sys.stderr)
+    raise SystemExit(1)
+assert args[0] == "filesystem"
+assert set(args[2:]) == {
+    "--json", "--no-color", "--results=verified,unknown",
+    "--fail", "--fail-on-scan-errors", "--no-update",
+}
+pack = Path(args[1])
+Path(__file__).with_name("scan.json").write_text(json.dumps({
+    "pack": str(pack),
+    "prompt": pack.read_text(encoding="utf-8"),
+}))
+''',
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"PATH": f"{root}{os.pathsep}{os.environ.get('PATH', '')}"},
+            ):
+                self.helper["scan_outgoing_review_pack"](repo, prompt)
+
+            record = json.loads((root / "scan.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["prompt"], prompt)
+            self.assertFalse(Path(record["pack"]).parent.exists())
+
     def test_outgoing_pack_scan_reads_exact_prompt_including_deleted_lines(self) -> None:
         prompt = (
             "# Change Bundle\n"

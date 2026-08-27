@@ -1621,6 +1621,7 @@ def scan_outgoing_review_pack(repo: Path, prompt: str) -> None:
                 "--results=verified,unknown",
                 "--fail",
                 "--fail-on-scan-errors",
+                "--no-update",
             ],
             Path(tempdir),
             check=False,

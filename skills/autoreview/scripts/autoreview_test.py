@@ -770,6 +770,7 @@ class AutoreviewTruffleHogTests(unittest.TestCase):
                         "--results=verified,unknown",
                         "--fail",
                         "--fail-on-scan-errors",
+                        "--no-update",
                     ],
                 )
                 self.assertEqual(kwargs["check"], False)
