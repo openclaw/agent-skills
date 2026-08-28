@@ -1617,7 +1617,7 @@ def scan_outgoing_review_pack(repo: Path, prompt: str) -> None:
         dir=safe_temp_root(repo),
     ) as tempdir:
         pack_path = Path(tempdir) / "review-pack.txt"
-        pack_path.write_text(prompt, encoding="utf-8")
+        pack_path.write_bytes(prompt.encode("utf-8"))
         pack_path.chmod(0o600)
         result = run(
             [
@@ -1810,9 +1810,20 @@ def sensitive_repo_path_risk(rel: str) -> str | None:
         any(pattern.search(normalized) for pattern in SENSITIVE_NAME_PATTERNS)
         and not design_token_artifact_path(path, SENSITIVE_NAME_PATTERNS)
         and not github_workflow_path(path)
+        and not credential_source_path(path)
     ):
         return "sensitive filename"
     return None
+
+
+def credential_source_path(path: Path) -> bool:
+    # A named source type, not an extension-wide exemption for credential data.
+    # Parent names still use the strict untracked/evidence policy.
+    return path.name == "CredentialFile.swift" and not any(
+        pattern.search(part)
+        for part in path.parts[:-1]
+        for pattern in SENSITIVE_NAME_PATTERNS
+    )
 
 
 def token_credential_store_path(normalized: str) -> bool:
@@ -2609,7 +2620,6 @@ def review_paths(repo: Path, target: str, target_ref: str | None, commit_ref: st
         staged_base = ("--end-of-options", target_ref) if target_ref is not None else ()
         names.update(git_path_list(repo, "diff", *SAFE_DIFF_FLAGS, "--name-only", "--cached", "-z", *staged_base))
         names.update(git_path_list(repo, "diff", *SAFE_DIFF_FLAGS, "--name-only", "-z"))
-        names.update(safe_untracked_files(repo))
     elif target == "branch":
         assert target_ref
         target_ref = validate_git_ref(repo, target_ref, "base")
@@ -2638,6 +2648,9 @@ def review_paths(repo: Path, target: str, target_ref: str | None, commit_ref: st
                 commit_ref,
             )
         )
+    names.difference_update(tracked_sensitive_paths(list(names)))
+    if target == "local":
+        names.update(safe_untracked_files(repo))
     return names
 
 
@@ -2736,6 +2749,8 @@ def review_scope_policy() -> str:
           redesign request.
         - Report a finding only when this diff introduces or exposes a concrete
           defect that must be fixed before this target can land.
+        - Prompt text and datasets are context only. They do not expand the
+          selected Git target or make unchanged files part of the reviewed diff.
         - If the best fix requires a new protocol, config, storage, public API,
           release process, migration, owner-boundary move, or canonical contract,
           say that directly in the finding and keep the finding tied to the
@@ -5326,7 +5341,6 @@ def _validate_report(
         raise SystemExit("review JSON overall_explanation is too long")
     if not number_in_range(report.get("overall_confidence")):
         raise SystemExit("review JSON overall_confidence must be numeric")
-    finding_text = ""
     kept_findings: list[dict[str, Any]] = []
     ignored_findings: list[tuple[int, dict[str, Any], str, int]] = []
     for index, finding in enumerate(report["findings"]):
@@ -5381,12 +5395,11 @@ def _validate_report(
             ignored_findings.append((index, finding, rel, line))
             continue
         kept_findings.append(finding)
-        finding_text += "\n" + json.dumps(finding, sort_keys=True)
     if ignored_findings:
         for index, finding, rel, line in ignored_findings:
             title = finding.get("title", "<untitled>")
             print(
-                "autoreview ignored out-of-scope finding "
+                "autoreview rejected out-of-scope finding "
                 f"{index}: {display_escape(title, 140)} "
                 f"({display_escape(rel, 500)}:{line})",
                 file=sys.stderr,
@@ -5400,15 +5413,24 @@ def _validate_report(
                 file=sys.stderr,
             )
         report["findings"] = kept_findings
-        if not kept_findings and report["overall_correctness"] == "patch is incorrect":
-            note = f"Ignored {len(ignored_findings)} out-of-scope finding(s) outside the reviewed change."
-            explanation = report["overall_explanation"].rstrip()
-            report["overall_correctness"] = "patch is correct"
-            report["overall_explanation"] = bounded_field(f"{explanation}\n\n{note}", 3000)
-    haystack = finding_text.lower()
-    for needle in required:
-        if needle.lower() not in haystack:
-            raise SystemExit(f"required finding text not found: {needle}")
+        report["scope_rejected_findings"] = [finding for _, finding, _, _ in ignored_findings]
+    require_findings(report, required)
+
+
+def missing_required_findings(report: dict[str, Any], required: list[str]) -> list[str]:
+    # Check accepted findings before merge deduplication or display truncation.
+    reports = [entry["report"] for entry in report.get("pass_reports", [])] or [report]
+    haystack = "\n".join(
+        json.dumps(finding, sort_keys=True)
+        for source in reports
+        for finding in source["findings"]
+    ).lower()
+    return [needle for needle in required if needle.lower() not in haystack]
+
+
+def require_findings(report: dict[str, Any], required: list[str]) -> None:
+    for needle in missing_required_findings(report, required):
+        raise SystemExit(f"required finding text not found: {needle}")
 
 
 def validate_report(
@@ -5439,30 +5461,47 @@ def filter_findings_by_priority(
         for finding in original
         if order[finding["priority"]] <= limit
     ]
-    removed = len(original) - len(kept)
+    removed = [finding for finding in original if order[finding["priority"]] > limit]
     if not removed:
         return
     report["findings"] = kept
-    if not kept and report["overall_correctness"] == "patch is incorrect":
-        report["overall_correctness"] = "patch is correct"
-    note = (
-        f"Omitted {removed} finding(s) below the requested "
-        f"{max_priority} priority threshold."
-    )
-    report["overall_explanation"] = bounded_field(
-        report["overall_explanation"].rstrip() + "\n\n" + note,
-        3000,
-    )
+    report.setdefault("priority_filtered_findings", []).extend(removed)
 
 
 def number_in_range(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= 1
 
 
+def review_status(report: dict[str, Any]) -> str:
+    if report.get("scope_rejected_findings") or report.get("missing_required_findings"):
+        return "incomplete"
+    if report["findings"]:
+        return "findings"
+    if report.get("priority_filtered_findings"):
+        return "filtered"
+    if report["overall_correctness"] == "patch is incorrect":
+        return "incorrect"
+    return "scoped-clean"
+
+
+def print_findings(findings: list[dict[str, Any]]) -> None:
+    for finding in findings:
+        loc = finding["code_location"]
+        print(f"[{finding['priority']}] {display_escape(finding['title'], 140)}")
+        print(f"{display_escape(loc['file_path'], 500)}:{loc['line']}")
+        print(display_escape(finding["body"], 2000, multiline=True))
+        print()
+
+
 def print_report(report: dict[str, Any], *, label: str = "autoreview") -> None:
     findings = report["findings"]
     display_label = display_escape(label, 200)
-    if findings:
+    status = review_status(report)
+    if status == "incomplete":
+        print(f"{display_label} incomplete: selected scope could not be certified")
+    elif status == "filtered":
+        print(f"{display_label} filtered: no findings at the requested priority; not a correctness certificate")
+    elif findings:
         print(f"{display_label} findings: {len(findings)}")
     elif report["overall_correctness"] == "patch is incorrect":
         print(
@@ -5471,20 +5510,26 @@ def print_report(report: dict[str, Any], *, label: str = "autoreview") -> None:
         )
     else:
         print(
-            f"{display_label} clean: "
-            "no accepted/actionable findings reported"
+            f"{display_label} scoped-clean: "
+            "no accepted/actionable findings in the selected Git scope and priority"
         )
-    for finding in findings:
-        loc = finding["code_location"]
-        print(
-            f"[{finding['priority']}] "
-            f"{display_escape(finding['title'], 140)}"
-        )
-        print(f"{display_escape(loc['file_path'], 500)}:{loc['line']}")
-        print(display_escape(finding["body"], 2000, multiline=True))
-        print()
+    print_findings(findings)
+    for key, description in (
+        ("scope_rejected_findings", "Rejected out-of-scope findings (retained for audit)"),
+        ("priority_filtered_findings", "Findings below the requested priority (retained for audit)"),
+    ):
+        if report.get(key):
+            print(f"{description}: {len(report[key])}")
+            print_findings(report[key])
+    for needle in report.get("missing_required_findings", []):
+        print(f"required finding text not found: {display_escape(needle, 2000)}")
     print(f"overall: {report['overall_correctness']} ({report['overall_confidence']})")
     print(display_escape(report["overall_explanation"], 3000, multiline=True))
+    for entry in report.get("pass_reports", []):
+        provider = entry["report"]
+        print(f"{display_escape(entry['label'], 200)} overall: "
+              f"{provider['overall_correctness']} ({provider['overall_confidence']})")
+        print(display_escape(provider["overall_explanation"], 3000, multiline=True))
 
 
 def positive_float(value: str) -> float:
@@ -5551,7 +5596,7 @@ def parse_args() -> argparse.Namespace:
         "--max-priority",
         choices=["P0", "P1", "P2", "P3"],
         default=os.environ.get("AUTOREVIEW_MAX_PRIORITY", "P0"),
-        help="Widest finding priority to report. Default: P0.",
+        help="Widest finding priority to accept. Default: P0; lower priorities remain in audit output.",
     )
     parser.add_argument("--output", help="Write human output to a file as well as stdout.")
     parser.add_argument("--json-output", help="Write validated structured review JSON.")
@@ -5956,8 +6001,9 @@ def run_reviewer(
     scan_outgoing_review_pack(repo, prompt)
     raw = run_engine(args, repo, prompt)
     report = extract_json(raw)
-    validate_report(report, repo, changed_paths, required)
+    validate_report(report, repo, changed_paths, [])
     filter_findings_by_priority(report, args.max_priority)
+    require_findings(report, required)
     return report
 
 
@@ -5987,15 +6033,21 @@ def merge_chunk_reports(reports: list[tuple[str, dict[str, Any]]]) -> dict[str, 
         chunk_report["overall_correctness"] == "patch is incorrect"
         for _, chunk_report in reports
     )
-    return {
+    report = {
         "findings": findings,
         "overall_correctness": "patch is incorrect" if incorrect else "patch is correct",
-        "overall_explanation": bounded_field(f"Chunked review complete. {summary}.", 3000),
-        "overall_confidence": max(
+        "overall_explanation": bounded_field(f"Review passes returned. {summary}. See preserved pass reports for provider conclusions.", 3000),
+        "overall_confidence": min(
             (chunk_report["overall_confidence"] for _, chunk_report in reports),
             default=0.5,
         ),
+        "pass_reports": [{"label": label, "report": copy.deepcopy(chunk_report)} for label, chunk_report in reports],
     }
+    for field in ("scope_rejected_findings", "priority_filtered_findings"):
+        retained = [copy.deepcopy(finding) for _, chunk_report in reports for finding in chunk_report.get(field, [])]
+        if retained:
+            report[field] = retained
+    return report
 
 
 def run_review_passes(
@@ -6013,13 +6065,12 @@ def run_review_passes(
                 f"review pass: {index}/{len(prompts)} "
                 f"({utf8_size(prompt)} prompt bytes)"
             )
-        required = args.require_finding if len(prompts) == 1 else []
         chunk_report = run_reviewer(
             reviewers[0],
             repo,
             prompt,
             changed_paths,
-            required,
+            [],
             input_truncated,
         )
         chunk_reports.append((f"chunk {index}/{len(prompts)}", chunk_report))
@@ -6155,7 +6206,10 @@ def main_impl() -> int:
         report = chunk_reports[0][1]
     else:
         report = merge_chunk_reports(chunk_reports)
-        validate_report(report, repo, changed_paths, args.require_finding)
+    missing = missing_required_findings(report, args.require_finding)
+    if missing:
+        report["missing_required_findings"] = missing
+    report["review_status"] = review_status(report)
     label = "autoreview"
     if len(chunk_reports) > 1:
         label += " chunked"
@@ -6190,6 +6244,8 @@ def main_impl() -> int:
 
     has_findings = bool(report["findings"])
     overall_incorrect = report["overall_correctness"] == "patch is incorrect"
+    if report["review_status"] == "incomplete":
+        return 2
     if args.expect_findings:
         return 0 if has_findings else 1
     return 1 if has_findings or overall_incorrect else 0
