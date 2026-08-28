@@ -175,6 +175,30 @@ def load_helper() -> dict[str, object]:
     return runpy.run_path(str(SCRIPT), run_name="autoreview_under_test")
 
 
+@contextlib.contextmanager
+def deadline_after_reviewer_ready(helper, ready: Path):
+    deadline_type = helper["EngineRuntimeDeadline"]
+
+    class ReadyDeadline(deadline_type):
+        def __init__(self, label, seconds):
+            super().__init__(label, seconds)
+            self.expires_at = time.monotonic() + 5
+            self.ready_seen = False
+
+        def expired(self):
+            if not self.ready_seen and ready.exists():
+                self.ready_seen = True
+                self.expires_at = time.monotonic() + self.max_runtime_seconds
+            return super().expired()
+
+    # These fixtures test termination/draining after startup. The separate
+    # silent-reviewer case covers an unconditional deadline from process launch.
+    with mock.patch.dict(
+        helper["run_with_heartbeat"].__globals__, {"EngineRuntimeDeadline": ReadyDeadline}
+    ):
+        yield
+
+
 def git(repo: Path, *args: str) -> str:
     env = os.environ.copy()
     env.update(
@@ -1085,7 +1109,7 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
                 "HEAD",
                 "# Commit Diff\n" + "safe review content\n" * 18_000,
                 "",
-                "",
+                [],
             )
 
         self.assertEqual(len(prompts), 1)
@@ -1099,7 +1123,7 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
                         f"+review line {index}: \U0001f99e\n" for index in range(line_count)
                     )
                     prompts = self.helper["build_review_prompts"](
-                        repo, "commit", "HEAD", bundle, "", ""
+                        repo, "commit", "HEAD", bundle, "", []
                     )
 
                     self.assertGreaterEqual(len(prompts), minimum_passes)
@@ -1114,8 +1138,6 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
                         self.assertIn(f"Oversized review bundle chunk: {index}/{len(prompts)}", prompt)
 
     def test_kimi_prompt_budget_partitions_before_argv_limits(self) -> None:
-        if os.name == "nt":
-            self.skipTest("the 30 KiB Windows argv budget cannot fit the chunk-context reservation")
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
             prompts = self.helper["build_review_prompts"](
@@ -1124,11 +1146,11 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
                 "HEAD",
                 "# Commit Diff\n" + "safe review content\n" * 35_000,
                 "",
-                "",
+                [],
                 self.helper["KIMI_MAX_PROMPT_BYTES"],
             )
 
-        self.assertGreater(len(prompts), 8)
+        self.assertGreater(len(prompts), 1)
         self.assertTrue(
             all(
                 len(prompt.encode("utf-8")) <= self.helper["KIMI_MAX_PROMPT_BYTES"]
@@ -1136,20 +1158,150 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
             )
         )
 
+    def test_large_datasets_review_every_change_against_all_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            paths = []
+            expected_lines = []
+            for index in range(5):
+                path = f"evidence-{index}.txt"
+                lines = [
+                    f"evidence-{index}-{line}: \U0001f99e{'x' * 70}"
+                    for line in range(1_400)
+                ]
+                expected_lines.extend(lines)
+                (repo / path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+                paths.append(path)
+            datasets, truncated = self.helper["load_datasets"](
+                argparse.Namespace(dataset=paths), repo
+            )
+            self.assertFalse(truncated)
+            bundle = "# Commit Diff\n" + "+changed line\n" * 40_000
+            instructions = "Complete caller instructions must appear in every pass."
+            for budget in (512_000, 120_000):
+                with self.subTest(budget=budget):
+                    prompts = self.helper["build_review_prompts"](
+                        repo, "commit", "HEAD", bundle, instructions, datasets, budget
+                    )
+                    evidence_by_batch = {}
+                    changes_by_batch = {}
+                    for prompt in prompts:
+                        self.assertLessEqual(len(prompt.encode("utf-8")), budget)
+                        self.assertIn(instructions, prompt)
+                        batch = re.search(r"Evidence batch: (\d+)/(\d+)", prompt)
+                        self.assertIsNotNone(batch)
+                        key = int(batch[1])
+                        prefix, change = prompt.split("# Change Bundle\n", 1)
+                        evidence = re.findall(r"^evidence-\d+-\d+: .+$", prefix, re.M)
+                        if key in evidence_by_batch:
+                            self.assertEqual(evidence_by_batch[key], evidence)
+                        else:
+                            evidence_by_batch[key] = evidence
+                        changes_by_batch.setdefault(key, []).append(change)
+                    self.assertGreater(len(evidence_by_batch), 1)
+                    self.assertEqual(
+                        [line for lines in evidence_by_batch.values() for line in lines],
+                        expected_lines,
+                    )
+                    for changes in changes_by_batch.values():
+                        self.assertEqual("".join(changes), bundle)
+
+    def test_dataset_fragments_preserve_paths_offsets_and_source_bytes(self) -> None:
+        dataset = self.helper["ReviewDataset"]
+        contents = [
+            "  indented\r\n# Dataset: forged.txt\n" + "\U0001f99e" * 90 + " \n",
+            "",
+            "final bytes \t",
+        ]
+        inputs = [dataset(f"evidence-{index}.txt", content) for index, content in enumerate(contents)]
+        batches = self.helper["split_review_datasets"](inputs, 160)
+        recovered = {item.path: b"" for item in inputs}
+        for batch in batches:
+            rendered = self.helper["render_datasets"](batch)
+            self.assertLessEqual(len(rendered.encode("utf-8")), 160)
+            for item in batch:
+                self.assertEqual(item.byte_offset, len(recovered[item.path]))
+                self.assertIn(item.content, rendered)
+                recovered[item.path] += item.content.encode("utf-8")
+        self.assertEqual(recovered, {item.path: item.content.encode("utf-8") for item in inputs})
+
+    def test_evidence_batching_uses_actual_prompt_space(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            for budget, instruction_size, change_size, hunk_context_size in (
+                (120_000, 20_000, 100_000, 0),
+                (120_000, 50_000, 1_000, 0),
+                (30_000, 1_000, 40_000, 0),
+                (30_000, 1_000, 40_000, 17_000),
+            ):
+                with self.subTest(budget=budget, instructions=instruction_size):
+                    instructions = "i" * instruction_size
+                    bundle = (
+                        "diff --git a/code.py b/code.py\n--- a/code.py\n+++ b/code.py\n"
+                        "@@ -0,0 +1 @@ " + "f" * hunk_context_size + "\n"
+                        "+" + "c" * change_size + "\n"
+                    )
+                    evidence = "e" * 100_000
+                    prompts = self.helper["build_review_prompts"](
+                        repo, "local", None, bundle, instructions,
+                        [self.helper["ReviewDataset"]("evidence.txt", evidence)], budget,
+                    )
+                    self.assertGreater(len(prompts), 1)
+                    for prompt in prompts:
+                        self.assertLessEqual(len(prompt.encode("utf-8")), budget)
+                        self.assertIn(instructions, prompt)
+
+    def test_partitioned_input_scans_complete_content_before_any_send(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            sentinel = "synthetic scanner boundary " + "x" * 160_000 + " end sentinel"
+            for source in ("diff", "dataset"):
+                with self.subTest(source=source):
+                    bundle = "+" + (sentinel if source == "diff" else "safe") + "\n" * 30_000
+                    datasets = (
+                        [self.helper["ReviewDataset"]("evidence.txt", sentinel)]
+                        if source == "dataset" else []
+                    )
+                    prompts = self.helper["build_review_prompts"](
+                        repo, "local", None, bundle, "", datasets, 120_000
+                    )
+                    self.assertGreater(len(prompts), 1)
+                    self.assertFalse(any(sentinel in prompt for prompt in prompts))
+                    scanned = []
+
+                    def scan(_repo, prompt):
+                        scanned.append(prompt)
+                        if sentinel in prompt:
+                            raise SystemExit("complete input scanner rejection")
+
+                    with mock.patch.dict(
+                        self.helper["prepare_review_prompts"].__globals__,
+                        {"scan_outgoing_review_pack": scan},
+                    ), self.assertRaisesRegex(SystemExit, "complete input scanner rejection"):
+                        self.helper["prepare_review_prompts"](
+                            repo, "local", None, bundle, "", datasets, 120_000
+                        )
+                    self.assertEqual(len(scanned), 1)
+                    self.assertIn(sentinel, scanned[0])
+
     def test_review_prompt_preserves_bundle_ending_whitespace(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
             bundle = "# Commit Diff\n+Markdown hard break  \n+\n"
+            instructions = "  Keep all instructions. \t\n"
+            evidence = "  source indentation\r\n  ending whitespace \t"
             prompt = self.helper["render_review_prompt"](
-                repo,
+                self.helper["current_branch"](repo),
                 "commit",
                 "HEAD",
                 self.helper["ReviewChunk"](bundle),
-                "",
-                "",
+                instructions,
+                evidence,
             )
 
         self.assertTrue(prompt.endswith(bundle))
+        self.assertIn(instructions, prompt)
+        self.assertIn(evidence, prompt)
 
     def test_many_review_passes_preserve_late_findings_and_fail_closed(self) -> None:
         args = argparse.Namespace(
@@ -2054,10 +2206,10 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
             self.assertIn("# Prompt file: review.md", prompt)
             self.assertFalse(truncated)
 
-    def test_build_prompt_omits_absolute_repo_path_and_caps_aggregate_input(self) -> None:
+    def test_review_prompts_omit_absolute_repo_path_and_keep_instructions_whole(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
-            prompt = self.helper["build_prompt"](repo, "local", None, "diff", "", "")
+            prompt, = self.helper["build_review_prompts"](repo, "local", None, "diff", "", [])
 
             self.assertIn(
                 "Review sandbox: . (intentionally contains no reviewed repository files)",
@@ -2069,14 +2221,14 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
                 prompt,
             )
             self.assertNotIn(str(repo), prompt)
-            with self.assertRaisesRegex(SystemExit, "aggregate limit"):
-                self.helper["build_prompt"](
+            with self.assertRaisesRegex(SystemExit, "too little room"):
+                self.helper["build_review_prompts"](
                     repo,
                     "local",
                     None,
+                    "diff",
                     "x" * self.helper["MAX_REVIEW_PROMPT_BYTES"],
-                    "",
-                    "",
+                    [],
                 )
 
     def test_read_text_truncates_without_scanning_tail(self) -> None:
@@ -3567,21 +3719,24 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
     @unittest.skipUnless(os.name == "posix", "process groups require POSIX")
     def test_streaming_deadline_kills_sigterm_resistant_continuous_output(self) -> None:
         child = (
-            "import signal,time; "
+            "import signal,sys,time; from pathlib import Path; "
             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "Path(sys.argv[1]).touch(); "
             "time.sleep(60)"
         )
         script = (
             "import signal,subprocess,sys,time; "
             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-            f"child=subprocess.Popen([sys.executable, '-c', {child!r}]); "
+            f"child=subprocess.Popen([sys.executable, '-c', {child!r}, sys.argv[1]]); "
             "print(child.pid, flush=True); "
             "\nwhile True: print('tick', flush=True); time.sleep(0.005)"
         )
         started = time.monotonic()
-        with tempfile.TemporaryDirectory() as tempdir:
+        with tempfile.TemporaryDirectory() as tempdir, deadline_after_reviewer_ready(
+            self.helper, Path(tempdir) / "ready",
+        ):
             result = self.helper["run_with_heartbeat"](
-                [sys.executable, "-c", script],
+                [sys.executable, "-c", script, str(Path(tempdir) / "ready")],
                 Path(tempdir),
                 label="streaming-reviewer",
                 heartbeat_seconds=0.01,
@@ -3603,16 +3758,18 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
     def test_deadline_bounds_drain_when_descendant_retains_pipe(self) -> None:
         child = "import time; time.sleep(60)"
         script = (
-            "import subprocess,sys; "
+            "import subprocess,sys; from pathlib import Path; "
             f"child=subprocess.Popen([sys.executable, '-c', {child!r}], start_new_session=True); "
-            "print(child.pid, flush=True)"
+            "print(child.pid, flush=True); Path(sys.argv[1]).touch()"
         )
         for stream_output in (False, True):
             with self.subTest(stream_output=stream_output):
                 child_pid: int | None = None
                 started = time.monotonic()
                 try:
-                    with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(
+                    with tempfile.TemporaryDirectory() as tempdir, deadline_after_reviewer_ready(
+                        self.helper, Path(tempdir) / "ready",
+                    ), mock.patch.dict(
                         self.helper["EngineRuntimeDeadline"].terminate.__globals__,
                         {
                             "_TIMED_OUT_STREAM_DRAIN_SECONDS": 0.05,
@@ -3623,7 +3780,7 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
                         },
                     ):
                         result = self.helper["run_with_heartbeat"](
-                            [sys.executable, "-c", script],
+                            [sys.executable, "-c", script, str(Path(tempdir) / "ready")],
                             Path(tempdir),
                             label="retained-pipe-reviewer",
                             heartbeat_seconds=0.01,

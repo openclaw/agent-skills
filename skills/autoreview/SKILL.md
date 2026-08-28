@@ -171,8 +171,10 @@ with `--base`.
 
 ## Oversized Bundles
 
-The helper validates the complete patch before partitioning it and scans each
-exact outgoing review pack before sending it. A safe bundle that fits
+The helper validates the complete patch before partitioning it. For partitioned
+reviews it scans the complete frozen input first, so credentials cannot evade
+detection by crossing a chunk boundary. It also scans each exact outgoing review
+pack before sending it. A safe bundle that fits
 the aggregate prompt limit remains one integrated review pass. Larger bundles
 are split at bundle sections and file boundaries where possible; an oversized
 single-file block is split at line boundaries with repeated file/hunk context
@@ -180,15 +182,20 @@ and an absolute new- or old-file line offset. Untracked snapshots use
 injection-safe source-line records so continuation passes retain reportable
 locations. A single physical diff line split across passes also retains its
 original addition, deletion, or context marker.
-Every original bundle byte appears exactly once across the pass sequence, and
-all validated reports are merged before required-finding and exit-status checks.
+Prompt instructions remain whole in every pass. Large datasets are grouped from
+their validated file records, never by reparsing headings inside evidence.
+Individual oversized datasets split at lines or UTF-8 boundaries with their
+original path and byte offset. Each evidence batch is paired with the complete
+change bundle: every original change byte appears exactly once per evidence
+batch, and every evidence byte is retained. All validated reports are merged
+before required-finding and exit-status checks.
 There is no fixed pass-count ceiling: the complete frozen input determines the
 finite pass sequence. The helper prints its size and pass count before running
 passes serially. Each pass retains the same prompt-size limit, secret scan, and
 reviewer isolation; a failed pass aborts without publishing a partial verdict.
 
-Chunking makes large-diff review usable, but it cannot give one model call every
-cross-file implementation detail. For architecture-heavy changes, still prefer
+Evidence batches can multiply the pass count. Chunking cannot give one model
+call every cross-file implementation detail. For architecture-heavy changes, still prefer
 a coherent branch or PR shape whose semantic decision surface fits one pass.
 Removing verified non-authoritative generated noise remains useful, but never
 drop lockfiles, generated clients, policies, manifests, schemas, or other

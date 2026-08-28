@@ -167,6 +167,12 @@ class ReviewChunk(NamedTuple):
     context: str = ""
 
 
+class ReviewDataset(NamedTuple):
+    path: str
+    content: str
+    byte_offset: int = 0
+
+
 DEFAULT_ENGINE_PATHS = ("/usr/local/bin", "/usr/bin", "/bin")
 # Keep this explicit: suffix matching leaks unrelated process credentials such
 # as package-registry and telemetry tokens into reviewer subprocesses.
@@ -2666,14 +2672,60 @@ def load_extra_prompt(args: argparse.Namespace, repo: Path) -> tuple[str, bool]:
     return "\n\n".join(chunks), input_truncated
 
 
-def load_datasets(args: argparse.Namespace, repo: Path) -> tuple[str, bool]:
-    chunks: list[str] = []
+def load_datasets(args: argparse.Namespace, repo: Path) -> tuple[list[ReviewDataset], bool]:
+    chunks: list[ReviewDataset] = []
     input_truncated = False
     for spec in args.dataset or []:
         path, content, truncated = validate_evidence_file(repo, spec, "--dataset")
         input_truncated = input_truncated or truncated
-        chunks.append(f"# Dataset: {path.relative_to(repo.resolve())}\n{content}")
-    return "\n\n".join(chunks), input_truncated
+        chunks.append(ReviewDataset(str(path.relative_to(repo.resolve())), content))
+    return chunks, input_truncated
+
+
+def render_datasets(datasets: list[ReviewDataset]) -> str:
+    return "\n\n".join(
+        f"# Dataset: {dataset.path}\n"
+        f"[Dataset byte offset: {dataset.byte_offset}]\n{dataset.content}"
+        for dataset in datasets
+    )
+
+
+def split_review_datasets(
+    datasets: list[ReviewDataset],
+    limit: int,
+) -> list[list[ReviewDataset]]:
+    batches: list[list[ReviewDataset]] = []
+    pending: list[ReviewDataset] = []
+    for dataset in datasets:
+        # Keep loader-owned paths separate from evidence text: source may itself
+        # contain headings that look like dataset boundaries.
+        overhead = utf8_size(render_datasets(
+            [ReviewDataset(dataset.path, "", utf8_size(dataset.content))]
+        ))
+        content_limit = limit - overhead
+        if content_limit < 4:
+            raise SystemExit("dataset path leaves too little room for evidence content")
+        fragments: list[str] = []
+        lines: list[str] = []
+        size = 0
+        for line in literal_lf_lines(dataset.content):
+            if size + utf8_size(line) > content_limit and lines:
+                fragments.append("".join(lines))
+                lines, size = [], 0
+            pieces = split_utf8_fragment(line, content_limit)
+            fragments.extend(pieces[:-1])
+            lines.append(pieces[-1])
+            size += utf8_size(pieces[-1])
+        fragments.append("".join(lines))
+        offset = 0
+        for fragment in fragments:
+            part = ReviewDataset(dataset.path, fragment, offset)
+            if pending and utf8_size(render_datasets([*pending, part])) > limit:
+                batches.append(pending)
+                pending = []
+            pending.append(part)
+            offset += utf8_size(fragment)
+    return [*batches, pending] if pending else [[]]
 
 
 def review_scope_policy() -> str:
@@ -3048,7 +3100,7 @@ def split_review_bundle(bundle: str, limit: int) -> list[ReviewChunk]:
 
 
 def render_review_prompt(
-    repo: Path,
+    branch: str,
     target: str,
     target_ref: str | None,
     chunk: ReviewChunk,
@@ -3057,7 +3109,6 @@ def render_review_prompt(
     chunk_position: tuple[int, int] | None = None,
 ) -> str:
     target_line = f"{target} {target_ref}" if target_ref else target
-    branch = current_branch(repo)
     scope_policy = review_scope_policy()
     chunk_policy = ""
     if chunk_position:
@@ -3106,45 +3157,25 @@ def render_review_prompt(
 
         {chunk_policy}
 
-        {extra_prompt}
-
-        {datasets}
-
-        # Change Bundle
         """
     ).strip()
-    return instructions + "\n" + chunk.content
-
-
-def build_prompt(repo: Path, target: str, target_ref: str | None, bundle: str, extra_prompt: str, datasets: str) -> str:
-    prompt = render_review_prompt(
-        repo,
-        target,
-        target_ref,
-        ReviewChunk(bundle),
-        extra_prompt,
-        datasets,
+    return (
+        instructions + "\n\n" + extra_prompt + "\n\n" + datasets
+        + "\n\n# Change Bundle\n" + chunk.content
     )
-    prompt_bytes = len(prompt.encode("utf-8"))
-    if prompt_bytes > MAX_REVIEW_PROMPT_BYTES:
-        raise SystemExit(
-            f"review input is {prompt_bytes} bytes, exceeding the {MAX_REVIEW_PROMPT_BYTES}-byte aggregate limit; "
-            "reduce the change, prompt files, or datasets"
-        )
-    return prompt
 
 
-def build_review_prompts(
-    repo: Path,
+def build_change_review_prompts(
+    branch: str,
     target: str,
     target_ref: str | None,
     bundle: str,
     extra_prompt: str,
     datasets: str,
     max_prompt_bytes: int = MAX_REVIEW_PROMPT_BYTES,
-) -> list[str]:
+) -> list[str] | None:
     full_prompt = render_review_prompt(
-        repo,
+        branch,
         target,
         target_ref,
         ReviewChunk(bundle),
@@ -3155,7 +3186,7 @@ def build_review_prompts(
         return [full_prompt]
 
     empty_chunk_prompt = render_review_prompt(
-        repo,
+        branch,
         target,
         target_ref,
         ReviewChunk(""),
@@ -3166,19 +3197,15 @@ def build_review_prompts(
     content_limit = (
         max_prompt_bytes
         - utf8_size(empty_chunk_prompt)
-        - MAX_REVIEW_CHUNK_CONTEXT_BYTES
         - 4_096
     )
-    if content_limit < 16_000:
-        raise SystemExit(
-            "review prompt files and datasets leave too little room for change chunks; "
-            "reduce the extra review context"
-        )
-    for _attempt in range(4):
+    if content_limit < 4:
+        return None
+    while content_limit >= 4:
         chunks = split_review_bundle(bundle, content_limit)
         prompts = [
             render_review_prompt(
-                repo,
+                branch,
                 target,
                 target_ref,
                 chunk,
@@ -3192,11 +3219,92 @@ def build_review_prompts(
         if largest <= max_prompt_bytes:
             return prompts
         content_limit -= largest - max_prompt_bytes + 1_024
-        if content_limit < 16_000:
-            break
-    raise SystemExit(
-        "unable to partition the review bundle within the aggregate prompt limit"
+    return None
+
+
+def build_review_prompts(
+    repo: Path,
+    target: str,
+    target_ref: str | None,
+    bundle: str,
+    extra_prompt: str,
+    datasets: list[ReviewDataset],
+    max_prompt_bytes: int = MAX_REVIEW_PROMPT_BYTES,
+) -> list[str]:
+    branch = current_branch(repo)
+    rendered_datasets = render_datasets(datasets)
+    full_prompt = render_review_prompt(
+        branch, target, target_ref, ReviewChunk(bundle), extra_prompt, rendered_datasets,
     )
+    if utf8_size(full_prompt) <= max_prompt_bytes:
+        return [full_prompt]
+    fixed_prompt = render_review_prompt(
+        branch, target, target_ref, ReviewChunk(""), extra_prompt, "", (999_999, 999_999),
+    )
+    available = (
+        max_prompt_bytes - utf8_size(fixed_prompt) - 4_096
+    )
+    batch_policy = (
+        "\n\nEvidence batch: {index}/{total}\n"
+        "The complete change is reviewed against every evidence batch. "
+        "Change bytes appear once within each batch's chunk sequence. "
+        "Dataset fragments retain their original path and UTF-8 byte offset. "
+        "Do not treat evidence absent from this batch as proof of missing behavior."
+    )
+    evidence_limit = (
+        available - min(utf8_size(bundle), available // 2)
+        - utf8_size(batch_policy.format(index=999_999, total=999_999))
+    )
+    if available < 4 or (datasets and evidence_limit < 4):
+        raise SystemExit(
+            "review prompt files leave too little room for change chunks; "
+            "reduce the review instructions or move source evidence to datasets"
+        )
+    while True:
+        batches = split_review_datasets(datasets, evidence_limit)
+        prompts: list[str] = []
+        for index, batch in enumerate(batches, 1):
+            batch_prompt = extra_prompt
+            if len(batches) > 1:
+                batch_prompt += batch_policy.format(index=index, total=len(batches))
+            change_prompts = build_change_review_prompts(
+                branch, target, target_ref, bundle, batch_prompt,
+                render_datasets(batch), max_prompt_bytes,
+            )
+            if change_prompts is None:
+                break
+            prompts.extend(change_prompts)
+        else:
+            return prompts
+        # Actual continuation headers may need more room than the initial
+        # evidence allocation leaves. Rebatch before sending any partial pass.
+        evidence_limit //= 2
+        if not datasets or evidence_limit < 4:
+            raise SystemExit(
+                "unable to partition the review bundle within the aggregate prompt limit"
+            )
+
+
+def prepare_review_prompts(
+    repo: Path,
+    target: str,
+    target_ref: str | None,
+    bundle: str,
+    extra_prompt: str,
+    datasets: list[ReviewDataset],
+    max_prompt_bytes: int,
+) -> list[str]:
+    prompts = build_review_prompts(
+        repo, target, target_ref, bundle, extra_prompt, datasets, max_prompt_bytes,
+    )
+    if len(prompts) > 1:
+        # A credential can span a partition boundary. Scan the complete frozen
+        # input before any send, in addition to each exact outgoing pack.
+        scan_outgoing_review_pack(repo, render_review_prompt(
+            current_branch(repo), target, target_ref, ReviewChunk(bundle),
+            extra_prompt, render_datasets(datasets),
+        ))
+    return prompts
 
 
 def write_json_temp(data: dict[str, Any], temp_root: Path) -> Path:
@@ -5774,7 +5882,7 @@ def dry_run_preflight(
         print(f"bundle: FAILED ({exc})")
 
     extra_prompt = ""
-    datasets = ""
+    datasets: list[ReviewDataset] = []
     prompt_truncated = False
     datasets_truncated = False
     inputs_ok = True
@@ -5803,7 +5911,7 @@ def dry_run_preflight(
             if reviewers:
                 ensure_reviewer_input_complete(reviewers[0], input_truncated)
             threshold_extra_prompt = apply_finding_threshold_prompt(args, extra_prompt)
-            prompts = build_review_prompts(
+            prompts = prepare_review_prompts(
                 repo,
                 target,
                 target_ref,
@@ -6018,7 +6126,8 @@ def main_impl() -> int:
     datasets, datasets_truncated = load_datasets(args, repo)
     input_truncated = bundle_truncated or prompt_truncated or datasets_truncated
     max_prompt_bytes = max_prompt_bytes_for_reviewers(reviewers)
-    prompts = build_review_prompts(
+    ensure_reviewer_input_complete(reviewer, input_truncated)
+    prompts = prepare_review_prompts(
         repo,
         target,
         target_ref,
