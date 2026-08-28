@@ -160,7 +160,8 @@ MAX_REVIEW_PROMPT_BYTES = 512_000
 # command line at ~32,767 characters.
 KIMI_MAX_PROMPT_BYTES = 30_000 if os.name == "nt" else 120_000
 MAX_REVIEW_CHUNK_CONTEXT_BYTES = 64_000
-MAX_REVIEW_PASSES = 8
+
+
 class ReviewChunk(NamedTuple):
     content: str
     context: str = ""
@@ -3165,19 +3166,8 @@ def build_review_prompts(
             "review prompt files and datasets leave too little room for change chunks; "
             "reduce the extra review context"
         )
-    if utf8_size(bundle) > content_limit * MAX_REVIEW_PASSES:
-        raise SystemExit(
-            f"review bundle requires more than {MAX_REVIEW_PASSES} bounded passes; "
-            "reduce or split the change before review"
-        )
-
     for _attempt in range(4):
         chunks = split_review_bundle(bundle, content_limit)
-        if len(chunks) > MAX_REVIEW_PASSES:
-            raise SystemExit(
-                f"review bundle requires {len(chunks)} bounded passes; "
-                f"limit {MAX_REVIEW_PASSES}; reduce or split the change before review"
-            )
         prompts = [
             render_review_prompt(
                 repo,

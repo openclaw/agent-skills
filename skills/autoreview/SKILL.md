@@ -155,7 +155,8 @@ with `--base`.
 
 ## Oversized Bundles
 
-The helper scans the full patch before partitioning it. A safe bundle that fits
+The helper validates the complete patch before partitioning it and scans each
+exact outgoing review pack before sending it. A safe bundle that fits
 the aggregate prompt limit remains one integrated review pass. Larger bundles
 are split at bundle sections and file boundaries where possible; an oversized
 single-file block is split at line boundaries with repeated file/hunk context
@@ -165,9 +166,10 @@ locations. A single physical diff line split across passes also retains its
 original addition, deletion, or context marker.
 Every original bundle byte appears exactly once across the pass sequence, and
 all validated reports are merged before required-finding and exit-status checks.
-The helper caps one run at eight bounded passes so an unexpectedly huge branch
-cannot create unbounded model calls; split still-larger work into coherent review
-targets.
+There is no fixed pass-count ceiling: the complete frozen input determines the
+finite pass sequence. The helper prints its size and pass count before running
+passes serially. Each pass retains the same prompt-size limit, secret scan, and
+reviewer isolation; a failed pass aborts without publishing a partial verdict.
 
 Chunking makes large-diff review usable, but it cannot give one model call every
 cross-file implementation detail. For architecture-heavy changes, still prefer
@@ -314,7 +316,7 @@ The helper:
 - supports `codex`, `claude`, `amp`, `pi`, and `kimi`; default is `AUTOREVIEW_ENGINE` or `codex`
 - resolves bare `git`, `gh`, reviewer, and PowerShell shell commands from absolute `PATH` entries only, never from the reviewed checkout; explicit `--*-bin` paths are interpreted from the reviewed repository root when relative and accepted only when both the supplied path and resolved target stay outside the reviewed repository
 - use `--mode commit --commit <ref>` for already-committed work, especially clean `main` after landing
-- scans safe Git patches in full, recognizes synthetic fixture values tied to their credential field, reviews them in one pass up to the aggregate prompt limit, and automatically uses complete bounded passes above it
+- validates complete Git patches, scans every outgoing review pack, reviews them in one pass up to the aggregate prompt limit, and automatically uses complete bounded passes above it
 - should be left in `--mode auto` or forced to `--mode branch` for PR/branch work; do not force `--mode local` after committing
 - writes only to stdout unless `--output`, `--json-output`, or live streamed engine stderr is set
 - supports `--dry-run` (validates bundle construction, reviewer CLI resolution, and local isolation startup with version/help probes without contacting a provider; exits nonzero if any check fails), an opt-in per-reviewer wall-clock bound via `--engine-timeout-seconds`, `--prompt`, repo-relative `--prompt-file`, repo-relative `--dataset`, `--no-tools`, `--no-web-search`, repeatable Codex-only safe model/response tuning with `--codex-config key=value`, Codex-only `--codex-speed fast|flex|default`, and commit refs

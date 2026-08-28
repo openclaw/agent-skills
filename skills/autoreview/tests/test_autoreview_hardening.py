@@ -975,24 +975,25 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
     def test_bundle_above_prompt_limit_uses_complete_bounded_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
-            prompts = self.helper["build_review_prompts"](
-                repo,
-                "commit",
-                "HEAD",
-                "# Commit Diff\n" + "safe review content\n" * 35_000,
-                "",
-                "",
-            )
+            for line_count, minimum_passes in ((35_000, 2), (200_000, 9)):
+                with self.subTest(line_count=line_count):
+                    bundle = "# Commit Diff\n" + "".join(
+                        f"+review line {index}: \U0001f99e\n" for index in range(line_count)
+                    )
+                    prompts = self.helper["build_review_prompts"](
+                        repo, "commit", "HEAD", bundle, "", ""
+                    )
 
-        self.assertGreater(len(prompts), 1)
-        self.assertTrue(
-            all(
-                len(prompt.encode("utf-8"))
-                <= self.helper["MAX_REVIEW_PROMPT_BYTES"]
-                for prompt in prompts
-            )
-        )
-        self.assertTrue(all("Oversized review bundle chunk:" in prompt for prompt in prompts))
+                    self.assertGreaterEqual(len(prompts), minimum_passes)
+                    self.assertEqual(
+                        "".join(prompt.split("# Change Bundle\n", 1)[1] for prompt in prompts),
+                        bundle,
+                    )
+                    for index, prompt in enumerate(prompts, 1):
+                        self.assertLessEqual(
+                            len(prompt.encode("utf-8")), self.helper["MAX_REVIEW_PROMPT_BYTES"]
+                        )
+                        self.assertIn(f"Oversized review bundle chunk: {index}/{len(prompts)}", prompt)
 
     def test_kimi_prompt_budget_partitions_before_argv_limits(self) -> None:
         if os.name == "nt":
@@ -1003,13 +1004,13 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
                 repo,
                 "commit",
                 "HEAD",
-                "# Commit Diff\n" + "safe review content\n" * 12_000,
+                "# Commit Diff\n" + "safe review content\n" * 35_000,
                 "",
                 "",
                 self.helper["KIMI_MAX_PROMPT_BYTES"],
             )
 
-        self.assertGreater(len(prompts), 1)
+        self.assertGreater(len(prompts), 8)
         self.assertTrue(
             all(
                 len(prompt.encode("utf-8")) <= self.helper["KIMI_MAX_PROMPT_BYTES"]
@@ -1032,20 +1033,72 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
 
         self.assertTrue(prompt.endswith(bundle))
 
-    def test_review_pass_count_is_bounded(self) -> None:
-        builder = self.helper["build_review_prompts"]
-        with tempfile.TemporaryDirectory() as tempdir:
-            repo = init_repo(Path(tempdir))
-            with mock.patch.dict(builder.__globals__, {"MAX_REVIEW_PASSES": 1}):
-                with self.assertRaisesRegex(SystemExit, "more than 1 bounded passes"):
-                    builder(
-                        repo,
-                        "commit",
-                        "HEAD",
-                        "# Commit Diff\n" + "safe review content\n" * 35_000,
-                        "",
-                        "",
+    def test_many_review_passes_preserve_late_findings_and_fail_closed(self) -> None:
+        args = argparse.Namespace(
+            engine="codex", max_priority="P0", require_finding=["late defect"]
+        )
+        prompts = [f"pass {index}" for index in range(10)]
+        finding = {
+            "title": "Late defect",
+            "body": "The last pass demonstrates the defect.",
+            "priority": "P0",
+            "confidence": 0.9,
+            "category": "bug",
+            "code_location": {"file_path": "source.txt", "line": 1},
+        }
+        for failure in (None, "scan", "engine"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                events = []
+
+                def scan(_repo, prompt):
+                    events.append(("scan", prompt))
+                    if failure == "scan" and prompt == prompts[8]:
+                        raise SystemExit("late scan failure")
+
+                def engine(_args, _repo, prompt):
+                    events.append(("engine", prompt))
+                    if failure == "engine" and prompt == prompts[8]:
+                        raise SystemExit("late engine failure")
+                    findings = [finding] if prompt == prompts[-1] else []
+                    return json.dumps(
+                        {
+                            "findings": findings,
+                            "overall_correctness": (
+                                "patch is incorrect" if findings else "patch is correct"
+                            ),
+                            "overall_explanation": "test review",
+                            "overall_confidence": 0.9,
+                        }
                     )
+
+                with mock.patch.dict(
+                    self.helper["run_review_passes"].__globals__,
+                    {"scan_outgoing_review_pack": scan, "run_engine": engine},
+                ), contextlib.redirect_stdout(io.StringIO()):
+                    if failure:
+                        with self.assertRaisesRegex(SystemExit, f"late {failure} failure"):
+                            self.helper["run_review_passes"](
+                                args, [args], repo, prompts, {"source.txt"}, False
+                            )
+                    else:
+                        reports = self.helper["run_review_passes"](
+                            args, [args], repo, prompts, {"source.txt"}, False
+                        )
+                        report = self.helper["merge_chunk_reports"](reports)
+                        self.helper["validate_report"](
+                            report, repo, {"source.txt"}, args.require_finding
+                        )
+                        self.assertEqual(report["overall_correctness"], "patch is incorrect")
+                        self.assertEqual(
+                            [item["title"] for item in report["findings"]], [finding["title"]]
+                        )
+                expected = [
+                    (stage, prompt) for prompt in prompts for stage in ("scan", "engine")
+                ]
+                if failure:
+                    expected = expected[:17 if failure == "scan" else 18]
+                self.assertEqual(events, expected)
 
     def test_review_patch_does_not_disclose_controls_in_omitted_paths(self) -> None:
         path = ".env.\x1b]52;c;VEVTVA==\x07\udc9b"
