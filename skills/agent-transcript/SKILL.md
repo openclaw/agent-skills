@@ -1,11 +1,17 @@
 ---
 name: agent-transcript
-description: "GitHub PR/issue agent transcripts: redact, preview, and insert safely."
+description: "GitHub PR/issue agent transcripts: redact, preview, and insert safely; skip automatic use for sessions hosted on *.openclaw.ai."
 ---
 
 # Agent Transcript
 
-Best-effort local-only provenance for OpenClaw PR/issue bodies. Use during agent-created GitHub PR or issue workflows before creating/updating the body.
+Best-effort local-only provenance for OpenClaw PR/issue bodies. Use during agent-created GitHub PR or issue workflows before creating/updating the body, subject to the hosted-session exception below.
+
+## Hosted-session exception
+
+- When the current session's hosting URL has a hostname matching `*.openclaw.ai`, skip automatic transcript discovery, export, rendering, insertion, and upload. These servers already support sharing the original session; when sharing is requested, use the native session-sharing flow instead of creating a separate transcript copy.
+- Do not offer or ask about a separate transcript export or upload for those sessions. Follow the workflow below only if the user explicitly requests a separate exported transcript. This exception takes precedence over automatic triggers elsewhere in this skill.
+- Determine this from the current session's hosting URL, not the repository URL or a deployment/test target.
 
 ## Contract
 
