@@ -511,8 +511,10 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
             self.assertEqual(git(repo, "diff", "--name-only", "--diff-filter=U").strip(), "")
             source.write_text("resolved staged task\nretained line\nunstaged task\n", encoding="utf-8")
             (repo / "notes.md").write_text("untracked task note\n", encoding="utf-8")
-            staged = git(repo, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--cached", incoming)
-            unstaged = git(repo, "diff", "--no-ext-diff", "--no-textconv", "--no-renames")
+            # Review reads ignore host Git settings, including Windows autocrlf.
+            # Expected patches must use the same protected Git policy.
+            staged = self.helper["git"](repo, "diff", *self.helper["SAFE_DIFF_FLAGS"], "--cached", incoming)
+            unstaged = self.helper["git"](repo, "diff", *self.helper["SAFE_DIFF_FLAGS"])
             scanned: list[str] = []
             sent: list[str] = []
             report = {
