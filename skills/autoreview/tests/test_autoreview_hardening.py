@@ -1170,7 +1170,7 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
                     for line in range(1_400)
                 ]
                 expected_lines.extend(lines)
-                (repo / path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+                (repo / path).write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
                 paths.append(path)
             datasets, truncated = self.helper["load_datasets"](
                 argparse.Namespace(dataset=paths), repo
