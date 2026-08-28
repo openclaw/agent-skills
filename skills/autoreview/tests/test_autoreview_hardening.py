@@ -617,7 +617,7 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
                     self.assertIn(safe, self.helper["review_paths"](repo, "local", None, "HEAD"))
                     for label in ("--dataset", "--prompt-file"):
                         _, content, truncated = self.helper["validate_evidence_file"](repo, safe, label)
-                        self.assertEqual(content, source.read_text())
+                        self.assertEqual(content, source.read_bytes().decode("utf-8"))
                         self.assertFalse(truncated)
 
             blocked = (
@@ -640,6 +640,8 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             repo = init_repo(root)
+            # Match the helper's raw Git policy so CRLF fixtures stay committed-only.
+            git(repo, "config", "core.autocrlf", "false")
             (repo / "runtime.txt").write_text("old runtime\n", encoding="utf-8")
             (repo / "context.md").write_text("Full candidate context: integration contract broken.\n", encoding="utf-8")
             git(repo, "add", ".")
@@ -650,6 +652,7 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
             test_file.write_text("// synthetic integration fixture\n" * 27 + "func testLive() { preconditionFailure() }\n", encoding="utf-8")
             git(repo, "add", e2e)
             git(repo, "commit", "-q", "-m", "original candidate")
+            self.assertEqual(git(repo, "status", "--porcelain"), "")
             for rel in (source, untracked):
                 path = repo / rel
                 path.parent.mkdir(parents=True)
@@ -709,7 +712,7 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
                         rejected = result.get("scope_rejected_findings", [])
                         self.assertEqual(len(rejected), 2 - len(accepted))
                         self.assertEqual(scans, sends)
-                        self.assertIn("# Dataset: " + e2e, sends[0])
+                        self.assertIn("# Dataset: " + str(Path(e2e)), sends[0])
                         self.assertNotIn("OMIT_STAGED_STORE", sends[0])
                         self.assertNotIn("OMIT_UNTRACKED_ENV", sends[0])
                         if mode == "local" and ref:
@@ -812,7 +815,7 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
 
                 def scanner(command, _repo, **_kwargs):
                     outgoing = Path(command[2])
-                    self.assertEqual(outgoing.read_text(encoding="utf-8"), pack)
+                    self.assertEqual(outgoing.read_bytes(), pack.encode("utf-8"))
                     if os.name != "nt":
                         self.assertEqual(stat.S_IMODE(outgoing.stat().st_mode), 0o600)
                     self.assertIn("--results=verified,unknown", command)
