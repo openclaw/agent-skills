@@ -1611,7 +1611,7 @@ def scan_outgoing_review_pack(repo: Path, prompt: str) -> None:
         dir=safe_temp_root(repo),
     ) as tempdir:
         pack_path = Path(tempdir) / "review-pack.txt"
-        pack_path.write_text(prompt, encoding="utf-8")
+        pack_path.write_bytes(prompt.encode("utf-8"))
         pack_path.chmod(0o600)
         result = run(
             [

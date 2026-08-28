@@ -255,7 +255,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.helper = load_helper()
 
     def test_outgoing_pack_scan_disables_installed_scanner_updates(self) -> None:
-        prompt = "harmless review pack\n"
+        prompt = "harmless review pack\npreserved CRLF\r\nfinal line\r"
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             repo = root / "repo"
@@ -279,7 +279,7 @@ assert set(args[2:]) == {
 pack = Path(args[1])
 Path(__file__).with_name("scan.json").write_text(json.dumps({
     "pack": str(pack),
-    "prompt": pack.read_text(encoding="utf-8"),
+    "prompt": pack.read_bytes().decode("utf-8"),
 }))
 ''',
             )
@@ -312,7 +312,7 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
                 **_kwargs: object,
             ) -> subprocess.CompletedProcess[str]:
                 self.assertEqual(command[1], "filesystem")
-                self.assertEqual(Path(command[2]).read_text(encoding="utf-8"), prompt)
+                self.assertEqual(Path(command[2]).read_bytes(), prompt.encode("utf-8"))
                 self.assertIn("-const apiKey", prompt)
                 return subprocess.CompletedProcess(command, 0, "", "")
 
