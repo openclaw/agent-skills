@@ -13,7 +13,7 @@ Do not invoke Autoreview automatically before a commit, push, PR, merge, deploy,
 
 ## Contract
 
-- Default output is P0 only: report issues worth blocking the current change
+- Default accepted findings are P0 only: report issues worth blocking the current change
   because they materially break the normal flow, outcome, or safety boundary.
   Use `--max-priority P1`, `P2`, or `P3` only when the caller explicitly asks
   for a wider review.
@@ -38,7 +38,7 @@ Do not invoke Autoreview automatically before a commit, push, PR, merge, deploy,
 - If the blamed PR was merged by `clawsweeper[bot]` or another automation, identify the human trigger when practical. Check timeline/comments first; if rate-limited, use gitcrawl/cache or public PR HTML. Look for maintainer commands such as `@clawsweeper automerge`, `/landpr`, or labels/status comments that armed automerge. Report `automerge triggered by @login`; if not found, say trigger unknown.
 - Do not invoke built-in `codex review`, nested reviewers, or review panels from inside the review. The helper builds one validated bundle, calls the selected engine once for normal inputs or once per complete bounded chunk for oversized inputs, validates the structured results, and stops.
 - Stop as soon as the helper exits 0 with no accepted/actionable findings. Do not run an extra review just to get a nicer "clean" line, a second opinion, or clearer closeout wording.
-- Treat the helper's successful exit plus absence of actionable findings as the clean review result, even if the underlying Codex CLI output is terse.
+- Treat `scoped-clean` with exit 0 as clean only for the selected Git target and requested priority. `filtered` is not a correctness certificate; `incomplete` requires resolving the scope mismatch or missing required finding before claiming clean.
 - If rejecting a finding as intentional/not worth fixing, add a brief inline code comment only when it explains a real invariant or ownership decision that future reviewers should know.
 - If `gh`/Gitcrawl reports `database disk image is malformed`, run `gitcrawl doctor --json` once to let the portable cache repair before retrying review; do not bypass the shim unless repair fails and freshness requires live GitHub.
 - If Gitcrawl reports a portable manifest mismatch, source/runtime DB health error, or stale portable-store checkout, run `gitcrawl doctor --json` and inspect `source_db_health`, `runtime_db_health`, and `portable_store_status` before falling back to live GitHub.
@@ -110,18 +110,17 @@ $AUTOREVIEW_HARNESS = Join-Path $AgentsHome "skills\autoreview\scripts\test-revi
 
 ## Pick Target
 
-Dirty local work:
+Dirty local work relative to HEAD:
 
 ```bash
 "$AUTOREVIEW" --mode local
 ```
 
-Use this only when the patch is actually unstaged/staged/untracked in the
-current checkout. `--mode uncommitted` is accepted as an alias for `--mode local`.
-For committed, pushed, or PR work, point the helper at the commit
-or branch diff instead; do not force dirty modes just
-because the helper docs mention dirty work first. A clean local review
-only proves there is no local patch.
+Without `--base`, this reviews HEAD-to-index, index-to-working-tree, and validated
+untracked files only. `--mode auto` selects the same HEAD-based scope when dirty;
+it does not include the committed PR merely because the checkout is on a PR
+branch. `--mode uncommitted` is an alias for `--mode local`. A clean local checkout
+without an explicit base has no local patch to review.
 
 To review a dirty candidate against an explicit base, including a resolved merge
 that has not been committed:
@@ -139,13 +138,29 @@ staged base. Git status remains relative to HEAD and does not define review scop
 Without `--base`, local mode retains its usual HEAD-to-index behavior; it never
 infers a base from an in-progress merge.
 
-Branch/PR work:
+Committed-only branch/PR work:
 
 ```bash
 "$AUTOREVIEW" --mode branch --base origin/main
 ```
 
-Optional review context is first-class. Prompt files and datasets must be repo-relative so review bundles cannot pull arbitrary host files:
+Branch mode reviews `BASE...HEAD` (merge-base-to-HEAD); staged, unstaged, and
+untracked changes are excluded even in a dirty checkout. To review the **complete
+PR candidate including dirty rewrites**, pin the PR merge base and use local mode:
+
+```bash
+pr_base=$(gh pr view --json baseRefName --jq .baseRefName)
+merge_base=$(git merge-base HEAD "origin/$pr_base")
+"$AUTOREVIEW" --mode local --base "$merge_base"
+```
+
+The remote base must already be available and current locally; the helper does
+not fetch. The pinned merge base avoids including unrelated upstream changes.
+Add `--max-priority P2` when the caller requests P2 findings. An explicit `--base`
+also applies when auto selects local, but explicit local mode avoids changing
+targets when the checkout becomes clean.
+
+Optional review context is first-class. Prompt files and datasets must be repo-relative so review bundles cannot pull arbitrary host files. Context never expands the selected Git target, even if it contains a complete candidate diff or asks to review the whole PR. Finding membership is checked by changed file, not individual hunk:
 
 ```bash
 "$AUTOREVIEW" --mode branch --base origin/main --prompt-file review-notes.md --dataset evidence.json
@@ -333,7 +348,7 @@ The helper:
 - resolves bare `git`, `gh`, reviewer, and PowerShell shell commands from absolute `PATH` entries only, never from the reviewed checkout; explicit `--*-bin` paths are interpreted from the reviewed repository root when relative and accepted only when both the supplied path and resolved target stay outside the reviewed repository
 - use `--mode commit --commit <ref>` for already-committed work, especially clean `main` after landing
 - validates complete Git patches, scans every outgoing review pack, reviews them in one pass up to the aggregate prompt limit, and automatically uses complete bounded passes above it
-- should be left in `--mode auto` or forced to `--mode branch` for PR/branch work; do not force `--mode local` after committing
+- uses branch mode for committed-only PR work, or explicit local mode with a pinned merge base for a complete PR plus dirty candidate
 - writes only to stdout unless `--output`, `--json-output`, or live streamed engine stderr is set
 - supports `--dry-run` (validates bundle construction, reviewer CLI resolution, and local isolation startup with version/help probes without contacting a provider; exits nonzero if any check fails), an opt-in per-reviewer wall-clock bound via `--engine-timeout-seconds`, `--prompt`, repo-relative `--prompt-file`, repo-relative `--dataset`, `--no-tools`, `--no-web-search`, repeatable Codex-only safe model/response tuning with `--codex-config key=value`, Codex-only `--codex-speed fast|flex|default`, and commit refs
 - supports `--stream-engine-output` or `AUTOREVIEW_STREAM_ENGINE_OUTPUT=1` for live engine text while preserving structured validation; Codex and Claude hide tool/file event details, emit compact activity summaries, and report usage at turn completion
@@ -345,8 +360,39 @@ The helper:
 - runs Pi `v0.79.0+` from neutral temporary directories with `--no-approve`, `--no-session`, disabled Pi context/resource loading, and `--no-tools` because its built-in read tools are not repository-confined
 - runs Kimi Code CLI `v0.30.0+` from an empty temporary workspace with a staged `KIMI_CODE_HOME`, sanitized config, an empty `--skills-dir`, and a no-tools/no-subagents Markdown `--agent-file`
 - prints `review still running: <engine> elapsed=<seconds>s pid=<pid>` to stderr at long-running intervals while waiting for the selected review engine, unless streamed output or compact Codex activity has been visible recently
-- prints `autoreview clean: no accepted/actionable findings reported` when the selected review command exits 0
-- exits nonzero when accepted/actionable findings are present
+- prints `autoreview scoped-clean` only when no findings were rejected or filtered and the provider returned a correct verdict
+- exits nonzero for accepted findings, a provider's incorrect verdict, or an incomplete result
+
+## Result handling
+
+Filtering never rewrites provider correctness, explanation, or confidence.
+`findings` contains accepted findings at the requested priority; local JSON and
+text results retain `scope_rejected_findings` and `priority_filtered_findings`
+separately. Any scope rejection makes `review_status` `incomplete` and exits 2,
+including when other findings remain or `--expect-findings` is set. Resolve the
+target mismatch explicitly; do not infer a broader target from prompt prose.
+
+With no scope rejection, status is `findings` for accepted findings, `filtered`
+when only lower-priority findings remain, `incorrect` for an incorrect verdict
+without findings, or `scoped-clean` otherwise. Exit 1 means accepted findings or
+an incorrect provider verdict; even a priority-filtered incorrect verdict stays
+nonzero. Exit 0 for a filtered correct verdict does not certify correctness.
+`--expect-findings` accepts retained findings for harness checks, never scope
+rejections. `--require-finding` checks only accepted findings after both filters
+across every pass; missing text is retained in `missing_required_findings` and
+exits 2 after writing results.
+
+Chunked results retain each provider report under `pass_reports`, print each
+provider explanation, and use the minimum pass confidence rather than promoting
+confidence from another pass. Provider JSON remains strictly validated before
+the helper adds local audit metadata. All engines use this same result path.
+
+The exact source filename `CredentialFile.swift` is allowed for untracked and
+evidence inputs only outside sensitive parent paths, matching its existing
+tracked-source treatment. This is not a general source-extension exemption:
+credential stores, credential directories, `.env`, PEM, and key files retain
+their exclusions. TruffleHog still scans the exact outgoing pack, including
+source content, deleted lines, prompts, and datasets, before every provider call.
 
 ## Final Report
 
