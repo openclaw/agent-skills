@@ -123,6 +123,22 @@ or branch diff instead; do not force dirty modes just
 because the helper docs mention dirty work first. A clean local review
 only proves there is no local patch.
 
+To review a dirty candidate against an explicit base, including a resolved merge
+that has not been committed:
+
+```bash
+"$AUTOREVIEW" --mode local --base origin/main
+```
+
+The helper pins that base to a commit at target selection. It reviews base-to-index
+changes and index-to-working-tree changes separately, plus validated untracked
+files. Only files identical across the base, index, and working tree are outside
+the change bundle; staged changes later undone remain included. Actual binary
+or submodule changes still refuse review. The bundle labels its pinned
+staged base. Git status remains relative to HEAD and does not define review scope.
+Without `--base`, local mode retains its usual HEAD-to-index behavior; it never
+infers a base from an in-progress merge.
+
 Branch/PR work:
 
 ```bash

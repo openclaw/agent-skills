@@ -1380,7 +1380,8 @@ def choose_target(repo: Path, mode: str, base_ref: str | None) -> tuple[str, str
     mode = "local" if mode == "uncommitted" else mode
     branch = current_branch(repo)
     if mode == "local" or (mode == "auto" and is_dirty(repo)):
-        return "local", None
+        # Pin an explicit base once; later queries must not follow a moving branch.
+        return "local", validate_git_ref(repo, base_ref, "base", pin=True) if base_ref is not None else None
     if mode == "commit":
         return "commit", None
     if mode == "branch" or (mode == "auto" and branch != "main"):
@@ -1466,7 +1467,7 @@ def first_executable_candidate(path: Path, *, reject_root: Path | None = None) -
     return None
 
 
-def validate_git_ref(repo: Path, ref: str, label: str) -> str:
+def validate_git_ref(repo: Path, ref: str, label: str, *, pin: bool = False) -> str:
     if not ref or ref.startswith("-") or ":" in ref or "\0" in ref or any(char.isspace() for char in ref):
         raise SystemExit(f"unsafe {label} ref: {ref}")
     result = git(
@@ -1480,7 +1481,7 @@ def validate_git_ref(repo: Path, ref: str, label: str) -> str:
     )
     if not result:
         raise SystemExit(f"unknown {label} ref: {ref}")
-    return ref
+    return result.strip() if pin else ref
 
 
 TRUFFLEHOG_INSTALL_URL = "https://github.com/trufflesecurity/trufflehog#installation"
@@ -2190,12 +2191,15 @@ def local_status(repo: Path, untracked: list[str], *, redact: bool = False) -> s
     return "\n".join(lines)
 
 
-def local_bundle(repo: Path) -> tuple[str, bool]:
-    staged_patch = git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--patch")
+def local_bundle(repo: Path, base_ref: str | None = None) -> tuple[str, bool]:
+    if base_ref is not None:
+        base_ref = validate_git_ref(repo, base_ref, "base", pin=True)
+    staged_base = ("--end-of-options", base_ref) if base_ref is not None else ()
+    staged_patch = git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--patch", *staged_base)
     unstaged_patch = git(repo, "diff", *SAFE_DIFF_FLAGS, "--patch")
     require_no_binary_diff(
         "local staged diff",
-        git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--numstat", "-z"),
+        git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--numstat", "-z", *staged_base),
     )
     require_no_binary_diff(
         "local unstaged diff",
@@ -2203,7 +2207,7 @@ def local_bundle(repo: Path) -> tuple[str, bool]:
     )
     require_no_gitlink_diff(
         "local staged diff",
-        git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--raw", "-z"),
+        git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--raw", "-z", *staged_base),
     )
     require_no_gitlink_diff(
         "local unstaged diff",
@@ -2216,6 +2220,7 @@ def local_bundle(repo: Path) -> tuple[str, bool]:
         "--name-only",
         "--cached",
         "-z",
+        *staged_base,
     )
     unstaged_paths = git_path_list(
         repo,
@@ -2247,11 +2252,11 @@ def local_bundle(repo: Path) -> tuple[str, bool]:
             untracked,
             redact=bool(omitted_tracked or omitted_untracked),
         ),
-        "# Staged Diff",
+        "# Staged Diff" if base_ref is None else f"# Staged Diff\nbase: {base_ref}",
         (
             REVIEW_SECURITY_OMISSION
             if tracked_sensitive_paths(staged_paths)
-            else git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--stat")
+            else git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--stat", *staged_base)
         ),
         staged_patch,
         "# Unstaged Diff",
@@ -2593,7 +2598,10 @@ def commit_bundle(repo: Path, commit_ref: str) -> tuple[str, bool]:
 def review_paths(repo: Path, target: str, target_ref: str | None, commit_ref: str) -> set[str]:
     names: set[str] = set()
     if target == "local":
-        names.update(git_path_list(repo, "diff", *SAFE_DIFF_FLAGS, "--name-only", "--cached", "-z"))
+        if target_ref is not None:
+            target_ref = validate_git_ref(repo, target_ref, "base", pin=True)
+        staged_base = ("--end-of-options", target_ref) if target_ref is not None else ()
+        names.update(git_path_list(repo, "diff", *SAFE_DIFF_FLAGS, "--name-only", "--cached", "-z", *staged_base))
         names.update(git_path_list(repo, "diff", *SAFE_DIFF_FLAGS, "--name-only", "-z"))
         names.update(safe_untracked_files(repo))
     elif target == "branch":
@@ -5384,7 +5392,7 @@ def positive_float(value: str) -> float:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Bundle-driven AI code review.")
     parser.add_argument("--mode", choices=["auto", "local", "uncommitted", "branch", "commit"], default="auto")
-    parser.add_argument("--base")
+    parser.add_argument("--base", help="Branch base, or explicit commit to compare with the index in local mode.")
     parser.add_argument("--commit", default="HEAD")
     parser.add_argument("--engine", choices=ENGINE_CHOICES, default=os.environ.get("AUTOREVIEW_ENGINE", "codex"))
     parser.add_argument(
@@ -5745,7 +5753,7 @@ def dry_run_preflight(
     bundle_ok = True
     try:
         if target == "local":
-            bundle, bundle_truncated = local_bundle(repo)
+            bundle, bundle_truncated = local_bundle(repo, target_ref)
         elif target == "branch":
             assert target_ref
             bundle, bundle_truncated = branch_bundle(repo, target_ref)
@@ -5998,7 +6006,7 @@ def main_impl() -> int:
 
     review_source_snapshot = source_tree_snapshot(repo)
     if target == "local":
-        bundle, bundle_truncated = local_bundle(repo)
+        bundle, bundle_truncated = local_bundle(repo, target_ref)
     elif target == "branch":
         assert target_ref
         bundle, bundle_truncated = branch_bundle(repo, target_ref)
