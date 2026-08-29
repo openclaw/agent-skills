@@ -548,7 +548,9 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
     def test_preparation_ticker_reports_while_caller_is_blocked(self):
         stderr = io.StringIO()
-        progress = self.helper["PreparationProgress"]("bundle preparation")
+        # An exact clock origin keeps the 15-second boundary independent of host float precision.
+        with mock.patch.object(time, "monotonic", return_value=100.0):
+            progress = self.helper["PreparationProgress"]("bundle preparation")
         progress.stopped = mock.Mock()
         progress.stopped.wait.side_effect = [False, True]
         with mock.patch.object(time, "monotonic", return_value=progress.started + 15), \
