@@ -209,6 +209,22 @@ finite pass sequence. The helper prints its size and pass count before running
 passes serially. Each pass retains the same prompt-size limit, secret scan, and
 reviewer isolation; a failed pass aborts without publishing a partial verdict.
 
+Preparation prints immediate phase updates and periodic elapsed time to stderr,
+with file/byte counts during hashing and no filenames or contents. These updates
+are separate from provider heartbeats and do not count against engine deadlines.
+Bundle construction captures finding membership alongside validated text; normal
+and dry runs reuse that record without reopening untracked files for membership.
+
+Dry runs reuse capture and scanning without whole-tree integrity sweeps. Real
+reviews retain full fresh tree hashing before bundle construction, before review,
+and before publication, including unrelated tracked files, nonignored untracked files, index
+state, and initialized submodules. Explicit prompt files and datasets also retain
+their own frozen bytes and raw path identities, regardless of Git ignore status
+or finding scope. They are revalidated before sending each pass and before
+publication; content changes, replacements, and leaf or ancestor symlink swaps
+refuse stale results. These endpoint checks are not atomic filesystem snapshots
+and cannot guarantee detection of transient changes restored between checks.
+
 Evidence batches can multiply the pass count. Chunking cannot give one model
 call every cross-file implementation detail. For architecture-heavy changes, still prefer
 a coherent branch or PR shape whose semantic decision surface fits one pass.
@@ -356,7 +372,7 @@ The helper:
 - use `--mode commit --commit <ref>` for already-committed work, especially clean `main` after landing
 - validates complete Git patches, scans every outgoing review pack, reviews them in one pass up to the aggregate prompt limit, and automatically uses complete bounded passes above it
 - uses branch mode for committed-only PR work, or explicit local mode with a pinned merge base for a complete PR plus dirty candidate
-- writes only to stdout unless `--output`, `--json-output`, or live streamed engine stderr is set
+- writes reports to stdout and optionally to `--output` or `--json-output` files; preparation progress and provider heartbeats use stderr
 - supports `--dry-run` (validates bundle construction, reviewer CLI resolution, and local isolation startup with version/help probes without contacting a provider; exits nonzero if any check fails), an opt-in per-reviewer wall-clock bound via `--engine-timeout-seconds`, `--prompt`, repo-relative `--prompt-file`, repo-relative `--dataset`, `--no-tools`, `--no-web-search`, repeatable Codex-only safe model/response tuning with `--codex-config key=value`, Codex-only `--codex-speed fast|flex|default`, and commit refs
 - supports `--stream-engine-output` or `AUTOREVIEW_STREAM_ENGINE_OUTPUT=1` for live engine text while preserving structured validation; Codex and Claude hide tool/file event details, emit compact activity summaries, and report usage at turn completion
 - supports per-engine `--model`, `--thinking`, and Claude `--fallback-model`
