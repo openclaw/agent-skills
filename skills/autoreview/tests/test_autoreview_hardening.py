@@ -750,6 +750,11 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
 
         self.assertIn("[ValidateSet('codex', 'claude', 'amp', 'pi', 'kimi')]", harness)
 
+    def test_smoke_harness_validates_runtime_prompt_without_provider(self) -> None:
+        harness = runpy.run_path(str(SCRIPT.with_name("test-review-harness.py")))
+        with tempfile.TemporaryDirectory() as tempdir:
+            harness["validate_prompt_policy"](init_repo(Path(tempdir)), SCRIPT)
+
     def test_local_bundle_omits_sensitive_untracked_file_without_blocking(self) -> None:
         for rel in (".env", "tokens/session.dat", "secrets/local.py"):
             with self.subTest(rel=rel), tempfile.TemporaryDirectory() as tempdir:
@@ -1386,8 +1391,134 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
             git(repo, "commit", "-q", "-m", "main")
             git(repo, "merge", "-q", "--no-ff", "side", "-m", "merge")
 
-            with self.assertRaisesRegex(SystemExit, "does not accept merge commits"):
-                self.helper["commit_bundle"](repo, "HEAD")
+            shallow = Path(tempdir) / "shallow"
+            git(repo, "clone", "-q", "--depth=1", repo.resolve().as_uri(), str(shallow))
+            for checkout in (repo, shallow):
+                with self.subTest(checkout=checkout.name), self.assertRaisesRegex(
+                    SystemExit, "does not accept merge commits"
+                ):
+                    self.helper["commit_bundle"](checkout, "HEAD")
+
+    def test_commit_review_uses_raw_parents_at_history_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir).resolve()
+            repo = init_repo(root)
+            (repo / "behavior.py").write_text("def behavior(): return 'preexisting'\n", encoding="utf-8")
+            git(repo, "add", "behavior.py")
+            git(repo, "commit", "-qm", "initial behavior")
+            initial = git(repo, "rev-parse", "HEAD").strip()
+            for value in ("before", "after"):
+                (repo / "unrelated.txt").write_text(value + "\n", encoding="utf-8")
+                git(repo, "add", "unrelated.txt")
+                git(repo, "commit", "-qm", "unrelated maintenance")
+            expected_parent = git(repo, "rev-parse", "HEAD^").strip()
+            expected_patch = git(repo, "diff", *self.helper["SAFE_DIFF_FLAGS"], "HEAD^", "HEAD")
+            for state, depth in (("missing", 1), ("available", 2), ("retained", None)):
+                with self.subTest(state=state):
+                    checkout = root / state
+                    depth_args = [f"--depth={depth}"] if depth else []
+                    git(repo, "clone", "-q", *depth_args, repo.as_uri(), str(checkout))
+                    if state == "retained":
+                        git(checkout, "fetch", "-q", "--depth=1", "origin")
+                    self.assertEqual(git(checkout, "rev-parse", "--is-shallow-repository").strip(), "true")
+                    if state == "missing":
+                        # Missing history stays unknown even without a shallow marker.
+                        for marked in (True, False):
+                            if not marked:
+                                (checkout / ".git" / "shallow").unlink()
+                            with self.subTest(marked=marked), self.assertRaisesRegex(
+                                SystemExit, "missing parent.*deepen"
+                            ):
+                                self.helper["build_bundle"](checkout, "commit", None, "HEAD")
+                        continue
+                    captured = self.helper["build_bundle"](checkout, "commit", None, "HEAD")
+                    self.assertFalse(captured.truncated)
+                    self.assertIn(f"parent: {expected_parent}\n", captured.text)
+                    self.assertIn(expected_patch, captured.text)
+                    self.assertNotIn("behavior.py", captured.text)
+                    self.assertEqual(captured.paths, {"unrelated.txt"})
+            git(repo, "replace", "--graft", "HEAD")
+            captured = self.helper["build_bundle"](repo, "commit", None, "HEAD")
+            self.assertIn(f"parent: {expected_parent}\n", captured.text)
+            self.assertIn(expected_patch, captured.text)
+            self.assertNotIn("behavior.py", captured.text)
+            self.assertEqual(captured.paths, {"unrelated.txt"})
+            captured = self.helper["build_bundle"](repo, "commit", None, initial)
+            self.assertFalse(captured.truncated)
+            self.assertIn("parent: none (verified raw root)\n", captured.text)
+            self.assertIn("+def behavior(): return 'preexisting'", captured.text)
+            self.assertEqual(captured.paths, {"behavior.py"})
+            tree = git(repo, "rev-parse", f"{initial}^{{tree}}").strip()
+            graft_parents = [git(repo, "commit-tree", tree, "-m", f"graft {index}").strip() for index in range(2)]
+            for count in (1, 2):
+                with self.subTest(graft_parents=count):
+                    (repo / ".git/info/grafts").write_text(" ".join([initial, *graft_parents[:count]]) + "\n")
+                    captured = self.helper["build_bundle"](repo, "commit", None, initial)
+                    self.assertIn("parent: none (verified raw root)\n", captured.text)
+                    self.assertIn("+def behavior(): return 'preexisting'", captured.text)
+                    self.assertEqual(captured.paths, {"behavior.py"})
+                    self.assertEqual(self.helper["git"](repo, "rev-list", "--parents", "-n", "1", initial).split(), [initial])
+
+    def test_commit_review_keeps_identity_separators_out_of_parent_records(self) -> None:
+        for codepoint in (11, 12, 13, 28, 29, 30, 0x85, 0x2028, 0x2029):
+            with self.subTest(codepoint=codepoint), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                (repo / "code.py").write_text("root_content = True\n", encoding="utf-8")
+                git(repo, "add", "code.py")
+                name = f"A{chr(codepoint)}parent HEAD{chr(codepoint)}B"
+                git(repo, "commit", "-qm", "root", "--author", f"{name} <author@example.invalid>")
+                raw = self.helper["git_bytes"](repo, "cat-file", "-p", "HEAD").stdout
+                self.assertIn(f"author {name}".encode(), raw)
+                self.assertNotIn(b"\nparent ", raw.partition(b"\n\n")[0])
+                captured = self.helper["build_bundle"](repo, "commit", None, "HEAD")
+                self.assertFalse(captured.truncated)
+                self.assertIn("parent: none (verified raw root)\n", captured.text)
+                self.assertIn("+root_content = True", captured.text)
+                self.assertEqual(captured.paths, {"code.py"})
+
+    def test_commit_review_follows_only_contiguous_full_parent_ids(self) -> None:
+        for algorithm in ("sha1", "sha256"):
+            with self.subTest(algorithm=algorithm), tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                repo = root / "repo"
+                repo.mkdir()
+                git(repo, "init", "-q", f"--object-format={algorithm}")
+                (repo / "code.py").write_text("root_content = True\n", encoding="utf-8")
+                git(repo, "add", "code.py")
+                git(repo, "commit", "-qm", "root")
+                initial = git(repo, "rev-parse", "HEAD").strip()
+                raw = self.helper["git_bytes"](repo, "cat-file", "-p", "HEAD").stdout
+                headers, body = raw.split(b"\n\n", 1)
+                tree, identity = headers.split(b"\n", 1)
+                for label, parent in (
+                    ("late", initial.encode()),
+                    ("uppercase", initial.upper().encode()),
+                    ("symbolic", b"HEAD"),
+                    ("short", initial[:12].encode()),
+                    ("CR-suffix", initial.encode() + bytes([13])),
+                ):
+                    with self.subTest(label=label):
+                        candidate_headers = (
+                            headers + b"\nparent " + parent if label == "late"
+                            else tree + b"\nparent " + parent + b"\n" + identity
+                        )
+                        payload = root / "candidate.commit"
+                        payload.write_bytes(candidate_headers + b"\n\n" + body)
+                        commit = git(repo, "hash-object", "--literally", "-t", "commit", "-w", str(payload)).strip()
+                        if label not in ("late", "uppercase"):
+                            with self.assertRaises(SystemExit):
+                                self.helper["build_bundle"](repo, "commit", None, commit)
+                            continue
+                        captured = self.helper["build_bundle"](repo, "commit", None, commit)
+                        self.assertFalse(captured.truncated)
+                        if label == "late":
+                            self.assertEqual(git(repo, "rev-list", "--parents", "-n", "1", commit).split(), [commit])
+                            self.assertIn("parent: none (verified raw root)\n", captured.text)
+                            self.assertIn("+root_content = True", captured.text)
+                            self.assertEqual(captured.paths, {"code.py"})
+                        else:
+                            self.assertIn(f"parent: {parent.decode()}\n", captured.text)
+                            self.assertEqual(captured.paths, set())
 
     def test_git_path_list_preserves_newline_filenames(self) -> None:
         if os.name == "nt":
@@ -2764,18 +2895,24 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
     def test_review_prompts_omit_absolute_repo_path_and_keep_instructions_whole(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
-            prompt, = self.helper["build_review_prompts"](repo, "local", None, "diff", "", [])
-
-            self.assertIn(
-                "Review sandbox: . (intentionally contains no reviewed repository files)",
-                prompt,
-            )
-            self.assertIn("Read-only tools cannot access unchanged repository files", prompt)
-            self.assertIn(
-                "Do not report a missing import, symbol, definition, call site, config entry",
-                prompt,
-            )
-            self.assertNotIn(str(repo), prompt)
+            for bundle in ("diff", "# Staged Diff\n" + "+changed line\n" * 40_000):
+                prompts = self.helper["build_review_prompts"](repo, "local", None, bundle, "", [])
+                for prompt in prompts:
+                    self.assertIn(
+                        "Review sandbox: . (intentionally contains no reviewed repository files)",
+                        prompt,
+                    )
+                    self.assertIn("Read-only tools cannot access unchanged repository files", prompt)
+                    self.assertIn(
+                        "Do not report a missing import, symbol, definition, call site, config entry",
+                        prompt,
+                    )
+                    for evidence_rule in (
+                        "raw commit parents", "^sha", "porcelain boundary", "missing parents",
+                        "parent-relative patch", "unknown", "carried forward", "merger",
+                    ):
+                        self.assertIn(evidence_rule, prompt)
+                    self.assertNotIn(str(repo), prompt)
             with self.assertRaisesRegex(SystemExit, "too little room"):
                 self.helper["build_review_prompts"](
                     repo,
@@ -5497,6 +5634,9 @@ os.execv(target, [str(target), *sys.argv[1:]])
             )
             env = os.environ.copy()
             add_fake_trufflehog(self.helper, root, env)
+            # Prompt limits must not depend on the host's Kimi configuration.
+            env["KIMI_CODE_HOME"] = str(root / "kimi-empty-home")
+            (root / "kimi-empty-home").mkdir()
             prompt_file = repo / "big-prompt.md"
             prompt_file.write_text(
                 "context line filler text here\n" * 5_000,
