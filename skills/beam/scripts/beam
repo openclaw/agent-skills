@@ -266,13 +266,15 @@ function isSafeReceiverUrl(resultUrl, endpoint) {
 
 function isPrettyBeamUrl(resultUrl, endpoint, beamId) {
   const pathPrefix = `${expectedControlUiBasePath(endpoint)}/beam/`;
-  const returnedId = resultUrl.pathname.startsWith(pathPrefix)
+  const returnedPath = resultUrl.pathname.startsWith(pathPrefix)
     ? resultUrl.pathname.slice(pathPrefix.length)
     : "";
+  const match = /^(?:([a-z0-9]+(?:-[a-z0-9]+)*)-)?([0-9a-f]{12,32})$/u.exec(returnedPath);
   return (
     /^[0-9a-f]{32}$/u.test(beamId) &&
-    /^[0-9a-f]{12,32}$/u.test(returnedId) &&
-    beamId.startsWith(returnedId) &&
+    match !== null &&
+    (match[1]?.length ?? 0) <= 48 &&
+    beamId.startsWith(match[2]) &&
     resultUrl.searchParams.size === 0
   );
 }

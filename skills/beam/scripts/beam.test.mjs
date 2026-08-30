@@ -1042,38 +1042,39 @@ test("publish rejects receiver URLs containing reflected credentials", async (t)
   assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /test-access-token/);
 });
 
-test("publish accepts the endpoint-derived Control UI base path", async (t) => {
+test("publish accepts bare and named Beam URLs below the endpoint-derived base path", async (t) => {
   const session = claudeSession();
+  let makePath;
+  let returnedPath;
   const endpoint = await beamReceiverEndpoint(
     t,
-    (payload) => `/openclaw/beam/${payload.beamId.slice(0, 12)}`,
+    ({ beamId }) => (returnedPath = `/openclaw/beam/${makePath(beamId)}`),
     "/openclaw",
   );
-  const result = await run([
-    "publish",
-    "--endpoint",
-    endpoint,
-    "--session",
-    session,
-  ]);
+  const cases = [
+    ["bare prefix", (beamId) => beamId.slice(0, 12)],
+    ["bare full id", (beamId) => beamId],
+    ["current title", (beamId) => `current-session-title-${beamId.slice(0, 12)}`],
+    ["stale title", (beamId) => `previous-title-${beamId.slice(0, 12)}`],
+    ["named full id", (beamId) => `collision-fallback-${beamId}`],
+    ["maximum title length", (beamId) => `${"a".repeat(48)}-${beamId.slice(0, 12)}`],
+  ];
 
-  assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stdout, /\/openclaw\/beam\/[a-f0-9]{12}/);
-});
+  for (const [label, pathFactory] of cases) {
+    makePath = pathFactory;
+    const result = await run([
+      "publish",
+      "--endpoint",
+      endpoint,
+      "--session",
+      session,
+      "--title",
+      "Current session title",
+    ]);
 
-test("publish accepts a full-id pretty URL for collision fallback", async (t) => {
-  const session = claudeSession();
-  const endpoint = await beamReceiverEndpoint(t, (payload) => `/beam/${payload.beamId}`);
-  const result = await run([
-    "publish",
-    "--endpoint",
-    endpoint,
-    "--session",
-    session,
-  ]);
-
-  assert.equal(result.code, 0, result.stderr);
-  assert.match(result.stdout, /\/beam\/[a-f0-9]{32}/);
+    assert.equal(result.code, 0, `${label}: ${result.stderr}`);
+    assert.ok(result.stdout.includes(returnedPath), label);
+  }
 });
 
 test("publish accepts the current canonical catalog URL during rollout", async (t) => {
@@ -1109,9 +1110,24 @@ test("publish rejects malformed pretty Beam URLs", async (t) => {
     ["uppercase id", ({ beamId }) => `/beam/${beamId.slice(0, 12).toUpperCase()}`],
     ["nonhex id", ({ beamId }) => `/beam/${beamId.slice(0, 11)}g`],
     ["long id", ({ beamId }) => `/beam/${beamId}0`],
+    ["uppercase title", ({ beamId }) => `/beam/Current-title-${beamId.slice(0, 12)}`],
+    ["long title", ({ beamId }) => `/beam/${"a".repeat(49)}-${beamId.slice(0, 12)}`],
+    ["empty title", ({ beamId }) => `/beam/-${beamId.slice(0, 12)}`],
+    ["title with empty word", ({ beamId }) => `/beam/current--title-${beamId.slice(0, 12)}`],
+    ["title with trailing hyphen", ({ beamId }) => `/beam/current-title--${beamId.slice(0, 12)}`],
+    ["title with punctuation", ({ beamId }) => `/beam/current_title-${beamId.slice(0, 12)}`],
+    ["encoded title", ({ beamId }) => `/beam/current%2ftitle-${beamId.slice(0, 12)}`],
+    ["named short id", ({ beamId }) => `/beam/current-title-${beamId.slice(0, 11)}`],
+    ["named uppercase id", ({ beamId }) => `/beam/current-title-${beamId.slice(0, 12).toUpperCase()}`],
+    ["named nonhex id", ({ beamId }) => `/beam/current-title-${beamId.slice(0, 11)}g`],
+    ["named long id", ({ beamId }) => `/beam/current-title-${beamId}0`],
     [
       "wrong prefix",
       ({ beamId }) => `/beam/${beamId[0] === "0" ? "1" : "0"}${beamId.slice(1, 12)}`,
+    ],
+    [
+      "named wrong prefix",
+      ({ beamId }) => `/beam/current-title-${beamId[0] === "0" ? "1" : "0"}${beamId.slice(1, 12)}`,
     ],
     ["extra segment", ({ beamId }) => `/beam/${beamId.slice(0, 12)}/extra`],
     ["query", ({ beamId }) => `/beam/${beamId.slice(0, 12)}?view=debug`],

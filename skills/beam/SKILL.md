@@ -55,15 +55,16 @@ Useful options:
 ```bash
 node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --session /path/to/session.jsonl
 node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --thread-id "$CODEX_THREAD_ID"
+node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --title "Fix upload flow"
 node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --complete
 node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --dry-run
 ```
 
 `--dry-run` prints the sanitized payload locally and performs no network request.
 
-On success, return only the Beam URL and a short disclosure summary: source harness, shared message count, whether older entries were truncated, and whether the beam is complete. The URL uses the endpoint-derived Control UI base path followed by `/beam/<12-character lowercase hex prefix>`, for example `https://gateway.example.com/beam/0123456789ab`.
+On success, return only the Beam URL and a short disclosure summary: source harness, shared message count, whether older entries were truncated, and whether the beam is complete. The URL uses the endpoint-derived Control UI base path followed by `/beam/<title-slug>-<id-prefix>`, for example `https://gateway.example.com/beam/fix-upload-flow-0123456789ab`. The title comes from `--title` or the first shared user message. The stable ID suffix identifies the session; links with an earlier title remain valid.
 
-During rollout, the helper also accepts the current server's exact `/chat/<agent>?catalog=beam&host=gateway&thread=<full-beam-id>` response. It still rejects the obsolete `?session=catalog:...` beta form.
+The helper also accepts bare `/beam/<id-prefix>` links and, during rollout, the current server's exact `/chat/<agent>?catalog=beam&host=gateway&thread=<full-beam-id>` response. It still rejects the obsolete `?session=catalog:...` beta form.
 
 ## Live Hooks
 

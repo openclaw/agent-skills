@@ -74,18 +74,25 @@ On success, Beam prints the endpoint-derived Control UI URL in its short share
 form, for example:
 
 ```text
-Beamed session: https://gateway.example.com/beam/0123456789ab
+Beamed session: https://gateway.example.com/beam/fix-upload-flow-0123456789ab
 ```
 
 A Gateway mounted below a base path returns that same base path, such as
-`https://gateway.example.com/openclaw/beam/0123456789ab`.
+`https://gateway.example.com/openclaw/beam/fix-upload-flow-0123456789ab`.
+
+The Gateway builds the optional title slug from the redacted `--title` value or
+the first shared user message. It contains up to 48 lowercase alphanumeric
+characters and hyphens. The final 12–32 lowercase hex characters identify the
+session independently of its title, so earlier named links still work after a
+rename. Bare `/beam/<id-prefix>` links remain accepted.
 
 Explicit transcript:
 
 ```sh
 node "$BEAM_SKILL_DIR/scripts/beam" publish \
   --endpoint "$BEAM_ENDPOINT" \
-  --session /path/to/session.jsonl
+  --session /path/to/session.jsonl \
+  --title "Fix upload flow"
 ```
 
 Inspect the exact sanitized payload without networking:
