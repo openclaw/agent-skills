@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Rescan the exact outgoing Autoreview pack before Codex access-fallback retries, refusing findings, scanner errors, and missing scanners before another provider invocation.
 - Show Autoreview preparation progress, reuse captured bundle membership, and guard explicit evidence against content and path changes while preserving full-tree integrity checks.
 - Verify raw Git parents in Autoreview commit bundles, preserving true roots and refusing unsupported attribution from shallow boundaries, grafts, or misleading metadata.
 - Partition oversized Autoreview evidence without dropping change context, keeping complete-input and per-pass credential scans within existing engine limits.
