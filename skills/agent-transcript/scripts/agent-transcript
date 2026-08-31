@@ -9,15 +9,16 @@ const MARKER_START = "<!-- agent-transcript:start -->";
 const MARKER_END = "<!-- agent-transcript:end -->";
 const DEFAULT_MAX_CHARS = 50000;
 const DEFAULT_ENTRY_MAX_CHARS = 6000;
+const MAX_DISCOVERY_FILES = 20_000;
 
 function usage() {
   console.log(`Usage:
-  agent-transcript find --query TEXT [--cwd PATH] [--since-days N] [--max-files N] [--root PATH...]
+  agent-transcript find --query TEXT [--cwd PATH] [--since-days N] [--max-files N] [--max-discovery-files N] [--root PATH...]
   agent-transcript render --session FILE [--app-server] [--thread-id ID] [--out FILE] [--max-chars N] [--entry-max-chars N] [--title TEXT] [--url URL]
   agent-transcript render-thread --thread-id ID [--out FILE] [--max-chars N] [--entry-max-chars N] [--title TEXT] [--url URL]
   agent-transcript preview --session FILE [--app-server] [--thread-id ID] [--out FILE] [--max-chars N] [--entry-max-chars N] [--title TEXT] [--url URL]
   agent-transcript append-body --body FILE --session FILE [--app-server] [--thread-id ID] [--out FILE] [--max-chars N] [--entry-max-chars N]
-  agent-transcript html --prs FILE [--out FILE] [--since-days N] [--min-score N] [--root PATH...] [--exclude-session FILE...]
+  agent-transcript html --prs FILE [--out FILE] [--since-days N] [--min-score N] [--max-discovery-files N] [--root PATH...] [--exclude-session FILE...]
 
 Local-only. No network calls.`);
 }
@@ -115,21 +116,65 @@ function defaultRoots() {
   ];
 }
 
-function walkJsonl(root, sinceMs, out = []) {
+function discoveryLimit(options = {}) {
+  const value = options.maxDiscoveryFiles ?? options["max-discovery-files"] ?? MAX_DISCOVERY_FILES;
+  const maxFiles = Number(value);
+  if (typeof value === "boolean" || !Number.isSafeInteger(maxFiles) || maxFiles < 1) {
+    throw new Error("--max-discovery-files must be a positive integer");
+  }
+  return maxFiles;
+}
+
+function walkJsonl(root, sinceMs, out, state) {
   if (!root || !fs.existsSync(root)) return out;
-  const stat = fs.statSync(root);
-  if (stat.isFile()) {
-    if (root.endsWith(".jsonl") && stat.mtimeMs >= sinceMs) out.push(root);
+  let stat;
+  try {
+    stat = fs.statSync(root);
+  } catch {
     return out;
   }
-  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+  if (stat.isFile()) {
+    if (root.endsWith(".jsonl")) {
+      if (state.files >= state.maxFiles) throw new Error("session discovery exceeded its file limit");
+      state.files++;
+      if (stat.mtimeMs >= sinceMs) out.push(root);
+    }
+    return out;
+  }
+  let entries;
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const entry of entries) {
     if (entry.name === "node_modules" || entry.name === ".git") continue;
     const file = path.join(root, entry.name);
-    if (entry.isDirectory()) walkJsonl(file, sinceMs, out);
-    else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+    if (entry.isDirectory()) {
+      walkJsonl(file, sinceMs, out, state);
+      continue;
+    }
+    if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+    if (state.files >= state.maxFiles) throw new Error("session discovery exceeded its file limit");
+    state.files++;
+    try {
       const entryStat = fs.statSync(file);
       if (entryStat.mtimeMs >= sinceMs) out.push(file);
+    } catch {
+      // File disappeared during discovery.
     }
+  }
+  return out;
+}
+
+function discoverSessionFiles(roots, sinceMs, options = {}) {
+  const state = {
+    files: 0,
+    maxFiles: discoveryLimit(options),
+  };
+  const out = [];
+  for (const root of roots) {
+    walkJsonl(root, sinceMs, out, state);
   }
   return out;
 }
@@ -722,7 +767,7 @@ function recentFiles(files, maxFiles) {
 }
 
 function candidateFiles(roots, terms, sinceMs, options = {}) {
-  return recentFiles(roots.flatMap((root) => walkJsonl(root, sinceMs)), Number(options["max-files"] || 400));
+  return recentFiles(discoverSessionFiles(roots, sinceMs, options), Number(options["max-files"] || 400));
 }
 
 function findSessions(options) {
@@ -749,8 +794,7 @@ function sessionScanRecords(options) {
   const sinceMs = Date.now() - sinceDays * 24 * 60 * 60 * 1000;
   const roots = asArray(options.root).length ? asArray(options.root) : defaultRoots();
   const excluded = new Set(asArray(options["exclude-session"]).map((file) => path.resolve(file)));
-  return roots
-    .flatMap((root) => walkJsonl(root, sinceMs))
+  return discoverSessionFiles(roots, sinceMs, options)
     .filter((file) => !excluded.has(path.resolve(file)))
     .map((file) => sessionScanRecord(file, Number(options["scan-bytes"] || 90000)));
 }

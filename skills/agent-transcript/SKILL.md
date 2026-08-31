@@ -44,7 +44,7 @@ skills/agent-transcript/scripts/agent-transcript find \
   --since-days 14
 ```
 
-`find` scans the newest 400 matching local JSONL logs by default across Codex, Claude, Pi, and OpenClaw agent sessions. Use `--max-files N` for a wider local search.
+`find` scans the newest 400 matching local JSONL logs by default across Codex, Claude, Pi, and OpenClaw agent sessions. Use `--max-files N` for a wider local search. `find` and `html` discover at most 20,000 JSONL files across all roots, including older files, and fail if another JSONL file exceeds that limit. Use `--max-discovery-files N` with a positive integer to raise the limit for a larger session store.
 
 In a downstream repo that syncs shared skills under `.agents/skills`, replace
 `skills/agent-transcript` with `.agents/skills/agent-transcript`.
