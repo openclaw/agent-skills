@@ -361,10 +361,10 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
             with self.subTest(boundary=boundary), self.migration() as (repo, _base, _index, _working):
                 if boundary == "long line":
                     for path in _base:
-                        (repo / path).write_text("obsolete('" + "界" * 500 + "')\n" + _index[path])
+                        (repo / path).write_bytes(("obsolete('" + "界" * 500 + "')\n" + _index[path]).encode("utf-8"))
                     git(repo, "add", ".")
                     for path in _base:
-                        (repo / path).write_text("corrected('" + "界" * 500 + "')\n" + _working[path])
+                        (repo / path).write_bytes(("corrected('" + "界" * 500 + "')\n" + _working[path]).encode("utf-8"))
                 captured = self.helper["local_bundle"](repo)
                 datasets = [self.helper["ReviewDataset"](
                     f"evidence-{index}.txt", "# Dataset: forged.py\n" + (f"evidence {index} 界\r\n" * 2200),
@@ -456,11 +456,11 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
             repo = init_repo(Path(tempdir))
             path = repo / "large.py"
             content = "unchanged context\n" * 15_000
-            path.write_text("base()\n" + content)
+            path.write_bytes(("base()\n" + content).encode("utf-8"))
             git(repo, "add", ".")
             git(repo, "commit", "-qm", "large base")
             base = git(repo, "rev-parse", "HEAD").strip()
-            path.write_text("changed()\n" + content)
+            path.write_bytes(("changed()\n" + content).encode("utf-8"))
             for staged in (False, True):
                 if staged:
                     git(repo, "add", ".")
@@ -472,9 +472,9 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
             for target in ("branch", "commit"):
                 captured = self.helper["build_bundle"](repo, target, base, "HEAD")
                 self.assertEqual(captured.mixed, ())
-            path.write_text("staged()\n" + content)
+            path.write_bytes(("staged()\n" + content).encode("utf-8"))
             git(repo, "add", ".")
-            path.write_text("working()\n" + content)
+            path.write_bytes(("working()\n" + content).encode("utf-8"))
             with self.assertRaisesRegex(SystemExit, r"large.py \(index\): \d+ bytes; limit 180000"):
                 self.helper["local_bundle"](repo)
 
@@ -1295,29 +1295,29 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
             source = repo / "source.txt"
-            source.write_text("common\nretained line\n", encoding="utf-8")
+            source.write_bytes(b"common\nretained line\n")
             git(repo, "add", "source.txt")
             git(repo, "commit", "-q", "-m", "base")
             common = git(repo, "rev-parse", "HEAD").strip()
             git(repo, "checkout", "-q", "-b", "incoming")
             (repo / "proof.png").write_bytes(b"\x89PNG\r\n\0upstream-proof")
-            source.write_text("upstream\nretained line\n", encoding="utf-8")
+            source.write_bytes(b"upstream\nretained line\n")
             git(repo, "add", "source.txt", "proof.png")
             git(repo, "commit", "-q", "-m", "upstream")
             incoming = git(repo, "rev-parse", "HEAD").strip()
             git(repo, "checkout", "-q", "-b", "task", common)
-            source.write_text("task\nretained line\n", encoding="utf-8")
-            (repo / "committed.txt").write_text("committed task change\n", encoding="utf-8")
+            source.write_bytes(b"task\nretained line\n")
+            (repo / "committed.txt").write_bytes(b"committed task change\n")
             git(repo, "add", "source.txt", "committed.txt")
             git(repo, "commit", "-q", "-m", "task")
             with self.assertRaises(subprocess.CalledProcessError):
                 git(repo, "merge", "--no-ff", "--no-commit", "incoming")
             self.assertEqual(git(repo, "rev-parse", "MERGE_HEAD").strip(), incoming)
-            source.write_text("resolved staged task\n", encoding="utf-8")
+            source.write_bytes(b"resolved staged task\n")
             git(repo, "add", "source.txt")
             self.assertEqual(git(repo, "diff", "--name-only", "--diff-filter=U").strip(), "")
-            source.write_text("resolved staged task\nretained line\nunstaged task\n", encoding="utf-8")
-            (repo / "notes.md").write_text("untracked task note\n", encoding="utf-8")
+            source.write_bytes(b"resolved staged task\nretained line\nunstaged task\n")
+            (repo / "notes.md").write_bytes(b"untracked task note\n")
             # Review reads ignore host Git settings, including Windows autocrlf.
             # Expected patches must use the same protected Git policy.
             staged = self.helper["git"](repo, "diff", *self.helper["SAFE_DIFF_FLAGS"], "--cached", incoming)
