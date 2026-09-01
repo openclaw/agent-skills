@@ -7,12 +7,20 @@ description: "Cryptographically logs and verifies autonomous agent tool executio
 
 Best-effort local-only cryptographic flight recorder for OpenClaw agents. Use during autonomous coding, terminal commands, file mutations, or database operations to produce offline-verifiable proof that agent actions were unaltered.
 
-## Contract
+## Contract & Safety Boundaries
 
-- **Zero network**: Audit ledgers are signed locally with Ed25519 keys and written to the local filesystem.
-- **RFC 8785 Canonicalization**: JSON envelopes are canonicalized using RFC 8785 (JCS) before hashing.
-- **SHA-256 Causal Chaining**: Every record cryptographically seals the previous event hash.
-- **Offline Verifiable**: Any user or CI process can verify chain integrity using `guardclaw verify <DIR>`.
+- **Zero Network Egress**: Key generation, hashing, and verification operate 100% offline. No telemetry, network requests, or cloud dependencies are invoked.
+- **RFC 8785 Canonicalization**: JSON payloads are normalized using RFC 8785 (JSON Canonicalization Scheme) prior to hashing.
+- **SHA-256 Causal Chaining**: Every execution record incorporates the SHA-256 hash of the preceding record envelope.
+- **Credential & Secret Redaction**: Secrets, authorization tokens, API keys, and environment variables must be scrubbed before logging.
+- **Non-Privileged Execution**: Operates strictly within user-designated storage paths without requiring elevated or root system privileges.
+- **Offline Verifiable**: Any user or CI process can verify chain integrity using `guardclaw verify <DIR> --pinned-key <KEY>`.
+
+## Inputs & Outputs
+
+- **Inputs**: Tool name (`str`), payload/parameters (`dict`), local storage directory (`Path`).
+- **Outputs**: Append-only `ledger.jsonl` with detached Ed25519 signatures and causal hash chains.
+- **Failure Modes**: Missing keys or corrupted entries yield `INVALID` during verification; runtime emission failures log warnings without blocking foreground agent workflows.
 
 ## Quickstart
 
