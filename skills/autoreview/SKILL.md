@@ -125,6 +125,23 @@ it does not include the committed PR merely because the checkout is on a PR
 branch. `--mode uncommitted` is an alias for `--mode local`. A clean local checkout
 without an explicit base has no local patch to review.
 
+### Converge after a fix
+
+Review the smallest fix delta before rebundling the branch:
+
+```bash
+# Fix is still uncommitted.
+"$AUTOREVIEW" --mode uncommitted
+
+# Fix is already committed.
+"$AUTOREVIEW" --mode commit --commit HEAD
+```
+
+When several reviewers are required, select them in one `--reviewers` invocation
+so they receive the same frozen bundle. Narrow checks validate each repair; run
+one full `--mode branch --base <base>` review only after the focused fixes pass,
+and use that full review as the final convergence gate.
+
 To review a dirty candidate against an explicit base, including a resolved merge
 that has not been committed:
 
