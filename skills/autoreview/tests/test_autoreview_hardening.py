@@ -422,20 +422,21 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as tempdir:
                 repo = init_repo(Path(tempdir))
                 path = repo / "source.py"
+                # These versions must be byte-identical even with Windows text translation.
                 if state != "unborn":
                     if state != "new":
-                        path.write_text("base()\n")
+                        path.write_bytes(b"base()\n")
                     git(repo, "add", ".")
                     git(repo, "commit", "--allow-empty", "-qm", "base")
                 if state == "readd":
                     git(repo, "rm", "source.py")
                 else:
-                    path.write_text("staged()\n")
+                    path.write_bytes(b"staged()\n")
                     git(repo, "add", ".")
                 if state == "removed":
                     path.unlink()
                 else:
-                    path.write_text("base()\n" if state == "undone" else "working()\n")
+                    path.write_bytes(b"base()\n" if state == "undone" else b"working()\n")
                 captured = self.helper["local_bundle"](repo)
                 record, = captured.mixed
                 self.assertIn("source.py", captured.paths)
@@ -684,11 +685,11 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
             path = repo / "source.py"
-            path.write_text("base()\n")
+            path.write_bytes(b"base()\n")
             git(repo, "add", ".")
             git(repo, "commit", "-qm", "base")
             git(repo, "rm", "source.py")
-            path.write_text("readded()\n")
+            path.write_bytes(b"readded()\n")
             read = mock.Mock(wraps=self.helper["read_prefix"])
             with mock.patch.dict(self.helper["local_bundle"].__globals__, {"read_prefix": read}):
                 captured = self.helper["local_bundle"](repo)
