@@ -16,10 +16,10 @@ Best-effort local-only cryptographic flight recorder for OpenClaw agents. Use du
 
 ## Quickstart
 
-Install the lightweight audit library:
+Install the lightweight audit library (pinned release):
 
 ```bash
-pip install guardclaw
+pip install "guardclaw==0.8.2"
 ```
 
 ### 1. Emit Signed Intent & Execution Receipts
