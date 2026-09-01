@@ -25,10 +25,24 @@ pip install guardclaw
 ### 1. Emit Signed Intent & Execution Receipts
 
 ```python
+from pathlib import Path
 from guardclaw import GEFLedger, Ed25519KeyManager, RecordType
 
-# Initialize session ledger in local vault
-key_mgr = Ed25519KeyManager.generate()
+# 1. Load or persist trusted signing key outside the audited directory
+trusted_key_dir = Path.home() / ".openclaw" / "keys"
+trusted_key_dir.mkdir(parents=True, exist_ok=True)
+key_file = trusted_key_dir / "agent_signing_key.json"
+
+if key_file.exists():
+    key_mgr = Ed25519KeyManager.load(str(key_file))
+else:
+    key_mgr = Ed25519KeyManager.generate()
+    key_mgr.save(str(key_file))
+
+# Store the expected public key in a secure, trusted configuration location
+trusted_pubkey = key_mgr.public_key_hex
+
+# 2. Initialize ledger
 ledger = GEFLedger(
     key_manager=key_mgr,
     agent_id="openclaw-agent",
@@ -56,22 +70,25 @@ ledger.emit(
 )
 ```
 
-### 2. Verify Ledger Integrity
+### 2. Verify Ledger Integrity Against Pinned Signer
 
 Verify from the command line:
 
 ```bash
-guardclaw verify ./.agent_audit
+guardclaw verify ./.agent_audit --pinned-key "$TRUSTED_PUBKEY"
 ```
 
-Or verify in Python:
+Or verify in Python against the pinned trusted public key:
 
 ```python
 from guardclaw import verify_ledger
 
+# Verifier supplies expected public key anchored outside the ledger
 summary = verify_ledger("./.agent_audit")
-if summary["chain_valid"]:
-    print(f"Verified {summary['verified_count']} records with zero tampering.")
+
+# Ensure the chain is mathematically valid AND signed by the trusted agent identity
+if summary["chain_valid"] and summary.get("signer_public_key") == trusted_pubkey:
+    print(f"Verified {summary['verified_count']} records with zero tampering from trusted agent.")
 else:
-    print(f"Tampering detected: {summary['failure_detail']}")
+    print(f"Verification failed or untrusted signer: {summary.get('failure_detail')}")
 ```
