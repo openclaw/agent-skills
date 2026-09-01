@@ -33,7 +33,8 @@ Do not invoke Autoreview automatically before a commit, push, PR, merge, deploy,
 - Tools are useful in review mode. Codex receives the validated bundle in an empty workspace so ignored files and linked-worktree metadata remain unreadable; web search stays available for dependency contracts and upstream docs.
 - Security perspective is always included, but it should not cripple legitimate functionality. Report security findings only when the change creates a concrete, actionable risk or removes an important safety check.
 - Reviewer subprocesses preserve engine authentication and non-credentialed proxy variables needed by headless or restricted-network environments while stripping process-injection, Git override, and credentialed proxy values.
-- Credential checking belongs to the reviewer: the hard rules require inspection of the entire change bundle for accidentally committed credentials and require every suspected real credential to be reported as a P0 security finding without reproducing its value. The helper does not invoke an external credential scanner. Security-sensitive paths remain omitted. Safe large diffs are sent as one pass while they fit the aggregate prompt limit, then partitioned into complete bounded passes without truncation.
+- Immediately before every provider call, autoreview writes the exact outgoing review pack to an owner-only temporary file and scans it with TruffleHog using `verified,unknown`. It uses the installed binary with `--no-update` to disable self-update checks and attempts. The scan covers prompt and dataset inputs, untracked content, and every diff line, including deleted lines. A finding, scanner error, or missing TruffleHog binary refuses the send and names the implicated repository file when it can be resolved; credentials are never redacted and forwarded. Security-sensitive paths remain omitted. Safe large diffs are sent as one pass while they fit the aggregate prompt limit, then partitioned into complete bounded passes without truncation.
+- Reviewer credential checks remain defense in depth alongside the restored mandatory pre-send scanner. Reviewers inspect the entire change bundle for accidentally committed credentials and report every suspected real credential as a P0 security finding without reproducing its value.
 - Regression provenance needs patch proof, not blame alone. `git log -S/-G`, `git blame`, commit subjects, and PR metadata locate candidates. Before saying `introduced by`, inspect raw parents with `git --no-replace-objects cat-file -p <sha>` and verify the implicated behavior changed in `git --no-replace-objects diff --no-ext-diff --no-textconv <raw-parent> <sha> -- <path>`; a genuine root needs raw-header proof that it has no parents.
 - Blame `^sha`, porcelain `boundary`, and shallow/grafted history alone are not introduction proof. `--root` can hide boundary markers; `git show` or `rev-list --parents` can make a shallow boundary look like a root. An available raw parent permits explicit comparison even at a shallow boundary; missing parents or an unverifiable patch require `unknown` with the gap. Use `carried forward` only for verified preexisting behavior and `made visible` only for a verified trigger. Apply the same bar to finding prose, summaries, and owner hints.
 - Keep code author, introducing PR author, merger, committer, automation trigger, and current PR author separate; none of those roles alone proves causation. Cite the verified commit/PR/date. If no PR is traceable, use the verified commit and known author identity; unknown identities stay unknown, and missing PR metadata is not a separate finding.
@@ -140,6 +141,15 @@ staged base. Git status remains relative to HEAD and does not define review scop
 Without `--base`, local mode retains its usual HEAD-to-index behavior; it never
 infers a base from an in-progress merge.
 
+For a local path changed in both transitions, capture retains immutable base,
+index, and working-tree identities, modes and absence states. Every pass with
+that path's delta includes its complete authoritative index and working-tree
+sources plus validated removed-line context. Re-additions and staged changes
+undone in the working tree remain in scope. A genuine index defect remains
+actionable, visibly `INDEX-only`, even when the working tree corrects it.
+Datasets never replace these source records. Nonmixed local paths and branch or
+commit reviews retain their existing patch-based source contract.
+
 Committed-only branch/PR work:
 
 ```bash
@@ -191,7 +201,10 @@ history and rerun. The helper does not fetch it automatically.
 
 ## Oversized Bundles
 
-The helper validates the complete patch before partitioning it. A bundle that fits
+The helper validates the complete patch before partitioning it. For partitioned
+reviews it scans the complete frozen input first, so credentials cannot evade
+detection by crossing a chunk boundary. It also scans each exact outgoing review
+pack before sending it. A safe bundle that fits
 the aggregate prompt limit remains one integrated review pass. Larger bundles
 are split at bundle sections and file boundaries where possible; an oversized
 single-file block is split at line boundaries with repeated file/hunk context
@@ -208,8 +221,19 @@ batch, and every evidence byte is retained. All validated reports are merged
 before required-finding and exit-status checks.
 There is no fixed pass-count ceiling: the complete frozen input determines the
 finite pass sequence. The helper prints its size and pass count before running
-passes serially. Each pass retains the same prompt-size limit and
+passes serially. Each pass retains the same prompt-size limit, secret scan, and
 reviewer isolation; a failed pass aborts without publishing a partial verdict.
+
+Mixed-path ownership travels as structured capture metadata through file, hunk,
+and physical-line splits. Repeated authoritative sources have separate identities
+and cannot be scheduled independently of their original delta fragments. Full
+source capture uses the existing sensitive-path, binary, gitlink, UTF-8 and
+180,000-byte file safeguards. Required context increases pack sizes and may
+increase pass counts or refuse a review. Evidence is rebatched first; if intact
+instructions and mandatory context cannot fit the existing engine/continuation
+limits, preparation stops before any provider call with a safe path, version,
+size and limit diagnosis. No limits are raised and no original bytes are dropped.
+Whole-input and exact outgoing-pack scans include the newly sent source context.
 
 Preparation prints immediate phase updates and periodic elapsed time to stderr,
 with file/byte counts during hashing and no filenames or contents. These updates
@@ -217,7 +241,7 @@ are separate from provider heartbeats and do not count against engine deadlines.
 Bundle construction captures finding membership alongside validated text; normal
 and dry runs reuse that record without reopening untracked files for membership.
 
-Dry runs reuse captured inputs and prompt construction without whole-tree integrity sweeps. Real
+Dry runs reuse capture and scanning without whole-tree integrity sweeps. Real
 reviews retain full fresh tree hashing before bundle construction, before review,
 and before publication, including unrelated tracked files, nonignored untracked files, index
 state, and initialized submodules. Explicit prompt files and datasets also retain
@@ -372,7 +396,7 @@ The helper:
 - supports `codex`, `claude`, `amp`, `pi`, and `kimi`; default is `AUTOREVIEW_ENGINE` or `codex`
 - resolves bare `git`, `gh`, reviewer, and PowerShell shell commands from absolute `PATH` entries only, never from the reviewed checkout; explicit `--*-bin` paths are interpreted from the reviewed repository root when relative and accepted only when both the supplied path and resolved target stay outside the reviewed repository
 - use `--mode commit --commit <ref>` for already-committed work, especially clean `main` after landing
-- validates complete Git patches, reviews them in one pass up to the aggregate prompt limit, and automatically uses complete bounded passes above it
+- validates complete Git patches, scans every outgoing review pack, reviews them in one pass up to the aggregate prompt limit, and automatically uses complete bounded passes above it
 - uses branch mode for committed-only PR work, or explicit local mode with a pinned merge base for a complete PR plus dirty candidate
 - writes reports to stdout and optionally to `--output` or `--json-output` files; preparation progress and provider heartbeats use stderr
 - supports `--dry-run` (validates bundle construction, reviewer CLI resolution, and local isolation startup with version/help probes without contacting a provider; exits nonzero if any check fails), an opt-in per-reviewer wall-clock bound via `--engine-timeout-seconds`, `--prompt`, repo-relative `--prompt-file`, repo-relative `--dataset`, `--no-tools`, `--no-web-search`, repeatable Codex-only safe model/response tuning with `--codex-config key=value`, Codex-only `--codex-speed fast|flex|default`, and commit refs
@@ -397,6 +421,19 @@ separately. Any scope rejection makes `review_status` `incomplete` and exits 2,
 including when other findings remain or `--expect-findings` is set. Resolve the
 target mismatch explicitly; do not infer a broader target from prompt prose.
 
+The shared provider schema adds nullable `source_attribution`; older findings
+without this field remain valid only for nonmixed paths. Mixed-path findings
+must explicitly supply `target` (`index` or `working_tree`), `record_id`,
+`source_id`, `side` (`present` or `removed`), `column`, and `excerpt`.
+`code_location.line` and `column` are 1-based; the excerpt must match exactly
+within that physical source line at the Unicode character column. Removed-side
+anchors must identify a line actually removed from the target's predecessor.
+Validation checks identity, bounds, exact source and availability in that pass
+before filtering or aggregation. Missing or incorrect attribution is retained
+with a reason in `attribution_rejected_findings`, makes the result `incomplete`,
+and exits 2 even if other findings are accepted or `--expect-findings` is set.
+Source anchoring proves attribution, not the correctness of the provider's claim.
+
 With no scope rejection, status is `findings` for accepted findings, `filtered`
 when only lower-priority findings remain, `incorrect` for an incorrect verdict
 without findings, or `scoped-clean` otherwise. Exit 1 means accepted findings or
@@ -412,12 +449,21 @@ provider explanation, and use the minimum pass confidence rather than promoting
 confidence from another pass. Provider JSON remains strictly validated before
 the helper adds local audit metadata. All engines use this same result path.
 
+`provider_report` preserves the well-formed provider conclusion before path
+normalization or enrichment. Mixed reviews retain `pass_reports` for one pass
+as well as multiple passes. Mixed observations group by target, record/source,
+anchor and category, never title. Exact repeated bodies share a claim variant;
+distinct bodies remain visible in `claim_variants`, with every contributing
+pass, title, priority and confidence. Index and working-tree findings never
+collapse together. Required-finding checks inspect accepted observations before
+deduplication; grouping cannot remove a provider verdict or hide a rejection.
+
 The exact source filename `CredentialFile.swift` is allowed for untracked and
 evidence inputs only outside sensitive parent paths, matching its existing
 tracked-source treatment. This is not a general source-extension exemption:
 credential stores, credential directories, `.env`, PEM, and key files retain
-their exclusions. Reviewers inspect the source content, deleted lines, prompts,
-and datasets present in each outgoing pack for accidentally committed credentials.
+their exclusions. TruffleHog still scans the exact outgoing pack, including
+source content, deleted lines, prompts, and datasets, before every provider call.
 
 ## Final Report
 
