@@ -46,6 +46,8 @@ skills/agent-transcript/scripts/agent-transcript find \
 
 `find` scans the newest 400 matching local JSONL logs by default across Codex, Claude, Pi, and OpenClaw agent sessions. Use `--max-files N` for a wider local search.
 
+`render`, `preview`, `append-body`, and `html` read at most 8 MiB of each session file (head and tail) before JSONL parse. Use `--max-read-bytes N` with a positive integer to change the limit. Output includes a visible partial-transcript notice and `sourceTruncated` in its stats if the read limit or the existing 12,000-line parse limit omits source content.
+
 In a downstream repo that syncs shared skills under `.agents/skills`, replace
 `skills/agent-transcript` with `.agents/skills/agent-transcript`.
 

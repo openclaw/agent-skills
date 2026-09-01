@@ -9,15 +9,16 @@ const MARKER_START = "<!-- agent-transcript:start -->";
 const MARKER_END = "<!-- agent-transcript:end -->";
 const DEFAULT_MAX_CHARS = 50000;
 const DEFAULT_ENTRY_MAX_CHARS = 6000;
+const MAX_TRANSCRIPT_BYTES = 8 * 1024 * 1024;
 
 function usage() {
   console.log(`Usage:
   agent-transcript find --query TEXT [--cwd PATH] [--since-days N] [--max-files N] [--root PATH...]
-  agent-transcript render --session FILE [--app-server] [--thread-id ID] [--out FILE] [--max-chars N] [--entry-max-chars N] [--title TEXT] [--url URL]
+  agent-transcript render --session FILE [--app-server] [--thread-id ID] [--out FILE] [--max-chars N] [--entry-max-chars N] [--max-read-bytes N] [--title TEXT] [--url URL]
   agent-transcript render-thread --thread-id ID [--out FILE] [--max-chars N] [--entry-max-chars N] [--title TEXT] [--url URL]
-  agent-transcript preview --session FILE [--app-server] [--thread-id ID] [--out FILE] [--max-chars N] [--entry-max-chars N] [--title TEXT] [--url URL]
-  agent-transcript append-body --body FILE --session FILE [--app-server] [--thread-id ID] [--out FILE] [--max-chars N] [--entry-max-chars N]
-  agent-transcript html --prs FILE [--out FILE] [--since-days N] [--min-score N] [--root PATH...] [--exclude-session FILE...]
+  agent-transcript preview --session FILE [--app-server] [--thread-id ID] [--out FILE] [--max-chars N] [--entry-max-chars N] [--max-read-bytes N] [--title TEXT] [--url URL]
+  agent-transcript append-body --body FILE --session FILE [--app-server] [--thread-id ID] [--out FILE] [--max-chars N] [--entry-max-chars N] [--max-read-bytes N]
+  agent-transcript html --prs FILE [--out FILE] [--since-days N] [--min-score N] [--max-read-bytes N] [--root PATH...] [--exclude-session FILE...]
 
 Local-only. No network calls.`);
 }
@@ -134,18 +135,27 @@ function walkJsonl(root, sinceMs, out = []) {
   return out;
 }
 
-function readJsonl(file, maxLines = 12000) {
-  const text = fs.readFileSync(file, "utf8");
-  const lines = text.split(/\n+/).filter(Boolean).slice(0, maxLines);
+function transcriptReadLimit(options = {}) {
+  const value = options.maxReadBytes ?? options["max-read-bytes"] ?? MAX_TRANSCRIPT_BYTES;
+  const maxBytes = Number(value);
+  if (typeof value === "boolean" || !Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+    throw new Error("--max-read-bytes must be a positive integer");
+  }
+  return maxBytes;
+}
+
+function readJsonl(file, maxLines = 12000, maxBytes = MAX_TRANSCRIPT_BYTES) {
+  const { text, truncated } = readBoundedText(file, maxBytes);
+  const lines = text.split(/\n+/).filter(Boolean);
   const rows = [];
-  for (const line of lines) {
+  for (const line of lines.slice(0, maxLines)) {
     try {
       rows.push(JSON.parse(line));
     } catch {
       rows.push({ type: "unparsed", text: line });
     }
   }
-  return rows;
+  return { rows, sourceTruncated: truncated || lines.length > maxLines };
 }
 
 function sessionThreadId(file) {
@@ -407,10 +417,11 @@ function expandCompactedReplacementItems(row) {
 }
 
 function renderSession(file, options = {}) {
-  const rows = readJsonl(file);
+  const { rows, sourceTruncated } = readJsonl(file, 12000, transcriptReadLimit(options));
   const agent = detectAgent(file, rows);
   const stats = {
     agent,
+    sourceTruncated,
     entries: 0,
     user: 0,
     assistant: 0,
@@ -480,7 +491,7 @@ function renderSession(file, options = {}) {
 
 \`\`\`\`text
 source: [LOCAL_SESSION]
-redaction: local paths, emails, phone-shaped strings, token-shaped strings, auth headers, auth query params
+${sourceTruncated ? "source truncated: the read or line limit omitted session content; this transcript is partial.\n" : ""}redaction: local paths, emails, phone-shaped strings, token-shaped strings, auth headers, auth query params
 omitted: raw tool outputs, system/developer prompts, local paths, secrets, browser/session/auth details
 stats: ${JSON.stringify(stats)}
 
@@ -659,15 +670,18 @@ function readBoundedText(file, maxBytes = 220000) {
     const stat = fs.fstatSync(fd);
     if (stat.size <= maxBytes) {
       const buffer = Buffer.alloc(stat.size);
-      fs.readSync(fd, buffer, 0, stat.size, 0);
-      return buffer.toString("utf8");
+      const bytesRead = fs.readSync(fd, buffer, 0, stat.size, 0);
+      return { text: buffer.subarray(0, bytesRead).toString("utf8"), truncated: false };
     }
     const half = Math.floor(maxBytes / 2);
     const head = Buffer.alloc(half);
     const tail = Buffer.alloc(half);
-    fs.readSync(fd, head, 0, half, 0);
-    fs.readSync(fd, tail, 0, half, Math.max(0, stat.size - half));
-    return `${head.toString("utf8")}\n[...middle omitted for scan...]\n${tail.toString("utf8")}`;
+    const headBytes = fs.readSync(fd, head, 0, half, 0);
+    const tailBytes = fs.readSync(fd, tail, 0, half, Math.max(0, stat.size - half));
+    return {
+      text: `${head.subarray(0, headBytes).toString("utf8")}\n[...middle omitted for scan...]\n${tail.subarray(0, tailBytes).toString("utf8")}`,
+      truncated: true,
+    };
   } finally {
     fs.closeSync(fd);
   }
@@ -680,7 +694,7 @@ function sessionScanRecord(file, maxBytes) {
     file,
     agent,
     mtime: new Date(stat.mtimeMs).toISOString(),
-    haystack: `${file}\n${readBoundedText(file, maxBytes)}`.toLowerCase(),
+    haystack: `${file}\n${readBoundedText(file, maxBytes).text}`.toLowerCase(),
   };
 }
 

@@ -142,3 +142,108 @@ test("find labels explicit roots under trailing-slash CLAUDE_CONFIG_DIR as Claud
   assert.equal(matches[0].file, session);
   assert.equal(matches[0].agent, "claude");
 });
+
+function oversizedSession(dir) {
+  const session = path.join(dir, "session.jsonl");
+  const pad = JSON.stringify({
+    type: "user",
+    message: { role: "user", content: `pad-${"x".repeat(80)}` },
+  });
+  const lines = [
+    JSON.stringify({ type: "user", message: { role: "user", content: "HEAD_READ_BOUND_MARKER" } }),
+    ...Array.from({ length: 40 }, () => pad),
+    JSON.stringify({ type: "user", message: { role: "user", content: "MIDDLE_READ_BOUND_MARKER" } }),
+    ...Array.from({ length: 40 }, () => pad),
+    JSON.stringify({ type: "user", message: { role: "user", content: "TAIL_READ_BOUND_MARKER" } }),
+  ];
+  fs.writeFileSync(session, `${lines.join("\n")}\n`);
+  return session;
+}
+
+test("render bounds oversized JSONL reads before parse", () => {
+  const dir = tempDir();
+  const session = oversizedSession(dir);
+
+  const output = run(["render", "--session", session, "--max-read-bytes", "400"]);
+  assert.match(output, /HEAD_READ_BOUND_MARKER/);
+  assert.match(output, /TAIL_READ_BOUND_MARKER/);
+  assert.doesNotMatch(output, /MIDDLE_READ_BOUND_MARKER/);
+  assert.match(output, /source truncated:/);
+  assert.match(output, /"sourceTruncated":true/);
+});
+
+test("html bounds oversized JSONL reads before parse", () => {
+  const dir = tempDir();
+  const home = tempDir();
+  oversizedSession(dir);
+  const prs = path.join(dir, "prs.json");
+  fs.writeFileSync(prs, JSON.stringify([{ title: "HEAD_READ_BOUND_MARKER", url: "https://example.com/pr/1" }]));
+
+  const output = run(
+    ["html", "--prs", prs, "--root", dir, "--since-days", "1", "--min-score", "1", "--max-read-bytes", "400"],
+    { env: { ...process.env, HOME: home } },
+  );
+  assert.match(output, /HEAD_READ_BOUND_MARKER/);
+  assert.match(output, /TAIL_READ_BOUND_MARKER/);
+  assert.doesNotMatch(output, /MIDDLE_READ_BOUND_MARKER/);
+  assert.match(output, /source truncated:/);
+  assert.match(output, /&quot;sourceTruncated&quot;:true/);
+});
+
+test("preview and append-body retain source truncation notices even when output is shortened", () => {
+  const dir = tempDir();
+  const session = oversizedSession(dir);
+  const body = path.join(dir, "body.md");
+  fs.writeFileSync(body, "# Synthetic PR\n");
+  for (const command of [["render"], ["preview"], ["append-body", "--body", body]]) {
+    const output = run([...command, "--session", session, "--max-read-bytes", "400", "--max-chars", "1"]);
+    assert.match(output, /source truncated:/);
+    assert.match(output, /this transcript is partial/);
+  }
+});
+
+test("default read cap discloses omitted content in a file larger than eight MiB", () => {
+  const dir = tempDir();
+  const session = path.join(dir, "large.jsonl");
+  const row = (content) => ({ type: "user", message: { role: "user", content } });
+  writeJsonl(session, [row("HEAD_DEFAULT_MARKER"), row("x".repeat(5 * 1024 * 1024)), row("MIDDLE_DEFAULT_MARKER"), row("y".repeat(5 * 1024 * 1024)), row("TAIL_DEFAULT_MARKER")]);
+  const output = run(["render", "--session", session]);
+  assert.match(output, /HEAD_DEFAULT_MARKER/);
+  assert.match(output, /TAIL_DEFAULT_MARKER/);
+  assert.doesNotMatch(output, /MIDDLE_DEFAULT_MARKER/);
+  assert.match(output, /source truncated:/);
+});
+
+test("exact byte limit and small sessions remain complete", () => {
+  const dir = tempDir();
+  const session = path.join(dir, "small.jsonl");
+  writeJsonl(session, [{ type: "user", message: { role: "user", content: "complete-session-marker" } }]);
+  for (const options of [[], ["--max-read-bytes", String(fs.statSync(session).size)]]) {
+    const output = run(["render", "--session", session, ...options]);
+    assert.match(output, /complete-session-marker/);
+    assert.match(output, /"sourceTruncated":false/);
+    assert.doesNotMatch(output, /source truncated:/);
+  }
+});
+
+test("line-limited sessions disclose omitted source content", () => {
+  const dir = tempDir();
+  const session = path.join(dir, "many-lines.jsonl");
+  const row = { type: "user", message: { role: "user", content: "line-cap-marker" } };
+  writeJsonl(session, Array.from({ length: 12001 }, () => row));
+  const output = run(["render", "--session", session]);
+  assert.match(output, /source truncated:/);
+  assert.match(output, /"sourceTruncated":true/);
+});
+
+test("render rejects invalid and missing byte limits", () => {
+  const dir = tempDir();
+  const session = path.join(dir, "small.jsonl");
+  writeJsonl(session, []);
+  for (const value of ["1.5", "0", "-1", "NaN", "Infinity", "9007199254740992", null]) {
+    assert.throws(
+      () => run(["render", "--session", session, "--max-read-bytes", ...(value === null ? [] : [value])]),
+      (error) => /--max-read-bytes must be a positive integer/.test(String(error.stderr)),
+    );
+  }
+});
