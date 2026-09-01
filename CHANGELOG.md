@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Bound agent-transcript session reads to 8 MiB and disclose partial source content in render, preview, append-body, and HTML output. Thanks @SebTardif.
+- Bound agent-transcript `find` and `html` discovery to 20,000 session files, with an integer override and correct exact-limit handling. Thanks @SebTardif.
 - Rescan the exact outgoing Autoreview pack before Codex access-fallback retries, refusing findings, scanner errors, and missing scanners before another provider invocation.
 - Show Autoreview preparation progress, reuse captured bundle membership, and guard explicit evidence against content and path changes while preserving full-tree integrity checks.
 - Verify raw Git parents in Autoreview commit bundles, preserving true roots and refusing unsupported attribution from shallow boundaries, grafts, or misleading metadata.

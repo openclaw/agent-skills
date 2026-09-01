@@ -247,3 +247,107 @@ test("render rejects invalid and missing byte limits", () => {
     );
   }
 });
+
+test("find fails closed when session discovery exceeds the walk cap", () => {
+  const dir = tempDir();
+  const home = tempDir();
+  writeJsonl(path.join(dir, "a.jsonl"), [
+    { type: "user", message: { role: "user", content: "walk-cap-find-marker" } },
+  ]);
+  writeJsonl(path.join(dir, "b.jsonl"), [
+    { type: "user", message: { role: "user", content: "walk-cap-find-marker" } },
+  ]);
+
+  assert.throws(
+    () =>
+      run(
+        [
+          "find",
+          "--query",
+          "walk-cap-find-marker",
+          "--root",
+          dir,
+          "--since-days",
+          "1",
+          "--max-files",
+          "20",
+          "--max-discovery-files",
+          "1",
+        ],
+        { env: { ...process.env, HOME: home } },
+      ),
+    (error) => {
+      assert.match(String(error.stderr || ""), /session discovery exceeded its file limit/);
+      return true;
+    },
+  );
+});
+
+test("html fails closed when session discovery exceeds the walk cap", () => {
+  const dir = tempDir();
+  const home = tempDir();
+  writeJsonl(path.join(dir, "a.jsonl"), [
+    { type: "user", message: { role: "user", content: "walk-cap-html-marker" } },
+  ]);
+  writeJsonl(path.join(dir, "b.jsonl"), [
+    { type: "user", message: { role: "user", content: "walk-cap-html-marker" } },
+  ]);
+  const prs = path.join(dir, "prs.json");
+  fs.writeFileSync(prs, JSON.stringify([{ title: "walk-cap-html-marker", url: "https://example.com/pr/1" }]));
+
+  assert.throws(
+    () =>
+      run(["html", "--prs", prs, "--root", dir, "--since-days", "1", "--max-discovery-files", "1"], {
+        env: { ...process.env, HOME: home },
+      }),
+    (error) => {
+      assert.match(String(error.stderr || ""), /session discovery exceeded its file limit/);
+      return true;
+    },
+  );
+});
+
+test("discovery accepts exactly the cap across roots and ignores trailing non-session entries", () => {
+  const dir = tempDir();
+  const empty = tempDir();
+  writeJsonl(path.join(dir, "a.jsonl"), [
+    { type: "user", message: { role: "user", content: "exact-cap-marker" } },
+  ]);
+  fs.mkdirSync(path.join(dir, "z-empty"));
+  fs.writeFileSync(path.join(dir, "z-not-session.txt"), "ignored");
+  const prs = path.join(empty, "prs.json");
+  fs.writeFileSync(prs, JSON.stringify([{ title: "exact-cap-marker", url: "https://example.com/pr/1" }]));
+  for (const root of [dir, path.join(dir, "a.jsonl")]) {
+    const options = ["--root", root, "--root", empty, "--max-discovery-files", "1"];
+    const matches = JSON.parse(run(["find", "--query", "exact-cap-marker", ...options]));
+    assert.equal(matches.length, 1);
+    assert.match(run(["html", "--prs", prs, "--min-score", "1", ...options]), /exact-cap-marker/);
+  }
+});
+
+test("discovery shares its cap across roots and counts old JSONL files", () => {
+  const dir = tempDir();
+  const roots = ["a.jsonl", "b.jsonl"].map((name) => path.join(dir, name));
+  for (const file of roots) {
+    writeJsonl(file, [{ type: "user", message: { role: "user", content: "old-marker" } }]);
+    fs.utimesSync(file, new Date(0), new Date(0));
+  }
+  assert.throws(
+    () => run(["find", "--query", "old-marker", "--root", roots[0], "--root", roots[1], "--since-days", "1", "--max-discovery-files", "1"]),
+    (error) => /session discovery exceeded its file limit/.test(String(error.stderr)),
+  );
+});
+
+test("discovery rejects invalid and missing file limits", () => {
+  const dir = tempDir();
+  const prs = path.join(dir, "prs.json");
+  fs.writeFileSync(prs, "[]");
+  for (const value of ["1.5", "0", "-1", "NaN", "Infinity", "9007199254740992", null]) {
+    for (const command of [["find", "--query", "marker"], ["html", "--prs", prs]]) {
+      assert.throws(
+        () => run([...command, "--root", dir, "--max-discovery-files", ...(value === null ? [] : [value])]),
+        (error) => /--max-discovery-files must be a positive integer/.test(String(error.stderr)),
+      );
+    }
+  }
+});
