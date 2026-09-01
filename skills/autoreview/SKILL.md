@@ -137,10 +137,11 @@ Review the smallest fix delta before rebundling the branch:
 "$AUTOREVIEW" --mode commit --commit HEAD
 ```
 
-When several reviewers are required, select them in one `--reviewers` invocation
-so they receive the same frozen bundle. Narrow checks validate each repair; run
-one full `--mode branch --base <base>` review only after the focused fixes pass,
-and use that full review as the final convergence gate.
+The helper runs one reviewer per invocation and has no `--reviewers` flag. When
+an orchestration layer supports reviewer panels, select all reviewers there so
+they receive the same frozen bundle. Otherwise run explicit narrow invocations
+against the same commit. After the focused fixes pass, run one full
+`--mode branch --base <base>` review as the final convergence gate.
 
 To review a dirty candidate against an explicit base, including a resolved merge
 that has not been committed:
@@ -277,7 +278,7 @@ independently semantic artifacts merely to shrink the review.
 
 ## Models and thinking
 
-The helper accepts `--model` globally or per engine (`engine=model`) and `--thinking` globally or per engine (`engine=level`). Repeat either flag for multiple reviewers.
+The helper accepts `--model` globally or per engine (`engine=model`) and `--thinking` globally or per engine (`engine=level`). Repeating these flags configures engine-specific values; it does not add reviewers.
 
 Recommended model defaults:
 
