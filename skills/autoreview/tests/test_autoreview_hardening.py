@@ -451,6 +451,102 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                     self.assertEqual(record.base.content, record.working_tree.content)
                 self.helper["verify_mixed_sources"](repo, captured.mixed)
 
+    def test_file_to_directory_transitions_keep_staged_and_working_sources(self):
+        for state in ("staged", "untracked", "mixed-child", "mixed-parent", "committed"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                git(repo, "config", "core.autocrlf", "false")
+                path = repo / "foo"
+                path.write_bytes(b"base parent\n")
+                git(repo, "add", "foo")
+                git(repo, "commit", "-qm", "base file")
+                base = git(repo, "rev-parse", "HEAD").strip()
+                if state == "mixed-parent":
+                    path.write_bytes(b"staged parent\n")
+                    git(repo, "add", "foo")
+                    path.unlink()
+                else:
+                    git(repo, "rm", "foo")
+                path.mkdir()
+                child = path / "bar"
+                child.write_bytes(b"staged child\n")
+                if state in ("staged", "mixed-child", "committed"):
+                    git(repo, "add", "foo/bar")
+                if state == "committed":
+                    git(repo, "commit", "-qm", "replace file with directory")
+                if state in ("mixed-child", "committed"):
+                    child.write_bytes(b"working child\n")
+                if state == "mixed-child":
+                    (path / "extra").write_bytes(b"untracked child\n")
+                    (path / "ignored.txt").write_bytes(b"ignored child content\n")
+                    (repo / ".git/info/exclude").write_text("foo/ignored.txt\n", encoding="utf-8")
+                for ref in (None, base):
+                    with self.subTest(base=ref):
+                        captured = self.helper["local_bundle"](repo, ref)
+                        expected = {"foo/bar"}
+                        if state != "committed" or ref is not None:
+                            expected.add("foo")
+                            self.assertIn("-base parent\n", captured.text)
+                        if state == "mixed-child":
+                            expected.add("foo/extra")
+                            self.assertIn("untracked child", captured.text)
+                            self.assertNotIn("ignored child content", captured.text)
+                        self.assertEqual(captured.paths, expected)
+                        self.assertIn(child.read_text().strip(), captured.text)
+                        mixed = {record.path: record for record in captured.mixed}
+                        expected_mixed = set()
+                        if state == "mixed-parent":
+                            expected_mixed.add("foo")
+                        elif state == "mixed-child" or (state == "committed" and ref is not None):
+                            expected_mixed.add("foo/bar")
+                        self.assertEqual(set(mixed), expected_mixed)
+                        if "foo" in mixed:
+                            self.assertEqual(mixed["foo"].index.content, "staged parent\n")
+                            self.assertIsNone(mixed["foo"].working_tree.mode)
+                        if "foo/bar" in mixed:
+                            self.assertEqual(mixed["foo/bar"].index.content, "staged child\n")
+                            self.assertEqual(mixed["foo/bar"].working_tree.content, "working child\n")
+                        self.helper["verify_mixed_sources"](repo, captured.mixed)
+
+    def test_directory_to_file_transitions_preserve_snapshots_and_mixed_sources(self):
+        for mixed in (False, True):
+            with self.subTest(mixed=mixed), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                git(repo, "config", "core.autocrlf", "false")
+                parent = repo / "foo"
+                parent.mkdir()
+                child = parent / "bar"
+                child.write_bytes(b"base child\n")
+                git(repo, "add", ".")
+                git(repo, "commit", "-qm", "base directory")
+                base = git(repo, "rev-parse", "HEAD").strip()
+                if mixed:
+                    child.write_bytes(b"staged child\n")
+                    git(repo, "add", "foo/bar")
+                    child.unlink()
+                else:
+                    git(repo, "rm", "foo/bar")
+                if parent.exists():
+                    parent.rmdir()
+                parent.write_bytes(b"working parent\n")
+                if not mixed:
+                    git(repo, "add", "foo")
+                for ref in (None, base):
+                    with self.subTest(base=ref):
+                        snapshot = self.helper["source_tree_snapshot"](repo)
+                        captured = self.helper["local_bundle"](repo, ref)
+                        self.assertEqual(captured.paths, {"foo", "foo/bar"})
+                        self.assertIn("working parent", captured.text)
+                        if mixed:
+                            record, = captured.mixed
+                            self.assertEqual(record.path, "foo/bar")
+                            self.assertEqual(record.index.content, "staged child\n")
+                            self.assertIsNone(record.working_tree.mode)
+                        else:
+                            self.assertEqual(captured.mixed, ())
+                        self.helper["verify_mixed_sources"](repo, captured.mixed)
+                        self.assertEqual(self.helper["source_tree_snapshot"](repo), snapshot)
+
     def test_large_tracked_paths_keep_complete_mixed_sources(self):
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
@@ -725,8 +821,8 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
             provider.assert_not_called()
 
     def test_ignored_or_unsafe_readdition_cannot_bypass_mixed_capture(self):
-        for kind in ("ignored", "symlink"):
-            if kind == "symlink" and os.name == "nt":
+        for kind in ("ignored", "symlink", "directory symlink", "dangling symlink"):
+            if kind != "ignored" and os.name == "nt":
                 continue
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tempdir:
                 repo = init_repo(Path(tempdir))
@@ -740,8 +836,12 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                     path.write_text("ignored content never sent\n")
                 else:
                     outside = repo.parent / "outside.py"
-                    outside.write_text("outside content never sent\n")
-                    path.symlink_to(outside)
+                    if kind == "directory symlink":
+                        outside.mkdir()
+                        (outside / "child.py").write_text("outside content never sent\n")
+                    elif kind == "symlink":
+                        outside.write_text("outside content never sent\n")
+                    path.symlink_to(outside, target_is_directory=kind == "directory symlink")
                 with self.assertRaisesRegex(SystemExit, "working_tree.*validated untracked membership"):
                     self.helper["local_bundle"](repo)
 
@@ -1080,16 +1180,20 @@ args = sys.argv[1:]
 if "--no-update" not in args:
     print("updater: cannot move binary: permission denied", file=sys.stderr)
     raise SystemExit(1)
-assert args[0] == "filesystem"
-assert set(args[2:]) == {
+source = args[0]
+assert source in {"filesystem", "stdin"}
+pack = Path(args[1]) if source == "filesystem" else None
+assert set(args[2:] if pack else args[1:]) == {
     "--json", "--no-color", "--results=verified,unknown",
     "--fail", "--fail-on-scan-errors", "--no-update",
 }
-pack = Path(args[1])
-Path(__file__).with_name("scan.json").write_text(json.dumps({
-    "pack": str(pack),
-    "prompt": pack.read_bytes().decode("utf-8"),
-}))
+payload = pack.read_bytes() if pack else sys.stdin.buffer.read()
+with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as records:
+    records.write(json.dumps({
+        "source": source,
+        "pack": str(pack) if pack else None,
+        "prompt": payload.decode("utf-8"),
+    }) + "\n")
 ''',
             )
             with mock.patch.dict(
@@ -1098,9 +1202,10 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
             ):
                 self.helper["scan_outgoing_review_pack"](repo, prompt)
 
-            record = json.loads((root / "scan.json").read_text(encoding="utf-8"))
-            self.assertEqual(record["prompt"], prompt)
-            self.assertFalse(Path(record["pack"]).parent.exists())
+            records = [json.loads(line) for line in (root / "scans.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([record["source"] for record in records], ["filesystem", "stdin"])
+            self.assertEqual([record["prompt"] for record in records], [prompt, prompt])
+            self.assertFalse(Path(records[0]["pack"]).parent.exists())
 
     def test_outgoing_pack_scan_reads_exact_prompt_including_deleted_lines(self) -> None:
         prompt = (
@@ -1114,14 +1219,20 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
         )
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
+            sources = []
 
             def run_scanner(
                 command: list[str],
                 cwd: Path,
-                **_kwargs: object,
+                **kwargs: object,
             ) -> subprocess.CompletedProcess[str]:
-                self.assertEqual(command[1], "filesystem")
-                self.assertEqual(Path(command[2]).read_bytes(), prompt.encode("utf-8"))
+                sources.append(command[1])
+                if command[1] == "filesystem":
+                    payload = Path(command[2]).read_bytes()
+                else:
+                    self.assertEqual(command[1], "stdin")
+                    payload = kwargs["stdin"].read()
+                self.assertEqual(payload, prompt.encode("utf-8"))
                 self.assertIn("-const apiKey", prompt)
                 return subprocess.CompletedProcess(command, 0, "", "")
 
@@ -1133,8 +1244,9 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
                 },
             ):
                 self.helper["scan_outgoing_review_pack"](repo, prompt)
+            self.assertEqual(sources, ["filesystem", "stdin"])
 
-    def test_outgoing_pack_scan_refuses_and_names_deleted_file(self) -> None:
+    def test_deleted_input_scan_refusal_is_redacted_and_blocks_provider(self) -> None:
         prompt = (
             "# Change Bundle\n"
             "diff --git a/config.ts b/config.ts\n"
@@ -1157,21 +1269,39 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
         }
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
+            packs = []
+            provider = mock.Mock()
+
+            def run_scanner(command, cwd, **_kwargs):
+                self.assertEqual(command[1], "filesystem")
+                pack = Path(command[2])
+                self.assertEqual(pack.parent, cwd)
+                self.assertEqual(pack.read_bytes(), prompt.encode("utf-8"))
+                packs.append(pack)
+                return subprocess.CompletedProcess(
+                    command, self.helper["TRUFFLEHOG_FINDINGS_EXIT_CODE"], json.dumps(finding) + "\n", "",
+                )
+
             with mock.patch.dict(
-                self.helper["scan_outgoing_review_pack"].__globals__,
+                self.helper["run_reviewer"].__globals__,
                 {
                     "find_command": lambda _name, _repo: "/trusted/trufflehog",
-                    "run": lambda command, _cwd, **_kwargs: subprocess.CompletedProcess(
-                        command,
-                        self.helper["TRUFFLEHOG_FINDINGS_EXIT_CODE"],
-                        json.dumps(finding) + "\n",
-                        "",
-                    ),
+                    "run": run_scanner,
+                    "run_engine": provider,
                 },
-            ):
-                with self.assertRaisesRegex(SystemExit, "config.ts") as error:
-                    self.helper["scan_outgoing_review_pack"](repo, prompt)
-        self.assertNotIn("must-not-be-printed", str(error.exception))
+            ), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaisesRegex(SystemExit, "TruffleHog found credentials") as error:
+                    self.helper["run_reviewer"](
+                        argparse.Namespace(engine="codex", max_priority="P0"), repo, prompt, set(), [],
+                    )
+            self.assertEqual(len(packs), 1)
+            self.assertFalse(packs[0].parent.exists())
+            provider.assert_not_called()
+        self.assertEqual(
+            str(error.exception),
+            "refusing to send review pack: TruffleHog found credentials; "
+            "remove credential material from selected changes, prompt files, and datasets, then rerun",
+        )
 
     def test_outgoing_pack_scan_fails_closed_when_scanner_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -1182,28 +1312,6 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
             ):
                 with self.assertRaisesRegex(SystemExit, "refusing to send review pack"):
                     self.helper["scan_outgoing_review_pack"](repo, "prompt")
-
-    def test_reviewer_scan_refusal_prevents_provider_call(self) -> None:
-        args = argparse.Namespace(engine="codex", max_priority="P0")
-        provider = mock.Mock()
-        with mock.patch.dict(
-            self.helper["run_reviewer"].__globals__,
-            {
-                "scan_outgoing_review_pack": mock.Mock(
-                    side_effect=SystemExit("refusing to send review pack: config.ts")
-                ),
-                "run_engine": provider,
-            },
-        ):
-            with self.assertRaisesRegex(SystemExit, "config.ts"):
-                self.helper["run_reviewer"](
-                    args,
-                    Path.cwd(),
-                    "prompt",
-                    set(),
-                    [],
-                )
-        provider.assert_not_called()
 
     def test_local_bundle_preserves_boundary_when_sensitive_diff_is_omitted(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -1800,16 +1908,23 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
             for marker in (None, "DELETED_SCAN_MARKER", "STAGED_SCAN_MARKER", "UNTRACKED_SCAN_MARKER", "PROMPT_SCAN_MARKER"):
                 events = []
 
-                def scanner(command, _repo, **_kwargs):
-                    outgoing = Path(command[2])
-                    self.assertEqual(outgoing.read_bytes(), pack.encode("utf-8"))
+                def scanner(command, _repo, **kwargs):
+                    source_kind = command[1]
+                    if source_kind == "filesystem":
+                        outgoing = Path(command[2])
+                        payload = outgoing.read_bytes()
+                    else:
+                        self.assertEqual(source_kind, "stdin")
+                        outgoing = Path(kwargs["stdin"].name)
+                        payload = kwargs["stdin"].read()
+                    self.assertEqual(payload, pack.encode("utf-8"))
                     if os.name != "nt":
                         self.assertEqual(stat.S_IMODE(outgoing.stat().st_mode), 0o600)
                     self.assertIn("--results=verified,unknown", command)
                     self.assertIn("--no-update", command)
                     for token in ("-// DELETED_SCAN_MARKER", "+// STAGED_SCAN_MARKER", "UNTRACKED_SCAN_MARKER", "PROMPT_SCAN_MARKER", "# Dataset:", "# Prompt file:"):
                         self.assertIn(token, pack)
-                    events.append("scan")
+                    events.append(source_kind)
                     if marker:
                         line = next(i for i, text in enumerate(pack.splitlines(), 1) if marker in text)
                         detected = {"SourceMetadata": {"Data": {"Filesystem": {"file": str(outgoing), "line": line}}}}
@@ -1828,7 +1943,7 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
                     else:
                         self.helper["run_reviewer"](args, repo, pack, {source}, [])
                         provider.assert_called_once_with(args, repo, pack)
-                    self.assertEqual(events, ["scan"])
+                    self.assertEqual(events, ["filesystem"] if marker else ["filesystem", "stdin"])
 
     def test_tracked_binary_changes_are_blocked_in_all_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

@@ -97,6 +97,8 @@ The helper owns reviewer isolation, sanitized authentication, process cleanup,
 Git scope, and structured result validation. Keep those controls enabled.
 TruffleHog must scan the complete frozen input for partitioned reviews and each
 exact outgoing pack before it is sent; missing or failed scanning stops the run.
+Source-controlled ignore tags cannot suppress this gate. Scanner refusals never
+echo input headings or finding payloads; remove credentials locally and rerun.
 Never reproduce credentials in findings or work around an isolation failure.
 
 Review files have no size/count cap and are never truncated. Large diffs and

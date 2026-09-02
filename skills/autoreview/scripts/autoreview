@@ -29,7 +29,7 @@ import time
 import unicodedata
 import urllib.parse
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, NamedTuple
+from typing import Any, BinaryIO, Callable, NamedTuple
 
 
 ENGINES = ("codex", "claude", "amp", "pi", "kimi")
@@ -495,6 +495,7 @@ def run(
     cwd: Path,
     *,
     input_text: str | None = None,
+    stdin: BinaryIO | None = None,
     check: bool = True,
     env: dict[str, str] | None = None,
     text_errors: str = SUBPROCESS_TEXT_ERRORS,
@@ -503,6 +504,7 @@ def run(
         args,
         cwd=cwd,
         input=input_text,
+        stdin=stdin,
         text=True,
         encoding=SUBPROCESS_TEXT_ENCODING,
         errors=text_errors,
@@ -1681,78 +1683,6 @@ def safe_trufflehog_env(repo: Path) -> dict[str, str]:
     return env
 
 
-def review_pack_path_at_line(prompt: str, line_number: int) -> str:
-    current = "review pack"
-    pending_untracked = False
-    diff_header: list[str] = []
-    source_lines_remaining = 0
-    for index, raw_line in enumerate(literal_lf_lines(prompt), start=1):
-        line = raw_line.removesuffix("\n").removesuffix("\r")
-        if source_lines_remaining:
-            source_lines_remaining -= 1
-        elif line.startswith("# Prompt file: "):
-            current = line.removeprefix("# Prompt file: ").strip() or current
-        elif line.startswith("# Dataset: "):
-            current = line.removeprefix("# Dataset: ").strip() or current
-        elif line.startswith(("Source snapshot: ", "Removed source: ")):
-            try:
-                record = json.loads(line.partition(": ")[2])
-            except json.JSONDecodeError:
-                record = None
-            if isinstance(record, dict) and isinstance(record.get("path"), str):
-                current = record["path"] or current
-                count = record.get("line_count", 0)
-                if isinstance(count, int) and count > 0:
-                    source_lines_remaining = count
-        elif line == "# Untracked File":
-            pending_untracked = True
-            current = "review pack"
-        elif pending_untracked and line.startswith("path: "):
-            try:
-                path = json.loads(line.removeprefix("path: "))
-            except json.JSONDecodeError:
-                path = None
-            if isinstance(path, str) and path:
-                current = path
-            pending_untracked = False
-        elif line.startswith("diff --git "):
-            diff_header = [line]
-            current = "review pack"
-        elif diff_header and line.startswith(("--- ", "+++ ")):
-            diff_header.append(line)
-            old_path, new_path = diff_section_paths("\n".join(diff_header))
-            current = new_path or old_path or current
-        elif not diff_header and line.startswith(("--- ", "+++ ")):
-            path = diff_marker_path(line[4:])
-            if path:
-                current = path
-        elif diff_header and line.startswith("@@"):
-            old_path, new_path = diff_section_paths("\n".join(diff_header))
-            current = new_path or old_path or current
-            diff_header = []
-        if index == line_number:
-            return current
-    return current
-
-
-def trufflehog_review_pack_paths(prompt: str, output: str) -> list[str]:
-    paths: set[str] = set()
-    for line in output.splitlines():
-        try:
-            finding = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        filesystem = (
-            finding.get("SourceMetadata", {})
-            .get("Data", {})
-            .get("Filesystem", {})
-        )
-        line_number = filesystem.get("line", filesystem.get("Line"))
-        if isinstance(line_number, int) and line_number > 0:
-            paths.add(review_pack_path_at_line(prompt, line_number))
-    return sorted(paths or {"review pack"})
-
-
 def scan_outgoing_review_pack(repo: Path, prompt: str) -> None:
     trufflehog_bin = find_command("trufflehog", repo)
     if not trufflehog_bin:
@@ -1767,32 +1697,33 @@ def scan_outgoing_review_pack(repo: Path, prompt: str) -> None:
         pack_path = Path(tempdir) / "review-pack.txt"
         pack_path.write_bytes(prompt.encode("utf-8"))
         pack_path.chmod(0o600)
-        result = run(
-            [
-                trufflehog_bin,
-                "filesystem",
-                str(pack_path),
-                "--json",
-                "--no-color",
-                "--results=verified,unknown",
-                "--fail",
-                "--fail-on-scan-errors",
-                "--no-update",
-            ],
-            Path(tempdir),
-            check=False,
-            env=safe_trufflehog_env(repo),
-        )
-    if result.returncode == TRUFFLEHOG_FINDINGS_EXIT_CODE:
-        paths = trufflehog_review_pack_paths(prompt, result.stdout)
-        raise SystemExit(
-            "refusing to send review pack: TruffleHog found credentials in "
-            + ", ".join(paths)
-        )
-    if result.returncode != 0:
-        raise SystemExit(
-            "refusing to send review pack: TruffleHog could not complete the scan"
-        )
+        scanner_env = safe_trufflehog_env(repo)
+        # Filesystem preserves read/extraction failures; stdin does not honor
+        # inline ignore tags, including decoded ones. Both must pass. A binary
+        # file descriptor preserves exact bytes and avoids stdin pipe buffering.
+        with pack_path.open("rb") as pack_input:
+            for source_args, scan_input in ((["filesystem", str(pack_path)], None), (["stdin"], pack_input)):
+                result = run(
+                    [
+                        trufflehog_bin, *source_args,
+                        "--json", "--no-color", "--results=verified,unknown",
+                        "--fail", "--fail-on-scan-errors", "--no-update",
+                    ],
+                    Path(tempdir),
+                    stdin=scan_input,
+                    check=False,
+                    env=scanner_env,
+                )
+                if result.returncode == TRUFFLEHOG_FINDINGS_EXIT_CODE:
+                    # Input headings, filenames, and scanner metadata can themselves contain credentials.
+                    raise SystemExit(
+                        "refusing to send review pack: TruffleHog found credentials; "
+                        "remove credential material from selected changes, prompt files, and datasets, then rerun"
+                    )
+                if result.returncode != 0:
+                    raise SystemExit(
+                        "refusing to send review pack: TruffleHog could not complete the scan"
+                    )
 
 
 def bounded_field(text: str, limit: int) -> str:
@@ -2402,7 +2333,7 @@ def mixed_source_topology(repo: Path, path: str) -> tuple[tuple[int, int, int], 
         current /= part
         try:
             info = os.stat(current, follow_symlinks=False)
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             identities.append((0, 0, 0))
             break
         if stat.S_ISLNK(info.st_mode):
@@ -2411,13 +2342,23 @@ def mixed_source_topology(repo: Path, path: str) -> tuple[tuple[int, int, int], 
     return tuple(identities)
 
 
+def working_blob_stat(source: Path) -> os.stat_result | None:
+    try:
+        info = source.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    # Directories are not Git blobs. Keep symlinks/nonregular files visible
+    # to the caller's unsafe-file checks instead of following their targets.
+    return None if stat.S_ISDIR(info.st_mode) else info
+
+
 def working_source_version(
     repo: Path, path: str, untracked: dict[str, str] | None = None,
 ) -> SourceVersion:
     source = repo / path
-    if not source.exists():
+    info = working_blob_stat(source)
+    if info is None:
         return SourceVersion("absent", None, None)
-    info = source.lstat()
     if not stat.S_ISREG(info.st_mode):
         raise SystemExit(f"nonregular mixed source: {display_escape(path, 500)}")
     if untracked is not None and path in untracked:
@@ -2560,7 +2501,7 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
         metadata = raw_records[index]
         if metadata.startswith(":") and metadata.split()[-1] == "D":
             path = raw_records[index + 1]
-            if (path not in staged_blocked_paths and os.path.lexists(repo / path)
+            if (path not in staged_blocked_paths and working_blob_stat(repo / path) is not None
                     and path not in untracked):
                 # An ignored or unsafe re-addition must not silently become an
                 # index-only review through the old untracked omission path.
@@ -2651,7 +2592,7 @@ def source_file_fingerprint(
 ) -> tuple[str, int, int, str]:
     try:
         before = os.stat(path, follow_symlinks=False)
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         return "missing", 0, 0, ""
     file_mode = stat.S_IMODE(before.st_mode)
     if stat.S_ISLNK(before.st_mode):
