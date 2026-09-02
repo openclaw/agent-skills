@@ -56,6 +56,9 @@ merge_base=$(git merge-base HEAD "origin/$pr_base")
 When a file has both staged and unstaged changes, both states are reviewed.
 A defect in the index remains actionable even if the working tree fixes it;
 the report labels it `INDEX-only`.
+Git paths and patch text retain their literal whitespace. An empty present
+source uses line 1, column 1, and an empty excerpt; empty physical lines also
+use an empty excerpt at column 1. Source identity remains mandatory.
 
 ## Context and severity
 

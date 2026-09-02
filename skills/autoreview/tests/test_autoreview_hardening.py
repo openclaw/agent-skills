@@ -878,18 +878,25 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
             provider.assert_not_called()
 
     def test_ignored_or_unsafe_readdition_cannot_bypass_mixed_capture(self):
-        for kind in ("ignored", "symlink", "directory symlink", "dangling symlink"):
-            if kind != "ignored" and os.name == "nt":
+        for kind, name in (
+            ("ignored", "source.py"),
+            ("ignored", "line\rbreak.py"),
+            ("ignored", "line\r\nbreak.py"),
+            ("symlink", "source.py"),
+            ("directory symlink", "source.py"),
+            ("dangling symlink", "source.py"),
+        ):
+            if os.name == "nt" and (kind != "ignored" or "\r" in name):
                 continue
-            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tempdir:
+            with self.subTest(kind=kind, name=name), tempfile.TemporaryDirectory() as tempdir:
                 repo = init_repo(Path(tempdir))
-                path = repo / "source.py"
+                path = repo / name
                 path.write_text("base()\n")
                 git(repo, "add", ".")
                 git(repo, "commit", "-qm", "base")
-                git(repo, "rm", "source.py")
+                git(repo, "rm", "--", name)
                 if kind == "ignored":
-                    (repo / ".git/info/exclude").write_text("source.py\n")
+                    (repo / ".git/info/exclude").write_text("*.py\n")
                     path.write_text("ignored content never sent\n")
                 else:
                     outside = repo.parent / "outside.py"
@@ -2096,42 +2103,42 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
         )
 
     def test_untracked_files_respect_trusted_global_excludes(self) -> None:
-        with tempfile.TemporaryDirectory() as tempdir:
-            root = Path(tempdir)
-            repo = init_repo(root)
-            home = root / "home"
-            home.mkdir()
-            excludes = root / "global-ignore"
-            excludes.write_text(
-                "ignored.local\n!settings.local\n",
-                encoding="utf-8",
-            )
-            (home / ".gitconfig").write_text(
-                f"[core]\n\texcludesFile = {excludes.as_posix()}\n",
-                encoding="utf-8",
-            )
-            (repo / "ignored.local").write_text("private notes\n", encoding="utf-8")
-            (repo / ".gitignore").write_text("settings.local\n", encoding="utf-8")
-            (repo / "settings.local").write_text("repo private\n", encoding="utf-8")
-            git(repo, "add", ".gitignore")
-            (repo / "visible.txt").write_text("review me\n", encoding="utf-8")
-            (repo / "hostile-gitconfig").write_text(
-                "[core]\n\texcludesFile = /does/not/exist\n",
-                encoding="utf-8",
-            )
-
-            with mock.patch.dict(
-                os.environ,
-                {
-                    "HOME": str(home),
-                    "USERPROFILE": str(home),
-                    "GIT_CONFIG_GLOBAL": str(repo / "hostile-gitconfig"),
-                },
-            ):
-                self.assertEqual(
-                    [rel for rel, _ in self.helper["collect_untracked_file_snapshots"](repo)[0]],
-                    ["hostile-gitconfig", "visible.txt"],
+        cases = [("external", "global-ignore"), ("missing", "global-ignore"),
+                 ("inside", "global-ignore")]
+        if os.name != "nt":
+            cases.extend([("external", "global\rignore"), ("external", "global-ignore ")])
+        for location, name in cases:
+            with self.subTest(location=location, name=name), tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                repo = init_repo(root)
+                home = root / "home"
+                home.mkdir()
+                excludes = (repo if location == "inside" else root) / name
+                if location != "missing":
+                    excludes.write_text("ignored.local\n!settings.local\n", encoding="utf-8")
+                if location == "inside":
+                    git(repo, "add", "--", name)
+                git(repo, "config", "--file", str(home / ".gitconfig"),
+                    "core.excludesFile", str(excludes))
+                (repo / "ignored.local").write_text("private notes\n", encoding="utf-8")
+                (repo / ".gitignore").write_text("settings.local\n", encoding="utf-8")
+                (repo / "settings.local").write_text("repo private\n", encoding="utf-8")
+                git(repo, "add", ".gitignore")
+                (repo / "visible.txt").write_text("review me\n", encoding="utf-8")
+                (repo / "hostile-gitconfig").write_text(
+                    "[core]\n\texcludesFile = /does/not/exist\n", encoding="utf-8",
                 )
+                with mock.patch.dict(os.environ, {
+                    "HOME": str(home), "USERPROFILE": str(home),
+                    "GIT_CONFIG_GLOBAL": str(repo / "hostile-gitconfig"),
+                }):
+                    expected = ["hostile-gitconfig", "visible.txt"]
+                    if location != "external":
+                        expected.insert(1, "ignored.local")
+                    self.assertEqual(
+                        [rel for rel, _ in self.helper["collect_untracked_file_snapshots"](repo)[0]],
+                        expected,
+                    )
 
     def test_dirty_check_respects_trusted_global_excludes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -2325,18 +2332,38 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
                             self.assertIn(f"parent: {parent.decode()}\n", captured.text)
                             self.assertEqual(captured.paths, set())
 
+    def test_repo_root_preserves_exact_native_paths(self) -> None:
+        names = ["repo"]
+        if os.name != "nt":
+            names.extend(["repo\rname", "repo "])
+        for name in names:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                repo = init_repo(root)
+                if name != repo.name:
+                    repo = repo.rename(root / name)
+                nested = repo / "nested"
+                nested.mkdir()
+                previous = Path.cwd()
+                try:
+                    os.chdir(nested)
+                    self.assertEqual(self.helper["repo_root"](), repo.resolve())
+                finally:
+                    os.chdir(previous)
+
     def test_git_path_list_preserves_newline_filenames(self) -> None:
         if os.name == "nt":
             self.skipTest("Windows filesystems do not support newline path components")
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
-            rel = "line\nbreak.txt"
-            (repo / rel).write_text("content\n", encoding="utf-8")
-            git(repo, "add", rel)
+            names = [f"line{separator}break.txt" for separator in ("\n", "\r", "\r\n", "\t")]
+            for rel in names:
+                (repo / rel).write_text("content\n", encoding="utf-8")
+                git(repo, "add", "--", rel)
 
             paths = self.helper["git_path_list"](repo, "ls-files", "-z")
 
-            self.assertIn(rel, paths)
+            self.assertCountEqual(paths, names)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "requires raw non-UTF-8 filename support")
     def test_git_path_list_rejects_non_utf8_output(self) -> None:
@@ -4000,36 +4027,32 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
     def test_source_tree_snapshot_detects_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
-            source = repo / "source.txt"
-            source.write_text("before\n", encoding="utf-8")
-            git(repo, "add", "source.txt")
+            names = ["source.txt"]
+            if os.name != "nt":
+                names.extend(("source\r.txt", "source\r\n.txt"))
+            for name in names:
+                (repo / name).write_text("before\n", encoding="utf-8")
+                git(repo, "add", "--", name)
             git(repo, "commit", "-qm", "initial")
-            before = self.helper["source_tree_snapshot"](repo)
+            for name in names:
+                with self.subTest(name=name):
+                    source = repo / name
+                    before = self.helper["source_tree_snapshot"](repo)
+                    source.write_text("after\n", encoding="utf-8")
+                    self.assertNotEqual(self.helper["source_tree_snapshot"](repo), before)
+                    source.write_text("before\n", encoding="utf-8")
+                    self.assertEqual(self.helper["source_tree_snapshot"](repo), before)
 
-            source.write_text("after\n", encoding="utf-8")
-            self.assertNotEqual(
-                self.helper["source_tree_snapshot"](repo),
-                before,
-            )
-            source.write_text("before\n", encoding="utf-8")
-            self.assertEqual(
-                self.helper["source_tree_snapshot"](repo),
-                before,
-            )
+                    source.write_text("after\n", encoding="utf-8")
+                    git(repo, "add", "--", name)
+                    git(repo, "commit", "-qm", "mutated")
+                    self.assertNotEqual(self.helper["source_tree_snapshot"](repo), before)
 
-            source.write_text("after\n", encoding="utf-8")
-            git(repo, "add", "source.txt")
-            git(repo, "commit", "-qm", "mutated")
-            self.assertNotEqual(
-                self.helper["source_tree_snapshot"](repo),
-                before,
-            )
-
-            (repo / "generated.txt").write_text("generated\n", encoding="utf-8")
-            self.assertNotEqual(
-                self.helper["source_tree_snapshot"](repo),
-                before,
-            )
+                    generated = repo / ("generated-" + name)
+                    generated.write_text("generated\n", encoding="utf-8")
+                    generated_before = self.helper["source_tree_snapshot"](repo)
+                    generated.write_text("changed\n", encoding="utf-8")
+                    self.assertNotEqual(self.helper["source_tree_snapshot"](repo), generated_before)
 
     def test_rejects_output_paths_inside_reviewed_repository(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -4959,11 +4982,16 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
                 r"src\index.ts",
             )
 
-            report["findings"][0]["code_location"]["file_path"] = " "
-            with self.assertRaisesRegex(SystemExit, "invalid location"):
-                self.helper["validate_report"](report, repo, {"src/index.ts"}, [])
+            literal = copy.deepcopy(report)
+            literal["findings"][0]["code_location"]["file_path"] = " "
+            self.helper["validate_report"](literal, repo, {" "}, [])
+            self.assertEqual(literal["findings"][0]["code_location"]["file_path"], " ")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.helper["validate_report"](literal, repo, {"src/index.ts"}, [])
+            self.assertEqual(literal["findings"], [])
+            self.assertEqual(self.helper["review_status"](literal), "incomplete")
 
-            for invalid_path in (123, None, True):
+            for invalid_path in ("", 123, None, True):
                 with self.subTest(invalid_path=invalid_path):
                     report["findings"][0]["code_location"] = {
                         "file_path": invalid_path,

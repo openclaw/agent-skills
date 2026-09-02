@@ -207,7 +207,7 @@ class AutoreviewTargetResultTests(unittest.TestCase):
         finding = {
             "title": "Synthetic defect", "body": "A concrete synthetic claim.",
             "priority": "P0", "confidence": 0.8, "category": "bug",
-            "code_location": {"file_path": "src/migrate.py", "line": line},
+            "code_location": {"file_path": self.record.path, "line": line},
             "source_attribution": {"target": target, "record_id": self.record.identity,
                                    "source_id": source.identity, "side": side,
                                    "column": 1, "excerpt": excerpt},
@@ -256,6 +256,13 @@ class AutoreviewTargetResultTests(unittest.TestCase):
                 self.assertEqual(report["overall_correctness"], "patch is correct")
         report = self.validate([self.finding()], available=False)
         self.assertIn("not available", report["attribution_rejected_findings"][0]["attribution_rejection_reason"])
+        original = self.record
+        for path in (" src/migrate.py", "src/migrate.py ", " "):
+            with self.subTest(path=path):
+                self.record = original._replace(path=path)
+                finding = self.finding()
+                self.assertEqual(self.validate([finding])["findings"], [finding])
+            self.record = original
 
     def test_absence_readd_and_removed_side_are_distinct(self):
         absent = AUTOREVIEW.SourceVersion("absent", None, None)
@@ -272,6 +279,46 @@ class AutoreviewTargetResultTests(unittest.TestCase):
                 self.assertEqual(report["findings"], [removed])
                 self.assertIn("absent", report["attribution_rejected_findings"][0]["attribution_rejection_reason"])
                 self.record = original
+
+        original = self.record
+        for target, side, content, line in (
+            ("index", "present", "", 1), ("working_tree", "present", "", 1),
+            ("index", "present", "before()\n\n", 2), ("working_tree", "present", "before()\n\n", 2),
+            ("index", "removed", "\n", 1), ("working_tree", "removed", "\n", 1),
+        ):
+            with self.subTest(target=target, side=side, content=content):
+                owner = ("base" if target == "index" else "index") if side == "removed" else target
+                self.record = original._replace(**{owner: getattr(original, owner)._replace(content=content)})
+                if side == "removed":
+                    self.record = self.record._replace(**{target + "_removed": ((line, ""),)})
+                valid = self.finding(target, side=side, line=line, excerpt="")
+                self.assertEqual(self.validate([valid])["findings"], [valid])
+                invalid = []
+                for key, value in (("record_id", "wrong"), ("source_id", "wrong"),
+                                   ("column", 2), ("excerpt", "invented")):
+                    bad = copy.deepcopy(valid)
+                    bad["source_attribution"][key] = value
+                    invalid.append(bad)
+                bad = copy.deepcopy(valid)
+                bad["code_location"]["line"] = 2 if not content else 900
+                invalid.append(bad)
+                if side == "present" and content:
+                    bad = copy.deepcopy(valid)
+                    bad["code_location"]["line"] = 1
+                    invalid.append(bad)
+                for bad in invalid:
+                    report = self.validate([bad])
+                    self.assertEqual(report["findings"], [])
+                    self.assertEqual(AUTOREVIEW.review_status(report), "incomplete")
+                self.record = original
+        for target in ("index", "working_tree"):
+            for side in ("present", "removed"):
+                report = self.validate([self.finding(target, side=side, excerpt="")])
+                self.assertEqual(report["findings"], [])
+            self.record = original._replace(**{target: absent})
+            report = self.validate([self.finding(target, excerpt="")])
+            self.assertIn("absent", report["attribution_rejected_findings"][0]["attribution_rejection_reason"])
+            self.record = original
 
     def test_title_independent_groups_keep_variants_targets_and_observations(self):
         reports = []
