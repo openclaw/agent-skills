@@ -754,6 +754,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def preparation_fixture(self, *options):
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
+            # Protected review reads ignore host Git config, including Windows autocrlf.
+            git(repo, "config", "core.autocrlf", "false")
             for index in range(24):
                 (repo / f"unchanged-{index}.txt").write_text("old\n")
             (repo / "source.md").write_text("before\n")
@@ -1423,6 +1425,7 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
                     shutil.copytree(registered, copied)
                     (copied / "commondir").write_text(f"{common}\n", encoding="utf-8")
                     (copied / "gitdir").write_text(f"{child / '.git'}\n", encoding="utf-8")
+                    (child / ".git").unlink()
                     (child / ".git").write_text(f"gitdir: {copied}\n", encoding="utf-8")
                     self.assertEqual(
                         Path(git(child, "rev-parse", "--git-common-dir").strip()).resolve(),
@@ -1433,6 +1436,7 @@ Path(__file__).with_name("scan.json").write_text(json.dumps({
                     git(repo, "worktree", "add", "--detach", str(owner), "HEAD")
                     if kind == "mismatched":
                         git(repo, "worktree", "add", "--detach", str(child), "HEAD")
+                        (child / ".git").unlink()
                     else:
                         child.mkdir()
                     (child / ".git").write_bytes((owner / ".git").read_bytes())
