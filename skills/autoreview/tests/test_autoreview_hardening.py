@@ -418,10 +418,14 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                     self.assertTrue(any("Continuation" in chunk.context for chunk in splits))
 
     def test_staged_undone_add_remove_readd_and_modes(self):
-        for state in ("undone", "new", "removed", "readd", "unborn"):
+        for state in ("undone", "new", "removed", "readd", "unborn", "literal"):
+            if state == "literal" and os.name == "nt":
+                continue  # Windows filenames cannot contain a colon.
             with self.subTest(state=state), tempfile.TemporaryDirectory() as tempdir:
                 repo = init_repo(Path(tempdir))
-                path = repo / "source.py"
+                path = repo / (":source.py" if state == "literal" else "source.py")
+                if state == "literal":
+                    (repo / "source.py").write_bytes(b"unrelated base\n")
                 # These versions must be byte-identical even with Windows text translation.
                 if state != "unborn":
                     if state != "new":
@@ -431,19 +435,27 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                 if state == "readd":
                     git(repo, "rm", "source.py")
                 else:
-                    path.write_bytes(b"staged()\n")
+                    path.write_bytes(b"base()\nstaged()\n" if state == "literal" else b"staged()\n")
                     git(repo, "add", ".")
                 if state == "removed":
                     path.unlink()
+                elif state == "literal":
+                    path.write_bytes(b"base()\nstaged()\nworking()\n")
                 else:
                     path.write_bytes(b"base()\n" if state == "undone" else b"working()\n")
                 captured = self.helper["local_bundle"](repo)
                 record, = captured.mixed
-                self.assertIn("source.py", captured.paths)
+                self.assertEqual(captured.paths, {path.name})
                 self.assertEqual(record.index.mode is None, state == "readd")
                 self.assertEqual(record.base.mode is None, state in ("new", "unborn"))
                 self.assertEqual(record.working_tree.mode is None, state == "removed")
-                self.assertEqual(bool(record.working_tree_removed), state != "readd")
+                self.assertEqual(bool(record.working_tree_removed), state not in ("readd", "literal"))
+                if state == "literal":
+                    base_oid = git(repo, "rev-parse", f"HEAD:{path.name}").strip()
+                    self.assertEqual(record.base.identity, f"git:{base_oid}:100644")
+                    self.assertEqual(record.index.content, "base()\nstaged()\n")
+                    self.assertEqual(record.working_tree.content, "base()\nstaged()\nworking()\n")
+                    self.assertNotIn("unrelated base", captured.text)
                 if state == "readd":
                     self.assertIn("# Untracked File", record.unstaged)
                     self.assertEqual(record.index_removed, ((1, "base()"),))
@@ -452,7 +464,8 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                 self.helper["verify_mixed_sources"](repo, captured.mixed)
 
     def test_file_to_directory_transitions_keep_staged_and_working_sources(self):
-        for state in ("staged", "untracked", "mixed-child", "mixed-parent", "committed"):
+        for state in ("staged", "untracked", "mixed-child", "mixed-parent", "committed",
+                      "restored-parent", "restored-parent-siblings"):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as tempdir:
                 repo = init_repo(Path(tempdir))
                 git(repo, "config", "core.autocrlf", "false")
@@ -470,8 +483,13 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                 path.mkdir()
                 child = path / "bar"
                 child.write_bytes(b"staged child\n")
-                if state in ("staged", "mixed-child", "committed"):
-                    git(repo, "add", "foo/bar")
+                restored = state in ("restored-parent", "restored-parent-siblings")
+                children = {"foo/bar": "staged child\n"}
+                if state == "restored-parent-siblings":
+                    (path / "baz").write_bytes(b"staged sibling\n")
+                    children["foo/baz"] = "staged sibling\n"
+                if state in ("staged", "mixed-child", "committed") or restored:
+                    git(repo, "add", "foo")
                 if state == "committed":
                     git(repo, "commit", "-qm", "replace file with directory")
                 if state in ("mixed-child", "committed"):
@@ -480,10 +498,16 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                     (path / "extra").write_bytes(b"untracked child\n")
                     (path / "ignored.txt").write_bytes(b"ignored child content\n")
                     (repo / ".git/info/exclude").write_text("foo/ignored.txt\n", encoding="utf-8")
+                if restored:
+                    for rel in children:
+                        (repo / rel).unlink()
+                    path.rmdir()
+                    path.write_bytes(b"working parent\n")
                 for ref in (None, base):
                     with self.subTest(base=ref):
+                        snapshot = self.helper["source_tree_snapshot"](repo)
                         captured = self.helper["local_bundle"](repo, ref)
-                        expected = {"foo/bar"}
+                        expected = set(children)
                         if state != "committed" or ref is not None:
                             expected.add("foo")
                             self.assertIn("-base parent\n", captured.text)
@@ -492,25 +516,33 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                             self.assertIn("untracked child", captured.text)
                             self.assertNotIn("ignored child content", captured.text)
                         self.assertEqual(captured.paths, expected)
-                        self.assertIn(child.read_text().strip(), captured.text)
+                        self.assertIn("staged child", captured.text)
                         mixed = {record.path: record for record in captured.mixed}
                         expected_mixed = set()
-                        if state == "mixed-parent":
+                        if restored:
+                            expected_mixed = {"foo", *children}
+                        elif state == "mixed-parent":
                             expected_mixed.add("foo")
                         elif state == "mixed-child" or (state == "committed" and ref is not None):
                             expected_mixed.add("foo/bar")
                         self.assertEqual(set(mixed), expected_mixed)
                         if "foo" in mixed:
-                            self.assertEqual(mixed["foo"].index.content, "staged parent\n")
-                            self.assertIsNone(mixed["foo"].working_tree.mode)
-                        if "foo/bar" in mixed:
-                            self.assertEqual(mixed["foo/bar"].index.content, "staged child\n")
-                            self.assertEqual(mixed["foo/bar"].working_tree.content, "working child\n")
+                            self.assertEqual(mixed["foo"].base.content, "base parent\n")
+                            self.assertEqual(mixed["foo"].index.content, None if restored else "staged parent\n")
+                            self.assertEqual(mixed["foo"].working_tree.content, "working parent\n" if restored else None)
+                            absent = mixed["foo"].index if restored else mixed["foo"].working_tree
+                            self.assertEqual(absent, self.helper["SourceVersion"]("absent", None, None))
+                        for rel in set(children) & set(mixed):
+                            self.assertEqual(mixed[rel].index.content, children[rel])
+                            self.assertEqual(mixed[rel].working_tree.content, None if restored else "working child\n")
+                            if restored:
+                                self.assertEqual(mixed[rel].working_tree, self.helper["SourceVersion"]("absent", None, None))
                         self.helper["verify_mixed_sources"](repo, captured.mixed)
+                        self.assertEqual(self.helper["source_tree_snapshot"](repo), snapshot)
 
     def test_directory_to_file_transitions_preserve_snapshots_and_mixed_sources(self):
-        for mixed in (False, True):
-            with self.subTest(mixed=mixed), tempfile.TemporaryDirectory() as tempdir:
+        for state in ("staged", "mixed-child", "mixed-parent", "working-directory"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as tempdir:
                 repo = init_repo(Path(tempdir))
                 git(repo, "config", "core.autocrlf", "false")
                 parent = repo / "foo"
@@ -520,7 +552,7 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                 git(repo, "add", ".")
                 git(repo, "commit", "-qm", "base directory")
                 base = git(repo, "rev-parse", "HEAD").strip()
-                if mixed:
+                if state == "mixed-child":
                     child.write_bytes(b"staged child\n")
                     git(repo, "add", "foo/bar")
                     child.unlink()
@@ -528,22 +560,35 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                     git(repo, "rm", "foo/bar")
                 if parent.exists():
                     parent.rmdir()
-                parent.write_bytes(b"working parent\n")
-                if not mixed:
+                parent.write_bytes(b"working parent\n" if state == "mixed-child" else b"staged parent\n")
+                if state != "mixed-child":
                     git(repo, "add", "foo")
+                if state == "mixed-parent":
+                    parent.write_bytes(b"working parent\n")
+                elif state == "working-directory":
+                    parent.unlink()
+                    parent.mkdir()
+                    child.write_bytes(b"working child\n")
                 for ref in (None, base):
                     with self.subTest(base=ref):
                         snapshot = self.helper["source_tree_snapshot"](repo)
                         captured = self.helper["local_bundle"](repo, ref)
                         self.assertEqual(captured.paths, {"foo", "foo/bar"})
-                        self.assertIn("working parent", captured.text)
-                        if mixed:
-                            record, = captured.mixed
-                            self.assertEqual(record.path, "foo/bar")
-                            self.assertEqual(record.index.content, "staged child\n")
-                            self.assertIsNone(record.working_tree.mode)
-                        else:
-                            self.assertEqual(captured.mixed, ())
+                        self.assertIn("working parent" if state == "mixed-child" else "staged parent", captured.text)
+                        expected = {}
+                        if state in ("mixed-child", "working-directory"):
+                            expected["foo/bar"] = ("base child\n", "staged child\n", None) if state == "mixed-child" else (
+                                "base child\n", None, "working child\n",
+                            )
+                        if state in ("mixed-parent", "working-directory"):
+                            expected["foo"] = (None, "staged parent\n", "working parent\n" if state == "mixed-parent" else None)
+                        self.assertEqual({record.path for record in captured.mixed}, set(expected))
+                        for record in captured.mixed:
+                            for source, content in zip((record.base, record.index, record.working_tree), expected[record.path]):
+                                if content is None:
+                                    self.assertEqual(source, self.helper["SourceVersion"]("absent", None, None))
+                                else:
+                                    self.assertEqual(source.content, content)
                         self.helper["verify_mixed_sources"](repo, captured.mixed)
                         self.assertEqual(self.helper["source_tree_snapshot"](repo), snapshot)
 
@@ -606,8 +651,9 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
             self.assertNotIn("SYNTHETIC_", captured.text)
 
     def test_mixed_source_mutations_and_topology_refuse_later_sends(self):
-        for mutation in ("index", "content", "replace", "ancestor", "delete", "leaf symlink", "ancestor symlink"):
-            if "symlink" in mutation and os.name == "nt":
+        for mutation in ("index", "index conflict", "index symlink", "index gitlink", "content",
+                         "replace", "ancestor", "delete", "leaf symlink", "ancestor symlink"):
+            if mutation in ("leaf symlink", "ancestor symlink") and os.name == "nt":
                 continue
             with self.subTest(mutation=mutation), self.migration() as (repo, *_):
                 captured = self.helper["local_bundle"](repo)
@@ -616,6 +662,15 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                 source = path.read_bytes()
                 if mutation == "index":
                     git(repo, "add", str(path))
+                elif mutation.startswith("index "):
+                    oid = git(repo, "rev-parse", "HEAD" if mutation == "index gitlink" else ":src/migrate-0.py").strip()
+                    if mutation == "index conflict":
+                        git(repo, "update-index", "--force-remove", "--", "src/migrate-0.py")
+                        subprocess.run(["git", "update-index", "--index-info"], cwd=repo, check=True,
+                                       input=f"100644 {oid} 2\tsrc/migrate-0.py\n", text=True, capture_output=True)
+                    else:
+                        mode = "160000" if mutation == "index gitlink" else "120000"
+                        git(repo, "update-index", "--cacheinfo", f"{mode},{oid},src/migrate-0.py")
                 elif mutation == "content":
                     before = path.stat()
                     path.write_bytes(source.replace(b"corrected", b"different"))
@@ -641,7 +696,8 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                 with mock.patch.dict(self.helper["run_reviewer"].__globals__, {
                     "scan_outgoing_review_pack": lambda *_: None, "run_engine": provider,
                 }), contextlib.redirect_stderr(io.StringIO()):
-                    with self.assertRaisesRegex(SystemExit, "mixed source changed|symlinked mixed source"):
+                    refusal = "unsafe mixed source mode" if mutation.startswith("index ") else "mixed source changed|symlinked mixed source"
+                    with self.assertRaisesRegex(SystemExit, refusal):
                         self.helper["run_reviewer"](argparse.Namespace(engine="codex", max_priority="P0"),
                                                      repo, passes[0], captured, [])
                 provider.assert_not_called()

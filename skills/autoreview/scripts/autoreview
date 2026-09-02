@@ -2301,19 +2301,21 @@ def mixed_source_text(path: str, version: str, data: bytes) -> str:
 
 
 def git_source_version(repo: Path, path: str, ref: str | None) -> SourceVersion:
-    pathspec = f":(literal){path}"
-    if ref is None:
-        entries = git_path_list(repo, "ls-files", "--stage", "-z", "--", pathspec)
-    else:
-        entries = git_path_list(repo, "ls-tree", "-z", ref, "--", path)
+    command = ("ls-files", "--stage", "-z") if ref is None else ("ls-tree", "-z", ref)
+    entries = git_path_list(repo, "--literal-pathspecs", *command, "--", path)
+    # Directory queries return a tree or its descendants, not a blob here.
+    # Keep only exact entries, preserving their conflict stages and unsafe modes.
+    entries = [
+        metadata for metadata, actual in (entry.split("\t", 1) for entry in entries)
+        if actual == path and not (ref is not None and metadata.startswith("040000 tree "))
+    ]
     if not entries:
         return SourceVersion("absent", None, None)
     if len(entries) != 1:
         raise SystemExit(f"unmerged mixed source: {display_escape(path, 500)}")
-    metadata, actual = entries[0].split("\t", 1)
-    mode, middle, last = metadata.split()
+    mode, middle, last = entries[0].split()
     oid = middle if ref is None else last
-    if actual != path or (ref is None and last != "0") or mode not in {"100644", "100755"}:
+    if (ref is None and last != "0") or mode not in {"100644", "100755"}:
         raise SystemExit(f"unsafe mixed source mode: {display_escape(path, 500)} ({mode})")
     return SourceVersion(f"git:{oid}:{mode}", mode, None)
 
