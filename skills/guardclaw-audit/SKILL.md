@@ -89,12 +89,17 @@ guardclaw verify ./.agent_audit --pinned-key "$TRUSTED_PUBKEY"
 Or verify in Python against the pinned trusted public key:
 
 ```python
-from guardclaw import verify_ledger
+from pathlib import Path
+from guardclaw import verify_ledger, Ed25519KeyManager
 
-# Verifier supplies expected public key anchored outside the ledger
+# 1. Load expected public key from trusted location (outside audited directory)
+trusted_key_file = Path.home() / ".openclaw" / "keys" / "agent_signing_key.json"
+key_mgr = Ed25519KeyManager.load(str(trusted_key_file))
+trusted_pubkey = key_mgr.public_key_hex
+
+# 2. Verify ledger integrity against anchored identity
 summary = verify_ledger("./.agent_audit")
 
-# Ensure the chain is mathematically valid AND signed by the trusted agent identity
 if summary["chain_valid"] and summary.get("signer_public_key") == trusted_pubkey:
     print(f"Verified {summary['verified_count']} records with zero tampering from trusted agent.")
 else:
