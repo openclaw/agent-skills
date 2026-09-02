@@ -22,9 +22,14 @@ Best-effort local-only cryptographic flight recorder for OpenClaw agents. Use du
 - **Outputs**: Append-only `ledger.jsonl` with detached Ed25519 signatures and causal hash chains.
 - **Failure Modes**: Missing keys or corrupted entries yield `INVALID` during verification; runtime emission failures log warnings without blocking foreground agent workflows.
 
-## Quickstart
+## Package Provenance & Installation
 
-Install the lightweight audit library (pinned release):
+GuardClaw is an open-source, Apache-2.0 licensed cryptographic execution auditor published on PyPI:
+- **Source Repository**: [https://github.com/viruswami5511/guardclaw](https://github.com/viruswami5511/guardclaw)
+- **PyPI Release**: [https://pypi.org/project/guardclaw/0.8.2/](https://pypi.org/project/guardclaw/0.8.2/)
+- **Protocol Specification**: [GEF-SPEC-1.0](https://github.com/viruswami5511/guardclaw/blob/master/SPEC.md)
+
+Install the verified release:
 
 ```bash
 pip install "guardclaw==0.8.2"
