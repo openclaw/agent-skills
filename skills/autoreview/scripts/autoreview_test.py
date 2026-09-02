@@ -162,7 +162,7 @@ class AutoreviewResultScopeTests(unittest.TestCase):
                 AUTOREVIEW, "scan_outgoing_review_pack"
             ), mock.patch.object(AUTOREVIEW, "run_engine", return_value=json.dumps(DRAFT_REPORT)):
                 reports = AUTOREVIEW.run_review_passes(
-                    args, [args], Path.cwd(), ["pack"] * count, {"draft.js"}, False
+                    args, [args], Path.cwd(), ["pack"] * count, {"draft.js"}
                 )
             report = reports[0][1] if count == 1 else AUTOREVIEW.merge_chunk_reports(reports)
             self.assertEqual(
@@ -300,7 +300,7 @@ class AutoreviewTargetResultTests(unittest.TestCase):
                     self.assertIn(text, output.getvalue())
 
     def test_all_engines_keep_raw_reports_before_normalization_and_filters(self):
-        captured = AUTOREVIEW.CapturedBundle("delta", False, {self.record.path}, (self.record,), ())
+        captured = AUTOREVIEW.CapturedBundle("delta", {self.record.path}, (self.record,), ())
         prompt = AUTOREVIEW.ReviewPass("synthetic pack", AUTOREVIEW.ReviewChunk("delta", sources=(self.record,)))
         valid = self.finding()
         valid["code_location"]["file_path"] = r".\src\migrate.py"
