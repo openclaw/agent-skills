@@ -841,6 +841,54 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                 self.assertEqual(record.base.mode, "100644")
                 self.assertEqual(record.index.mode, "100755")
 
+    def test_git_display_settings_preserve_mixed_sources_and_chunk_coordinates(self):
+        settings = (
+            (), (("diff.suppressBlankEmpty", "false"),),
+            (("diff.suppressBlankEmpty", "true"),),
+            (("diff.suppress-blank-empty", "true"),),
+            (("color.ui", "always"),), (("color.diff", "always"),),
+            (("diff.color", "always"),),
+            (("diff.suppressBlankEmpty", "true"), ("color.diff", "always")),
+        )
+        for config in settings:
+            for pinned in (False, True):
+                with self.subTest(config=config, pinned=pinned), tempfile.TemporaryDirectory() as tempdir:
+                    repo = init_repo(Path(tempdir))
+                    git(repo, "config", "core.autocrlf", "false")
+                    for key, value in config:
+                        git(repo, "config", key, value)
+                    path = repo / "source.py"
+                    path.write_bytes(b"one\n\nbase\n")
+                    git(repo, "add", ".")
+                    git(repo, "commit", "-qm", "base")
+                    base = git(repo, "rev-parse", "HEAD").strip()
+                    if pinned:
+                        path.write_bytes(b"one\n\nhead\n")
+                        git(repo, "commit", "-qam", "advance HEAD")
+                    path.write_bytes(b"one\n\nstaged\n")
+                    git(repo, "add", ".")
+                    path.write_bytes(b"one\n\nworking\n")
+                    original_config = (repo / ".git/config").read_bytes()
+                    captured = self.helper["local_bundle"](repo, base if pinned else None)
+                    record, = captured.mixed
+                    self.assertEqual(record.base.content, "one\n\nbase\n")
+                    self.assertEqual(record.index.content, "one\n\nstaged\n")
+                    self.assertEqual(record.working_tree.content, "one\n\nworking\n")
+                    self.assertEqual(record.index_removed, ((3, "base"),))
+                    self.assertEqual(record.working_tree_removed, ((3, "staged"),))
+                    self.helper["verify_mixed_sources"](repo, captured.mixed)
+                    for patch in (record.staged, record.unstaged):
+                        self.assertNotIn("\x1b", patch)
+                        context = []
+                        new_line = old_line = None
+                        in_hunk = False
+                        for line in self.helper["literal_lf_lines"](patch):
+                            new_line, old_line, in_hunk = self.helper["update_review_chunk_context"](
+                                context, line, new_line, old_line, in_hunk,
+                            )
+                        self.assertEqual((new_line, old_line), (4, 4))
+                    self.assertEqual((repo / ".git/config").read_bytes(), original_config)
+
     def test_readded_untracked_capture_is_reused_and_evidence_stays_separate(self):
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))

@@ -34,25 +34,6 @@ from typing import Any, BinaryIO, Callable, NamedTuple
 
 ENGINES = ("codex", "claude", "amp", "pi", "kimi")
 ENGINE_CHOICES = ENGINES
-SAFE_GIT_CONFIG_ARGS = (
-    "-c",
-    "core.fsmonitor=false",
-    "-c",
-    "core.pager=cat",
-    "-c",
-    "diff.external=",
-    "-c",
-    "diff.renames=false",
-    "-c",
-    "pager.diff=cat",
-    "-c",
-    "pager.log=cat",
-    "-c",
-    "pager.show=cat",
-)
-SAFE_DIFF_FLAGS = ("--no-ext-diff", "--no-textconv", "--no-renames")
-COMMIT_DIFF_FLAGS = (*SAFE_DIFF_FLAGS, "--root", "--no-commit-id", "-r")
-DIFF_HUNK_CONTENT_BOUNDARY = "\0autoreview-diff-hunk-boundary\0"
 ENGINE_GIT_CONFIG_OVERRIDES = (
     ("core.fsmonitor", "false"),
     ("core.pager", "cat"),
@@ -62,6 +43,13 @@ ENGINE_GIT_CONFIG_OVERRIDES = (
     ("pager.log", "cat"),
     ("pager.show", "cat"),
 )
+# Machine-parsed diffs require space-prefixed empty context lines.
+SAFE_GIT_CONFIG_ARGS = tuple(
+    arg for key, value in ENGINE_GIT_CONFIG_OVERRIDES for arg in ("-c", f"{key}={value}")
+) + ("-c", "diff.suppressBlankEmpty=false")
+SAFE_DIFF_FLAGS = ("--no-ext-diff", "--no-textconv", "--no-renames", "--no-color")
+COMMIT_DIFF_FLAGS = (*SAFE_DIFF_FLAGS, "--root", "--no-commit-id", "-r")
+DIFF_HUNK_CONTENT_BOUNDARY = "\0autoreview-diff-hunk-boundary\0"
 SENSITIVE_PATH_PARTS = {
     ".aws",
     ".azure",
