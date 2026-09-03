@@ -28,11 +28,18 @@ GuardClaw is an open-source, Apache-2.0 licensed cryptographic execution auditor
 - **Source Repository**: [https://github.com/viruswami5511/guardclaw](https://github.com/viruswami5511/guardclaw)
 - **PyPI Release**: [https://pypi.org/project/guardclaw/0.8.2/](https://pypi.org/project/guardclaw/0.8.2/)
 - **Protocol Specification**: [GEF-SPEC-1.0](https://github.com/viruswami5511/guardclaw/blob/master/SPEC.md)
+- **Artifact SHA-256 (Wheel)**: `65a51259279df38e83dca9577d3097cf9fa3311ff4f761b29ff8482d43697e34`
 
 Install the verified release:
 
 ```bash
 pip install "guardclaw==0.8.2"
+```
+
+To enforce strict cryptographic artifact verification via pip:
+
+```bash
+pip install guardclaw==0.8.2 --no-deps --require-hashes -r <(echo "guardclaw==0.8.2 --hash=sha256:65a51259279df38e83dca9577d3097cf9fa3311ff4f761b29ff8482d43697e34")
 ```
 
 ### 1. Emit Signed Intent & Execution Receipts
