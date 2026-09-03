@@ -384,6 +384,30 @@ test("standalone parser handles modern Codex items without reasoning or raw outp
   );
 });
 
+test("standalone parser ignores persisted Codex inter-agent messages", () => {
+  const session = path.join(tempDir(), "rollout.jsonl");
+  writeJsonl(session, [
+    { type: "session_meta", payload: { id: "33333333-4444-4555-8666-777777777777" } },
+    { type: "response_item", payload: { type: "function_call", name: "read_file" } },
+    {
+      type: "response_item",
+      payload: {
+        type: "agent_message",
+        author: "agent-a",
+        recipient: "agent-b",
+        content: [{ type: "input_text", text: "private inter-agent coordination" }],
+      },
+    },
+    { type: "response_item", payload: { type: "function_call", name: "exec_command" } },
+  ]);
+
+  const rendered = renderSession(session, { source: "codex" });
+  assert.deepEqual(rendered.items, [
+    { type: "other", text: "1 read, 1 execute; raw tool outputs dropped: 0" },
+  ]);
+  assert.doesNotMatch(JSON.stringify(rendered), /private inter-agent coordination/);
+});
+
 test("publish dry-run emits a sanitized versioned payload", async () => {
   const session = claudeSession();
   const result = await run([

@@ -748,6 +748,7 @@ function parseCodex(rows, options) {
     }
     if (row.type !== "response_item") continue;
     const type = normalizedType(payload.type);
+    if (type === "agentmessage") continue;
     if (payload.role === "user" || payload.role === "assistant") {
       if (hasEventDialogue) continue;
       pushMessage(
