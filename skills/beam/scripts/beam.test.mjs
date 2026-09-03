@@ -177,6 +177,14 @@ test("standalone sanitizer keeps ordinary AGENTS.md tasks", () => {
   );
 });
 
+test("standalone sanitizer keeps its truncation marker inside the receiver item limit", () => {
+  const input = "visible ".repeat(900).trim();
+  const value = sanitizeVisibleText(input, { maxChars: 6_000 });
+
+  assert.equal(value.length, 6_000);
+  assert.match(value, /\n\.\.\.\[truncated \d+ chars\]$/);
+});
+
 test("standalone Claude discovery requires one exact session-id filename", () => {
   const configDir = tempDir();
   const projectDir = path.join(configDir, "projects", "demo");
@@ -460,7 +468,7 @@ test("publish honors the total max-chars disclosure limit", async () => {
   assert.doesNotMatch(payload.title, /^alpha/);
 });
 
-test("publish preserves a visible message when byte trimming drops tool summaries", async () => {
+test("publish keeps multibyte transcript items within receiver limits", async () => {
   const session = path.join(tempDir(), "multibyte.jsonl");
   writeJsonl(session, [
     { type: "user", message: { role: "user", content: "🦞".repeat(20_000) } },
@@ -474,8 +482,6 @@ test("publish preserves a visible message when byte trimming drops tool summarie
     session,
     "--max-chars",
     "48000",
-    "--entry-max-chars",
-    "48000",
     "--dry-run",
     "--quiet",
   ]);
@@ -483,8 +489,27 @@ test("publish preserves a visible message when byte trimming drops tool summarie
   assert.equal(result.code, 0, result.stderr);
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.items.some((item) => item.type === "userMessage"), true);
-  assert.equal(payload.items.every((item) => item.type !== "other"), true);
-  assert.equal(payload.truncated, true);
+  assert.equal(payload.items.some((item) => item.type === "other"), true);
+  assert.equal(payload.items.every((item) => item.text.length <= 6_000), true);
+  assert.ok(Buffer.byteLength(JSON.stringify(payload)) <= 52 * 1024);
+});
+
+test("publish rejects an entry limit above the receiver maximum", async () => {
+  const result = await run([
+    "publish",
+    "--endpoint",
+    "http://127.0.0.1:9/api/v1/beam/sessions",
+    "--session",
+    claudeSession(),
+    "--entry-max-chars",
+    "6001",
+    "--dry-run",
+    "--quiet",
+  ]);
+
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /--entry-max-chars must be at most 6000/);
+  assert.equal(result.stdout, "");
 });
 
 test("publish accepts IPv6 loopback development endpoints", async () => {

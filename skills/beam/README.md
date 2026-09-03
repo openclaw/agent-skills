@@ -154,6 +154,10 @@ Gateway HTTP authentication. Uploads require `operator.write` or
 `operator.admin`. Every `operator.read` client on that Gateway can view the
 catalog, so a separate Gateway remains the isolation boundary between teams.
 
+The receiver rejects transcript item text longer than 6,000 characters.
+Accordingly, explicit `--entry-max-chars` values above 6,000 fail locally
+before upload.
+
 The catalog has no continue, archive, terminal, tool, or node capability.
 
 For rollout compatibility, the helper also accepts the current server's exact

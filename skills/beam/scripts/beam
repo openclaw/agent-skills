@@ -12,6 +12,7 @@ import {
 
 const MAX_UPLOAD_BYTES = 52 * 1024;
 const MAX_UPLOAD_ITEMS = 200;
+const MAX_UPLOAD_ITEM_CHARS = 6_000;
 const DEFAULT_TIMEOUT_MS = 15_000;
 
 function usage() {
@@ -120,7 +121,7 @@ function resolveSession(options, hook) {
 
 function normalizeItems(rendered, hook, options) {
   const items = rendered.items.map((item) => ({ ...item }));
-  const entryMaxChars = positiveInteger(options["entry-max-chars"], 6_000, "--entry-max-chars");
+  const entryMaxChars = parseEntryMaxChars(options);
   const lastAssistant =
     typeof hook.last_assistant_message === "string" && hook.last_assistant_message.trim()
       ? sanitizeVisibleText(hook.last_assistant_message, { maxChars: entryMaxChars })
@@ -139,6 +140,18 @@ function positiveInteger(value, fallback, label, minimum = 1) {
     throw new Error(`${label} must be an integer of at least ${minimum}`);
   }
   return Math.floor(parsed);
+}
+
+function parseEntryMaxChars(options) {
+  const value = positiveInteger(
+    options["entry-max-chars"],
+    MAX_UPLOAD_ITEM_CHARS,
+    "--entry-max-chars",
+  );
+  if (value > MAX_UPLOAD_ITEM_CHARS) {
+    throw new Error(`--entry-max-chars must be at most ${MAX_UPLOAD_ITEM_CHARS}`);
+  }
+  return value;
 }
 
 function titleFromItems(items) {
@@ -210,7 +223,7 @@ function buildPayload(options, hook) {
   const session = resolveSession(options, hook);
   const rendered = renderSession(session.file, {
     source: session.source,
-    maxChars: positiveInteger(options["entry-max-chars"], 6_000, "--entry-max-chars"),
+    maxChars: parseEntryMaxChars(options),
   });
   const items = normalizeItems(rendered, hook, options);
   if (!items.length) throw new Error("the sanitized session contains no shareable messages");

@@ -576,9 +576,16 @@ export function sanitizeVisibleText(input, options = {}) {
   text = redact(text, stats).replace(/\n{3,}/g, "\n\n").trim();
   if (unsafePatterns(text).length) throw new Error("unsafe transcript text remains after redaction");
   const maxChars = Number(options.maxChars || DEFAULT_ENTRY_MAX_CHARS);
-  return text.length > maxChars
-    ? `${text.slice(0, maxChars).trimEnd()}\n...[truncated ${text.length - maxChars} chars]`
-    : text;
+  if (text.length <= maxChars) return text;
+  let omitted = text.length - maxChars;
+  while (true) {
+    const marker = `\n...[truncated ${omitted} chars]`;
+    if (marker.length >= maxChars) return marker.slice(0, maxChars);
+    const visible = text.slice(0, maxChars - marker.length).trimEnd();
+    const nextOmitted = text.length - visible.length;
+    if (nextOmitted === omitted) return `${visible}${marker}`;
+    omitted = nextOmitted;
+  }
 }
 
 function toolFamily(name) {
