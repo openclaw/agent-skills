@@ -1013,6 +1013,66 @@ class AutoreviewInputTests(unittest.TestCase):
 
 
 class AutoreviewCompatibilityTests(unittest.TestCase):
+    def test_astra_rejects_unsupported_effort_from_cli_and_environment(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-invalid-effort.") as tempdir:
+            for effort in ("none", "minimal", "ultra"):
+                for source in ("cli", "keyed-cli", "environment", "global-environment"):
+                    with self.subTest(effort=effort, source=source):
+                        argv = [sys.executable, str(SCRIPT_PATH), "--engine", "codex",
+                                "--codex-bin", str(Path(tempdir) / "missing-codex")]
+                        env = {key: value for key, value in os.environ.items()
+                               if not key.startswith("AUTOREVIEW_")}
+                        if source in {"cli", "keyed-cli"}:
+                            prefix = "codex=" if source == "keyed-cli" else ""
+                            argv += ["--model", prefix + "gpt-6-astra", "--thinking", prefix + effort]
+                        else:
+                            prefix = "AUTOREVIEW_CODEX_" if source == "environment" else "AUTOREVIEW_"
+                            env.update({prefix + "MODEL": "gpt-6-astra", prefix + "THINKING": effort})
+                        # No Git repository or engine exists: rejection must precede preparation.
+                        result = subprocess.run(argv, cwd=tempdir, env=env, text=True,
+                                                capture_output=True, timeout=30)
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        self.assertEqual(result.stdout, "")
+                        self.assertEqual(result.stderr.strip(),
+                                         f"invalid thinking level for codex model gpt-6-astra: {effort} "
+                                         "(valid: high, low, max, medium, xhigh)")
+
+    def test_astra_validation_uses_effective_cli_overrides(self) -> None:
+        cases = (
+            ({"AUTOREVIEW_CODEX_MODEL": "gpt-6-astra", "AUTOREVIEW_CODEX_THINKING": "none"},
+             ["--thinking", "high"], "gpt-6-astra", "high"),
+            ({"AUTOREVIEW_CODEX_MODEL": "gpt-6-astra", "AUTOREVIEW_CODEX_THINKING": "minimal"},
+             ["--model", "gpt-5.6-sol"], "gpt-5.6-sol", "minimal"),
+        )
+        for env, overrides, model, effort in cases:
+            with self.subTest(overrides=overrides), mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(sys, "argv", ["autoreview", "--engine", "codex", *overrides]):
+                reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+                self.assertEqual(reviewer.model, model)
+                self.assertEqual(reviewer.thinking, effort)
+
+    def test_astra_preserves_supported_effort_and_explicit_model(self) -> None:
+        for effort in (None, "low", "medium", "high", "xhigh", "max"):
+            with self.subTest(effort=effort):
+                argv = ["autoreview", "--engine", "codex", "--model", "gpt-6-astra"]
+                if effort:
+                    argv += ["--thinking", effort]
+                with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(sys, "argv", argv):
+                    reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+                self.assertEqual(reviewer.model, "gpt-6-astra")
+                self.assertEqual(reviewer.thinking, effort or "high")
+                self.assertIsNone(reviewer.fallback_model)
+
+    def test_astra_effort_restrictions_do_not_change_other_codex_models(self) -> None:
+        for effort in ("none", "minimal"):
+            with self.subTest(effort=effort), mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                sys, "argv", ["autoreview", "--engine", "codex", "--thinking", effort],
+            ):
+                reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+                self.assertEqual(reviewer.model, "gpt-5.6-sol")
+                self.assertEqual(reviewer.thinking, effort)
+                self.assertEqual(reviewer.fallback_model, "gpt-5.6-terra")
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.home_dir = tempfile.TemporaryDirectory(prefix="autoreview-test-home.")

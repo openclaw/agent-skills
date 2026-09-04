@@ -4,6 +4,7 @@
 
 **Highlights:** Authenticated proxy support for isolated reviews, explicit reviewer availability, and controlled session sharing.
 
+- Reject unsupported GPT-6 Astra reasoning efforts before Autoreview preparation, document explicit invocation, and keep source instructions subordinate to the noninteractive review contract. Thanks @coygeek.
 - Support launcher-provided authenticated HTTP/SOCKS proxies in Autoreview, preserve external transport trust settings, and redact proxy credentials from diagnostics and reports without changing reviewer isolation. Thanks @fuller-stack-dev.
 - Fix Claude reviewer startup when the CLI truncates piped help output, while retaining mandatory isolation checks. Thanks @phyrexia.
 - Add opt-in Autoreview `--status-output` to distinguish unavailable reviewers from clean, adverse, filtered, and incomplete reviews without changing existing report JSON or exit codes. Thanks @coygeek.
