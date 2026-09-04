@@ -19,7 +19,7 @@ it leaves review judgment to Codex. For an OpenClaw checkout:
 
 ```bash
 AUTOREVIEW=".agents/skills/autoreview/scripts/autoreview"
-"$AUTOREVIEW" --mode local --model gpt-6-astra
+"$AUTOREVIEW" --mode local
 ```
 
 In the canonical agent-skills repo, the path is
@@ -81,11 +81,9 @@ parent-relative patch; otherwise leave the attribution unknown.
 
 ## Engines
 
-Codex is the default engine. Use `--model gpt-6-astra` with high reasoning for
-Codex reviews unless the caller explicitly chooses another model. Pass the model
-explicitly on every Codex invocation to override the helper's built-in default.
-Honor explicit engine/model choices; do not switch because a review is slow or
-rate-limited.
+Codex is the default: `gpt-6-astra`, high reasoning, with no automatic model
+fallback. Honor explicit engine/model choices; do not switch because a review is
+slow or rate-limited.
 
 Use `--engine`, `--model`, and `--thinking` to override the defaults.
 `--codex-speed fast` selects priority service when supported. Only Claude accepts

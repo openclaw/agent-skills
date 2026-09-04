@@ -1092,6 +1092,16 @@ class AutoreviewTruffleHogTests(unittest.TestCase):
 
 
 class AutoreviewCompatibilityTests(unittest.TestCase):
+    def test_codex_defaults_to_astra_without_fallback(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            sys, "argv", ["autoreview"]
+        ):
+            reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+        self.assertEqual(reviewer.engine, "codex")
+        self.assertEqual(reviewer.model, "gpt-6-astra")
+        self.assertEqual(reviewer.thinking, "high")
+        self.assertIsNone(reviewer.fallback_model)
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.home_dir = tempfile.TemporaryDirectory(prefix="autoreview-test-home.")

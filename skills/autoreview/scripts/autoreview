@@ -373,10 +373,9 @@ PROVIDER_CREDENTIAL_PATH_ENV_KEYS = {
 }
 DEFAULT_MODEL_BY_ENGINE = {
     "amp": "openai/gpt-5.6-sol",
-    "codex": "gpt-5.6-sol",
+    "codex": "gpt-6-astra",
     "claude": "claude-fable-5",
 }
-DEFAULT_CODEX_ACCESS_FALLBACK_MODEL = "gpt-5.6-terra"
 AMP_THINKING_VALUES = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
 DEFAULT_THINKING_BY_ENGINE = {
     "amp": "high",
@@ -6025,7 +6024,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         action="append",
-        help="Model override or engine=model. Repeatable. Defaults: codex=gpt-5.6-sol with an access-only gpt-5.6-terra retry, claude=claude-fable-5, amp=openai/gpt-5.6-sol.",
+        help="Model override or engine=model. Repeatable. Defaults: codex=gpt-6-astra, claude=claude-fable-5, amp=openai/gpt-5.6-sol.",
     )
     parser.add_argument("--thinking", action="append", help="Thinking/effort override or engine=level. Repeatable. Codex: none, minimal, low, medium, high, xhigh, max. Claude: low, medium, high, xhigh, max. Amp: none, low, medium, high, xhigh, max. Pi: off, minimal, low, medium, high, xhigh. Kimi: off, on.")
     parser.add_argument(
@@ -6189,8 +6188,6 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
             or env_fallback_by_engine.get(engine)
             or env_global_fallback
         )
-    elif engine == "codex" and model == DEFAULT_MODEL_BY_ENGINE["codex"]:
-        fallback_model = DEFAULT_CODEX_ACCESS_FALLBACK_MODEL
     else:
         fallback_model = None
     if thinking and thinking not in THINKING_LEVELS_BY_ENGINE[engine]:
