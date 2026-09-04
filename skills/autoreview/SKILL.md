@@ -106,6 +106,12 @@ Source-controlled ignore tags cannot suppress this gate. Scanner refusals never
 echo input headings or finding payloads; remove credentials locally and rerun.
 Never reproduce credentials in findings or work around an isolation failure.
 
+On macOS, reviewer tools cannot access the shared `/tmp` and `/var/tmp` trees
+(including their `/private` aliases). The review workspace must remain outside
+those trees; unset a shared `TMPDIR`/`TMP`/`TEMP` override to use macOS's private
+temporary directory. Other engines and platforms retain their normal isolation.
+Tools installed in shared scratch or requiring writes there will be denied too.
+
 Review files have no size/count cap and are never truncated. Large diffs and
 datasets are partitioned automatically. Intact instructions and required mixed
 source context must still fit the per-pass prompt budget. A failed pass does not

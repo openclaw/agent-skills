@@ -36,7 +36,7 @@ jobs:
           python scripts/install-skills.test.py
           python scripts/validate-skills.test.py
       - name: Run Python tests
-        run: python -m unittest skills/autoreview/scripts/autoreview_test.py skills.autoreview.tests.test_autoreview_hardening
+        run: python -m unittest skills/autoreview/scripts/autoreview_test.py skills.autoreview.tests.test_autoreview_hardening skills.autoreview.tests.test_codex_sandbox
       - name: Check Node scripts
         run: |
           node --check skills/agent-transcript/scripts/agent-transcript

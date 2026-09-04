@@ -3712,6 +3712,20 @@ def toml_inline_string_table(values: dict[str, str]) -> str:
 
 def codex_config_isolation_flags(repo: Path, runtime_root: Path) -> list[str]:
     tool_env = toml_inline_string_table(codex_tool_git_env())
+    filesystem = {":minimal": "read", ":workspace_roots": "read"}
+    if sys.platform == "darwin":
+        # Codex's macOS process defaults otherwise grant shared scratch access.
+        # Glob denies override those defaults but cannot reopen a nested workspace.
+        scratch_roots = ("/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp")
+        if any(is_within(repo.resolve(), Path(root)) for root in scratch_roots):
+            raise SystemExit(
+                "Codex review workspace must be outside shared scratch directories; "
+                "unset TMPDIR/TMP/TEMP to use the macOS private temporary directory"
+            )
+        filesystem.update({f"{root}{{,/**}}": "deny" for root in scratch_roots})
+    filesystem_config = ",".join(
+        f"{json.dumps(path)}={json.dumps(access)}" for path, access in filesystem.items()
+    )
     state_home = runtime_root / "state"
     log_dir = runtime_root / "log"
     state_home.mkdir(parents=True, exist_ok=True)
@@ -3748,7 +3762,7 @@ def codex_config_isolation_flags(repo: Path, runtime_root: Path) -> list[str]:
         "-c",
         'default_permissions="autoreview"',
         "-c",
-        'permissions.autoreview.filesystem={":minimal"="read",":workspace_roots"="read"}',
+        f"permissions.autoreview.filesystem={{{filesystem_config}}}",
     ]
 
 

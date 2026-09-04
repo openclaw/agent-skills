@@ -4933,9 +4933,12 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
             "shell_environment_policy.experimental_use_profile=false",
             "allow_login_shell=false",
             'default_permissions="autoreview"',
-            'permissions.autoreview.filesystem={":minimal"="read",":workspace_roots"="read"}',
         ):
             self.assertIn(required, flags)
+        filesystem = '":minimal"="read",":workspace_roots"="read"'
+        if sys.platform == "darwin":
+            filesystem += ',"/tmp{,/**}"="deny","/private/tmp{,/**}"="deny","/var/tmp{,/**}"="deny","/private/var/tmp{,/**}"="deny"'
+        self.assertIn(f"permissions.autoreview.filesystem={{{filesystem}}}", flags)
         set_flag = next(
             flag for flag in flags if flag.startswith("shell_environment_policy.set=")
         )
