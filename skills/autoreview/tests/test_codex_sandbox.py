@@ -15,18 +15,6 @@ HELPER = Path(__file__).resolve().parents[1] / "scripts" / "autoreview"
 
 @unittest.skipUnless(sys.platform == "darwin" and shutil.which("codex"), "requires macOS and Codex")
 class CodexSandboxTests(unittest.TestCase):
-    def test_workspace_in_shared_scratch_is_rejected_before_runtime_setup(self):
-        helper = runpy.run_path(str(HELPER), run_name="autoreview_under_test")
-        for scratch_root in ("/private/tmp", "/private/var/tmp"):
-            with self.subTest(root=scratch_root), tempfile.TemporaryDirectory(
-                prefix="autoreview-scratch-test.", dir=scratch_root,
-            ) as scratch:
-                for spelling in (scratch, scratch.removeprefix("/private")):
-                    root = Path(spelling)
-                    with self.assertRaisesRegex(SystemExit, "outside shared scratch"):
-                        helper["codex_config_isolation_flags"](root, root / "runtime")
-                    self.assertFalse((root / "runtime").exists())
-
     def test_shared_scratch_is_denied_but_workspace_remains_read_only(self):
         helper = runpy.run_path(str(HELPER), run_name="autoreview_under_test")
         private_temp_root = Path(tempfile.gettempdir()).resolve()

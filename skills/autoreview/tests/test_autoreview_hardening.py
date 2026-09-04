@@ -4910,6 +4910,55 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
                 os.environ.clear()
                 os.environ.update(old)
 
+    @unittest.skipIf(os.name == "nt", "POSIX shared scratch roots")
+    def test_codex_rejects_shared_scratch_before_runtime_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            binary = write_executable(root / "codex", fake_codex_script())
+            source_home = root / "synthetic-auth-home"
+            source_home.mkdir()
+            source_auth = source_home / "auth.json"
+            source_auth.write_text('{"fixture":"synthetic"}')
+            auth_before = source_auth.read_bytes()
+            links_before = source_auth.stat().st_nlink
+            args = argparse.Namespace(
+                codex_bin=str(binary), model=None, tools=True, web_search=False,
+                thinking=None, codex_config=[], codex_speed=None,
+                stream_engine_output=False,
+            )
+            for scratch_root in ("/tmp", "/var/tmp"):
+                for entry in ("ensure_codex_isolation_supported", "run_codex"):
+                    with self.subTest(root=scratch_root, entry=entry), tempfile.TemporaryDirectory(
+                        prefix="autoreview-scratch-order.", dir=scratch_root,
+                    ) as scratch:
+                        runtime_auth = mock.Mock(wraps=self.helper["prepare_codex_runtime_auth"])
+                        with (
+                            mock.patch.dict(os.environ, {
+                                "PATH": os.environ["PATH"], "CODEX_HOME": str(source_home),
+                                "HOME": str(root),
+                            }, clear=True),
+                            mock.patch.object(sys, "platform", "darwin"),
+                            mock.patch.object(tempfile, "gettempdir", return_value=scratch),
+                            mock.patch.object(tempfile, "TemporaryDirectory", wraps=tempfile.TemporaryDirectory) as directories,
+                            mock.patch.object(tempfile, "NamedTemporaryFile", wraps=tempfile.NamedTemporaryFile) as files,
+                            mock.patch.dict(self.helper[entry].__globals__, {
+                                "prepare_codex_runtime_auth": runtime_auth,
+                            }),
+                        ):
+                            self.assertEqual(self.helper["safe_temp_root"](repo), Path(scratch).resolve())
+                            with self.assertRaisesRegex(SystemExit, "outside shared scratch"):
+                                if entry == "run_codex":
+                                    self.helper[entry](args, repo, "synthetic review input")
+                                else:
+                                    self.helper[entry](args, repo)
+                            runtime_auth.assert_not_called()
+                            directories.assert_not_called()
+                            files.assert_not_called()
+                        self.assertEqual(list(Path(scratch).iterdir()), [])
+                        self.assertEqual(source_auth.read_bytes(), auth_before)
+                        self.assertEqual(source_auth.stat().st_nlink, links_before)
+
     def test_codex_isolation_restricts_tool_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)

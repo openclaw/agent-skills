@@ -360,6 +360,7 @@ CODEX_TRUST_PATH_ENV_KEYS = {
     "SSL_CERT_DIR",
     "SSL_CERT_FILE",
 }
+CODEX_MACOS_SCRATCH_ROOTS = ("/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp")
 PROVIDER_CREDENTIAL_PATH_ENV_KEYS = {
     "AWS_CONFIG_FILE",
     "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
@@ -644,7 +645,7 @@ def safe_dbus_session_address(repo: Path, value: str) -> bool:
     return Path(path).is_absolute() and external_env_path(repo, path)
 
 
-def safe_temp_root(repo: Path) -> Path:
+def safe_temp_root(repo: Path, *, engine: str | None = None) -> Path:
     try:
         root = Path(tempfile.gettempdir()).resolve(strict=True)
     except OSError as exc:
@@ -653,6 +654,14 @@ def safe_temp_root(repo: Path) -> Path:
         raise SystemExit(
             "temporary directory must be outside the reviewed repository; "
             "unset or relocate TMPDIR/TMP/TEMP"
+        )
+    # Reject before Codex's probe or runtime can put file auth in shared scratch.
+    if engine == "codex" and sys.platform == "darwin" and any(
+        is_within(root, Path(scratch)) for scratch in CODEX_MACOS_SCRATCH_ROOTS
+    ):
+        raise SystemExit(
+            "Codex temporary directory must be outside shared scratch directories; "
+            "unset TMPDIR/TMP/TEMP to use the macOS private temporary directory"
         )
     return root
 
@@ -3715,14 +3724,8 @@ def codex_config_isolation_flags(repo: Path, runtime_root: Path) -> list[str]:
     filesystem = {":minimal": "read", ":workspace_roots": "read"}
     if sys.platform == "darwin":
         # Codex's macOS process defaults otherwise grant shared scratch access.
-        # Glob denies override those defaults but cannot reopen a nested workspace.
-        scratch_roots = ("/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp")
-        if any(is_within(repo.resolve(), Path(root)) for root in scratch_roots):
-            raise SystemExit(
-                "Codex review workspace must be outside shared scratch directories; "
-                "unset TMPDIR/TMP/TEMP to use the macOS private temporary directory"
-            )
-        filesystem.update({f"{root}{{,/**}}": "deny" for root in scratch_roots})
+        # Glob denies cover the root's listing as well as its descendants.
+        filesystem.update({f"{root}{{,/**}}": "deny" for root in CODEX_MACOS_SCRATCH_ROOTS})
     filesystem_config = ",".join(
         f"{json.dumps(path)}={json.dumps(access)}" for path, access in filesystem.items()
     )
@@ -3973,7 +3976,7 @@ def ensure_codex_isolation_supported(
 ) -> str:
     selected_bin = args.codex_bin
     codex_bin = resolve_command(selected_bin, repo)
-    temp_root = safe_temp_root(repo)
+    temp_root = safe_temp_root(repo, engine="codex")
     with tempfile.TemporaryDirectory(
         prefix="autoreview-codex-probe-workspace.",
         dir=temp_root,
@@ -4580,7 +4583,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     if not args.tools:
         raise SystemExit("--no-tools is not supported by the Codex engine; use --engine claude --no-tools for a no-tools run")
     ensure_codex_isolation_supported(args, repo)
-    temp_root = safe_temp_root(repo)
+    temp_root = safe_temp_root(repo, engine="codex")
     schema_path = write_json_temp(SCHEMA, temp_root)
     with tempfile.NamedTemporaryFile(
         "w",

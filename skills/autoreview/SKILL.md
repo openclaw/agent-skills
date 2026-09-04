@@ -107,8 +107,9 @@ echo input headings or finding payloads; remove credentials locally and rerun.
 Never reproduce credentials in findings or work around an isolation failure.
 
 On macOS, reviewer tools cannot access the shared `/tmp` and `/var/tmp` trees
-(including their `/private` aliases). The review workspace must remain outside
-those trees; unset a shared `TMPDIR`/`TMP`/`TEMP` override to use macOS's private
+(including their `/private` aliases). Codex preflight rejects those temporary
+roots before workspace, runtime, or authentication setup; unset a shared
+`TMPDIR`/`TMP`/`TEMP` override to use macOS's private
 temporary directory. Other engines and platforms retain their normal isolation.
 Tools installed in shared scratch or requiring writes there will be denied too.
 
