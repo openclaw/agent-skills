@@ -581,7 +581,18 @@ export function sanitizeVisibleText(input, options = {}) {
   while (true) {
     const marker = `\n...[truncated ${omitted} chars]`;
     if (marker.length >= maxChars) return marker.slice(0, maxChars);
-    const visible = text.slice(0, maxChars - marker.length).trimEnd();
+    let cutoff = maxChars - marker.length;
+    const lastCodeUnit = text.charCodeAt(cutoff - 1);
+    const nextCodeUnit = text.charCodeAt(cutoff);
+    if (
+      lastCodeUnit >= 0xd800 &&
+      lastCodeUnit <= 0xdbff &&
+      nextCodeUnit >= 0xdc00 &&
+      nextCodeUnit <= 0xdfff
+    ) {
+      cutoff--;
+    }
+    const visible = text.slice(0, cutoff).trimEnd();
     const nextOmitted = text.length - visible.length;
     if (nextOmitted === omitted) return `${visible}${marker}`;
     omitted = nextOmitted;

@@ -185,6 +185,15 @@ test("standalone sanitizer keeps its truncation marker inside the receiver item 
   assert.match(value, /\n\.\.\.\[truncated \d+ chars\]$/);
 });
 
+test("standalone sanitizer preserves astral characters at the truncation boundary", () => {
+  const value = sanitizeVisibleText("🦞".repeat(3_487), { maxChars: 6_000 });
+
+  assert.ok(value.length <= 6_000);
+  assert.match(value, /\n\.\.\.\[truncated \d+ chars\]$/);
+  assert.equal(Buffer.from(value, "utf8").toString("utf8"), value);
+  assert.equal(value.includes("\ufffd"), false);
+});
+
 test("standalone Claude discovery requires one exact session-id filename", () => {
   const configDir = tempDir();
   const projectDir = path.join(configDir, "projects", "demo");
