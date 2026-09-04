@@ -26,6 +26,7 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "autoreview"
 FIXTURES = Path(__file__).with_name("fixtures")
 PRIVATE_KEY_BEGIN_TEXT = "BEGIN " + "PRIVATE KEY"
 RSA_PRIVATE_KEY_BEGIN_TEXT = "BEGIN RSA " + "PRIVATE KEY"
+PROXY_CREDENTIALS = "review-user:" + "review-password"
 
 
 def write_executable(path: Path, text: str) -> Path:
@@ -4364,8 +4365,8 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
                 self.assertTrue(self.helper["safe_proxy_url"](value))
 
         for value in (
-            "http://review-user:review-password@proxy.example.invalid:8080",
-            "socks5://review-user:review-password@proxy.example.invalid:1080",
+            f"http://{PROXY_CREDENTIALS}@proxy.example.invalid:8080",
+            f"socks5://{PROXY_CREDENTIALS}@proxy.example.invalid:1080",
         ):
             with self.subTest(value=value):
                 self.assertFalse(self.helper["safe_proxy_url"](value))
@@ -4375,7 +4376,7 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
             os.environ,
             {
                 "HTTPS_PROXY": (
-                    "http://review-user:review-password@proxy.example.invalid:8080"
+                    f"http://{PROXY_CREDENTIALS}@proxy.example.invalid:8080"
                 )
             },
             clear=False,
