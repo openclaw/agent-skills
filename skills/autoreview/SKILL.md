@@ -81,9 +81,15 @@ parent-relative patch; otherwise leave the attribution unknown.
 
 ## Engines
 
-Codex is the default: `gpt-6-astra`, high reasoning, with no automatic model
-fallback. Honor explicit engine/model choices; do not switch because a review is
-slow or rate-limited.
+Codex is the default: `gpt-6-astra`, high reasoning. When no model override is
+set, retry `gpt-5.6-terra` only for an Astra account-access failure. Explicit
+CLI or environment model choices disable this fallback. Do not switch because
+a review is slow or rate-limited.
+
+Astra supports `low`, `medium`, `high`, `xhigh`, and `max`. Inherited `none`
+or `minimal` reasoning settings are rejected before review preparation; choose
+`--thinking low` or explicitly select a model that supports those settings.
+See the [Astra model reference](https://developers.openai.com/api/docs/models/gpt-6-astra).
 
 Use `--engine`, `--model`, and `--thinking` to override the defaults.
 `--codex-speed fast` selects priority service when supported. Only Claude accepts

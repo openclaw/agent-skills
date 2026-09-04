@@ -1092,7 +1092,56 @@ class AutoreviewTruffleHogTests(unittest.TestCase):
 
 
 class AutoreviewCompatibilityTests(unittest.TestCase):
-    def test_codex_defaults_to_astra_without_fallback(self) -> None:
+    def test_astra_rejects_unsupported_effort_before_preparation(self) -> None:
+        for effort in ("none", "minimal"):
+            for source in ("cli", "cli-keyed", "env", "env-keyed"):
+                with self.subTest(effort=effort, source=source):
+                    argv = [sys.executable, str(SCRIPT_PATH), "--mode", "local"]
+                    env = {key: value for key, value in os.environ.items() if not key.startswith("AUTOREVIEW_")}
+                    if source.startswith("cli"):
+                        argv += ["--thinking", f"codex={effort}" if source == "cli-keyed" else effort]
+                    else:
+                        env["AUTOREVIEW_CODEX_THINKING" if source == "env-keyed" else "AUTOREVIEW_THINKING"] = effort
+                    with tempfile.TemporaryDirectory(prefix="autoreview-astra-effort.") as directory:
+                        result = subprocess.run(argv, cwd=directory, env=env, capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("invalid thinking level for codex model gpt-6-astra", result.stderr)
+                    self.assertIn("high, low, max, medium, xhigh", result.stderr)
+                    self.assertNotIn("preparation:", result.stderr)
+
+    def test_astra_preserves_supported_efforts(self) -> None:
+        for effort in ("low", "medium", "high", "xhigh", "max"):
+            with self.subTest(effort=effort), mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                sys, "argv", ["autoreview", "--thinking", effort]
+            ):
+                reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+                self.assertEqual(reviewer.model, "gpt-6-astra")
+                self.assertEqual(reviewer.thinking, effort)
+                self.assertEqual(reviewer.fallback_model, "gpt-5.6-terra")
+
+    def test_explicit_astra_selection_has_no_fallback(self) -> None:
+        for source in ("cli", "cli-keyed", "env", "env-keyed"):
+            argv = ["autoreview"]
+            env = {}
+            if source.startswith("cli"):
+                argv += ["--model", "codex=gpt-6-astra" if source == "cli-keyed" else "gpt-6-astra"]
+            else:
+                env["AUTOREVIEW_CODEX_MODEL" if source == "env-keyed" else "AUTOREVIEW_MODEL"] = "gpt-6-astra"
+            with self.subTest(source=source), mock.patch.dict(os.environ, env, clear=True), mock.patch.object(sys, "argv", argv):
+                reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+                self.assertEqual(reviewer.model, "gpt-6-astra")
+                self.assertIsNone(reviewer.fallback_model)
+
+    def test_legacy_codex_models_keep_their_supported_efforts(self) -> None:
+        for effort in ("none", "minimal"):
+            with self.subTest(effort=effort), mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                sys, "argv", ["autoreview", "--model", "gpt-5.6-sol", "--thinking", effort]
+            ):
+                reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+                self.assertEqual(reviewer.model, "gpt-5.6-sol")
+                self.assertEqual(reviewer.thinking, effort)
+
+    def test_codex_defaults_to_astra_with_access_fallback(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             sys, "argv", ["autoreview"]
         ):
@@ -1100,7 +1149,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         self.assertEqual(reviewer.engine, "codex")
         self.assertEqual(reviewer.model, "gpt-6-astra")
         self.assertEqual(reviewer.thinking, "high")
-        self.assertIsNone(reviewer.fallback_model)
+        self.assertEqual(reviewer.fallback_model, "gpt-5.6-terra")
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -1270,20 +1319,11 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         args = argparse.Namespace(codex_config=['model_verbosity="low"'])
         self.assertEqual(AUTOREVIEW.codex_config_keys(args), ["model_verbosity"])
 
-    def test_codex_retries_terra_after_sol_access_failure(self) -> None:
-        args = argparse.Namespace(
-            engine="codex",
-            max_priority="P0",
-            codex_bin="codex",
-            codex_config=None,
-            codex_speed=None,
-            fallback_model="gpt-5.6-terra",
-            model="gpt-5.6-sol",
-            stream_engine_output=False,
-            thinking="high",
-            tools=True,
-            web_search=False,
-        )
+    def test_codex_retries_terra_after_astra_access_failure(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            sys, "argv", ["autoreview"]
+        ):
+            args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
         prompt = "complete retry pack: unicode \u03c0\r\n-deleted line\n unchanged context\n"
         for failed_source, failure in ((None, None), (None, "missing"),
                                        ("filesystem", "finding"), ("filesystem", "error"),
@@ -1300,7 +1340,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                     self.assertEqual(data, prompt.encode("utf-8"))
                     events.append(source)
                     code = 0
-                    if "gpt-5.6-sol" in events and source == failed_source:
+                    if "gpt-6-astra" in events and source == failed_source:
                         code = {"finding": AUTOREVIEW.TRUFFLEHOG_FINDINGS_EXIT_CODE, "error": 1}.get(failure, 0)
                     return subprocess.CompletedProcess(command, code, "", "")
 
@@ -1308,12 +1348,12 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                     self.assertEqual(kwargs["input_text"], prompt)
                     model = command[command.index("--model") + 1]
                     events.append(model)
-                    if model == "gpt-5.6-sol":
+                    if model == "gpt-6-astra":
                         if failure == "missing":
                             find.return_value = None
                         return subprocess.CompletedProcess(
                             command, 1, "",
-                            "The model `gpt-5.6-sol` does not exist or you do not have access to it.",
+                            "The model `gpt-6-astra` does not exist or you do not have access to it.",
                         )
                     output_path = Path(command[command.index("--output-last-message") + 1])
                     output_path.write_text(json.dumps(FINAL_REPORT))
@@ -1332,7 +1372,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                     else:
                         report = AUTOREVIEW.run_reviewer(args, Path(tmpdir), prompt, set(), [])
                         self.assertEqual(report["findings"], [])
-                expected = ["filesystem", "stdin", "gpt-5.6-sol"]
+                expected = ["filesystem", "stdin", "gpt-6-astra"]
                 if failure != "missing":
                     expected.append("filesystem")
                     if failed_source != "filesystem":
