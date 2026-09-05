@@ -31,7 +31,11 @@ function buildEmbeddedPayload(document: SessionDocument | null, options: HtmlOpt
     return JSON.stringify({ kind: "normalized", data: base64Utf8(JSON.stringify(document)) });
   }
   if (options.embedMode === "raw") {
-    return JSON.stringify({ kind: "raw", data: base64Utf8(options.rawText ?? "") });
+    return JSON.stringify({
+      kind: "raw",
+      data: base64Utf8(options.rawText ?? ""),
+      warnings: document?.warnings ?? [],
+    });
   }
   return JSON.stringify({ kind: "blank", data: "" });
 }
@@ -484,6 +488,15 @@ pre {
 }
 .body pre { font-size: 13px; }
 .raw pre { padding: 0 16px 16px; color: var(--muted); }
+.warnings {
+  margin-bottom: 20px;
+  padding: 16px;
+  border: 1px solid var(--hair);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  overflow-wrap: anywhere;
+}
+.warnings ul { margin: 8px 0 0; padding-left: 20px; }
 mark { background: var(--mark); color: var(--ink); padding: 0 1px; }
 .empty {
   max-width: 760px;
@@ -542,6 +555,7 @@ mark { background: var(--mark); color: var(--ink); padding: 0 1px; }
         <button class="chip" id="toggle-raw" aria-pressed="false">Raw JSON</button>
       </div>
     </div>
+    <section class="warnings" id="warnings" aria-label="Session warnings" hidden></section>
     <div class="event-list" id="events"></div>
   </main>
 </div>
@@ -1016,6 +1030,11 @@ mark { background: var(--mark); color: var(--ink); padding: 0 1px; }
     $("format-label").textContent = doc ? doc.format : "";
     $("title").textContent = doc ? shortenHomePaths(doc.title ?? "Session") : "Drop in a session";
     $("subtitle").textContent = doc?.sourcePath ? shortenHomePaths(doc.sourcePath) : "Load a Codex, Claude, or OpenClaw/Pi JSONL file.";
+    const warnings = doc?.warnings ?? [];
+    $("warnings").hidden = warnings.length === 0;
+    $("warnings").innerHTML = warnings.length
+      ? '<strong>Session warnings</strong><ul>' + warnings.map((warning) => '<li>' + escapeHtml(shortenHomePaths(warning)) + '</li>').join("") + '</ul>'
+      : "";
     const visible = doc ? doc.events.filter(isVisible) : [];
     const readerItems = doc && state.viewMode === "reader" ? buildReaderItems(doc.events) : [];
     const renderedReaderItems = state.query ? readerItems.slice(0, maxSearchBlocks) : readerItems;
@@ -1106,7 +1125,11 @@ mark { background: var(--mark); color: var(--ink); padding: 0 1px; }
   applyTheme();
   const embedded = JSON.parse($("viewer-payload").textContent || '{"kind":"blank"}');
   if (embedded.kind === "normalized") loadDoc(JSON.parse(decodeBase64(embedded.data)));
-  else if (embedded.kind === "raw") loadDoc(parseRaw(decodeBase64(embedded.data), "embedded session"));
+  else if (embedded.kind === "raw") {
+    const doc = parseRaw(decodeBase64(embedded.data), "embedded session");
+    doc.warnings.unshift(...(embedded.warnings ?? []));
+    loadDoc(doc);
+  }
   else render();
 })();
 </script>

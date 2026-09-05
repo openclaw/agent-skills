@@ -5,9 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
+import { runInNewContext } from "node:vm";
 import { parseSessionDocument } from "./core/detect.ts";
 import { parseJsonl } from "./core/jsonl.ts";
 import { resolveOpenBrowserCommand } from "./open-browser.ts";
+import { buildSessionViewerHtml } from "./html.ts";
+import { readSessionText } from "./read-session.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -830,4 +833,240 @@ test("CLI writes a one-file HTML export", async () => {
   )?.[1];
   assert.ok(payload);
   assert.equal(JSON.parse(payload).kind, "normalized");
+});
+
+function oversizedSessionJsonl(padLength = 80): string {
+  const pad = JSON.stringify({
+    timestamp: "2026-05-25T10:00:01Z",
+    type: "response_item",
+    payload: {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: `pad-${"x".repeat(padLength)}` }],
+    },
+  });
+  return [
+    JSON.stringify({
+      timestamp: "2026-05-25T10:00:00Z",
+      type: "session_meta",
+      payload: { id: "HEAD_READ_BOUND_MARKER" },
+    }),
+    ...Array.from({ length: 40 }, () => pad),
+    JSON.stringify({
+      timestamp: "2026-05-25T10:00:02Z",
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "MIDDLE_READ_BOUND_MARKER" }],
+      },
+    }),
+    ...Array.from({ length: 40 }, () => pad),
+    JSON.stringify({
+      timestamp: "2026-05-25T10:00:03Z",
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "TAIL_READ_BOUND_MARKER" }],
+      },
+    }),
+  ].join("\n");
+}
+
+function embeddedViewerPayload(html: string): { kind: string; data: string; warnings?: string[] } {
+  const payload = /<script id="viewer-payload" type="application\/json">([^<]*)<\/script>/u.exec(
+    html,
+  )?.[1];
+  assert.ok(payload);
+  return JSON.parse(payload);
+}
+
+function renderViewer(html: string) {
+  const elements = new Map<string, {
+    textContent: string;
+    innerHTML: string;
+    hidden: boolean;
+    value: string;
+    addEventListener: () => void;
+  }>();
+  for (const match of html.matchAll(/\bid="([^"]+)"/gu)) {
+    elements.set(match[1], {
+      textContent: "", innerHTML: "", hidden: true, value: "", addEventListener() {},
+    });
+  }
+  elements.get("viewer-payload")!.textContent = JSON.stringify(embeddedViewerPayload(html));
+  const script = [...html.matchAll(/<script>([\s\S]*?)<\/script>/gu)].at(-1)?.[1];
+  assert.ok(script);
+  runInNewContext(script, {
+    document: {
+      getElementById: (id: string) => elements.get(id),
+      documentElement: { dataset: {}, style: {} },
+    },
+    localStorage: { getItem: () => null },
+    window: {},
+    atob: (data: string) => Buffer.from(data, "base64").toString("binary"),
+    TextDecoder,
+  });
+  return elements;
+}
+
+test("CLI bounds oversized JSONL reads and displays warnings in both exports", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "session-viewer-bound-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const input = path.join(dir, "session.jsonl");
+  const output = path.join(dir, "session.html");
+  const text = oversizedSessionJsonl();
+  await fs.writeFile(input, `${text}\n`, "utf8");
+  const size = (await fs.stat(input)).size;
+  assert.ok(size > 400);
+  assert.match(text, /MIDDLE_READ_BOUND_MARKER/);
+
+  for (const mode of [[], ["--raw"]]) {
+    const { stdout } = await execFileAsync(process.execPath, [
+      "skills/session-viewer/scripts/session-viewer.ts",
+      input, "--out", output, ...mode, "--max-read-bytes", "400",
+    ]);
+    const html = await fs.readFile(output, "utf8");
+    const embedded = Buffer.from(embeddedViewerPayload(html).data, "base64").toString("utf8");
+    assert.doesNotMatch(embedded, /MIDDLE_READ_BOUND_MARKER/);
+    assert.match(embedded, /HEAD_READ_BOUND_MARKER/);
+    assert.match(embedded, /TAIL_READ_BOUND_MARKER/);
+    assert.match(stdout, /source truncated: omitted middle/);
+    const warning = renderViewer(html).get("warnings")!;
+    assert.equal(warning.hidden, false);
+    assert.match(warning.innerHTML, /source truncated: omitted middle/);
+    assert.match(warning.innerHTML, /read cap 400 bytes/);
+  }
+});
+
+test("CLI preserves full sessions over 8 MiB by default in both export modes", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "session-viewer-full-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const input = path.join(dir, "session.jsonl");
+  const output = path.join(dir, "session.html");
+  const text = oversizedSessionJsonl(128 * 1024);
+  assert.ok(Buffer.byteLength(text) > 8 * 1024 * 1024);
+  await fs.writeFile(input, text);
+  for (const mode of [[], ["--raw"]]) {
+    const { stdout } = await execFileAsync(process.execPath, [
+      "skills/session-viewer/scripts/session-viewer.ts", input, "--out", output, ...mode,
+    ]);
+    assert.doesNotMatch(stdout, /truncated|warnings:/);
+    const payload = embeddedViewerPayload(await fs.readFile(output, "utf8"));
+    const embedded = Buffer.from(payload.data, "base64");
+    if (payload.kind === "raw") {
+      assert.deepEqual(embedded, Buffer.from(text));
+      assert.deepEqual(payload.warnings, []);
+    } else {
+      const document = JSON.parse(embedded.toString("utf8"));
+      assert.equal(document.events.length, parse(text).events.length);
+      assert.ok(document.events.some((event: { text: string }) => event.text === "MIDDLE_READ_BOUND_MARKER"));
+      assert.deepEqual(document.warnings, []);
+    }
+  }
+});
+
+test("bounded reads retry short reads and close the file", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "session-viewer-short-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const input = path.join(dir, "session.jsonl");
+  const text = "HEAD-0123456789-TAIL";
+  await fs.writeFile(input, text);
+  const open = fs.open.bind(fs);
+  const handles: Awaited<ReturnType<typeof fs.open>>[] = [];
+  t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    const handle = await open(...args);
+    handles.push(handle);
+    const read = handle.read.bind(handle);
+    t.mock.method(handle, "read", (buffer: Buffer, offset: number, length: number, position: number) =>
+      read(buffer, offset, Math.min(length, 2), position));
+    return handle;
+  });
+  for (const limit of [text.length, text.length + 1, 9, 1]) {
+    const result = await readSessionText(input, limit);
+    assert.equal(result.size, text.length);
+    if (limit >= text.length) {
+      assert.equal(result.text, text);
+      assert.equal(result.truncated, false);
+    } else {
+      const head = Math.ceil(limit / 2);
+      const tail = limit - head;
+      assert.equal(result.text, `${text.slice(0, head)}\n[...middle omitted for scan...]\n${text.slice(text.length - tail)}`);
+      assert.equal(result.truncated, true);
+    }
+  }
+  assert.equal(handles.length, 4);
+  for (const handle of handles) assert.equal(handle.fd, -1);
+});
+
+test("bounded reads reject unexpected EOF and close the file", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "session-viewer-eof-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const input = path.join(dir, "session.jsonl");
+  const text = "HEAD-0123456789-TAIL";
+  await fs.writeFile(input, text);
+  const open = fs.open.bind(fs);
+  const handles: Awaited<ReturnType<typeof fs.open>>[] = [];
+  t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+    const handle = await open(...args);
+    handles.push(handle);
+    const read = handle.read.bind(handle);
+    t.mock.method(handle, "read", async (buffer: Buffer, offset: number, length: number, position: number) => {
+      if (position >= 3) return { buffer, bytesRead: 0 };
+      return read(buffer, offset, Math.min(length, 3 - position), position);
+    });
+    return handle;
+  });
+  for (const limit of [text.length, 4, 10]) {
+    await assert.rejects(readSessionText(input, limit), /ended before the expected read completed/);
+  }
+  assert.equal(handles.length, 3);
+  for (const handle of handles) assert.equal(handle.fd, -1);
+});
+
+test("CLI rejects invalid explicit byte limits without writing an export", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "session-viewer-invalid-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const output = path.join(dir, "session.html");
+  for (const value of ["0", "-1", "1.5", "NaN", "Infinity", "9007199254740992"]) {
+    await assert.rejects(execFileAsync(process.execPath, [
+      "skills/session-viewer/scripts/session-viewer.ts", "unused.jsonl", "--out", output,
+      "--max-read-bytes", value,
+    ]), /must be a positive integer/);
+  }
+  await assert.rejects(fs.stat(output), { code: "ENOENT" });
+});
+
+test("CLI preserves exact-limit raw input without truncation", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "session-viewer-exact-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const input = path.join(dir, "session.jsonl");
+  const output = path.join(dir, "session.html");
+  const text = oversizedSessionJsonl();
+  await fs.writeFile(input, text);
+  await execFileAsync(process.execPath, [
+    "skills/session-viewer/scripts/session-viewer.ts", input, "--out", output,
+    "--raw", "--max-read-bytes", String(Buffer.byteLength(text)),
+  ]);
+  const html = await fs.readFile(output, "utf8");
+  const payload = embeddedViewerPayload(html);
+  assert.equal(Buffer.from(payload.data, "base64").toString("utf8"), text);
+  assert.deepEqual(payload.warnings, []);
+  assert.equal(renderViewer(html).get("warnings")!.hidden, true);
+});
+
+test("viewer escapes warning text and accepts legacy raw payloads", () => {
+  const doc = parse(oversizedSessionJsonl());
+  doc.warnings = ['source truncated: <img src=x onerror="alert(1)"> & omitted'];
+  for (const embedMode of ["raw", "normalized"] as const) {
+    const html = buildSessionViewerHtml(doc, { embedMode, rawText: oversizedSessionJsonl() });
+    const warning = renderViewer(html).get("warnings")!;
+    assert.equal(warning.hidden, false);
+    assert.match(warning.innerHTML, /&lt;img src=x onerror=&quot;alert\(1\)&quot;&gt; &amp; omitted/);
+    assert.doesNotMatch(warning.innerHTML, /<img/);
+  }
+  const html = buildSessionViewerHtml(null, { embedMode: "raw", rawText: oversizedSessionJsonl() });
+  const legacy = html.replace(',"warnings":[]', "");
+  assert.equal(renderViewer(legacy).get("warnings")!.hidden, true);
 });

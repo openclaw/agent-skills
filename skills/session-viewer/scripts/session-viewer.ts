@@ -5,10 +5,12 @@ import { parseSessionDocument } from "./core/detect.ts";
 import { parseJsonl } from "./core/jsonl.ts";
 import { buildSessionViewerHtml } from "./html.ts";
 import { resolveOpenBrowserCommand } from "./open-browser.ts";
+import { readSessionText } from "./read-session.ts";
 
 type Options = {
   blank: boolean;
   inputPath?: string;
+  maxReadBytes?: number;
   open: boolean;
   outPath?: string;
   raw: boolean;
@@ -17,20 +19,33 @@ type Options = {
 function usage(): string {
   return [
     "Usage:",
-    "  node session-viewer.ts <session.jsonl> --out session.html [--open] [--raw]",
+    "  node session-viewer.ts <session.jsonl> --out session.html [--open] [--raw] [--max-read-bytes N]",
     "  node session-viewer.ts --blank --out viewer.html [--open]",
     "",
     "Options:",
-    "  --blank        Write reusable file-picker viewer",
-    "  --out PATH     Output HTML path",
-    "  --open         Open output path in the browser",
-    "  --raw          Embed raw JSONL instead of normalized data",
-    "  -h, --help     Show help",
+    "  --blank             Write reusable file-picker viewer",
+    "  --out PATH          Output HTML path",
+    "  --open              Open output path in the browser",
+    "  --raw               Embed raw JSONL instead of normalized data",
+    "  --max-read-bytes N   Opt into head/tail truncation (default: full file)",
+    "  -h, --help          Show help",
   ].join("\n");
 }
 
+function parsePositiveInteger(value: string, flag: string): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new Error(`${flag} must be a positive integer`);
+  }
+  return parsed;
+}
+
 function parseArgs(argv: string[]): Options {
-  const options: Options = { blank: false, open: false, raw: false };
+  const options: Options = {
+    blank: false,
+    open: false,
+    raw: false,
+  };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "-h" || arg === "--help") {
@@ -55,6 +70,15 @@ function parseArgs(argv: string[]): Options {
         throw new Error("missing value after --out");
       }
       options.outPath = value;
+      index += 1;
+      continue;
+    }
+    if (arg === "--max-read-bytes") {
+      const value = argv[index + 1];
+      if (!value) {
+        throw new Error("missing value after --max-read-bytes");
+      }
+      options.maxReadBytes = parsePositiveInteger(value, "--max-read-bytes");
       index += 1;
       continue;
     }
@@ -103,10 +127,16 @@ async function main(): Promise<void> {
   }
 
   const inputPath = path.resolve(options.inputPath ?? "");
-  const rawText = await fs.readFile(inputPath, "utf8");
+  const bounded = await readSessionText(inputPath, options.maxReadBytes);
+  const rawText = bounded.text;
   const { records, warnings } = parseJsonl(rawText);
   const document = parseSessionDocument(records, inputPath);
   document.warnings.unshift(...warnings);
+  if (bounded.truncated) {
+    const warning = `source truncated: omitted middle of ${inputPath} (${bounded.size} bytes, read cap ${options.maxReadBytes} bytes)`;
+    document.warnings.unshift(warning);
+    console.log(warning);
+  }
   const html = buildSessionViewerHtml(document, {
     embedMode: options.raw ? "raw" : "normalized",
     rawText,
