@@ -11,6 +11,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
 from .test_autoreview_hardening import init_repo, load_helper, write_executable
 
 
@@ -72,7 +77,7 @@ class CodexInferenceRouteTests(unittest.TestCase):
         def value(item):
             if isinstance(item, dict):
                 return "{" + ", ".join(f"{json.dumps(key)}={value(part)}" for key, part in item.items()) + "}"
-            return json.dumps(item)
+            return json.dumps(item, ensure_ascii=False)
 
         def table(values):
             return "\n".join(f"{key} = {value(item)}" for key, item in values.items())
@@ -82,7 +87,7 @@ class CodexInferenceRouteTests(unittest.TestCase):
         text += "\n[model_providers.review_api.auth]\n" + table(self.auth)
         # These unrelated operator capabilities must never enter the review runtime.
         text += '\n[mcp_servers.unrelated]\ncommand = "must-not-execute"\n'
-        (self.home / "config.toml").write_text(text)
+        (self.home / "config.toml").write_text(text, encoding="utf-8")
 
     def run_review(self, *, prepare_auth=None, during_run=None, scan=None):
         observed = {}
@@ -383,6 +388,32 @@ class CodexInferenceRouteTests(unittest.TestCase):
         self.auth["command"] = executable.name
         self.write_config()
         self.assert_route_refused()
+
+    def test_non_bmp_route_paths_round_trip_through_toml_overrides(self):
+        executable = write_executable(self.home / "credential-🦞", "#!/bin/sh\nexit 99\n")
+        working_dir = self.home / "working-🦞"
+        working_dir.mkdir()
+        self.auth.update(command=str(executable), cwd=str(working_dir))
+        self.write_config()
+        observed = self.run_review()
+
+        runtime = self.root / "runtime-🦞"
+        runtime.mkdir()
+        catalogue_flags = self.helper["prepare_codex_inference_config"](
+            ([], self.catalogue_bytes), runtime,
+        )
+        key, value = catalogue_flags[-1].split("=", 1)
+        flags = {**observed["flags"], key: value}
+        expected = {
+            "model_providers.review_api.auth.command": executable,
+            "model_providers.review_api.auth.cwd": working_dir,
+            "model_catalog_json": runtime / "model-catalog.json",
+        }
+        for key, path in expected.items():
+            with self.subTest(key=key):
+                parsed = tomllib.loads(f"value = {flags[key]}")["value"]
+                self.assertEqual(parsed, str(path.resolve()))
+        self.assertEqual((runtime / "model-catalog.json").read_bytes(), self.catalogue_bytes)
 
     def test_repository_owned_route_files_refuse_before_authentication(self):
         for name in ("config.toml", "models.json", self.runtime_helper.name):

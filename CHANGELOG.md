@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Make agent transcripts explicit-request-only and trim before previews or publication, retaining native hosted-session sharing and partial-source notices.
+
+- Preserve Unicode and control characters in Autoreview's Codex configuration overrides and isolated Kimi TOML configuration.
 - Allow explicit trusted OpenAI Responses route projection through Autoreview's existing Codex config override, preserving default auth-only compatibility, native provider defaults, and isolated catalogue snapshots.
 - Validate explicit index/working-tree targets for mixed local Autoreview paths, preserving source anchors, rejected-attribution audit and distinct claim variants while repeating mandatory context within existing capacity limits.
 - Restore mandatory Autoreview TruffleHog `verified,unknown` pre-send scans removed in #209, retaining reviewer P0 credential checks as defense in depth.
