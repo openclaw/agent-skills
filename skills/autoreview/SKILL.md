@@ -84,6 +84,8 @@ parent-relative patch; otherwise leave the attribution unknown.
 Codex is the default: `gpt-5.6-sol`, high reasoning, with a `gpt-5.6-terra` retry
 only for an account-access failure. Honor explicit engine/model choices; do not
 switch because a review is slow or rate-limited.
+Pass `--no-access-fallback` when the workflow requires the selected Codex model
+only; an account-access failure then stops without trying another model.
 
 Use `--engine`, `--model`, and `--thinking` to override the defaults.
 `--codex-speed fast` selects priority service when supported. Only Claude accepts
