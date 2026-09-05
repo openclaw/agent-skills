@@ -94,6 +94,7 @@ Codex can project a named OpenAI Responses route from the operator's external
 The route must use `https://api.openai.com/v1` and command authentication with
 an absolute external executable. Route parsing requires Python 3.11 or `tomli`;
 ordinary auth-only configuration retains the existing fallback parser.
+Built-in OpenAI retains its existing auth-only configuration projection.
 Optional auth timing, context and catalogue settings keep Codex's native defaults
 and semantics. A supplied external catalogue is copied byte-for-byte into the
 private client runtime; retries use the same route and catalogue snapshot.

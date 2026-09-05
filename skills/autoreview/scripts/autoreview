@@ -3926,13 +3926,11 @@ def load_codex_inference_route(
         "model_context_window", "model_auto_compact_token_limit",
         "model_auto_compact_token_limit_scope",
     )
-    if any(key in config for key in ("profile", "openai_base_url")):
-        refuse("profile or base URL overrides cannot be projected as one inference route")
     provider_id = config.get("model_provider", "openai")
     if provider_id == "openai":
-        if any(key in config for key in (*context_keys, "model_catalog_json")):
-            refuse("catalogue/context settings require a supported explicit inference route")
         return flags, None
+    if any(key in config for key in ("profile", "openai_base_url")):
+        refuse("profile or base URL overrides cannot be projected as one inference route")
     if not isinstance(provider_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", provider_id):
         refuse("invalid provider selector")
     if provider_id in {"ollama", "lmstudio", "amazon-bedrock", "amazon-bedrock-runtime"}:

@@ -207,6 +207,22 @@ class CodexInferenceRouteTests(unittest.TestCase):
         self.assertEqual(attempts[0][attempts[0].index("--model") + 1], "gpt-5.6-sol")
         self.assertEqual(self.available(), (True, None))
 
+    def test_builtin_route_preserves_auth_only_isolation(self):
+        self.config.update({
+            "model_provider": "openai", "profile": "operator-profile",
+            "openai_base_url": "https://example.invalid/operator",
+        })
+        self.write_config()
+        observed = self.run_review()
+        self.assertEqual(observed["flags"]["cli_auth_credentials_store"], '"file"')
+        for key in (
+            "model_provider", "model_catalog_json", "model_context_window",
+            "model_auto_compact_token_limit", "model_auto_compact_token_limit_scope",
+            "profile", "openai_base_url",
+        ):
+            self.assertNotIn(key, observed["flags"])
+        self.assertEqual(self.available(), (True, None))
+
     def test_optional_route_fields_keep_native_defaults_when_omitted(self):
         context = ("model_context_window", "model_auto_compact_token_limit", "model_auto_compact_token_limit_scope")
         original_config, original_auth = copy.deepcopy(self.config), copy.deepcopy(self.auth)
@@ -295,7 +311,7 @@ class CodexInferenceRouteTests(unittest.TestCase):
             self.assert_route_refused()
 
     def test_repository_owned_route_files_refuse_before_authentication(self):
-        for name in ("config.toml", "models.json", "credential-helper"):
+        for name in ("config.toml", "models.json", self.runtime_helper.name):
             with self.subTest(name=name):
                 self.write_config()
                 source = self.home / name
