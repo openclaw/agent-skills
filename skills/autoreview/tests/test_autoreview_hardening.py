@@ -5534,7 +5534,7 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
             found = argparse.Namespace(engine="codex", codex_bin="codex")
             with mock.patch.dict(
                 os.environ,
-                {"PATH": f"{fake_bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"},
+                {"PATH": f"{fake_bin_dir}{os.pathsep}{os.environ.get('PATH', '')}", "CODEX_HOME": str(root)},
             ):
                 available, reason = resolve_engine_binary(found, repo)
             self.assertTrue(available, reason)
@@ -5804,7 +5804,7 @@ os.execv(target, [str(target), *sys.argv[1:]])
             )
             # Dry run scans the exact prompt too, so use a deterministic
             # scanner instead of relying on the host installation.
-            env = os.environ.copy()
+            env = {**os.environ, "CODEX_HOME": str(root)}
             add_fake_trufflehog(self.helper, root, env)
 
             result = subprocess.run(
@@ -5896,7 +5896,7 @@ os.execv(target, [str(target), *sys.argv[1:]])
                 root / "codex",
                 fake_codex_script(),
             )
-            env = os.environ.copy()
+            env = {**os.environ, "CODEX_HOME": str(root)}
             env["PATH"] = path_excluding_command("trufflehog")
 
             result = subprocess.run(
@@ -6059,7 +6059,7 @@ os.execv(target, [str(target), *sys.argv[1:]])
                 root / "codex",
                 fake_codex_script(),
             )
-            env = os.environ.copy()
+            env = {**os.environ, "CODEX_HOME": str(root)}
             add_fake_trufflehog(self.helper, root, env)
 
             result = subprocess.run(
@@ -6572,7 +6572,7 @@ os.execv(target, [str(target), *sys.argv[1:]])
                 root / "codex",
                 fake_codex_script(),
             )
-            env = os.environ.copy()
+            env = {**os.environ, "CODEX_HOME": str(root)}
             add_fake_trufflehog(self.helper, root, env)
 
             result = subprocess.run(
@@ -6617,7 +6617,7 @@ os.execv(target, [str(target), *sys.argv[1:]])
                 root / "codex",
                 fake_codex_script(),
             )
-            env = os.environ.copy()
+            env = {**os.environ, "CODEX_HOME": str(root)}
             add_fake_trufflehog(self.helper, root, env)
 
             result = subprocess.run(

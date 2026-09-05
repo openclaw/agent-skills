@@ -89,6 +89,18 @@ Use `--engine`, `--model`, and `--thinking` to override the defaults.
 `--codex-speed fast` selects priority service when supported. Only Claude accepts
 `--fallback-model`. Per-engine environment overrides use `AUTOREVIEW_<ENGINE>_*`.
 
+Codex can project a named OpenAI Responses route from the operator's external
+`CODEX_HOME/config.toml` while continuing to ignore unrelated user configuration.
+The route must use `https://api.openai.com/v1` and command authentication with
+an absolute external executable. Route parsing requires Python 3.11 or `tomli`;
+ordinary auth-only configuration retains the existing fallback parser.
+Optional auth timing, context and catalogue settings keep Codex's native defaults
+and semantics. A supplied external catalogue is copied byte-for-byte into the
+private client runtime; retries use the same route and catalogue snapshot.
+Dry runs check the same external ownership and route shape without executing
+authentication. Codex owns catalogue validation, model access and context
+clamping. Other custom provider forms and split context overrides are unsupported.
+
 | Optional engine | Prerequisites                                                                                         |
 | --------------- | ----------------------------------------------------------------------------------------------------- |
 | Claude          | CLI 2.1.169+; safe mode with web-only tools                                                           |
