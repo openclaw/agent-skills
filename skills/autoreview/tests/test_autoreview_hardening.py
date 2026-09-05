@@ -2125,7 +2125,7 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
             'mcp_servers.review.command="touch /tmp/owned"',
             'notify=["sh", "-c", "touch /tmp/owned"]',
             'model_instructions_file="/tmp/hostile.md"',
-            'model_provider="credential-sink"',
+            'model_providers.review_api.auth.command="/tmp/credential-sink"',
             'hooks.PreToolUse.command="touch /tmp/owned"',
         ):
             with self.subTest(override=override), self.assertRaisesRegex(

@@ -3827,9 +3827,7 @@ def load_codex_auth_config(path: Path, *, strict: bool = False) -> dict[str, Any
         except ModuleNotFoundError:
             import tomli as tomllib
     except ModuleNotFoundError:
-        route_key = r"(?:model_provider|model_catalog_json|model_context_window|model_auto_compact_token_limit(?:_scope)?|profile|openai_base_url)"
-        route_setting = rf"(?m)^\s*(?:{route_key}|\"{route_key}\"|'{route_key}')\s*=|^\s*\[.*model_providers"
-        if strict and re.search(route_setting, text):
+        if strict:
             raise SystemExit("Codex inference configuration refused: reading an operator route requires Python 3.11 or tomli")
         return parse_codex_auth_config_fallback(text)
     try:
@@ -3899,11 +3897,30 @@ def load_codex_inference_route(
     def refuse(detail: str) -> None:
         raise SystemExit(f"Codex inference configuration refused: {detail}")
 
-    def external_path(value: Any, label: str, *, directory: bool = False) -> Path:
-        if not isinstance(value, str) or not Path(value).is_absolute():
-            refuse(f"{label} must be an absolute external path")
+    selectors = [
+        value.strip()
+        for key, _, value in (item.partition("=") for item in overrides)
+        if key.strip() == "model_provider"
+    ]
+    if not selectors:
+        # Unselected provider/profile/tuning settings keep their historical
+        # auth-only behavior, including on hosts without a TOML parser.
+        return codex_auth_config_flags(repo), None
+    if len(selectors) != 1:
+        refuse("select exactly one model_provider")
+    match = re.fullmatch(r'''(["']?)([A-Za-z0-9_-]+)\1''', selectors[0])
+    if match is None:
+        refuse("model_provider must be a bare or quoted provider identifier")
+    provider_id = match[2]
+
+    def external_path(
+        value: Any, label: str, *, directory: bool = False, absolute: bool = False,
+    ) -> Path:
+        if not isinstance(value, str) or not value or (absolute and not Path(value).is_absolute()):
+            refuse(f"{label} must be {'an absolute ' if absolute else 'an '}external path")
         try:
-            path = Path(value).resolve(strict=True)
+            # Codex resolves path settings relative to their owning config file.
+            path = (source_home / Path(value).expanduser()).resolve(strict=True)
         except (OSError, ValueError, RuntimeError):
             refuse(f"{label} is unavailable")
         if not external_env_path(repo, str(path)) or not (
@@ -3914,9 +3931,7 @@ def load_codex_inference_route(
 
     source_home = codex_source_home(repo)
     if source_home is None:
-        if os.environ.get("CODEX_HOME", "").strip():
-            refuse("CODEX_HOME must be an available external directory")
-        return [], None
+        refuse("CODEX_HOME must be an available external directory")
     config_path = source_home / "config.toml"
     if not external_env_path(repo, str(config_path)):
         refuse("operator config must be outside the reviewed repository")
@@ -3926,14 +3941,11 @@ def load_codex_inference_route(
         "model_context_window", "model_auto_compact_token_limit",
         "model_auto_compact_token_limit_scope",
     )
-    provider_id = config.get("model_provider", "openai")
-    if provider_id == "openai":
-        return flags, None
+    if config.get("model_provider") != provider_id:
+        refuse("selected model_provider must match the operator config")
     if any(key in config for key in ("profile", "openai_base_url")):
         refuse("profile or base URL overrides cannot be projected as one inference route")
-    if not isinstance(provider_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", provider_id):
-        refuse("invalid provider selector")
-    if provider_id in {"ollama", "lmstudio", "amazon-bedrock", "amazon-bedrock-runtime"}:
+    if provider_id in {"openai", "ollama", "lmstudio", "amazon-bedrock", "amazon-bedrock-runtime"}:
         refuse("command authentication requires a distinct named provider")
     providers = config.get("model_providers", {})
     provider = providers.get(provider_id) if isinstance(providers, dict) else None
@@ -3943,17 +3955,17 @@ def load_codex_inference_route(
         refuse("unsupported provider fields")
     if (
         provider.get("base_url") != "https://api.openai.com/v1"
-        or provider.get("wire_api") != "responses"
-        or provider.get("requires_openai_auth") is not False
+        or provider.get("wire_api", "responses") != "responses"
+        or provider.get("requires_openai_auth", False) is not False
         or not isinstance(provider.get("name", ""), str)
     ):
         refuse("only command-auth OpenAI Responses routes are supported")
     auth = provider.get("auth")
     if not isinstance(auth, dict) or set(auth) - {
-        "command", "cwd", "timeout_ms", "refresh_interval_ms",
-    }:
+        "command", "args", "cwd", "timeout_ms", "refresh_interval_ms",
+    } or auth.get("args", []) != []:
         refuse("unsupported provider authentication fields")
-    command = external_path(auth.get("command"), "authentication executable")
+    command = external_path(auth.get("command"), "authentication executable", absolute=True)
     if not os.access(command, os.X_OK):
         refuse("authentication executable is not executable")
     auth_cwd = external_path(auth.get("cwd", str(source_home)), "authentication cwd", directory=True)
@@ -4554,6 +4566,7 @@ def format_version(version: tuple[int, int, int]) -> str:
 
 SAFE_CODEX_CONFIG_KEYS = {
     "hide_agent_reasoning",
+    "model_provider",
     "model_auto_compact_token_limit",
     "model_auto_compact_token_limit_scope",
     "model_context_window",
@@ -4584,7 +4597,7 @@ def codex_config_overrides(args: argparse.Namespace) -> list[str]:
         if key not in SAFE_CODEX_CONFIG_KEYS:
             raise SystemExit(
                 f"unsafe Codex config override refused: {key}; "
-                "only model and response tuning keys are allowed"
+                "only model/response tuning and validated provider selection are allowed"
             )
         overrides.append(item)
     return overrides
@@ -4675,8 +4688,11 @@ def codex_command(
     if model:
         cmd.extend(["--model", model])
     # User overrides go before the isolation flags so isolation stays authoritative on conflicts.
-    for override in codex_config_overrides(args):
-        cmd.extend(["-c", override])
+    overrides = codex_config_overrides(args)
+    for override in overrides:
+        # Provider selection is emitted only by the validated route owner.
+        if override.partition("=")[0].strip() != "model_provider":
+            cmd.extend(["-c", override])
     # Dedicated settings win over the generic config escape hatch.
     if args.thinking:
         cmd.extend(["-c", f'model_reasoning_effort="{args.thinking}"'])
@@ -4685,7 +4701,11 @@ def codex_command(
     if speed_override is not None:
         cmd.extend(["-c", speed_override])
     cmd.extend(codex_config_isolation_flags(review_root, runtime_root))
-    cmd.extend(auth_config if auth_config is not None else codex_auth_config_flags(source_repo))
+    if auth_config is None:
+        auth_config = prepare_codex_inference_config(
+            load_codex_inference_route(source_repo, overrides), runtime_root,
+        )
+    cmd.extend(auth_config)
     if force_file_auth:
         cmd.extend(["-c", 'cli_auth_credentials_store="file"'])
     cmd.append("exec")
@@ -6174,7 +6194,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--codex-config",
         action="append",
-        help='Safe Codex model/response tuning "-c key=value" override (TOML value), codex reviewer only. Repeatable. Capability-, command-, and path-bearing keys are refused. Env default: AUTOREVIEW_CODEX_CONFIG (semicolon-separated), e.g. service_tier="fast".',
+        help='Codex "-c key=value" tuning override (TOML value). Select model_provider=<id> to project the matching trusted external route. Repeatable; one provider selector. Command-, path-, and provider-definition keys are refused. Env default: AUTOREVIEW_CODEX_CONFIG (semicolon-separated).',
     )
     parser.add_argument(
         "--codex-speed",

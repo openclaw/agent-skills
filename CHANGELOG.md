@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Preserve trusted command-auth OpenAI Responses routes in Autoreview's isolated Codex client, binding catalogue and context settings without loading unrelated operator capabilities.
+- Allow explicit trusted OpenAI Responses route projection through Autoreview's existing Codex config override, preserving default auth-only compatibility, native provider defaults, and isolated catalogue snapshots.
 - Validate explicit index/working-tree targets for mixed local Autoreview paths, preserving source anchors, rejected-attribution audit and distinct claim variants while repeating mandatory context within existing capacity limits.
 - Restore mandatory Autoreview TruffleHog `verified,unknown` pre-send scans removed in #209, retaining reviewer P0 credential checks as defense in depth.
 - Bound agent-transcript session reads to 8 MiB and disclose partial source content in render, preview, append-body, and HTML output. Thanks @SebTardif.

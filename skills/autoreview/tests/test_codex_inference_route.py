@@ -57,7 +57,7 @@ class CodexInferenceRouteTests(unittest.TestCase):
         }
         self.helper = load_helper()
         self.args = argparse.Namespace(
-            engine="codex", codex_bin="synthetic-codex", codex_config=[], codex_speed=None,
+            engine="codex", codex_bin="synthetic-codex", codex_config=['model_provider="review_api"'], codex_speed=None,
             fallback_model=None, model="gpt-5.6-sol", stream_engine_output=False,
             thinking="high", tools=True, web_search=False,
         )
@@ -162,7 +162,7 @@ class CodexInferenceRouteTests(unittest.TestCase):
 
     def assert_route_refused(self):
         prepare_auth = mock.Mock()
-        with self.assertRaisesRegex(SystemExit, "inference") as caught:
+        with self.assertRaisesRegex(SystemExit, "inference|Codex config") as caught:
             self.run_review(prepare_auth=prepare_auth)
         prepare_auth.assert_not_called()
         self.assertEqual(self.available(), (False, str(caught.exception.code)))
@@ -207,36 +207,86 @@ class CodexInferenceRouteTests(unittest.TestCase):
         self.assertEqual(attempts[0][attempts[0].index("--model") + 1], "gpt-5.6-sol")
         self.assertEqual(self.available(), (True, None))
 
-    def test_builtin_route_preserves_auth_only_isolation(self):
-        self.config.update({
-            "model_provider": "openai", "profile": "operator-profile",
-            "openai_base_url": "https://example.invalid/operator",
-        })
+    def test_default_keeps_legacy_auth_only_behavior_with_unrelated_routes(self):
+        self.args.codex_config = []
+        for provider in ("openai", "review_api", "unsupported-provider"):
+            for without_parser in (False, True):
+                with self.subTest(provider=provider, without_parser=without_parser):
+                    self.config.update({
+                        "model_provider": provider, "profile": "operator-profile",
+                        "openai_base_url": "https://example.invalid/operator",
+                        "forced_login_method": "api",
+                    })
+                    self.provider["base_url"] = "https://example.invalid/custom"
+                    self.write_config()
+                    modules = {"tomllib": None, "tomli": None} if without_parser else {}
+                    with mock.patch.dict(sys.modules, modules):
+                        observed = self.run_review()
+                        self.assertEqual(observed["flags"]["cli_auth_credentials_store"], '"file"')
+                        self.assertEqual(observed["flags"]["forced_login_method"], '"api"')
+                        for key in (
+                            "model_provider", "model_catalog_json", "model_context_window",
+                            "model_auto_compact_token_limit", "model_auto_compact_token_limit_scope",
+                            "profile", "openai_base_url", "model_providers.review_api.auth.command",
+                        ):
+                            self.assertNotIn(key, observed["flags"])
+                        self.assertEqual(self.available(), (True, None))
+
+    def test_tuning_override_alone_does_not_select_operator_route(self):
+        self.args.codex_config = ["model_context_window=240000"]
         self.write_config()
         observed = self.run_review()
-        self.assertEqual(observed["flags"]["cli_auth_credentials_store"], '"file"')
-        for key in (
-            "model_provider", "model_catalog_json", "model_context_window",
-            "model_auto_compact_token_limit", "model_auto_compact_token_limit_scope",
-            "profile", "openai_base_url",
-        ):
-            self.assertNotIn(key, observed["flags"])
+        self.assertEqual(observed["flags"]["model_context_window"], "240000")
+        self.assertNotIn("model_provider", observed["flags"])
+        self.assertNotIn("model_catalog_json", observed["flags"])
         self.assertEqual(self.available(), (True, None))
+
+    def test_projection_requires_explicit_matching_provider_selector(self):
+        self.write_config()
+        for selector in ('review_api', '"review_api"', "'review_api'"):
+            with self.subTest(selector=selector):
+                self.args.codex_config = [f"model_provider = {selector}"]
+                observed = self.run_review()
+                provider_flags = [part for part in observed["command"] if part.startswith("model_provider=")]
+                self.assertEqual(provider_flags, ['model_provider="review_api"'])
+                self.assertEqual(observed["catalogue"], self.catalogue_bytes)
+                self.assertEqual(self.available(), (True, None))
+
+    def test_provider_selector_rejects_mismatch_and_nonliteral_values(self):
+        self.write_config()
+        for selector in (
+            '"other"', '["review_api"]', '{id="review_api"}',
+            '"review_api"\nfeatures.hooks=true', '"review_api" # comment',
+            '"review\\u005fapi"', '""',
+        ):
+            with self.subTest(selector=selector):
+                self.args.codex_config = [f"model_provider={selector}"]
+                self.assert_route_refused()
+        self.args.codex_config = ['model_provider="review_api"', 'model_provider="other"']
+        self.assert_route_refused()
+        self.args.codex_config = ['model_provider="review_api"']
+        del self.config["model_provider"]
+        self.write_config()
+        self.assert_route_refused()
 
     def test_optional_route_fields_keep_native_defaults_when_omitted(self):
         context = ("model_context_window", "model_auto_compact_token_limit", "model_auto_compact_token_limit_scope")
-        original_config, original_auth = copy.deepcopy(self.config), copy.deepcopy(self.auth)
-        for absent in (("timeout_ms", "refresh_interval_ms"), context, (*context, "model_catalog_json", "timeout_ms", "refresh_interval_ms")):
+        original_config, original_auth, original_provider = copy.deepcopy(self.config), copy.deepcopy(self.auth), copy.deepcopy(self.provider)
+        for absent in (("timeout_ms", "refresh_interval_ms"), ("name", "wire_api", "requires_openai_auth"), context, (*context, "model_catalog_json", "timeout_ms", "refresh_interval_ms")):
             with self.subTest(absent=absent):
-                self.config, self.auth = copy.deepcopy(original_config), copy.deepcopy(original_auth)
+                self.config, self.auth, self.provider = copy.deepcopy(original_config), copy.deepcopy(original_auth), copy.deepcopy(original_provider)
+                self.auth["args"] = []
                 for key in absent:
                     self.config.pop(key, None)
                     self.auth.pop(key, None)
+                    self.provider.pop(key, None)
                 self.write_config()
                 observed = self.run_review()
                 self.assertEqual(observed["flags"]["model_provider"], '"review_api"')
                 for key in absent:
-                    flag = f"model_providers.review_api.auth.{key}" if key in {"timeout_ms", "refresh_interval_ms"} else key
+                    flag = (f"model_providers.review_api.auth.{key}" if key in {"timeout_ms", "refresh_interval_ms"}
+                            else f"model_providers.review_api.{key}" if key in {"name", "wire_api", "requires_openai_auth"}
+                            else key)
                     self.assertNotIn(flag, observed["flags"])
                 self.assertEqual(self.available(), (True, None))
 
@@ -261,9 +311,13 @@ class CodexInferenceRouteTests(unittest.TestCase):
         cases = [
             ("provider", {**provider, "base_url": "https://example.invalid/v1"}),
             ("provider", {**provider, "http_headers": {"Authorization": "synthetic"}}),
+            ("provider", {**provider, "requires_openai_auth": True}),
+            ("provider", {**provider, "requires_openai_auth": "false"}),
+            ("provider", {**provider, "wire_api": "chat"}),
             ("auth", {**auth, "command": "credential-helper"}),
             ("auth", {**auth, "args": ["synthetic-credential"]}),
             ("auth", {**auth, "cwd": str(self.repo)}),
+            ("auth", {**auth, "cwd": "../repo"}),
             ("auth", {**auth, "timeout_ms": True}),
             ("auth", {**auth, "refresh_interval_ms": -1}),
         ]
@@ -297,18 +351,38 @@ class CodexInferenceRouteTests(unittest.TestCase):
         self.write_config()
         self.assert_route_refused()
 
-    def test_auth_only_config_remains_supported_without_optional_toml_parser(self):
-        (self.home / "config.toml").write_text(
-            'cli_auth_credentials_store = "file"\nforced_login_method = "api"\n'
-        )
+    def test_explicit_projection_requires_toml_parser(self):
+        self.write_config()
         with mock.patch.dict(sys.modules, {"tomllib": None, "tomli": None}):
-            observed = self.run_review()
-            self.assertEqual(observed["flags"]["cli_auth_credentials_store"], '"file"')
-            self.assertEqual(observed["flags"]["forced_login_method"], '"api"')
-            self.assertNotIn("model_provider", observed["flags"])
-            self.assertEqual(self.available(), (True, None))
-            self.write_config()
             self.assert_route_refused()
+
+    def test_relative_catalogue_and_auth_cwd_use_the_operator_config_directory(self):
+        working_dir = self.home / "credential files"
+        working_dir.mkdir()
+        self.config["model_catalog_json"] = "models.json"
+        for cwd, expected in ((".", self.home), (working_dir.name, working_dir)):
+            with self.subTest(cwd=cwd):
+                self.auth["cwd"] = cwd
+                self.write_config()
+                observed = self.run_review()
+                self.assertEqual(observed["flags"]["model_providers.review_api.auth.cwd"], json.dumps(str(expected.resolve())))
+                self.assertEqual(observed["catalogue"], self.catalogue_bytes)
+                self.assertEqual(self.available(), (True, None))
+        repo_catalogue = self.repo / "models.json"
+        repo_catalogue.write_bytes(self.catalogue_bytes)
+        self.config["model_catalog_json"] = "../repo/models.json"
+        self.write_config()
+        self.assert_route_refused()
+
+    def test_configured_executable_is_preserved_including_platform_wrapper(self):
+        executable = write_executable(self.home / "credential tool", "#!/usr/bin/env python3\nraise SystemExit(99)\n")
+        self.auth["command"] = str(executable)
+        self.write_config()
+        observed = self.run_review()
+        self.assertEqual(observed["flags"]["model_providers.review_api.auth.command"], json.dumps(str(executable.resolve())))
+        self.auth["command"] = executable.name
+        self.write_config()
+        self.assert_route_refused()
 
     def test_repository_owned_route_files_refuse_before_authentication(self):
         for name in ("config.toml", "models.json", self.runtime_helper.name):
@@ -332,16 +406,17 @@ class CodexInferenceRouteTests(unittest.TestCase):
             self.assert_route_refused()
 
     def test_context_override_cannot_split_projected_route(self):
-        self.args.codex_config = ["model_context_window=240000"]
+        self.args.codex_config.append("model_context_window=240000")
         self.write_config()
         self.assert_route_refused()
 
     def test_builtin_provider_collision_does_not_silently_change_route(self):
-        for provider in ("ollama", "lmstudio", "amazon-bedrock", "amazon-bedrock-runtime"):
+        for provider in ("openai", "ollama", "lmstudio", "amazon-bedrock", "amazon-bedrock-runtime"):
             with self.subTest(provider=provider):
                 self.write_config()
                 config = self.home / "config.toml"
                 config.write_text(config.read_text().replace("review_api", provider))
+                self.args.codex_config = [f'model_provider="{provider}"']
                 self.assert_route_refused()
 
     def test_route_preserves_linked_auth_refresh_and_original_configuration(self):
