@@ -91,6 +91,21 @@ Use `--engine`, `--model`, and `--thinking` to override the defaults.
 `--codex-speed fast` selects priority service when supported. Only Claude accepts
 `--fallback-model`. Per-engine environment overrides use `AUTOREVIEW_<ENGINE>_*`.
 
+For GPT-6 Astra, select it explicitly on a Codex account with access:
+
+```bash
+"$AUTOREVIEW" --mode local --model gpt-6-astra --thinking high
+```
+
+Use `low`, `medium`, `high`, `xhigh`, or `max`; Astra does not support `none`
+or `minimal`. AutoReview keeps `high` when effort is omitted and does not fall
+back from an explicit Astra selection. Codex's `ultra` mode uses automatic
+delegation and is outside this helper's supported effort levels. Use `max`
+for its deepest supported review. For EU data residency, use
+`--codex-speed default`; Astra fast mode is unavailable there.
+See the [Astra migration guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6-astra)
+and [Codex reasoning modes](https://learn.chatgpt.com/docs/models#know-when-to-use-max-or-ultra).
+
 | Optional engine | Prerequisites                                                                                         |
 | --------------- | ----------------------------------------------------------------------------------------------------- |
 | Claude          | CLI 2.1.169+; safe mode with web-only tools                                                           |
