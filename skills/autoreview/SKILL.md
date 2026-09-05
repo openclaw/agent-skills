@@ -89,6 +89,34 @@ Use `--engine`, `--model`, and `--thinking` to override the defaults.
 `--codex-speed fast` selects priority service when supported. Only Claude accepts
 `--fallback-model`. Per-engine environment overrides use `AUTOREVIEW_<ENGINE>_*`.
 
+By default, Codex preserves only authentication settings from user configuration;
+provider, profile, context and catalogue settings remain ignored. To project a
+named route, select it explicitly through the existing config override:
+
+```bash
+"$AUTOREVIEW" --mode local --codex-config 'model_provider="review_api"'
+```
+
+The selector must match `model_provider` in the operator's external
+`CODEX_HOME/config.toml`. It accepts one bare or simply quoted identifier;
+provider definitions and other capabilities cannot be supplied through overrides.
+Projection requires Python 3.11 or `tomli`; default auth-only operation retains
+its existing fallback parser.
+
+The selected route must use `https://api.openai.com/v1` and command authentication
+with an absolute external executable. Fixed arguments belong in that executable's
+wrapper; omitted or empty `auth.args` are accepted. Omitted `wire_api` and
+`requires_openai_auth` retain Codex's `responses` and `false` defaults. Optional
+auth timing and context settings keep native defaults and semantics.
+
+Catalogue and authentication working-directory paths resolve relative to the
+operator config directory and must remain outside the reviewed repository.
+A supplied catalogue is copied byte-for-byte into the private client runtime;
+retries use the same route and catalogue snapshot. Dry runs check the same
+ownership and route shape without executing authentication. Codex owns catalogue
+validation, model access and context clamping. Other custom provider forms and
+split context overrides are unsupported when projection is selected.
+
 | Optional engine | Prerequisites                                                                                         |
 | --------------- | ----------------------------------------------------------------------------------------------------- |
 | Claude          | CLI 2.1.169+; safe mode with web-only tools                                                           |
