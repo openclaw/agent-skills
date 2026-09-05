@@ -21,6 +21,8 @@ repo. See [VISION.md](VISION.md) for catalog boundaries and admission principles
   proof.
 - `handoff`: path-free prompt handoff workflow for delegating a task to another
   agent.
+- `hol-guard`: fail-closed local runtime protection for supported coding-agent
+  harnesses using the pinned HOL Guard CLI.
 - `readme-standard`: house README structure, badge row, tone, and verification
   gates for steipete/openclaw repos.
 - `session-viewer`: local searchable HTML viewer for agent session JSONL.
