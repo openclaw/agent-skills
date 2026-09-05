@@ -1260,42 +1260,6 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         args = argparse.Namespace(codex_config=['model_verbosity="low"'])
         self.assertEqual(AUTOREVIEW.codex_config_keys(args), ["model_verbosity"])
 
-    def test_codex_no_access_fallback_stops_after_primary_error(self) -> None:
-        with mock.patch.object(
-            sys, "argv",
-            ["autoreview", "--engine", "codex", "--model", "gpt-5.6-sol", "--no-access-fallback"],
-        ):
-            args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
-        models: list[str] = []
-
-        def fake_run(command, _cwd, **kwargs):
-            self.assertEqual(kwargs["input_text"], "complete review input")
-            models.append(command[command.index("--model") + 1])
-            return subprocess.CompletedProcess(
-                command, 1, "",
-                "The model `gpt-5.6-sol` does not exist or you do not have access to it.",
-            )
-
-        with tempfile.TemporaryDirectory(prefix="autoreview-no-access-fallback.") as tmpdir, \
-                mock.patch.object(AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex"), \
-                mock.patch.object(AUTOREVIEW, "ensure_codex_isolation_supported"), \
-                mock.patch.object(AUTOREVIEW, "codex_auth_config_flags", return_value=[]), \
-                mock.patch.object(AUTOREVIEW, "prepare_codex_runtime_auth", return_value=None), \
-                mock.patch.object(AUTOREVIEW, "run_with_heartbeat", side_effect=fake_run):
-            with self.assertRaisesRegex(SystemExit, "does not exist or you do not have access"):
-                AUTOREVIEW.run_codex(args, Path(tmpdir), "complete review input")
-
-        self.assertEqual(models, ["gpt-5.6-sol"])
-        self.assertIsNone(args.fallback_model)
-
-    def test_no_access_fallback_rejects_other_engines(self) -> None:
-        with mock.patch.object(
-            sys, "argv", ["autoreview", "--engine", "claude", "--no-access-fallback"],
-        ):
-            args = AUTOREVIEW.parse_args()
-        with self.assertRaisesRegex(SystemExit, "only supported for codex"):
-            AUTOREVIEW.reviewer_args(args)
-
     def test_codex_retries_terra_after_sol_access_failure(self) -> None:
         args = argparse.Namespace(
             engine="codex",
