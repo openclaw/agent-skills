@@ -6034,6 +6034,11 @@ def parse_args() -> argparse.Namespace:
         help="Claude fallback model chain or claude=a,b. Repeatable.",
     )
     parser.add_argument(
+        "--no-access-fallback",
+        action="store_true",
+        help="Keep the selected Codex model on account-access failure; do not retry another model.",
+    )
+    parser.add_argument(
         "--engine-timeout-seconds",
         type=positive_float,
         default=os.environ.get("AUTOREVIEW_ENGINE_TIMEOUT_SECONDS"),
@@ -6168,6 +6173,8 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
         raise SystemExit("--codex-config is only supported for codex; no codex reviewer selected")
     if getattr(args, "codex_speed", None) and engine != "codex":
         raise SystemExit("--codex-speed is only supported for codex; no codex reviewer selected")
+    if getattr(args, "no_access_fallback", False) and engine != "codex":
+        raise SystemExit("--no-access-fallback is only supported for codex; no codex reviewer selected")
     model = (
         model_by_engine.get(engine)
         or global_model
@@ -6189,7 +6196,11 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
             or env_fallback_by_engine.get(engine)
             or env_global_fallback
         )
-    elif engine == "codex" and model == DEFAULT_MODEL_BY_ENGINE["codex"]:
+    elif (
+        engine == "codex"
+        and model == DEFAULT_MODEL_BY_ENGINE["codex"]
+        and not getattr(args, "no_access_fallback", False)
+    ):
         fallback_model = DEFAULT_CODEX_ACCESS_FALLBACK_MODEL
     else:
         fallback_model = None
