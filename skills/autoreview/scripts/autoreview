@@ -3813,7 +3813,7 @@ def parse_codex_auth_config_fallback(text: str) -> dict[str, Any]:
 
 def load_codex_auth_config(path: Path, *, strict: bool = False) -> dict[str, Any]:
     try:
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         if strict and path.is_symlink():
             raise SystemExit("Codex inference configuration refused: operator TOML is unavailable")

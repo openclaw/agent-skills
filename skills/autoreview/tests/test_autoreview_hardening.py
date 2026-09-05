@@ -2272,16 +2272,19 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir).resolve()
             repo = init_repo(root)
+            git(repo, "config", "core.autocrlf", "false")
             (repo / "behavior.py").write_text("def behavior(): return 'preexisting'\n", encoding="utf-8")
             git(repo, "add", "behavior.py")
             git(repo, "commit", "-qm", "initial behavior")
             initial = git(repo, "rev-parse", "HEAD").strip()
-            for value in ("before", "after"):
-                (repo / "unrelated.txt").write_text(value + "\n", encoding="utf-8")
+            for content in (b"before\n", b"after\r\n"):
+                (repo / "unrelated.txt").write_bytes(content)
                 git(repo, "add", "unrelated.txt")
                 git(repo, "commit", "-qm", "unrelated maintenance")
             expected_parent = git(repo, "rev-parse", "HEAD^").strip()
-            expected_patch = git(repo, "diff", *self.helper["SAFE_DIFF_FLAGS"], "HEAD^", "HEAD")
+            expected_patch = subprocess.check_output(
+                ["git", "diff", *self.helper["SAFE_DIFF_FLAGS"], "HEAD^", "HEAD"], cwd=repo,
+            ).decode("utf-8")
             for state, depth in (("missing", 1), ("available", 2), ("retained", None)):
                 with self.subTest(state=state):
                     checkout = root / state

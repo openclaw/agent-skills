@@ -87,7 +87,7 @@ class CodexInferenceRouteTests(unittest.TestCase):
         text += "\n[model_providers.review_api.auth]\n" + table(self.auth)
         # These unrelated operator capabilities must never enter the review runtime.
         text += '\n[mcp_servers.unrelated]\ncommand = "must-not-execute"\n'
-        (self.home / "config.toml").write_text(text)
+        (self.home / "config.toml").write_text(text, encoding="utf-8")
 
     def run_review(self, *, prepare_auth=None, during_run=None, scan=None):
         observed = {}
