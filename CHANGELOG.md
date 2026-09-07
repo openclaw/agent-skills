@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Restore trusted caller HOME only for explicitly selected Autoreview command-auth helpers on POSIX, preserving reviewer isolation and suppressing raw provider diagnostics.
 - Make agent transcripts explicit-request-only and trim before previews or publication, retaining native hosted-session sharing and partial-source notices.
 
 - Preserve Unicode and control characters in Autoreview's Codex configuration overrides and isolated Kimi TOML configuration.

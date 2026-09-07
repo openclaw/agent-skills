@@ -17,6 +17,7 @@ import os
 import queue
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import stat
@@ -3891,6 +3892,35 @@ def codex_auth_config_flags(
     return flags
 
 
+def codex_auth_helper_home(repo: Path) -> Path:
+    try:
+        home = Path(os.environ.get("HOME", ""))
+        resolved = home.resolve(strict=True)
+        if not home.is_absolute() or not resolved.is_dir():
+            raise ValueError("unavailable HOME")
+        roots = (repo.absolute(), repo.resolve())
+        pending = [home, *home.parents]
+        seen: set[Path] = set()
+        while pending:
+            path = pending.pop()
+            if path in seen:
+                continue
+            seen.add(path)
+            if any(is_within(path, root) or is_within(path.resolve(), root) for root in roots):
+                raise ValueError("repository-owned HOME")
+            if path.is_symlink():
+                # Check intermediate link targets too: a repository-owned link
+                # can lead back outside the repository before final resolution.
+                target = path.parent / os.readlink(path)
+                pending.extend((target, *target.parents))
+        return resolved
+    except (OSError, RuntimeError, ValueError):
+        raise SystemExit(
+            "Codex inference configuration refused: auth helper requires an available "
+            "absolute trusted caller HOME outside the reviewed repository"
+        ) from None
+
+
 def load_codex_inference_route(
     repo: Path, overrides: Sequence[str] = (),
 ) -> tuple[list[str], bytes | None]:
@@ -3969,6 +3999,8 @@ def load_codex_inference_route(
     command = external_path(auth.get("command"), "authentication executable", absolute=True)
     if not os.access(command, os.X_OK):
         refuse("authentication executable is not executable")
+    if os.name != "nt":
+        codex_auth_helper_home(repo)
     auth_cwd = external_path(auth.get("cwd", str(source_home)), "authentication cwd", directory=True)
     for key, minimum in (("timeout_ms", 1), ("refresh_interval_ms", 0)):
         if key in auth and (type(auth[key]) is not int or not minimum <= auth[key] <= (1 << 64) - 1):
@@ -4010,6 +4042,27 @@ def prepare_codex_inference_config(
         output.write(catalogue_bytes)
     catalogue.chmod(0o600)
     return [*flags, "-c", f"model_catalog_json={toml_string(str(catalogue.resolve()))}"]
+
+
+def stage_codex_auth_helper(repo: Path, runtime_root: Path, flags: list[str]) -> list[str]:
+    if os.name == "nt":
+        return flags
+    staged = list(flags)
+    for index, flag in enumerate(flags):
+        key, separator, value = flag.partition("=")
+        if not separator or not re.fullmatch(r"model_providers\.[A-Za-z0-9_-]+\.auth\.command", key):
+            continue
+        # Route validation owns the absolute executable. Native command auth
+        # runs outside the tool sandbox; only its launcher restores caller HOME.
+        command = json.loads(value)
+        home = codex_auth_helper_home(repo)
+        with tempfile.NamedTemporaryFile(
+            "w", prefix="provider-auth.", dir=runtime_root, delete=False, encoding="utf-8",
+        ) as wrapper:
+            wrapper.write(f"#!/bin/sh\nexport HOME={shlex.quote(str(home))}\nexec {shlex.quote(command)}\n")
+            os.fchmod(wrapper.fileno(), 0o700)
+        staged[index] = f"{key}={toml_string(wrapper.name)}"
+    return staged
 
 
 def codex_file_auth_source(repo: Path) -> Path | None:
@@ -4671,6 +4724,26 @@ def codex_model_access_failure(result: subprocess.CompletedProcess[str], model: 
     return False
 
 
+def codex_failure_category(result: subprocess.CompletedProcess[str]) -> str:
+    # Classify only; captured auth-helper diagnostics must never escape.
+    text = (result.stderr + "\n" + result.stdout).lower()
+    categories = (
+        ("provider-auth-helper", ("provider auth command", "external bearer")),
+        ("model-catalogue", ("model_catalog_json", "model catalog", "model catalogue")),
+        ("model-sandbox-policy", ("requires a sandbox", "reviewed escalations")),
+        ("cli-arguments", ("unexpected argument", "unrecognized option", "unrecognized subcommand")),
+        ("configuration", ("error loading config", "error parsing config", "failed to load config", "invalid configuration", "missing field", "unknown field")),
+        ("authentication", ("401 unauthorized", "http 401", "status code 401", "invalid api key", "missing bearer", "authentication failed")),
+        ("provider-access", ("403 forbidden", "http 403", "do not have access", "not supported when using codex")),
+        ("rate-limit", ("429 too many requests", "http 429", "rate limit", "rate_limit")),
+        ("transport", ("connection refused", "connection reset", "failed to connect", "stream disconnected", "certificate verify", "timed out")),
+    )
+    for category, markers in categories:
+        if any(marker in text for marker in markers):
+            return category
+    return "unclassified"
+
+
 def codex_command(
     args: argparse.Namespace,
     source_repo: Path,
@@ -4706,6 +4779,7 @@ def codex_command(
         auth_config = prepare_codex_inference_config(
             load_codex_inference_route(source_repo, overrides), runtime_root,
         )
+        auth_config = stage_codex_auth_helper(source_repo, runtime_root, auth_config)
     cmd.extend(auth_config)
     if force_file_auth:
         cmd.extend(["-c", 'cli_auth_credentials_store="file"'])
@@ -4762,6 +4836,8 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             runtime_codex_home = runtime_root / "codex-home"
             route = load_codex_inference_route(repo, codex_config_overrides(args))
             auth_config = prepare_codex_inference_config(route, runtime_root)
+            command_auth = any(flag.startswith("model_provider=") for flag in auth_config)
+            auth_config = stage_codex_auth_helper(repo, runtime_root, auth_config)
             file_auth_linked = prepare_codex_runtime_auth(repo, runtime_codex_home)
             for index, model in enumerate(models):
                 output_path.write_text("")
@@ -4787,7 +4863,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                     label="codex",
                     max_runtime_seconds=getattr(args, "engine_timeout_seconds", None),
                     stream_output=args.stream_engine_output,
-                    stream_display=CodexStreamDisplay() if args.stream_engine_output else None,
+                    stream_display=CodexStreamDisplay(suppress_diagnostics=command_auth) if args.stream_engine_output else None,
                     env=codex_runtime_env(
                         repo,
                         runtime_root,
@@ -4797,6 +4873,8 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                 )
                 output = output_path.read_text()
                 if result.returncode == 0:
+                    if command_auth and not output.strip():
+                        raise SystemExit("codex engine failed: missing-report; provider diagnostics suppressed")
                     return output or result.stdout
                 if (
                     index == 0
@@ -4810,6 +4888,10 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                         file=sys.stderr,
                     )
                     continue
+                if command_auth:
+                    raise SystemExit(
+                        f"codex engine failed: {codex_failure_category(result)}; provider diagnostics suppressed"
+                    )
                 detail = result.stderr or result.stdout
                 if primary_failure is not None:
                     primary_detail = primary_failure.stderr or primary_failure.stdout
@@ -5559,18 +5641,21 @@ def run_kimi(args: argparse.Namespace, repo: Path, prompt: str) -> str:
 
 
 class CodexStreamDisplay:
-    def __init__(self, *, activity_seconds: int = 20) -> None:
+    def __init__(self, *, activity_seconds: int = 20, suppress_diagnostics: bool = False) -> None:
         self.activity_seconds = activity_seconds
+        self.suppress_diagnostics = suppress_diagnostics
         self.hidden_events = 0
         self.last_visible = time.monotonic()
 
     def __call__(self, name: str, line: str) -> str | None:
         if name != "stdout":
-            return stream_display_escape(line)
+            return self.hidden_activity() if self.suppress_diagnostics else stream_display_escape(line)
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
-            return self.visible(line)
+            return self.hidden_activity() if self.suppress_diagnostics else self.visible(line)
+        if not isinstance(event, dict):
+            return self.hidden_activity()
         event_type = event.get("type")
         if event_type == "thread.started":
             return self.visible(f"codex thread: {event.get('thread_id', '<unknown>')}\n")

@@ -109,6 +109,15 @@ wrapper; omitted or empty `auth.args` are accepted. Omitted `wire_api` and
 `requires_openai_auth` retain Codex's `responses` and `false` defaults. Optional
 auth timing and context settings keep native defaults and semantics.
 
+On POSIX, a private launcher restores the validated caller `HOME` only for the
+selected authentication executable; the engine and reviewer tools retain their
+isolated environment and filesystem access. Caller `HOME` must be an available
+absolute directory with no repository-owned path or symlink provenance. Windows
+keeps the native executable route. Command-auth runs suppress raw provider
+diagnostics and report fixed failure categories, while retaining compact progress,
+usage and assistant report streaming. An empty final report fails without exposing
+captured stdout.
+
 Catalogue and authentication working-directory paths resolve relative to the
 operator config directory and must remain outside the reviewed repository.
 A supplied catalogue is copied byte-for-byte into the private client runtime;
