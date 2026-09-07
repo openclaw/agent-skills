@@ -2013,6 +2013,9 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
             ("timeout", unavailable("DIAGNOSTIC_SENTINEL", result=self.helper["TimedOutEngineProcess"]([], 124, "", "")), "engine_failed"),
             ("invalid-json", "not JSON", "invalid_report"),
             ("invalid-schema", '{"findings": []}', "invalid_report"),
+            ("invalid-field-type", json.dumps({"findings": [], "overall_correctness": [],
+                                               "overall_explanation": "Invalid enum", "overall_confidence": 0.9}), "invalid_report"),
+            ("invalid-event-type", '[{"type":"assistant","message":{"content":null}}]', "invalid_report"),
             ("isolation", SystemExit("isolation refused"), None),
             ("spawn", OSError("cannot execute reviewer"), None),
         )

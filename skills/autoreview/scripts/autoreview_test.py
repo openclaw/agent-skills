@@ -52,6 +52,38 @@ DRAFT_REPORT = {
 
 
 class AutoreviewCursorTests(unittest.TestCase):
+    def test_parser_resource_errors_are_invalid_reports(self) -> None:
+        args = argparse.Namespace(engine="codex", max_priority="P2")
+        for raw in ("[" * 2000 + "]" * 2000, '{"findings":[],"number":' + "9" * 10000 + "}"):
+            with self.subTest(length=len(raw)), mock.patch.object(
+                AUTOREVIEW, "run_engine", return_value=raw,
+            ), mock.patch.object(AUTOREVIEW, "scan_outgoing_review_pack"):
+                with self.assertRaises(AUTOREVIEW.ReviewerUnavailable) as caught:
+                    AUTOREVIEW.run_reviewer(args, Path.cwd(), "synthetic", set(), [])
+                self.assertEqual(caught.exception.reason, "invalid_report")
+
+    def test_container_valued_report_enums_are_invalid_reports(self) -> None:
+        args = argparse.Namespace(engine="codex", max_priority="P2")
+        finding = copy.deepcopy(DRAFT_REPORT["findings"][0])
+        finding["source_attribution"] = {
+            "target": "index", "record_id": "record", "source_id": "source",
+            "side": "present", "column": 1, "excerpt": "text",
+        }
+        for field in ("overall_correctness", "priority", "category", "target", "side"):
+            for value in ([], {}, None, 42, False):
+                report = copy.deepcopy(FINAL_REPORT)
+                report["findings"] = [copy.deepcopy(finding)]
+                owner = report if field == "overall_correctness" else report["findings"][0]
+                if field in {"target", "side"}:
+                    owner = owner["source_attribution"]
+                owner[field] = value
+                with self.subTest(field=field, value=value), mock.patch.object(
+                    AUTOREVIEW, "run_engine", return_value=json.dumps(report),
+                ), mock.patch.object(AUTOREVIEW, "scan_outgoing_review_pack"):
+                    with self.assertRaises(AUTOREVIEW.ReviewerUnavailable) as caught:
+                        AUTOREVIEW.run_reviewer(args, Path.cwd(), "synthetic", {"draft.js"}, [])
+                    self.assertEqual(caught.exception.reason, "invalid_report")
+
     def test_extract_json_prefers_terminal_result_event(self) -> None:
         stream = "\n".join(
             [
@@ -853,6 +885,7 @@ class AutoreviewAmpTests(unittest.TestCase):
                 (subprocess.CompletedProcess([], 7, '{"type":"system","subtype":"init"}\n', ""), "unexpected adapter event sequence"),
                 (subprocess.CompletedProcess([], 0, amp_test_stream(root, tools=["shell_command"]), ""), "exposed tools"),
                 (subprocess.CompletedProcess([], 0, amp_test_stream(root), ""), "produced no result file"),
+                (subprocess.CompletedProcess([], 0, '{"type":[]}\n', ""), "unexpected stream event type"),
             )
             for result, diagnostic in cases:
                 with self.subTest(diagnostic=diagnostic), self.assertRaises(AUTOREVIEW.ReviewerUnavailable) as caught:
@@ -860,6 +893,10 @@ class AutoreviewAmpTests(unittest.TestCase):
                 self.assertEqual(caught.exception.reason, "runtime_validation_failed")
                 self.assertIn(diagnostic, str(caught.exception))
                 self.assertEqual(caught.exception.returncode, result.returncode)
+            for raw in ("[" * 2000 + "]" * 2000, '{"number":' + "9" * 10000 + "}"):
+                with self.subTest(length=len(raw)), self.assertRaises(AUTOREVIEW.ReviewerUnavailable) as caught:
+                    AUTOREVIEW.amp_review_result(subprocess.CompletedProcess([], 0, raw, ""), root, root / "error", root / "result")
+                self.assertEqual(caught.exception.reason, "runtime_validation_failed")
 
     def test_amp_plugin_inventory_attestation_fails_closed(self) -> None:
         cwd = Path("/tmp/amp-review-empty")

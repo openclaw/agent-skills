@@ -4886,7 +4886,11 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                         file_auth_linked=file_auth_linked,
                     ),
                 )
-                output = output_path.read_text()
+                try:
+                    output = output_path.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    raise ReviewerUnavailable("codex engine returned non-UTF-8 report",
+                                              reason="invalid_report", result=result) from None
                 if result.returncode == 0:
                     if command_auth and not output.strip():
                         raise ReviewerUnavailable("codex engine failed: missing-report; provider diagnostics suppressed",
@@ -5083,7 +5087,7 @@ def attest_amp_stream(output: str, review_root: Path) -> bool:
             raise SystemExit(
                 f"amp isolation attestation failed: stream line {line_number} is not an object"
             )
-        if event.get("type") not in {"system", "user", "assistant", "result"}:
+        if not isinstance(event.get("type"), str) or event["type"] not in {"system", "user", "assistant", "result"}:
             raise SystemExit(
                 "amp isolation attestation failed: unexpected stream event type "
                 f"{event.get('type')!r}"
@@ -5153,7 +5157,7 @@ def attest_amp_stream(output: str, review_root: Path) -> bool:
             if not isinstance(block, dict):
                 raise SystemExit("amp isolation attestation failed: message block was malformed")
             block_type = block.get("type")
-            if block_type not in {"text", "thinking", "tool_use", "tool_result"}:
+            if not isinstance(block_type, str) or block_type not in {"text", "thinking", "tool_use", "tool_result"}:
                 raise SystemExit(
                     f"amp isolation attestation failed: unexpected message block {block_type!r}"
                 )
@@ -5187,10 +5191,13 @@ def attest_amp_stream(output: str, review_root: Path) -> bool:
     tool_succeeded = tool_result.get("is_error") is False
     if tool_succeeded and tool_result.get("content") != "Adapter completed.":
         raise SystemExit("amp isolation attestation failed: adapter success result was malformed")
-    if not tool_succeeded and tool_result.get("content") not in {
-        "Autoreview generation failed.",
-        "Error: Autoreview generation failed.",
-    }:
+    if not tool_succeeded and (
+        not isinstance(tool_result.get("content"), str)
+        or tool_result["content"] not in {
+            "Autoreview generation failed.",
+            "Error: Autoreview generation failed.",
+        }
+    ):
         raise SystemExit("amp isolation attestation failed: adapter failure result was not sanitized")
 
     result_events = [event for event in events if event.get("type") == "result"]
@@ -5524,7 +5531,7 @@ def amp_review_result(result: subprocess.CompletedProcess[str], review_root: Pat
         )
     except ReviewerUnavailable:
         raise
-    except SystemExit as exc:
+    except (SystemExit, ValueError, RecursionError) as exc:
         raise ReviewerUnavailable(str(exc), reason="runtime_validation_failed", result=result) from None
 
 
@@ -5901,9 +5908,11 @@ def _report_from_events(events: list[Any]) -> dict[str, Any] | None:
             candidates.append(data["content"])
         message = event.get("message")
         if isinstance(message, dict):
-            for item in message.get("content", []):
-                if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
-                    assistant_candidates.append(item["text"])
+            content = message.get("content", [])
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                        assistant_candidates.append(item["text"])
         if isinstance(event.get("result"), str):
             terminal_candidates.append(event["result"])
         if isinstance(event.get("result"), dict):
@@ -5980,9 +5989,9 @@ def validate_attribution_shape(value: Any, index: int) -> None:
     keys = {"target", "record_id", "source_id", "side", "column", "excerpt"}
     if not isinstance(value, dict) or set(value) != keys:
         raise SystemExit(f"finding {index} has invalid source_attribution keys")
-    if (value["target"] not in {"index", "working_tree"}
+    if (not all(isinstance(value[key], str) for key in ("target", "side", "record_id", "source_id", "excerpt"))
+            or value["target"] not in {"index", "working_tree"}
             or value["side"] not in {"present", "removed"}
-            or not all(isinstance(value[key], str) for key in ("record_id", "source_id", "excerpt"))
             or not isinstance(value["column"], int) or isinstance(value["column"], bool)
             or value["column"] < 1):
         raise SystemExit(f"finding {index} has invalid source_attribution")
@@ -6042,7 +6051,7 @@ def _validate_report(
             raise SystemExit(f"review JSON missing required key: {key}")
     if not isinstance(report["findings"], list):
         raise SystemExit("review JSON findings must be an array")
-    if report.get("overall_correctness") not in {"patch is correct", "patch is incorrect"}:
+    if not isinstance(report.get("overall_correctness"), str) or report["overall_correctness"] not in {"patch is correct", "patch is incorrect"}:
         raise SystemExit(f"review JSON has invalid overall_correctness: {report.get('overall_correctness')}")
     if not isinstance(report.get("overall_explanation"), str) or not report["overall_explanation"]:
         raise SystemExit("review JSON overall_explanation must be a non-empty string")
@@ -6072,12 +6081,12 @@ def _validate_report(
         if not isinstance(body, str) or not body or len(body) > 2000:
             raise SystemExit(f"finding {index} has invalid body")
         priority = finding.get("priority")
-        if priority not in {"P0", "P1", "P2", "P3"}:
+        if not isinstance(priority, str) or priority not in {"P0", "P1", "P2", "P3"}:
             raise SystemExit(f"finding {index} has invalid priority: {priority}")
         if not number_in_range(finding.get("confidence")):
             raise SystemExit(f"finding {index} has invalid confidence")
         category = finding.get("category")
-        if category not in {"bug", "security", "regression", "test_gap", "maintainability"}:
+        if not isinstance(category, str) or category not in {"bug", "security", "regression", "test_gap", "maintainability"}:
             raise SystemExit(f"finding {index} has invalid category: {category}")
         location = finding.get("code_location")
         if not isinstance(location, dict):
@@ -6718,7 +6727,7 @@ def run_reviewer(
         report = extract_json(raw)
         provider_report = copy.deepcopy(report)
         validate_report(report, repo, paths, [], mixed, available)
-    except SystemExit as exc:
+    except (SystemExit, ValueError, RecursionError) as exc:
         # Only parsing/schema validation is inside this boundary. Scanner,
         # isolation, attribution refusals, and required-finding gates stay distinct.
         raise ReviewerUnavailable(str(exc), reason="invalid_report") from None
