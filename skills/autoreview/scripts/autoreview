@@ -1183,6 +1183,21 @@ def emit_heartbeat(
     )
 
 
+class ReviewerUnavailable(SystemExit):
+    """A launched reviewer failed before returning a valid report."""
+
+    def __init__(self, message: str, *, reason: str = "engine_failed",
+                 result: subprocess.CompletedProcess[str] | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.returncode = result.returncode if result is not None else None
+        self.timed_out = isinstance(result, TimedOutEngineProcess)
+
+
+class TimedOutEngineProcess(subprocess.CompletedProcess[str]):
+    """Distinguish our deadline from a reviewer that itself exits 124."""
+
+
 class EngineRuntimeDeadline:
     """One absolute wall-clock deadline for an owned reviewer process."""
 
@@ -1227,7 +1242,7 @@ class EngineRuntimeDeadline:
     ) -> subprocess.CompletedProcess[str]:
         assert self.max_runtime_seconds is not None
         detail = f"{self.label} engine timed out after {self.max_runtime_seconds:g}s"
-        return subprocess.CompletedProcess(
+        return TimedOutEngineProcess(
             args,
             124,
             stdout,
@@ -4874,7 +4889,8 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                 output = output_path.read_text()
                 if result.returncode == 0:
                     if command_auth and not output.strip():
-                        raise SystemExit("codex engine failed: missing-report; provider diagnostics suppressed")
+                        raise ReviewerUnavailable("codex engine failed: missing-report; provider diagnostics suppressed",
+                                                  reason="invalid_report", result=result)
                     return output or result.stdout
                 if (
                     index == 0
@@ -4889,17 +4905,18 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                     )
                     continue
                 if command_auth:
-                    raise SystemExit(
-                        f"codex engine failed: {codex_failure_category(result)}; provider diagnostics suppressed"
+                    raise ReviewerUnavailable(
+                        f"codex engine failed: {codex_failure_category(result)}; provider diagnostics suppressed",
+                        result=result,
                     )
                 detail = result.stderr or result.stdout
                 if primary_failure is not None:
                     primary_detail = primary_failure.stderr or primary_failure.stdout
-                    raise SystemExit(
+                    raise ReviewerUnavailable(
                         f"codex engine failed with primary model ({primary_failure.returncode})\n{primary_detail}\n"
-                        f"codex fallback model failed ({result.returncode})\n{detail}"
+                        f"codex fallback model failed ({result.returncode})\n{detail}", result=result,
                     )
-                raise SystemExit(f"codex engine failed ({result.returncode})\n{detail}")
+                raise ReviewerUnavailable(f"codex engine failed ({result.returncode})\n{detail}", result=result)
     finally:
         schema_path.unlink(missing_ok=True)
         output_path.unlink(missing_ok=True)
@@ -4952,7 +4969,7 @@ def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             ),
         )
     if result.returncode != 0:
-        raise SystemExit(f"claude engine failed ({result.returncode})\n{result.stderr or result.stdout}")
+        raise ReviewerUnavailable(f"claude engine failed ({result.returncode})\n{result.stderr or result.stdout}", result=result)
     return result.stdout
 
 
@@ -5464,14 +5481,23 @@ def run_amp(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             stream_output=args.stream_engine_output,
             env=engine_env,
         )
+        return amp_review_result(result, review_root, error_path, result_path)
+
+
+def amp_review_result(result: subprocess.CompletedProcess[str], review_root: Path,
+                      error_path: Path, result_path: Path) -> str:
+    # This boundary is post-launch only. Attestation and private-file guards
+    # still run before report acceptance and retain their original diagnostics.
+    try:
         if result.returncode == 124:
             detail = result.stderr or result.stdout
-            raise SystemExit(
+            raise ReviewerUnavailable(
                 f"amp engine failed ({result.returncode})\n"
-                + display_escape(detail, 4000, multiline=True)
+                + display_escape(detail, 4000, multiline=True), result=result,
             )
         if len(result.stdout) > AMP_MAX_OUTPUT_CHARS:
-            raise SystemExit("amp engine stream exceeds the output limit")
+            raise ReviewerUnavailable("amp engine stream exceeds the output limit",
+                                      reason="invalid_report", result=result)
         tool_succeeded = attest_amp_stream(result.stdout, review_root)
         if error_path.exists():
             detail = read_amp_private_file(
@@ -5479,23 +5505,27 @@ def run_amp(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                 label="error",
                 max_chars=4000,
             )
-            raise SystemExit(
+            raise ReviewerUnavailable(
                 "amp direct generation failed: "
-                + display_escape(detail, 4000, multiline=True)
+                + display_escape(detail, 4000, multiline=True), result=result,
             )
         if not tool_succeeded:
-            raise SystemExit("amp adapter tool failed without producing an error file")
+            raise ReviewerUnavailable("amp adapter tool failed without producing an error file", result=result)
         if result.returncode != 0:
             detail = result.stderr or result.stdout
-            raise SystemExit(
+            raise ReviewerUnavailable(
                 f"amp engine failed ({result.returncode})\n"
-                + display_escape(detail, 4000, multiline=True)
+                + display_escape(detail, 4000, multiline=True), result=result,
             )
         return read_amp_private_file(
             result_path,
             label="result",
             max_chars=AMP_MAX_OUTPUT_CHARS,
         )
+    except ReviewerUnavailable:
+        raise
+    except SystemExit as exc:
+        raise ReviewerUnavailable(str(exc), reason="runtime_validation_failed", result=result) from None
 
 
 def json_file_declares_hooks(path: Path) -> bool:
@@ -5547,7 +5577,7 @@ def run_pi(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             ),
         )
     if result.returncode != 0:
-        raise SystemExit(f"pi engine failed ({result.returncode})\n{result.stderr or result.stdout}")
+        raise ReviewerUnavailable(f"pi engine failed ({result.returncode})\n{result.stderr or result.stdout}", result=result)
     return result.stdout
 
 
@@ -5614,8 +5644,8 @@ def run_kimi(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             ),
         )
     if result.returncode != 0:
-        raise SystemExit(
-            f"kimi engine failed ({result.returncode})\n{result.stderr or result.stdout}"
+        raise ReviewerUnavailable(
+            f"kimi engine failed ({result.returncode})\n{result.stderr or result.stdout}", result=result,
         )
     # stream-json: one JSON object per line; assistant content carries the
     # reply, tool/meta lines are progress noise (there are no tools anyway).
@@ -5634,8 +5664,9 @@ def run_kimi(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             if isinstance(content, str):
                 texts.append(content)
     if not texts:
-        raise SystemExit(
-            f"kimi engine returned no assistant output\n{result.stdout[:2000]}"
+        raise ReviewerUnavailable(
+            f"kimi engine returned no assistant output\n{result.stdout[:2000]}",
+            reason="invalid_report", result=result,
         )
     return "\n".join(texts)
 
@@ -6311,6 +6342,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", help="Write human output to a file as well as stdout.")
     parser.add_argument("--json-output", help="Write validated structured review JSON.")
+    parser.add_argument("--status-output", help="Write a versioned status sidecar, including reviewer_unavailable; does not change report JSON or exit codes.")
     parser.add_argument(
         "--stream-engine-output",
         action="store_true",
@@ -6682,9 +6714,14 @@ def run_reviewer(
         verify_evidence(repo, evidence or [])
         verify_mixed_sources(repo, mixed)
     raw = run_engine(args, repo, outgoing)
-    report = extract_json(raw)
-    provider_report = copy.deepcopy(report)
-    validate_report(report, repo, paths, [], mixed, available)
+    try:
+        report = extract_json(raw)
+        provider_report = copy.deepcopy(report)
+        validate_report(report, repo, paths, [], mixed, available)
+    except SystemExit as exc:
+        # Only parsing/schema validation is inside this boundary. Scanner,
+        # isolation, attribution refusals, and required-finding gates stay distinct.
+        raise ReviewerUnavailable(str(exc), reason="invalid_report") from None
     filter_findings_by_priority(report, args.max_priority)
     report["provider_report"] = provider_report
     if mixed:
@@ -6791,9 +6828,11 @@ def run_review_passes(
 
 def reject_repo_output_paths(args: argparse.Namespace, repo: Path) -> None:
     repo_root_path = repo.resolve()
+    outputs: list[tuple[str, Path]] = []
     for option, value in (
         ("--json-output", getattr(args, "json_output", None)),
         ("--output", getattr(args, "output", None)),
+        ("--status-output", getattr(args, "status_output", None)),
     ):
         if not value:
             continue
@@ -6801,6 +6840,21 @@ def reject_repo_output_paths(args: argparse.Namespace, repo: Path) -> None:
         resolved = (
             path if path.is_absolute() else Path.cwd() / path
         ).resolve()
+        if getattr(args, "status_output", None):
+            for previous_option, previous in outputs:
+                # Refuse spelling aliases even before files exist, including
+                # macOS case/decomposition aliases and Windows case aliases.
+                same = (unicodedata.normalize("NFD", str(resolved)).casefold()
+                        == unicodedata.normalize("NFD", str(previous)).casefold())
+                if (not same and resolved.parent.exists() and previous.parent.exists()
+                        and unicodedata.normalize("NFD", resolved.name).casefold()
+                        == unicodedata.normalize("NFD", previous.name).casefold()):
+                    same = os.path.samefile(resolved.parent, previous.parent)
+                if not same and resolved.exists() and previous.exists():
+                    same = os.path.samefile(resolved, previous)
+                if same:
+                    raise SystemExit(f"{option} must use a different path from {previous_option}")
+            outputs.append((option, resolved))
         inside_repo = resolved.is_relative_to(repo_root_path)
         if not inside_repo:
             for ancestor in (resolved, *resolved.parents):
@@ -6833,6 +6887,23 @@ def atomic_write_text(path: Path, content: str) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
+def write_review_status(args: argparse.Namespace, status: str, exit_code: int,
+                        failure: ReviewerUnavailable | None = None) -> None:
+    if not getattr(args, "status_output", None):
+        return
+    envelope = {
+        "schema_version": 1,
+        "status": status,
+        "exit_code": exit_code,
+        "engine": args.engine,
+        "report_produced": failure is None,
+        "reason": failure.reason if failure else None,
+        "reviewer_exit_code": failure.returncode if failure else None,
+        "timed_out": failure.timed_out if failure else False,
+    }
+    atomic_write_text(Path(args.status_output).expanduser(), json.dumps(envelope, indent=2) + "\n")
+
+
 def main() -> int:
     with OwnedProcessSignalHandlers():
         try:
@@ -6850,6 +6921,8 @@ def main_impl() -> int:
     with PreparationProgress("target selection"):
         repo = repo_root()
         reject_repo_output_paths(args, repo)
+        if getattr(args, "status_output", None):
+            Path(args.status_output).expanduser().unlink(missing_ok=True)
         target, target_ref = choose_target(repo, args.mode, args.base)
         branch = current_branch(repo)
     print(f"autoreview target: {target}", flush=True)
@@ -6900,14 +6973,18 @@ def main_impl() -> int:
                 "source changed while the review bundle was being created; "
                 "rerun autoreview against the updated tree"
             )
-    chunk_reports = run_review_passes(
-        args,
-        reviewers,
-        repo,
-        prompts,
-        captured,
-        evidence.files,
-    )
+    try:
+        chunk_reports = run_review_passes(
+            args,
+            reviewers,
+            repo,
+            prompts,
+            captured,
+            evidence.files,
+        )
+    except ReviewerUnavailable as exc:
+        write_review_status(args, "reviewer_unavailable", 1, exc)
+        raise
     if len(chunk_reports) == 1 and not captured.mixed:
         report = chunk_reports[0][1]
     else:
@@ -6955,10 +7032,13 @@ def main_impl() -> int:
     has_findings = bool(report["findings"])
     overall_incorrect = report["overall_correctness"] == "patch is incorrect"
     if report["review_status"] == "incomplete":
-        return 2
-    if args.expect_findings:
-        return 0 if has_findings else 1
-    return 1 if has_findings or overall_incorrect else 0
+        exit_code = 2
+    elif args.expect_findings:
+        exit_code = 0 if has_findings else 1
+    else:
+        exit_code = 1 if has_findings or overall_incorrect else 0
+    write_review_status(args, report["review_status"], exit_code)
+    return exit_code
 
 
 def sanitized_main() -> int:

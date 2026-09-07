@@ -1971,7 +1971,8 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
                             "overall_explanation": "Synthetic provider explanation.", "overall_confidence": 0.61,
                         }
                         argv = [str(SCRIPT), "--engine", "codex", "--mode", "local", "--max-priority", priority,
-                                "--output", str(root / "result.txt"), "--json-output", str(root / "result.json")]
+                                "--output", str(root / "result.txt"), "--json-output", str(root / "result.json"),
+                                "--status-output", str(root / "status.json")]
                         for needle in required:
                             argv.extend(["--require-finding", needle])
                         if expect:
@@ -1984,6 +1985,12 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
                         }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                             self.assertEqual(self.helper["main_impl"](), exit_code)
                         result = json.loads((root / "result.json").read_text())
+                        outcome = json.loads((root / "status.json").read_text())
+                        self.assertEqual(outcome, {
+                            "schema_version": 1, "status": expected_status, "exit_code": exit_code,
+                            "engine": "codex", "report_produced": True, "reason": None,
+                            "reviewer_exit_code": None, "timed_out": False,
+                        })
                         text = (root / "result.txt").read_text()
                         self.assertEqual(result["review_status"], expected_status)
                         self.assertEqual(result["overall_correctness"], verdict)
@@ -1996,6 +2003,127 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
                             self.assertIn("incomplete:", text)
                         if required and expected_status == "incomplete":
                             self.assertEqual(result["missing_required_findings"], required)
+
+    def test_status_unavailable_and_local_refusals_remain_distinct(self) -> None:
+        clean = json.dumps({"findings": [], "overall_correctness": "patch is correct",
+                            "overall_explanation": "Synthetic review.", "overall_confidence": 0.9})
+        unavailable = self.helper["ReviewerUnavailable"]
+        cases = (
+            ("engine", unavailable("DIAGNOSTIC_SENTINEL", result=subprocess.CompletedProcess([], 7, "", "")), "engine_failed"),
+            ("timeout", unavailable("DIAGNOSTIC_SENTINEL", result=self.helper["TimedOutEngineProcess"]([], 124, "", "")), "engine_failed"),
+            ("invalid-json", "not JSON", "invalid_report"),
+            ("invalid-schema", '{"findings": []}', "invalid_report"),
+            ("isolation", SystemExit("isolation refused"), None),
+            ("spawn", OSError("cannot execute reviewer"), None),
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            git(repo, "commit", "-q", "--allow-empty", "-m", "base")
+            (repo / "source.txt").write_text("changed\n")
+            for count in (1, 2):
+                for label, failure, reason in cases:
+                    with self.subTest(count=count, label=label):
+                        sidecar = root / "status.json"
+                        report = root / "result.json"
+                        sidecar.write_text('{"status":"scoped-clean"}')
+                        argv = [str(SCRIPT), "--mode", "local", "--engine", "codex",
+                                "--status-output", str(sidecar), "--json-output", str(report)]
+                        engine = mock.Mock(side_effect=[clean] * (count - 1) + [failure])
+                        with mock.patch.dict(self.helper["main_impl"].__globals__, {
+                            "repo_root": lambda: repo,
+                            "build_review_prompts": lambda *_args: ["synthetic pack"] * count,
+                            "scan_outgoing_review_pack": lambda *_args: None,
+                            "run_engine": engine,
+                        }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                            with self.assertRaises((SystemExit, OSError)):
+                                self.helper["main_impl"]()
+                        self.assertFalse(report.exists())
+                        self.assertEqual(sidecar.exists(), reason is not None)
+                        if reason:
+                            text = sidecar.read_text()
+                            outcome = json.loads(text)
+                            self.assertEqual(outcome["status"], "reviewer_unavailable")
+                            self.assertEqual(outcome["reason"], reason)
+                            self.assertFalse(outcome["report_produced"])
+                            self.assertEqual(outcome["timed_out"], label == "timeout")
+                            self.assertEqual(outcome["reviewer_exit_code"], {"engine": 7, "timeout": 124}.get(label))
+                            self.assertNotIn("DIAGNOSTIC_SENTINEL", text)
+
+    def test_status_paths_reject_repo_and_aliases_before_removing_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            existing = root / "status.json"
+            existing.write_text("keep existing output")
+            for first, second in (("result.json", "RESULT.json"), ("caf\u00e9.json", "cafe\u0301.json")):
+                args = argparse.Namespace(status_output=str(root / first), output=None, json_output=str(root / second))
+                with self.assertRaises(SystemExit):
+                    self.helper["reject_repo_output_paths"](args, repo)
+                self.assertFalse((root / first).exists())
+            for value in (str(repo / "result.json"), str(existing)):
+                args = argparse.Namespace(status_output=value, output=None, json_output=str(existing))
+                with self.assertRaises(SystemExit):
+                    self.helper["reject_repo_output_paths"](args, repo)
+                self.assertEqual(existing.read_text(), "keep existing output")
+            if os.name != "nt":
+                alias = root / "alias.json"
+                alias.symlink_to(existing)
+                args.status_output = str(alias)
+                with self.assertRaises(SystemExit):
+                    self.helper["reject_repo_output_paths"](args, repo)
+                alias.unlink()
+                os.link(existing, alias)
+                with self.assertRaises(SystemExit):
+                    self.helper["reject_repo_output_paths"](args, repo)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS firmlink alias")
+    def test_status_rejects_absent_outputs_under_same_parent_inode(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir).resolve()
+            alias = Path("/System/Volumes/Data") / root.relative_to("/")
+            if not alias.exists() or not os.path.samefile(root, alias):
+                self.skipTest("temporary directory has no data-volume alias")
+            repo = init_repo(root)
+            args = argparse.Namespace(status_output=str(root / "result.json"),
+                                      json_output=str(alias / "result.json"), output=None)
+            with self.assertRaises(SystemExit):
+                self.helper["reject_repo_output_paths"](args, repo)
+            self.assertFalse((root / "result.json").exists())
+
+    @unittest.skipIf(os.name == "nt", "the executable fixtures are POSIX-only")
+    def test_cli_status_for_launched_codex_and_claude_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            git(repo, "commit", "-q", "--allow-empty", "-m", "base")
+            (repo / "source.txt").write_text("review me\n")
+            env = os.environ.copy()
+            add_fake_trufflehog(self.helper, root, env)
+            env.update({"HOME": str(root), "USERPROFILE": str(root)})
+            for engine, source in (("codex", fake_codex_script()), ("claude", fake_claude_script())):
+                for timeout in (False, True):
+                    with self.subTest(engine=engine, timeout=timeout):
+                        # Help/version preflights succeed; only the launched review fails.
+                        injected = "import time; sys.stdin.read(); time.sleep(30)" if timeout else "print('DIAGNOSTIC_SENTINEL\\x1b[31m', file=sys.stderr); raise SystemExit(17)"
+                        executable = write_executable(root / engine, source.replace('record = os.environ["AUTOREVIEW_FAKE_RECORD"]', injected + '\nrecord = os.environ["AUTOREVIEW_FAKE_RECORD"]'))
+                        sidecar = root / "status.json"
+                        report = root / "result.json"
+                        argv = [sys.executable, str(SCRIPT), "--mode", "local", "--engine", engine,
+                                f"--{engine}-bin", str(executable), "--status-output", str(sidecar),
+                                "--json-output", str(report)]
+                        if timeout:
+                            argv += ["--engine-timeout-seconds", "0.2"]
+                        result = subprocess.run(argv, cwd=repo, env=env, text=True, capture_output=True, timeout=30)
+                        self.assertEqual(result.returncode, 1, result.stderr)
+                        outcome = json.loads(sidecar.read_text())
+                        self.assertEqual(outcome["status"], "reviewer_unavailable")
+                        self.assertEqual(outcome["engine"], engine)
+                        self.assertEqual(outcome["reviewer_exit_code"], 124 if timeout else 17)
+                        self.assertEqual(outcome["timed_out"], timeout)
+                        self.assertFalse(report.exists())
+                        self.assertNotIn("DIAGNOSTIC_SENTINEL", sidecar.read_text())
+                        self.assertNotIn("\x1b", result.stderr)
 
     def test_credential_source_exception_still_scans_every_outgoing_input(self) -> None:
         source = "Sources/Configuration/CredentialFile.swift"

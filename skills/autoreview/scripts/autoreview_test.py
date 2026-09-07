@@ -845,6 +845,22 @@ class AutoreviewAmpTests(unittest.TestCase):
         self.assertIn("amp engine timed out after 0.01s", message)
         attest.assert_not_called()
 
+    def test_amp_failed_process_and_invalid_artifact_keep_runtime_guards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cases = (
+                (subprocess.CompletedProcess([], 7, "", "provider failed"), "expected exactly one leading"),
+                (subprocess.CompletedProcess([], 7, '{"type":"system","subtype":"init"}\n', ""), "unexpected adapter event sequence"),
+                (subprocess.CompletedProcess([], 0, amp_test_stream(root, tools=["shell_command"]), ""), "exposed tools"),
+                (subprocess.CompletedProcess([], 0, amp_test_stream(root), ""), "produced no result file"),
+            )
+            for result, diagnostic in cases:
+                with self.subTest(diagnostic=diagnostic), self.assertRaises(AUTOREVIEW.ReviewerUnavailable) as caught:
+                    AUTOREVIEW.amp_review_result(result, root, root / "error", root / "result")
+                self.assertEqual(caught.exception.reason, "runtime_validation_failed")
+                self.assertIn(diagnostic, str(caught.exception))
+                self.assertEqual(caught.exception.returncode, result.returncode)
+
     def test_amp_plugin_inventory_attestation_fails_closed(self) -> None:
         cwd = Path("/tmp/amp-review-empty")
         plugin_path = cwd.parent / "config" / "amp" / "plugins" / "autoreview-token.ts"
@@ -1178,6 +1194,24 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                 AUTOREVIEW.ensure_kimi_isolation_supported(args, Path(tmpdir)),
                 "/usr/bin/kimi",
             )
+
+    def test_kimi_invalid_streams_are_unavailable_after_launch(self) -> None:
+        args = argparse.Namespace(engine="kimi", kimi_bin="kimi", model="kimi-model",
+                                  stream_engine_output=False, thinking="on", max_priority="P2")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir) / "repo"
+            repo.mkdir()
+            for stream in ("malformed JSON", '{"role":"meta"}\n', '{"role":"assistant","content":"{}"}'):
+                with self.subTest(stream=stream), mock.patch.object(
+                    AUTOREVIEW, "ensure_kimi_isolation_supported", return_value="/usr/bin/kimi",
+                ), mock.patch.object(
+                    AUTOREVIEW, "load_kimi_review_config", return_value=({"telemetry": False}, None),
+                ), mock.patch.object(
+                    AUTOREVIEW, "run_with_heartbeat", return_value=subprocess.CompletedProcess([], 0, stream, ""),
+                ), mock.patch.object(AUTOREVIEW, "scan_outgoing_review_pack"):
+                    with self.assertRaises(AUTOREVIEW.ReviewerUnavailable) as caught:
+                        AUTOREVIEW.run_reviewer(args, repo, "synthetic pack", set(), [])
+                    self.assertEqual(caught.exception.reason, "invalid_report")
 
     def test_kimi_runs_with_empty_tools_skills_and_mcp(self) -> None:
         args = argparse.Namespace(
