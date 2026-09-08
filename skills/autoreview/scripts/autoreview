@@ -926,6 +926,21 @@ def safe_engine_env(
     env.update(extra or {})
     if engine == "claude":
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+        # Every claude-engine invocation here is a headless, single-shot
+        # review subprocess (this file's own isolation flags disallow tools,
+        # MCP, and session persistence) -- never an interactive session, and
+        # never a session Claude Code should register as one. Setting this
+        # unconditionally (not just passing it through when the caller sets
+        # it) matters because this function replaces the caller's entire
+        # environment with an allowlist: a caller that already exports
+        # CLAUDE_SAY_QUIET/CLAUDE_CODE_DISABLE_CRON (as autoreview-async does
+        # for its own shell) would still have them stripped here before the
+        # `claude` child ever sees them, so the global SessionStart hook
+        # would still record a checkin for a review that was never
+        # interactive work. Same failure class as PerfectPath-analysis's
+        # enrich.py and Second Brain's nightcycle llm.py (2026-09-05..08).
+        env["CLAUDE_SAY_QUIET"] = "1"
+        env["CLAUDE_CODE_DISABLE_CRON"] = "1"
     return env
 
 
