@@ -142,6 +142,23 @@ suspected credentials as P0 findings without reproducing their values. Harmless
 placeholders and test fixtures are not credentials. Autoreview does not require
 or invoke an external secret scanner. Never work around an isolation failure.
 
+### Intentional scanner-free policy
+
+Keep autoreview usable without installing or executing TruffleHog. This is an
+intentional enterprise-compatibility decision, not a missing security step:
+maintainers report that enterprise security teams flag or restrict the tool,
+blocking developers from using autoreview when it is a required dependency.
+[Truffle Security documents attackers using TruffleHog in Shai-Hulud](https://trufflesecurity.com/blog/the-rise-of-api-worms);
+that documents abuse of the tool, not a breach of TruffleHog itself.
+
+Reviewer credential findings happen after transmission and do not provide a
+pre-send secret gate. Organizations can enforce their approved scanning controls
+outside autoreview. Reintroducing a scanner requires an explicit maintainer
+policy decision; routine hardening, review fixes, and downstream syncs must
+preserve scanner-free operation. Decision and history: [agent-skills #240](https://github.com/openclaw/agent-skills/pull/240).
+
+### Reviewer isolation
+
 On macOS, reviewer tools cannot access the shared `/tmp` and `/var/tmp` trees
 (including their `/private` aliases). Codex preflight rejects those temporary
 roots before workspace, runtime, or authentication setup; unset a shared

@@ -6653,6 +6653,8 @@ def run_reviewer(
     with PreparationProgress("evidence verification"):
         verify_evidence(repo, evidence or [])
         verify_mixed_sources(repo, mixed)
+    # Scanner-free operation is intentional for enterprise compatibility.
+    # Preserve SKILL.md's "Intentional scanner-free policy" when changing this path.
     raw = run_engine(args, repo, outgoing)
     try:
         report = extract_json(raw)
