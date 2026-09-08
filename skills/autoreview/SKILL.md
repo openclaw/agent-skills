@@ -41,7 +41,7 @@ PR base or `origin/main`. Clean main has no implicit review target.
 
 Registered nested linked checkouts from the same repository are outside the
 current review scope. Their presence or edits do not make the parent dirty;
-ordinary adjacent files remain included and scanned. Worktree boundaries are
+ordinary adjacent files remain included in the review. Worktree boundaries are
 revalidated without changing Git ignore rules.
 
 For a complete PR candidate **including dirty rewrites**, use local mode with
@@ -137,11 +137,10 @@ split context overrides are unsupported when projection is selected.
 
 The helper owns reviewer isolation, sanitized authentication, process cleanup,
 Git scope, and structured result validation. Keep those controls enabled.
-TruffleHog must scan the complete frozen input for partitioned reviews and each
-exact outgoing pack before it is sent; missing or failed scanning stops the run.
-Source-controlled ignore tags cannot suppress this gate. Scanner refusals never
-echo input headings or finding payloads; remove credentials locally and rerun.
-Never reproduce credentials in findings or work around an isolation failure.
+Every reviewer pass must inspect its bundle for real credentials and report
+suspected credentials as P0 findings without reproducing their values. Harmless
+placeholders and test fixtures are not credentials. Autoreview does not require
+or invoke an external secret scanner. Never work around an isolation failure.
 
 On macOS, reviewer tools cannot access the shared `/tmp` and `/var/tmp` trees
 (including their `/private` aliases). Codex preflight rejects those temporary
@@ -205,7 +204,7 @@ The sidecar contains no provider logs, prompts, findings, or model identifiers.
 Existing bounded, display-safe diagnostics remain on stderr; command-auth
 diagnostic suppression remains in force. Use a fresh status path per invocation:
 after argument and output-path validation, a previous sidecar is removed before
-target selection. Dry runs, preflight/scan refusals, pre-launch isolation failures, source mutations,
+target selection. Dry runs, preflight refusals, pre-launch isolation failures, source mutations,
 interruptions, and output failures produce no new status. Absence means no
 outcome was published, never a clean review. No retry policy is added.
 
