@@ -4582,6 +4582,31 @@ with Path(__file__).with_name("scans.jsonl").open("a", encoding="utf-8") as reco
             ):
                 self.helper["ensure_claude_isolation_supported"](args, repo)
 
+    @unittest.skipIf(os.name == "nt", "POSIX executable fixture")
+    def test_claude_probe_captures_help_from_pipe_sensitive_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            cli = write_executable(root / "claude", r'''#!/usr/bin/env python3
+import os
+import stat
+import sys
+
+if "--version" in sys.argv:
+    print("2.1.226 (Claude Code)")
+else:
+    text = "Usage: claude\n" + " " * 16384
+    text += "--safe-mode --setting-sources --strict-mcp-config --disallowedTools --tools\n"
+    if stat.S_ISFIFO(os.fstat(1).st_mode):
+        text = text[:512]
+    sys.stdout.write(text)
+''')
+            args = argparse.Namespace(claude_bin=str(cli), model=None, fallback_model=None)
+            self.helper["ensure_claude_isolation_supported"](args, repo)
+            cli.write_text(cli.read_text().replace("--safe-mode", "--unsafe-mode"))
+            with self.assertRaisesRegex(SystemExit, "missing from --help: --safe-mode"):
+                self.helper["ensure_claude_isolation_supported"](args, repo)
+
     def test_claude_canonical_fable_model_uses_portable_cli_selector(self) -> None:
         self.assertEqual(
             self.helper["claude_cli_model_selector"]("claude-fable-5"),

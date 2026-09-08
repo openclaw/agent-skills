@@ -489,19 +489,32 @@ def run(
     check: bool = True,
     env: dict[str, str] | None = None,
     text_errors: str = SUBPROCESS_TEXT_ERRORS,
+    capture_dir: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        args,
-        cwd=cwd,
-        input=input_text,
-        stdin=stdin,
-        text=True,
-        encoding=SUBPROCESS_TEXT_ENCODING,
-        errors=text_errors,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-    )
+    with contextlib.ExitStack() as stack:
+        captures = [
+            stack.enter_context(tempfile.TemporaryFile(
+                mode="w+", encoding=SUBPROCESS_TEXT_ENCODING,
+                errors=text_errors, dir=capture_dir,
+            ))
+            for _ in range(2)
+        ] if capture_dir is not None else []
+        result = subprocess.run(
+            args,
+            cwd=cwd,
+            input=input_text,
+            stdin=stdin,
+            text=True,
+            encoding=SUBPROCESS_TEXT_ENCODING,
+            errors=text_errors,
+            stdout=captures[0] if captures else subprocess.PIPE,
+            stderr=captures[1] if captures else subprocess.PIPE,
+            env=env,
+        )
+        if captures:
+            for capture in captures:
+                capture.seek(0)
+            result.stdout, result.stderr = (capture.read() for capture in captures)
     if check and result.returncode != 0:
         cmd = " ".join(args)
         raise SystemExit(f"command failed ({result.returncode}): {cmd}\n{result.stderr or result.stdout}")
@@ -4289,7 +4302,12 @@ def ensure_claude_isolation_supported(args: argparse.Namespace, repo: Path) -> N
             f"claude engine requires Claude Code >= {format_version(minimum_version)} "
             f"{version_reason} (found {format_version(version)})"
         )
-    help_result = run([claude_bin, "--help"], temp_root, check=False, env=engine_env)
+    # Claude can exit before flushing piped help; regular files preserve the
+    # complete capability list without weakening any required isolation flag.
+    help_result = run(
+        [claude_bin, "--help"], temp_root, check=False, env=engine_env,
+        capture_dir=temp_root,
+    )
     help_text = f"{help_result.stdout}\n{help_result.stderr}"
     required_flags = ["--safe-mode", "--setting-sources", "--strict-mcp-config", "--disallowedTools", "--tools"]
     missing = [flag for flag in required_flags if flag not in help_text]
