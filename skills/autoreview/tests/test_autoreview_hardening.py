@@ -4233,6 +4233,81 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "credentialed or malformed proxy"):
                 self.helper["safe_engine_env"](repo, engine="codex")
 
+    MANAGED_PROXY_URL = "http://openclaw:fixture-run-token@127.0.0.1:19090"
+    MANAGED_CA_KEYS = (
+        "NODE_EXTRA_CA_CERTS",
+        "SSL_CERT_FILE",
+        "CURL_CA_BUNDLE",
+        "REQUESTS_CA_BUNDLE",
+    )
+
+    def managed_proxy_env(self, bundle: Path) -> dict[str, str]:
+        return {key: str(bundle) for key in self.MANAGED_CA_KEYS}
+
+    def test_safe_proxy_url_accepts_managed_loopback_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            bundle = Path(tempdir) / "trust-bundle.pem"
+            bundle.write_text("fixture", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ, self.managed_proxy_env(bundle), clear=False
+            ):
+                self.assertTrue(self.helper["safe_proxy_url"](self.MANAGED_PROXY_URL))
+
+    def test_safe_proxy_url_rejects_incomplete_managed_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            bundle = Path(tempdir) / "trust-bundle.pem"
+            bundle.write_text("fixture", encoding="utf-8")
+            full = self.managed_proxy_env(bundle)
+            cases = {
+                "missing CA variables": {},
+                "mismatched CA variable": {**full, "SSL_CERT_FILE": str(bundle) + "-other"},
+                "missing CA file": self.managed_proxy_env(bundle.with_name("absent.pem")),
+            }
+            old = os.environ.copy()
+            try:
+                for label, env in cases.items():
+                    with self.subTest(label):
+                        for key in self.MANAGED_CA_KEYS:
+                            os.environ.pop(key, None)
+                        os.environ.update(env)
+                        self.assertFalse(self.helper["safe_proxy_url"](self.MANAGED_PROXY_URL))
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
+    def test_safe_proxy_url_rejects_credentialed_non_loopback_with_managed_ca(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            bundle = Path(tempdir) / "trust-bundle.pem"
+            bundle.write_text("fixture", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ, self.managed_proxy_env(bundle), clear=False
+            ):
+                for value in (
+                    "http://review-user:review-password@proxy.example.invalid:8080",
+                    "socks5://review-user:review-password@127.0.0.1:19090",
+                    "http://review-user:review-password@127.0.0.1:19090/path",
+                ):
+                    with self.subTest(value=value):
+                        self.assertFalse(self.helper["safe_proxy_url"](value))
+
+    def test_safe_engine_env_accepts_managed_loopback_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir).resolve()
+            bundle = root / "trust-bundle.pem"
+            bundle.write_text("fixture", encoding="utf-8")
+            repo = init_repo(root)
+            old = os.environ.copy()
+            try:
+                for key in self.MANAGED_CA_KEYS:
+                    os.environ.pop(key, None)
+                os.environ.update(self.managed_proxy_env(bundle))
+                os.environ["HTTPS_PROXY"] = self.MANAGED_PROXY_URL
+                env = self.helper["safe_engine_env"](repo, engine="codex")
+                self.assertEqual(env["HTTPS_PROXY"], self.MANAGED_PROXY_URL)
+            finally:
+                os.environ.clear()
+                os.environ.update(old)
+
     def test_safe_temp_root_rejects_reviewed_repo_parent(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
@@ -4431,6 +4506,9 @@ else:
                 os.environ["GITLAB_TOKEN"] = "test-token-placeholder"
                 os.environ["NODE_OPTIONS"] = "--require=/tmp/unsafe.js"
                 os.environ["GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES"] = "1"
+                for key in list(os.environ):
+                    if key.lower() in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}:
+                        os.environ.pop(key, None)
                 env = self.helper["safe_engine_env"](repo, engine="pi")
                 for key in (
                             "AWS_ROLE_ARN",
@@ -4562,6 +4640,9 @@ else:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
             try:
+                for key in list(os.environ):
+                    if key.lower() in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}:
+                        os.environ.pop(key, None)
                 os.environ["CLAUDE_CONFIG_DIR"] = str(repo / ".claude")
                 os.environ["CODEX_HOME"] = str(repo / ".codex")
                 os.environ["PI_CODING_AGENT_DIR"] = str(repo / ".pi")

@@ -680,6 +680,35 @@ def safe_temp_root(repo: Path, *, engine: str | None = None) -> Path:
     return root
 
 
+MANAGED_PROXY_CA_KEYS = (
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+)
+
+
+def trusted_managed_proxy(parsed: urllib.parse.SplitResult) -> bool:
+    """Accept only the OpenClaw Gateway-managed loopback egress proxy shape.
+
+    The Gateway injects one run-scoped Basic credential in a loopback proxy URL
+    together with four CA variables that all point at its ephemeral trust
+    bundle. That exact shape is the managed proxy; arbitrary credentialed or
+    non-loopback proxy URLs remain rejected.
+    """
+    if parsed.scheme.lower() != "http":
+        return False
+    hostname = (parsed.hostname or "").lower()
+    if hostname not in {"127.0.0.1", "::1", "localhost"}:
+        return False
+    bundle = os.environ.get("NODE_EXTRA_CA_CERTS")
+    if not bundle:
+        return False
+    if any(os.environ.get(key) != bundle for key in MANAGED_PROXY_CA_KEYS[1:]):
+        return False
+    return Path(bundle).is_file()
+
+
 def safe_proxy_url(value: str) -> bool:
     try:
         candidate = value if "://" in value else f"http://{value}"
@@ -687,12 +716,13 @@ def safe_proxy_url(value: str) -> bool:
         _ = parsed.port
     except ValueError:
         return False
+    credentialed = parsed.username is not None or parsed.password is not None
+    if credentialed and not trusted_managed_proxy(parsed):
+        return False
     return (
         parsed.scheme.lower()
         in {"http", "https", "socks", "socks4", "socks4a", "socks5", "socks5h"}
         and bool(parsed.hostname)
-        and parsed.username is None
-        and parsed.password is None
         and parsed.path in {"", "/"}
         and not parsed.query
         and not parsed.fragment
