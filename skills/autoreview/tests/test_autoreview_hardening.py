@@ -6815,6 +6815,44 @@ Path(sys.argv[sys.argv.index(flag) + 1]).write_text(json.dumps({
                 self.assertNotIn(f"u@name{suffix}@", redacted)
                 self.assertIn("user u@name is configured", redacted)
 
+    def test_long_username_only_tokens_are_redacted_outside_url_contexts(self):
+        token = 'synthetic-user-token@/+"\\value'
+        encoded = urllib.parse.quote(token, safe="")
+        forms = (token, encoded, urllib.parse.quote(encoded, safe=""),
+                 json.dumps(token)[1:-1])
+        for suffix in ("", ":"):
+            with self.subTest(suffix=suffix), mock.patch.dict(os.environ, {
+                "HTTPS_PROXY": f"http://{encoded}{suffix}@localhost:8080",
+            }, clear=True):
+                for form in forms:
+                    with self.subTest(form=form):
+                        rendered = self.helper["display_escape"]("rejected credential " + form, 4000)
+                        self.assertNotIn(form, rendered)
+                        self.assertIn("[REDACTED]", rendered)
+                        report = {"overall_correctness": "patch is incorrect",
+                                  "overall_explanation": "rejected credential " + form}
+                        saved = self.helper["redact_proxy_report"](report)
+                        self.assertNotIn(form, saved["overall_explanation"])
+                        self.assertEqual(saved["overall_correctness"], "patch is incorrect")
+
+    def test_username_only_redaction_preserves_short_labels_and_report_enums(self):
+        for username in ("u", "openclaw", "review-bot", "incorrect"):
+            for suffix in ("", ":"):
+                with self.subTest(username=username, suffix=suffix), mock.patch.dict(os.environ, {
+                    "HTTPS_PROXY": f"http://{username}{suffix}@localhost:8080",
+                }, clear=True):
+                    prose = f"user {username} is configured"
+                    self.assertEqual(self.helper["redact_proxy_credentials"](prose), prose)
+                    for label in ("username", "proxy_user", "proxy-username"):
+                        diagnostic = f'{label}="{username}"'
+                        redacted = self.helper["redact_proxy_credentials"](diagnostic)
+                        self.assertNotIn(diagnostic, redacted)
+                        self.assertIn("[REDACTED]", redacted)
+                    report = {"overall_correctness": "patch is incorrect",
+                              "review_status": "incomplete", "overall_explanation": prose,
+                              "findings": [{"priority": "P1", "category": "regression"}]}
+                    self.assertEqual(self.helper["redact_proxy_report"](report), report)
+
     def test_output_redaction_covers_split_writes_and_final_unterminated_line(self):
         proxy, _forms = self.proxy_fixture()
         stream = io.StringIO()

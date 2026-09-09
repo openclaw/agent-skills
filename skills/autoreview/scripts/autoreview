@@ -727,6 +727,7 @@ def safe_proxy_url(value: str) -> bool:
 def proxy_credential_pattern(values: tuple[str, ...]) -> re.Pattern[str] | None:
     forms: set[str] = set()
     labeled_passwords: set[str] = set()
+    labeled_usernames: set[str] = set()
     for value in values:
         try:
             parsed = urllib.parse.urlsplit(value if "://" in value else f"http://{value}")
@@ -740,8 +741,8 @@ def proxy_credential_pattern(values: tuple[str, ...]) -> re.Pattern[str] | None:
         forms.add(base64.b64encode(user + b":" + password).decode("ascii"))
         encoded_userinfo = parsed.netloc.rsplit("@", 1)[0]
         raw_userinfo = user + (b":" + password if parsed.password is not None else b"")
-        # Keep username-only and empty-password auth in a URL context. A bare
-        # public label such as "u" or "openclaw" must not mask ordinary text.
+        # Always hide userinfo in URL contexts, even when it is a short public
+        # label such as "u" or "openclaw".
         if encoded_userinfo:
             forms.add(encoded_userinfo + "@")
             forms.add(urllib.parse.quote_from_bytes(raw_userinfo, safe="") + "%40")
@@ -749,6 +750,17 @@ def proxy_credential_pattern(values: tuple[str, ...]) -> re.Pattern[str] | None:
                 forms.add(raw_userinfo.decode("utf-8") + "@")
             except UnicodeDecodeError:
                 pass
+        if not parsed.password and user:
+            username_forms = {parsed.username, urllib.parse.quote_from_bytes(user, safe="")}
+            try:
+                username_forms.add(user.decode("utf-8"))
+            except UnicodeDecodeError:
+                pass
+            labeled_usernames.update(username_forms)
+            # Some proxies put their token in the username with no password.
+            # Hide standalone long values while preserving ordinary short labels.
+            if len(user) >= 16:
+                forms.update(username_forms)
         if parsed.password:
             forms.add(encoded_userinfo)
             # Short bare passwords are indistinguishable from prose or enum
@@ -783,13 +795,15 @@ def proxy_credential_pattern(values: tuple[str, ...]) -> re.Pattern[str] | None:
         # Percent escape casing is insignificant; credential casing is not.
         escaped = re.sub(r"%[0-9a-fA-F]{2}", lambda match: "(?i:" + match[0] + ")", escaped)
         patterns.append(escaped)
-    for password in labeled_passwords:
-        escaped = re.escape(password)
-        escaped = re.sub(r"%[0-9a-fA-F]{2}", lambda match: "(?i:" + match[0] + ")", escaped)
-        patterns.append(
-            r"(?i:\b(?:proxy[_-]?)?password[\"']?[ \t]*[:=][ \t]*[\"']?)"
-            + escaped + r"(?=$|[\s\"',;\)\]}])"
-        )
+    for label, credentials in (("password", labeled_passwords),
+                               ("(?:username|user)", labeled_usernames)):
+        for credential in credentials:
+            escaped = re.escape(credential)
+            escaped = re.sub(r"%[0-9a-fA-F]{2}", lambda match: "(?i:" + match[0] + ")", escaped)
+            patterns.append(
+                r"(?i:\b(?:proxy[_-]?)?" + label + r"[\"']?[ \t]*[:=][ \t]*[\"']?)"
+                + escaped + r"(?=$|[\s\"',;\)\]}])"
+            )
     return re.compile("|".join(patterns))
 
 
