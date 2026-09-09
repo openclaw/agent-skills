@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import copy
 import io
@@ -18,6 +19,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from unittest import mock
 from pathlib import Path, PureWindowsPath
 
@@ -4208,6 +4210,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "proxy.example.invalid:8080",
             "socks4://proxy.example.invalid",
             "socks4a://proxy.example.invalid",
+            "http://[fe80::1%25en0]:8080",
         ):
             with self.subTest(value=value):
                 self.assertTrue(self.helper["safe_proxy_url"](value))
@@ -4217,20 +4220,20 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "socks5://review-user:review-password@proxy.example.invalid:1080",
         ):
             with self.subTest(value=value):
-                self.assertFalse(self.helper["safe_proxy_url"](value))
+                self.assertTrue(self.helper["safe_proxy_url"](value))
 
-    def test_safe_engine_env_rejects_credentialed_proxy(self) -> None:
+    def test_safe_engine_env_rejects_malformed_proxy(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir, mock.patch.dict(
             os.environ,
             {
                 "HTTPS_PROXY": (
-                    "http://review-user:review-password@proxy.example.invalid:8080"
+                    "http://review-user:review-password@proxy.example.invalid:bad"
                 )
             },
             clear=False,
         ):
             repo = init_repo(Path(tempdir))
-            with self.assertRaisesRegex(SystemExit, "credentialed or malformed proxy"):
+            with self.assertRaisesRegex(SystemExit, "malformed proxy"):
                 self.helper["safe_engine_env"](repo, engine="codex")
 
     def test_safe_temp_root_rejects_reviewed_repo_parent(self) -> None:
@@ -6556,6 +6559,290 @@ os.execv(target, [str(target), *sys.argv[1:]])
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("inputs: FAILED", result.stdout)
             self.assertIn("missing-dataset.json", result.stdout)
+
+PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+
+
+class AuthenticatedProxyTests(unittest.TestCase):
+    def setUp(self):
+        self.helper = load_helper()
+
+    def test_authenticated_proxy_urls_are_transport_not_openclaw_provenance(self):
+        for value in (
+            "http://user:password@proxy.example.invalid:8080",
+            "https://user:password@[::1]:8443/",
+            "socks5h://u:p%40ss%3Aword@proxy.example.invalid:1080",
+            "user:password@proxy.example.invalid:8080",
+            "http://user@proxy.example.invalid",
+            "http://:password@proxy.example.invalid",
+            "http://proxy.example.invalid:8080",
+            "proxy.example.invalid:8080",
+            "socks4a://proxy.example.invalid",
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(self.helper["safe_proxy_url"](value))
+
+    def test_malformed_proxy_urls_still_fail_closed(self):
+        for value in (
+            "", "http://", "file:///proxy", "http://host:0", "http://host:65536",
+            "http://host:bad", "http://[::1", "http://host/path", "http://host?q=1",
+            "http://host#fragment", " http://host", "http://host\n", "http://ho\tst",
+            "http://user:p%0Ass@host", "http://user:p%00ss@host", "http://user:p%zz@host",
+            "http://user:p@ss@host", "http://user:p\\ass@host", "http://ho st",
+            "http://host%0a.example", "http://host%2f.example",
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(self.helper["safe_proxy_url"](value))
+
+    def test_engine_env_preserves_authenticated_transport_without_marker_or_api_leak(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            repo = root / "repo"
+            repo.mkdir()
+            proxy = "http://fixture:transport-password@127.0.0.1:8080"
+            transport = {key: proxy for key in PROXY_KEYS}
+            transport.update({"NO_PROXY": "localhost", "NODE_USE_ENV_PROXY": "1"})
+            ca_keys = ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+                       "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE")
+            transport.update({key: str(root / "trust.pem") for key in ca_keys})
+            inherited = {**transport, "OPENAI_API_KEY": "provider-auth-fixture",
+                         "UNRELATED_SECRET": "not-for-review", "NODE_OPTIONS": "--require hostile"}
+            for engine in self.helper["ENGINES"]:
+                with self.subTest(engine=engine), mock.patch.dict(os.environ, inherited, clear=True):
+                    env = self.helper["safe_engine_env"](repo, engine=engine)
+                    for key, value in transport.items():
+                        self.assertEqual(env.get(key), value, key)
+                    self.assertNotIn("UNRELATED_SECRET", env)
+                    self.assertNotIn("NODE_OPTIONS", env)
+                    if engine == "codex":
+                        self.assertEqual(env["OPENAI_API_KEY"], "provider-auth-fixture")
+                    elif engine in {"claude", "amp"}:
+                        self.assertNotIn("OPENAI_API_KEY", env)
+
+    def test_repository_ca_paths_are_not_inherited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            certificate = repo / "trust.pem"
+            certificate.touch()
+            external_link = root / "trust-link.pem"
+            external_link.symlink_to(certificate)
+            for engine in self.helper["ENGINES"]:
+                for value in (str(certificate), str(external_link)):
+                    with self.subTest(engine=engine, value=value), mock.patch.dict(os.environ, {
+                        key: value for key in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+                                              "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE")
+                    }, clear=True):
+                        env = self.helper["safe_engine_env"](repo, engine=engine)
+                        for key in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+                                    "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
+                            self.assertNotIn(key, env)
+
+    def proxy_fixture(self):
+        username = "u"
+        password = 'synthetic-p@ss:/+%"\\word'
+        userinfo = f"{username}:{password}"
+        encoded = urllib.parse.quote(password, safe="")
+        proxy = f"http://{username}:{encoded}@127.0.0.1:8080"
+        basic = base64.b64encode(userinfo.encode()).decode()
+        forms = (proxy, userinfo, f"{username}:{encoded}", password, encoded,
+                 "Proxy-Authorization: Basic " + basic)
+        return proxy, forms
+
+    def test_proxy_credentials_are_redacted_in_diagnostics_not_short_user_labels(self):
+        proxy, forms = self.proxy_fixture()
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": proxy}, clear=True):
+            for form in (*forms, *(json.dumps(form)[1:-1] for form in forms)):
+                with self.subTest(form=form):
+                    rendered = self.helper["display_escape"]("failure: " + form, 4000, multiline=True)
+                    self.assertNotIn(form, rendered)
+                    self.assertIn("[REDACTED]", rendered)
+            self.assertEqual(self.helper["display_escape"]("user u requests an update", 100),
+                             "user u requests an update")
+            for display in (self.helper["CodexStreamDisplay"](), self.helper["ClaudeStreamDisplay"]()):
+                self.assertNotIn(forms[0], display("stderr", "failure: " + forms[0]))
+
+    def test_real_stream_and_buffered_failure_keep_exit_semantics_without_disclosure(self):
+        proxy, forms = self.proxy_fixture()
+        source = "import os,sys; print(os.environ['HTTPS_PROXY']); print(os.environ['HTTPS_PROXY'],file=sys.stderr); sys.exit(7)"
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"HTTPS_PROXY": proxy}, clear=False):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                result = self.helper["run_with_heartbeat"](
+                    [sys.executable, "-c", source], Path(tmp), label="proxy-test", stream_output=True,
+                    env={"HTTPS_PROXY": proxy},
+                )
+            self.assertEqual(result.returncode, 7)
+            self.assertNotIn(proxy, stdout.getvalue() + stderr.getvalue())
+            failure = self.helper["ReviewerUnavailable"]("failed (7): " + result.stderr, result=result)
+            with mock.patch.dict(self.helper["sanitized_main"].__globals__, {
+                "main": mock.Mock(side_effect=failure),
+            }):
+                with self.assertRaises(SystemExit) as caught:
+                    self.helper["sanitized_main"]()
+            self.assertNotIn(proxy, str(caught.exception))
+            self.assertIn("failed (7)", str(caught.exception))
+            self.assertEqual(failure.returncode, 7)
+
+    def test_report_files_and_terminal_are_redacted_without_changing_verdict(self):
+        proxy, forms = self.proxy_fixture()
+        report = {"findings": [], "overall_correctness": "patch is incorrect",
+                  "overall_explanation": "provider says " + " | ".join(forms), "overall_confidence": 0.8}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"HTTPS_PROXY": proxy}, clear=True):
+            output = Path(tmp) / "report.json"
+            self.helper["atomic_write_text"](output, json.dumps(self.helper["redact_proxy_report"](report)))
+            saved = json.loads(output.read_text())
+            terminal = io.StringIO()
+            with contextlib.redirect_stdout(terminal):
+                self.helper["print_report"](report)
+            for form in forms:
+                self.assertNotIn(form, saved["overall_explanation"])
+                self.assertNotIn(form, terminal.getvalue())
+            self.assertEqual(saved["overall_correctness"], "patch is incorrect")
+            self.assertEqual(saved["findings"], [])
+            self.assertEqual(report["overall_explanation"], "provider says " + " | ".join(forms))
+
+    def test_codex_tools_do_not_inherit_transport_or_authentication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            flags = self.helper["codex_config_isolation_flags"](root / "repo", root / "runtime")
+            self.assertIn('shell_environment_policy.inherit="core"', flags)
+            self.assertIn("shell_environment_policy.ignore_default_excludes=false", flags)
+            self.assertFalse(set(PROXY_KEYS) & self.helper["codex_tool_git_env"]().keys())
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable fixture")
+    def test_cli_preserves_transport_and_redacts_streams_reports_and_failures(self):
+        proxy, forms = self.proxy_fixture()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            repo = root / "repo"
+            repo.mkdir()
+            def git(*args):
+                subprocess.run(["git", "-C", str(repo), "-c", "user.name=Proxy Test",
+                                "-c", "user.email=proxy@example.invalid", "-c", "commit.gpgsign=false",
+                                *args], check=True, capture_output=True)
+            git("init", "-q")
+            (repo / "source.txt").write_text("before\n")
+            git("add", ".")
+            git("commit", "-qm", "fixture")
+            (repo / "source.txt").write_text("after\n")
+            fake = root / "codex-fixture"
+            fake.write_text(f"#!{sys.executable}\n" + '''import json, os, sys
+from pathlib import Path
+if "--version" in sys.argv:
+    print("codex-cli 0.0.0-test")
+    raise SystemExit(0)
+Path(os.environ["AUTOREVIEW_FAKE_PROXY_RECORD"]).write_text(json.dumps({
+    "proxy": os.environ["HTTPS_PROXY"], "auth": os.environ.get("OPENAI_API_KEY"), "argv": sys.argv,
+}))
+print(os.environ["HTTPS_PROXY"])
+print(os.environ["HTTPS_PROXY"], file=sys.stderr)
+if os.environ.get("AUTOREVIEW_FAKE_PROXY_EXIT"):
+    raise SystemExit(7)
+flag = "--output-last-message" if "--output-last-message" in sys.argv else "-o"
+Path(sys.argv[sys.argv.index(flag) + 1]).write_text(json.dumps({
+    "findings": [], "overall_correctness": "patch is incorrect",
+    "overall_explanation": "transport diagnostics: " + os.environ["HTTPS_PROXY"], "overall_confidence": 0.8,
+}))
+''')
+            fake.chmod(0o755)
+            home = root / "home"
+            home.mkdir()
+            record = root / "record.json"
+            human, report, status = (root / name for name in ("report.txt", "report.json", "status.json"))
+            env = {key: value for key, value in os.environ.items() if key in {"PATH", "TMPDIR", "TEMP", "TMP"}}
+            env.update({"HOME": str(home), "HTTPS_PROXY": proxy, "OPENAI_API_KEY": "opaque-provider-fixture",
+                        "AUTOREVIEW_FAKE_PROXY_RECORD": str(record)})
+            command = [sys.executable, str(SCRIPT), "--mode", "local", "--codex-bin", str(fake),
+                       "--output", str(human), "--json-output", str(report), "--status-output", str(status),
+                       "--stream-engine-output"]
+            result = subprocess.run(command, cwd=repo, env=env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(report.exists(), result.stdout + result.stderr)
+            saved = json.loads(report.read_text())
+            self.assertEqual(saved["overall_correctness"], "patch is incorrect")
+            captured = json.loads(record.read_text())
+            self.assertEqual(captured["proxy"], proxy)
+            self.assertEqual(captured["auth"], "opaque-provider-fixture")
+            self.assertIn('shell_environment_policy.inherit="core"', captured["argv"])
+            published = result.stdout + result.stderr + human.read_text() + report.read_text()
+            for form in forms:
+                self.assertNotIn(form, published)
+            self.assertEqual(json.loads(status.read_text())["exit_code"], result.returncode)
+            env["AUTOREVIEW_FAKE_PROXY_EXIT"] = "1"
+            failed = subprocess.run(command, cwd=repo, env=env, capture_output=True, text=True)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertNotIn(proxy, failed.stdout + failed.stderr)
+            self.assertEqual(json.loads(status.read_text())["reviewer_exit_code"], 7)
+
+    def test_serialized_redaction_does_not_turn_short_passwords_into_json_syntax(self):
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": "http://u:1@localhost:8080"}, clear=True):
+            report = {"code": 1, "accepted": True, "explanation": "password=1", "u": "user u"}
+            saved = json.loads(json.dumps(self.helper["redact_proxy_report"](report)))
+            self.assertEqual(saved["code"], 1)
+            self.assertIs(saved["accepted"], True)
+            self.assertEqual(saved["explanation"], "[REDACTED]")
+            self.assertEqual(saved["u"], "user u")
+
+    def test_short_password_does_not_corrupt_prose_or_serialized_enums(self):
+        for password in ("a", "incorrect"):
+            with self.subTest(password=password), mock.patch.dict(os.environ, {
+                "HTTPS_PROXY": f"http://u:{password}@localhost:8080",
+            }, clear=True):
+                report = {"overall_correctness": "patch is incorrect", "review_status": "incomplete",
+                          "overall_explanation": "a branch has a bug", "findings": [{
+                              "priority": "P1", "category": "regression", "body": "password=" + password,
+                          }]}
+                saved = self.helper["redact_proxy_report"](report)
+                self.assertEqual(saved["overall_correctness"], "patch is incorrect")
+                self.assertEqual(saved["review_status"], "incomplete")
+                self.assertEqual(saved["overall_explanation"], "a branch has a bug")
+                self.assertEqual(saved["findings"][0]["priority"], "P1")
+                self.assertEqual(saved["findings"][0]["category"], "regression")
+                self.assertNotIn("password=" + password, saved["findings"][0]["body"])
+
+    def test_username_only_and_empty_password_are_hidden_in_url_contexts(self):
+        for suffix in ("", ":"):
+            with self.subTest(suffix=suffix), mock.patch.dict(os.environ, {
+                "HTTPS_PROXY": f"http://u%40name{suffix}@localhost:8080",
+            }, clear=True):
+                diagnostic = f"proxy=http://u@name{suffix}@LOCALHOST:8080/; user u@name is configured"
+                redacted = self.helper["redact_proxy_credentials"](diagnostic)
+                self.assertNotIn(f"u@name{suffix}@", redacted)
+                self.assertIn("user u@name is configured", redacted)
+
+    def test_output_redaction_covers_split_writes_and_final_unterminated_line(self):
+        proxy, _forms = self.proxy_fixture()
+        stream = io.StringIO()
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": proxy}, clear=True):
+            output = self.helper["ProxyRedactedOutput"](stream)
+            for char in proxy:
+                output.write(char)
+                output.flush()
+            self.assertEqual(stream.getvalue(), "")
+            output.write("\n")
+            self.assertEqual(stream.getvalue(), "[REDACTED]\n")
+            output.write(proxy)
+            output.finish()
+            self.assertEqual(stream.getvalue(), "[REDACTED]\n[REDACTED]")
+
+    def test_redacting_output_bounds_unterminated_lines_and_retains_stream_interface(self):
+        proxy, _forms = self.proxy_fixture()
+        stream = io.StringIO()
+        with mock.patch.dict(os.environ, {"HTTPS_PROXY": proxy}, clear=True):
+            output = self.helper["ProxyRedactedOutput"](stream)
+            output.write("x" * 65_537 + proxy)
+            self.assertLessEqual(len(output.pending), 65_536)
+            output.write("still the suppressed line\nnext line\n")
+            output.finish()
+            self.assertEqual(stream.getvalue(),
+                             "[output line suppressed: exceeds redaction buffer]\nnext line\n")
+            self.assertFalse(output.isatty())
+            self.assertEqual(output.encoding, stream.encoding)
+            with self.assertRaises(io.UnsupportedOperation):
+                output.fileno()
+
 
 if __name__ == "__main__":
     unittest.main()

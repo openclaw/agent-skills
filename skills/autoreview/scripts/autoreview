@@ -361,6 +361,14 @@ CODEX_TRUST_PATH_ENV_KEYS = {
     "SSL_CERT_DIR",
     "SSL_CERT_FILE",
 }
+PROXY_ENV_KEYS = (
+    "ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY",
+    "all_proxy", "http_proxy", "https_proxy",
+)
+TRANSPORT_TRUST_PATH_ENV_KEYS = {
+    "NODE_EXTRA_CA_CERTS", "SSL_CERT_DIR", "SSL_CERT_FILE",
+    "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
+}
 CODEX_MACOS_SCRATCH_ROOTS = ("/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp")
 PROVIDER_CREDENTIAL_PATH_ENV_KEYS = {
     "AWS_CONFIG_FILE",
@@ -681,22 +689,177 @@ def safe_temp_root(repo: Path, *, engine: str | None = None) -> Path:
 
 
 def safe_proxy_url(value: str) -> bool:
+    # A proxy is launcher-provided transport, like the provider URL and API
+    # authentication. URL shape is not proof that it belongs to any runtime.
+    # Check before urlsplit, which silently removes some control characters.
+    if not value or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value):
+        return False
+    if "\\" in value or re.search(r"%(?![0-9a-fA-F]{2})", value):
+        return False
     try:
         candidate = value if "://" in value else f"http://{value}"
         parsed = urllib.parse.urlsplit(candidate)
-        _ = parsed.port
+        port = parsed.port
+        hostname = urllib.parse.unquote(parsed.hostname or "")
+        for part in (parsed.username, parsed.password):
+            if part is not None and any(
+                byte < 32 or byte == 127 for byte in urllib.parse.unquote_to_bytes(part)
+            ):
+                return False
     except ValueError:
         return False
     return (
         parsed.scheme.lower()
         in {"http", "https", "socks", "socks4", "socks4a", "socks5", "socks5h"}
-        and bool(parsed.hostname)
-        and parsed.username is None
-        and parsed.password is None
+        and bool(hostname)
+        and not any(char.isspace() or ord(char) < 32 or ord(char) == 127
+                    or char in "/\\@?#" for char in hostname)
+        and parsed.netloc.count("@") <= 1
+        and not parsed.netloc.endswith(":")
+        and port != 0
         and parsed.path in {"", "/"}
         and not parsed.query
         and not parsed.fragment
     )
+
+
+@functools.lru_cache(maxsize=8)
+def proxy_credential_pattern(values: tuple[str, ...]) -> re.Pattern[str] | None:
+    forms: set[str] = set()
+    labeled_passwords: set[str] = set()
+    for value in values:
+        try:
+            parsed = urllib.parse.urlsplit(value if "://" in value else f"http://{value}")
+            if parsed.username is None:
+                continue
+            user = urllib.parse.unquote_to_bytes(parsed.username)
+            password = urllib.parse.unquote_to_bytes(parsed.password or "")
+        except ValueError:
+            continue
+        forms.add(value)
+        forms.add(base64.b64encode(user + b":" + password).decode("ascii"))
+        encoded_userinfo = parsed.netloc.rsplit("@", 1)[0]
+        raw_userinfo = user + (b":" + password if parsed.password is not None else b"")
+        # Keep username-only and empty-password auth in a URL context. A bare
+        # public label such as "u" or "openclaw" must not mask ordinary text.
+        if encoded_userinfo:
+            forms.add(encoded_userinfo + "@")
+            forms.add(urllib.parse.quote_from_bytes(raw_userinfo, safe="") + "%40")
+            try:
+                forms.add(raw_userinfo.decode("utf-8") + "@")
+            except UnicodeDecodeError:
+                pass
+        if parsed.password:
+            forms.add(encoded_userinfo)
+            # Short bare passwords are indistinguishable from prose or enum
+            # values. Always hide them in auth/password contexts; additionally
+            # mask standalone longer values, including run-scoped proxy tokens.
+            if len(password) >= 8:
+                forms.add(parsed.password)
+            labeled_passwords.add(parsed.password)
+            for raw in (password, raw_userinfo):
+                try:
+                    decoded = raw.decode("utf-8")
+                    if raw != password or len(password) >= 8:
+                        forms.add(decoded)
+                    if raw == password:
+                        labeled_passwords.add(decoded)
+                except UnicodeDecodeError:
+                    pass
+                encoded = urllib.parse.quote_from_bytes(raw, safe="")
+                if raw != password or len(password) >= 8:
+                    forms.add(encoded)
+                if raw == password:
+                    labeled_passwords.add(encoded)
+    forms.discard("")
+    forms.update(urllib.parse.quote(form, safe="") for form in tuple(forms))
+    # Diagnostics and streamed JSON may escape strings before we see them.
+    forms.update(json.dumps(form, ensure_ascii=True)[1:-1] for form in tuple(forms))
+    if not forms:
+        return None
+    patterns = []
+    for form in sorted(forms, key=len, reverse=True):
+        escaped = re.escape(form)
+        # Percent escape casing is insignificant; credential casing is not.
+        escaped = re.sub(r"%[0-9a-fA-F]{2}", lambda match: "(?i:" + match[0] + ")", escaped)
+        patterns.append(escaped)
+    for password in labeled_passwords:
+        escaped = re.escape(password)
+        escaped = re.sub(r"%[0-9a-fA-F]{2}", lambda match: "(?i:" + match[0] + ")", escaped)
+        patterns.append(
+            r"(?i:\b(?:proxy[_-]?)?password[\"']?[ \t]*[:=][ \t]*[\"']?)"
+            + escaped + r"(?=$|[\s\"',;\)\]}])"
+        )
+    return re.compile("|".join(patterns))
+
+
+def redact_proxy_credentials(text: str) -> str:
+    pattern = proxy_credential_pattern(tuple(os.environ.get(key, "") for key in PROXY_ENV_KEYS))
+    return pattern.sub("[REDACTED]", text) if pattern else text
+
+
+def redact_proxy_report(value: Any) -> Any:
+    # Redact after validation, at serialization only. Keep the original report
+    # and exit-status decisions intact; never edit source snapshots or auth.
+    if isinstance(value, str):
+        return redact_proxy_credentials(value)
+    if isinstance(value, list):
+        return [redact_proxy_report(item) for item in value]
+    if isinstance(value, dict):
+        enums = {"overall_correctness", "priority", "category", "review_status", "target", "side"}
+        return {key: item if key in enums else redact_proxy_report(item)
+                for key, item in value.items()}
+    return value
+
+
+class ProxyRedactedOutput:
+    """Cover plain progress/error prints as well as the formatted reports."""
+
+    def __init__(self, stream: Any) -> None:
+        self.stream = stream
+        self.pending = ""
+        self.discarding_line = False
+        self.lock = threading.Lock()
+
+    def write(self, text: str) -> int:
+        # print() and other writers can split a URL across writes. Emit whole
+        # lines only; flush must not expose a still-incomplete credential.
+        with self.lock:
+            parts = text.split("\n")
+            for index, part in enumerate(parts):
+                newline = index < len(parts) - 1
+                if self.discarding_line:
+                    self.discarding_line = not newline
+                    continue
+                if len(self.pending) + len(part) > 65_536:
+                    self.pending = ""
+                    self.discarding_line = not newline
+                    self.stream.write("[output line suppressed: exceeds redaction buffer]\n")
+                    continue
+                self.pending += part
+                if newline:
+                    self.stream.write(redact_proxy_credentials(self.pending) + "\n")
+                    self.pending = ""
+        return len(text)
+
+    def flush(self) -> None:
+        self.stream.flush()
+
+    @property
+    def encoding(self) -> str | None:
+        return self.stream.encoding
+
+    def isatty(self) -> bool:
+        return self.stream.isatty()
+
+    def fileno(self) -> int:
+        return self.stream.fileno()
+
+    def finish(self) -> None:
+        with self.lock:
+            self.stream.write(redact_proxy_credentials(self.pending))
+            self.pending = ""
+            self.stream.flush()
 
 
 def safe_engine_env(
@@ -719,6 +882,7 @@ def safe_engine_env(
         "LC_ALL",
         "LOGNAME",
         "NO_PROXY",
+        "NODE_USE_ENV_PROXY",
         "PATHEXT",
         "SHELL",
         "SYSTEMROOT",
@@ -879,19 +1043,11 @@ def safe_engine_env(
             )
         )
     }
-    for key in (
-        "ALL_PROXY",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "all_proxy",
-        "http_proxy",
-        "https_proxy",
-    ):
+    for key in PROXY_ENV_KEYS:
         value = env.get(key)
         if value and not safe_proxy_url(value):
             raise SystemExit(
-                f"unsafe credentialed or malformed proxy URL in {key}; "
-                "configure a credential-free proxy URL before running autoreview"
+                f"malformed proxy URL in {key}; configure a valid proxy URL before running autoreview"
             )
     env["PATH"] = safe_engine_path(repo, extra_paths)
     for key in ("HOME", "USERPROFILE"):
@@ -907,6 +1063,11 @@ def safe_engine_env(
         value = os.environ.get(key)
         if value and external_env_path(repo, value):
             env[key] = value
+    for key in TRANSPORT_TRUST_PATH_ENV_KEYS:
+        value = os.environ.get(key)
+        normalized = normalize_external_env_path_value(repo, key, value) if value else None
+        if normalized:
+            env[key] = normalized
     if engine == "codex":
         dbus_address = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
         if dbus_address and safe_dbus_session_address(repo, dbus_address):
@@ -1672,7 +1833,7 @@ def bounded_field(text: str, limit: int) -> str:
 
 def display_escape(text: object, limit: int, *, multiline: bool = False) -> str:
     parts: list[str] = []
-    for char in str(text):
+    for char in redact_proxy_credentials(str(text)):
         codepoint = ord(char)
         if multiline and char == "\n":
             parts.append(char)
@@ -6954,7 +7115,7 @@ def main_impl() -> int:
     if args.json_output:
         atomic_write_text(
             Path(args.json_output),
-            json.dumps(report, indent=2) + "\n",
+            json.dumps(redact_proxy_report(report), indent=2) + "\n",
         )
 
     if args.output:
@@ -6984,8 +7145,15 @@ def main_impl() -> int:
 
 
 def sanitized_main() -> int:
+    stdout = ProxyRedactedOutput(sys.stdout)
+    stderr = ProxyRedactedOutput(sys.stderr)
     try:
-        return main()
+        try:
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                return main()
+        finally:
+            stdout.finish()
+            stderr.finish()
     except SystemExit as exc:
         if isinstance(exc.code, str):
             raise SystemExit(
