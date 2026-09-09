@@ -6611,7 +6611,10 @@ class AuthenticatedProxyTests(unittest.TestCase):
                 with self.subTest(engine=engine), mock.patch.dict(os.environ, inherited, clear=True):
                     env = self.helper["safe_engine_env"](repo, engine=engine)
                     for key, value in transport.items():
-                        self.assertEqual(env.get(key), value, key)
+                        # Windows os.environ canonicalizes names to uppercase;
+                        # POSIX must retain each supplied casing independently.
+                        lookup_key = key.upper() if os.name == "nt" else key
+                        self.assertEqual(env.get(lookup_key), value, key)
                     self.assertNotIn("UNRELATED_SECRET", env)
                     self.assertNotIn("NODE_OPTIONS", env)
                     if engine == "codex":
