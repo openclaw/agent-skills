@@ -3,8 +3,8 @@
 ## Unreleased
 
 **Highlights:** Authenticated proxy support for isolated reviews, explicit reviewer availability, and controlled session sharing.
-- Support launcher-provided authenticated HTTP/SOCKS proxies in Autoreview, preserve external transport trust settings, and redact proxy credentials from diagnostics and reports without changing reviewer isolation.
 
+- Support launcher-provided authenticated HTTP/SOCKS proxies in Autoreview, preserve external transport trust settings, and redact proxy credentials from diagnostics and reports without changing reviewer isolation.
 - Fix Claude reviewer startup when the CLI truncates piped help output, while retaining mandatory isolation checks. Thanks @phyrexia.
 - Add opt-in Autoreview `--status-output` to distinguish unavailable reviewers from clean, adverse, filtered, and incomplete reviews without changing existing report JSON or exit codes. Thanks @coygeek.
 - Provide shared Autoreview, Crabbox, behavior-validator, handoff, readme-standard, agent-transcript, session-viewer, and Beam workflows, with selectable symlink/copy installation and cross-platform skill validation.
