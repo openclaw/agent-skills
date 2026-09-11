@@ -2,9 +2,7 @@
 
 ## Unreleased
 
-**Highlights:** Cross-platform transcript privacy, reliable isolated reviews, and controlled session sharing.
-
-- Redact Linux, Windows, file-URI, quoted, Markdown-wrapped, and Unicode local paths in agent transcripts while preserving HTTP links and surrounding prose; bound delimiter scanning before output truncation. Thanks @SebTardif.
+**Highlights:** Authenticated proxy support for isolated reviews, explicit reviewer availability, and controlled session sharing.
 - Support launcher-provided authenticated HTTP/SOCKS proxies in Autoreview, preserve external transport trust settings, and redact proxy credentials from diagnostics and reports without changing reviewer isolation.
 
 - Fix Claude reviewer startup when the CLI truncates piped help output, while retaining mandatory isolation checks. Thanks @phyrexia.
