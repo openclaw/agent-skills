@@ -29,7 +29,10 @@ The `beam` helper is self-contained. It does not require `agent-transcript`,
 
 Beam refuses fuzzy discovery. If an exact session cannot be resolved or multiple
 exact candidates exist, publication stops without choosing the newest nearby
-session.
+session. Discovery permits up to 20,000 JSONL files across the native roots;
+non-session files and empty directories do not consume that budget. Reads retry
+short filesystem results and stop publication on unexpected EOF, so an incomplete
+read cannot be uploaded as a complete snapshot.
 
 ## Install
 
