@@ -30,6 +30,7 @@ jobs:
         with:
           python-version: '3.14'
           cache: pip
+          cache-dependency-path: requirements-dev.txt
       - name: Install Python dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Install development typechecker
