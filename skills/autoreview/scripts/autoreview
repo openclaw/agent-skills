@@ -29,12 +29,12 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+from collections.abc import Callable, Sequence
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Callable, NamedTuple, Sequence
+from typing import Any, BinaryIO, NamedTuple
 
 
 ENGINES = ("codex", "claude", "amp", "pi", "kimi")
-ENGINE_CHOICES = ENGINES
 ENGINE_GIT_CONFIG_OVERRIDES = (
     ("core.fsmonitor", "false"),
     ("core.pager", "cat"),
@@ -630,10 +630,6 @@ def external_env_path(repo: Path, value: str) -> bool:
     except OSError:
         return False
     return not is_within(resolved, repo.resolve())
-
-
-def external_env_path_value(repo: Path, key: str, value: str) -> bool:
-    return normalize_external_env_path_value(repo, key, value) is not None
 
 
 def normalize_external_env_path_value(
@@ -2134,19 +2130,6 @@ def diff_marker_path(value: str) -> str | None:
     if not value.startswith(("a/", "b/")):
         return None
     return value[2:]
-
-
-def diff_section_paths(section: str) -> tuple[str | None, str | None]:
-    old_path: str | None = None
-    new_path: str | None = None
-    for line in section.splitlines():
-        if line.startswith("@@"):
-            break
-        if line.startswith("--- "):
-            old_path = diff_marker_path(line[4:])
-        elif line.startswith("+++ "):
-            new_path = diff_marker_path(line[4:])
-    return old_path, new_path
 
 
 def tracked_sensitive_paths(paths: list[str]) -> set[str]:
@@ -5644,23 +5627,6 @@ def amp_review_result(result: subprocess.CompletedProcess[str], review_root: Pat
         raise ReviewerUnavailable(str(exc), reason="runtime_validation_failed", result=result) from None
 
 
-def json_file_declares_hooks(path: Path) -> bool:
-    try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return True
-    if not isinstance(parsed, dict):
-        return False
-    if parsed.get("hooks"):
-        return True
-    enabled_plugins = parsed.get("enabledPlugins")
-    return isinstance(enabled_plugins, dict) and any(bool(enabled) for enabled in enabled_plugins.values())
-
-
-def format_repo_paths(repo: Path, paths: list[Path]) -> str:
-    return "; ".join(str(path.relative_to(repo)) for path in paths)
-
-
 def run_pi(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     pi_bin = ensure_pi_isolation_supported(args, repo)
     cmd = [
@@ -6407,7 +6373,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["auto", "local", "uncommitted", "branch", "commit"], default="auto")
     parser.add_argument("--base", help="Branch base, or explicit commit to compare with the index in local mode.")
     parser.add_argument("--commit", default="HEAD")
-    parser.add_argument("--engine", choices=ENGINE_CHOICES, default=os.environ.get("AUTOREVIEW_ENGINE", "codex"))
+    parser.add_argument("--engine", choices=ENGINES, default=os.environ.get("AUTOREVIEW_ENGINE", "codex"))
     parser.add_argument(
         "--model",
         action="append",
@@ -6496,13 +6462,13 @@ def env_defaults_for(env_suffix: str) -> tuple[str | None, dict[str, str]]:
     if global_value is not None:
         global_value = global_value.strip() or None
     per_engine: dict[str, str] = {}
-    for configured_engine in ENGINE_CHOICES:
+    for configured_engine in ENGINES:
         configured_key = configured_engine.replace("-", "_").upper()
         value = os.environ.get(f"AUTOREVIEW_{configured_key}_{env_key}")
         if value is None:
             continue
         value = value.strip()
-        if value and configured_engine not in per_engine:
+        if value:
             per_engine[configured_engine] = value
     return global_value, per_engine
 
@@ -6518,7 +6484,7 @@ def parse_keyed_options(values: list[str] | None, option: str) -> tuple[str | No
             engine, engine_value = value.split("=", 1)
             engine = engine.strip()
             engine_value = engine_value.strip()
-            if engine not in ENGINE_CHOICES:
+            if engine not in ENGINES:
                 raise SystemExit(f"--{option} uses unknown engine: {engine}")
             if not engine_value:
                 raise SystemExit(f"--{option} for {engine} cannot be empty")
