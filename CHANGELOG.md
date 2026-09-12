@@ -19,6 +19,7 @@
 - Publish redacted coding sessions through Beam's authenticated read-only catalog; accept readable and named share URLs, ignore persisted agent messages, and keep transcript items within receiver limits.
 - Make agent transcripts explicit-request-only and trim before previews or publication, retaining native hosted-session sharing and partial-source notices.
 - Bound agent-transcript session reads to 8 MiB and disclose partial source content in render, preview, append-body, and HTML output. Thanks @SebTardif.
+- Retry short agent-transcript reads and fail on unexpected EOF before rendering or scoring incomplete session content.
 - Bound agent-transcript `find` and `html` discovery to 20,000 session files, with an integer override and correct exact-limit handling. Thanks @SebTardif.
 - Add opt-in session-viewer head/tail reads with `--max-read-bytes`, preserving complete exports by default and showing escaped truncation warnings; retry short reads and fail on unexpected EOF. Thanks @SebTardif.
 - Normalize session-viewer metadata and timestamps, improve searchable local HTML exports, and avoid the Windows shell when opening an export.
