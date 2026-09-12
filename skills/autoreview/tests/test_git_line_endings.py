@@ -66,6 +66,11 @@ class GitLineEndingTests(unittest.TestCase):
             self.helper["local_bundle"](self.repo)
         self.assertEqual(self.snapshot(), before)
 
+    def test_explicit_home_does_not_require_a_platform_home(self):
+        self.seed()
+        with mock.patch("pathlib.Path.home", side_effect=RuntimeError("no platform home")):
+            self.assertFalse(self.helper["is_dirty"](self.repo))
+
     def test_default_home_global_config_is_honored(self):
         self.seed()
         os.environ.pop("GIT_CONFIG_GLOBAL")
