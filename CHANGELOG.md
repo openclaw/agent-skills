@@ -24,3 +24,4 @@
 - Normalize session-viewer metadata and timestamps, improve searchable local HTML exports, and avoid the Windows shell when opening an export.
 - Make Crabbox guidance portable and provider-neutral while preserving source-trust, remote-proof, and cleanup ownership boundaries.
 - Pin validation actions and Node.js 26, share reproducible Python/Node checks across local development and CI, typecheck the session viewer, and exercise native macOS sandbox controls alongside Linux/Windows regression coverage.
+- Declare the repository's native Node helpers as ES modules to avoid loader warnings when running from a development checkout.

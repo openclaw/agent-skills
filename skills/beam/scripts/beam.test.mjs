@@ -1299,3 +1299,12 @@ test("publish never prints access tokens on receiver errors", async (t) => {
   assert.doesNotMatch(result.stderr, /\nforged/);
   assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /super-secret-access-token/);
 });
+
+test("CLI loads its native module format without loader warnings", async () => {
+  const result = await run(["--help"], {
+    env: { NODE_OPTIONS: "", NODE_NO_WARNINGS: "" },
+  });
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /Usage:/);
+  assert.equal(result.stderr, "");
+});
