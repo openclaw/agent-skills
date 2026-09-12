@@ -429,12 +429,8 @@ function toolCallFamily(row) {
 }
 
 function compactToolSummary(familyCounts, dropped) {
-  const families = new Map();
-  for (const [family, count] of familyCounts.entries()) {
-    families.set(family, (families.get(family) || 0) + count);
-  }
   const ordered = ["read", "write", "execute", "network", "other"]
-    .map((family) => [family, families.get(family) || 0])
+    .map((family) => [family, familyCounts.get(family) || 0])
     .filter(([, count]) => count > 0)
     .map(([family, count]) => `${count} ${family}`);
   const calls = ordered.length ? ordered.join(", ") : "0 tool";
@@ -780,7 +776,7 @@ function recentFiles(files, maxFiles) {
     .map((entry) => entry.file);
 }
 
-function candidateFiles(roots, terms, sinceMs, options = {}) {
+function candidateFiles(roots, sinceMs, options = {}) {
   return recentFiles(discoverSessionFiles(roots, sinceMs, options), Number(options["max-files"] || 400));
 }
 
@@ -793,7 +789,7 @@ function findSessions(options) {
     .split(/\s+/)
     .concat(query.match(/https?:\/\/\S+/g) || [])
     .filter(Boolean);
-  const files = candidateFiles(roots, terms, sinceMs, options);
+  const files = candidateFiles(roots, sinceMs, options);
   const scanBytes = Number(options["scan-bytes"] || 60000);
   const results = files
     .map((file) => scoreScanRecord(sessionScanRecord(file, scanBytes), terms, options.cwd))
