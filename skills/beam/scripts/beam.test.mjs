@@ -3,7 +3,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import test, { after } from "node:test";
 import {
   renderSession,
@@ -1397,4 +1397,16 @@ test("CLI loads its native module format without loader warnings", async () => {
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /Usage:/);
   assert.equal(result.stderr, "");
+});
+
+test("copied Beam runs inside a CommonJS project without dependencies", () => {
+  const root = tempDir();
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ type: "commonjs" }));
+  const installed = path.join(root, "installed-beam");
+  fs.cpSync(path.dirname(path.dirname(script)), installed, { recursive: true });
+  const output = execFileSync(process.execPath, [path.join(installed, "scripts", "beam"), "--help"], {
+    cwd: root, encoding: "utf8", stdio: "pipe",
+    env: { ...process.env, NODE_OPTIONS: "", NODE_NO_WARNINGS: "" },
+  });
+  assert.match(output, /Usage:/);
 });

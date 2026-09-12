@@ -82,6 +82,8 @@ scripts/install-skills --force autoreview
 
 Symlinks are best for local development because changes in this checkout are
 immediately visible. Copies are better for portable or locked-down setups.
+Node-based skills declare their module format locally, so copied helpers also
+run inside CommonJS projects without installing dependencies.
 
 ## Codex And Claude
 

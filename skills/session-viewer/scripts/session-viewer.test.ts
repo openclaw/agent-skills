@@ -1070,3 +1070,17 @@ test("viewer escapes warning text and accepts legacy raw payloads", () => {
   const legacy = html.replace(',"warnings":[]', "");
   assert.equal(renderViewer(legacy).get("warnings")!.hidden, true);
 });
+
+test("copied viewer renders inside a CommonJS project without dependencies", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "copied-viewer-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await fs.writeFile(path.join(root, "package.json"), JSON.stringify({ type: "commonjs" }));
+  const installed = path.join(root, "installed-viewer");
+  await fs.cp(path.resolve("skills/session-viewer"), installed, { recursive: true });
+  const output = path.join(root, "viewer.html");
+  await execFileAsync(process.execPath, [path.join(installed, "scripts", "session-viewer.ts"), "--blank", "--out", output], {
+    cwd: root,
+    env: { ...process.env, NODE_OPTIONS: "", NODE_NO_WARNINGS: "" },
+  });
+  assert.match(await fs.readFile(output, "utf8"), /<!doctype html>/);
+});

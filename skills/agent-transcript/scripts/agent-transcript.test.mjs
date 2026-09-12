@@ -431,3 +431,15 @@ test("render and discovery fail instead of treating unexpected EOF as complete i
     );
   }
 });
+
+test("copied agent-transcript runs inside a CommonJS project without dependencies", () => {
+  const root = tempDir();
+  fs.writeFileSync(path.join(root, "package.json"), JSON.stringify({ type: "commonjs" }));
+  const installed = path.join(root, "installed-transcript");
+  fs.cpSync(path.dirname(path.dirname(script)), installed, { recursive: true });
+  const output = execFileSync(process.execPath, [path.join(installed, "scripts", "agent-transcript"), "--help"], {
+    cwd: root, encoding: "utf8", stdio: "pipe",
+    env: { ...process.env, NODE_OPTIONS: "", NODE_NO_WARNINGS: "" },
+  });
+  assert.match(output, /Usage:/);
+});
