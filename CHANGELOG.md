@@ -8,6 +8,7 @@
 - Fix Claude reviewer startup when the CLI truncates piped help output, while retaining mandatory isolation checks. Thanks @phyrexia.
 - Add opt-in Autoreview `--status-output` to distinguish unavailable reviewers from clean, adverse, filtered, and incomplete reviews without changing existing report JSON or exit codes. Thanks @coygeek.
 - Provide shared Autoreview, Crabbox, behavior-validator, handoff, readme-standard, agent-transcript, session-viewer, and Beam workflows, with selectable symlink/copy installation and cross-platform skill validation.
+- Reject malformed frontmatter closing delimiters and report non-mapping YAML values accurately during skill validation.
 - Run explicitly requested reviews through isolated Codex, Claude, Amp, Pi, or Kimi engines, with structured findings, scoped attribution, progress, streaming diagnostics, dry-run preflight, and optional process deadlines.
 - Preserve complete Autoreview source and evidence without file or count caps, partitioning oversized inputs across review passes without truncation or partial-clean success.
 - Preserve base/index/working-tree source identity, literal paths, empty-source anchors, raw Git parents, and directory transitions; honor explicit local bases and normalize Git diff presentation.

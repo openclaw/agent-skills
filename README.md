@@ -185,7 +185,8 @@ controls without a reviewer account or provider request.
 
 For a quick frontmatter-only check, run `scripts/validate-skills`. It checks
 every `skills/*/SKILL.md` for YAML frontmatter plus required `name` and
-`description`.
+`description` strings. Frontmatter must be a mapping enclosed by standalone
+`---` lines; trailing spaces or tabs are allowed on the closing line.
 
 Session exports can contain sensitive conversation data. Treat `session-viewer`
 HTML as local/private output unless it has been separately redacted and reviewed.
