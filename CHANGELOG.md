@@ -23,4 +23,4 @@
 - Add opt-in session-viewer head/tail reads with `--max-read-bytes`, preserving complete exports by default and showing escaped truncation warnings; retry short reads and fail on unexpected EOF. Thanks @SebTardif.
 - Normalize session-viewer metadata and timestamps, improve searchable local HTML exports, and avoid the Windows shell when opening an export.
 - Make Crabbox guidance portable and provider-neutral while preserving source-trust, remote-proof, and cleanup ownership boundaries.
-- Update validation to Node.js 26 and current setup actions, restrict workflow permissions, and maintain Python and Node regression coverage across Linux and Windows.
+- Pin validation actions and Node.js 26, share reproducible Python/Node checks across local development and CI, typecheck the session viewer, and exercise native macOS sandbox controls alongside Linux/Windows regression coverage.

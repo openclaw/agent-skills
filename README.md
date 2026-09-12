@@ -166,27 +166,26 @@ belong inside that skill's `scripts/` directory.
 
 ## Validate
 
-Run this after edits:
+Development checks use Python 3.14 and Node.js 26, matching CI. Install the
+development dependencies once, then run the shared check command:
 
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -r requirements-dev.txt
-scripts/validate-skills
-python3 -m py_compile scripts/install-skills scripts/install-skills.test.py scripts/validate-skills scripts/validate-skills.test.py
-python3 scripts/install-skills.test.py
-python3 scripts/validate-skills.test.py
-bash -n skills/autoreview/scripts/test-review-harness
-python3 -m py_compile skills/autoreview/scripts/autoreview skills/autoreview/scripts/test-review-harness.py skills/autoreview/scripts/autoreview_test.py
-python3 -m unittest skills/autoreview/scripts/autoreview_test.py skills.autoreview.tests.test_autoreview_hardening
-node --check skills/agent-transcript/scripts/agent-transcript
-node --check skills/beam/scripts/beam
-node --check skills/beam/scripts/beam-session.js
-node --test skills/agent-transcript/scripts/agent-transcript.test.mjs skills/beam/scripts/beam.test.mjs skills/session-viewer/scripts/session-viewer.test.ts
+npm ci --ignore-scripts
+python scripts/check-skills
 ```
 
-The validator checks every `skills/*/SKILL.md` for YAML frontmatter plus required
-`name` and `description`.
+The check command runs frontmatter validation, syntax checks, all Python and
+Node tests, and `npm run typecheck` for the session viewer. The Node packages
+are development-only; installed skills do not need `npm install`. The separate
+macOS CI job installs a pinned Codex CLI to exercise native sandbox access
+controls without a reviewer account or provider request.
+
+For a quick frontmatter-only check, run `scripts/validate-skills`. It checks
+every `skills/*/SKILL.md` for YAML frontmatter plus required `name` and
+`description`.
 
 Session exports can contain sensitive conversation data. Treat `session-viewer`
 HTML as local/private output unless it has been separately redacted and reviewed.
