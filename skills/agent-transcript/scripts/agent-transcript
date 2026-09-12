@@ -705,22 +705,31 @@ async function renderTranscript(options) {
   return renderSession(options.session, options);
 }
 
+function readRegion(fd, start, length) {
+  const buffer = Buffer.alloc(length);
+  let offset = 0;
+  while (offset < length) {
+    const read = fs.readSync(fd, buffer, offset, length - offset, start + offset);
+    if (read === 0) {
+      throw new Error("session file ended before the expected read completed; retry the read");
+    }
+    offset += read;
+  }
+  return buffer.toString("utf8");
+}
+
 function readBoundedText(file, maxBytes = 220000) {
   const fd = fs.openSync(file, "r");
   try {
     const stat = fs.fstatSync(fd);
     if (stat.size <= maxBytes) {
-      const buffer = Buffer.alloc(stat.size);
-      const bytesRead = fs.readSync(fd, buffer, 0, stat.size, 0);
-      return { text: buffer.subarray(0, bytesRead).toString("utf8"), truncated: false };
+      return { text: readRegion(fd, 0, stat.size), truncated: false };
     }
     const half = Math.floor(maxBytes / 2);
-    const head = Buffer.alloc(half);
-    const tail = Buffer.alloc(half);
-    const headBytes = fs.readSync(fd, head, 0, half, 0);
-    const tailBytes = fs.readSync(fd, tail, 0, half, Math.max(0, stat.size - half));
+    const head = readRegion(fd, 0, half);
+    const tail = readRegion(fd, stat.size - half, half);
     return {
-      text: `${head.subarray(0, headBytes).toString("utf8")}\n[...middle omitted for scan...]\n${tail.subarray(0, tailBytes).toString("utf8")}`,
+      text: `${head}\n[...middle omitted for scan...]\n${tail}`,
       truncated: true,
     };
   } finally {

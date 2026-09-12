@@ -40,6 +40,8 @@ at most 12,000 lines. `--max-read-bytes N` changes the byte limit. Preserve the
 visible partial-transcript notice and `sourceTruncated` stats through trimming,
 preview, and insertion; omitted source must never be described as complete.
 These are file-read limits, not limits on the separate app-server rendering mode.
+Short filesystem reads are retried. Unexpected EOF stops rendering or discovery
+instead of treating incomplete input as a complete session.
 
 Automatically trim the rendered Markdown **before showing, previewing, or
 inserting it**. Keep only task-relevant user prompts, visible decisions, terse

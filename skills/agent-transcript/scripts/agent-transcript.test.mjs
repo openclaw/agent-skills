@@ -3,12 +3,49 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
+import { pathToFileURL } from "node:url";
 
 const script = path.resolve("skills/agent-transcript/scripts/agent-transcript");
+const tempDirs = [];
+
+after(() => {
+  for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true });
+});
 
 function tempDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "agent-transcript-test-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-transcript-test-"));
+  tempDirs.push(dir);
+  return dir;
+}
+
+function runWithLimitedReads(args, session, chunkSize, earlyEof = false) {
+  const preload = path.join(tempDir(), "limited-reads.mjs");
+  fs.writeFileSync(preload, `
+import fs from "node:fs";
+import path from "node:path";
+const open = fs.openSync, read = fs.readSync, close = fs.closeSync;
+const owned = new Set();
+let calls = 0;
+fs.openSync = (file, ...args) => {
+  const fd = open(file, ...args);
+  if (typeof file === "string" && path.resolve(file) === path.resolve(process.env.TEST_SESSION)) owned.add(fd);
+  return fd;
+};
+fs.closeSync = (fd) => { owned.delete(fd); return close(fd); };
+fs.readSync = (fd, buffer, offset, length, position) => {
+  if (owned.has(fd)) {
+    if (process.env.TEST_EOF === "1" && calls++ > 0) return 0;
+    length = Math.min(length, Number(process.env.TEST_CHUNK));
+  }
+  return read(fd, buffer, offset, length, position);
+};
+`);
+  return execFileSync(process.execPath, ["--import", pathToFileURL(preload).href, script, ...args], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, TEST_SESSION: session, TEST_CHUNK: String(chunkSize), TEST_EOF: earlyEof ? "1" : "0" },
+  });
 }
 
 function writeJsonl(file, rows) {
@@ -349,5 +386,48 @@ test("discovery rejects invalid and missing file limits", () => {
         (error) => /--max-discovery-files must be a positive integer/.test(String(error.stderr)),
       );
     }
+  }
+});
+
+test("render retries short reads without losing complete source messages", () => {
+  const session = path.join(tempDir(), "session.jsonl");
+  writeJsonl(session, [
+    { type: "user", message: { role: "user", content: "First complete message" } },
+    { type: "assistant", message: { role: "assistant", content: "Second complete message" } },
+  ]);
+  const output = runWithLimitedReads(["render", "--session", session], session, 13);
+  assert.match(output, /First complete message/);
+  assert.match(output, /Second complete message/);
+  assert.match(output, /"sourceTruncated":false/);
+});
+
+test("bounded rendering retries both head and tail reads", () => {
+  const session = path.join(tempDir(), "session.jsonl");
+  const row = (content) => JSON.stringify({ type: "user", message: { role: "user", content } });
+  fs.writeFileSync(session, `${row("First complete message")}\n${"x".repeat(2048)}\n${row("Last complete message")}\n`);
+  const output = runWithLimitedReads(["render", "--session", session, "--max-read-bytes", "256"], session, 13);
+  assert.match(output, /First complete message/);
+  assert.match(output, /Last complete message/);
+  assert.match(output, /"sourceTruncated":true/);
+});
+
+test("find retries short reads before scoring a session", () => {
+  const root = tempDir();
+  const session = path.join(root, "session.jsonl");
+  writeJsonl(session, [{ type: "user", message: { role: "user", content: "tail-search-marker" } }]);
+  const output = runWithLimitedReads(["find", "--root", root, "--query", "tail-search-marker"], session, 13);
+  assert.equal(JSON.parse(output)[0]?.file, session);
+});
+
+test("render and discovery fail instead of treating unexpected EOF as complete input", () => {
+  const root = tempDir();
+  const session = path.join(root, "session.jsonl");
+  const first = JSON.stringify({ type: "user", message: { role: "user", content: "First complete message" } }) + "\n";
+  fs.writeFileSync(session, first + JSON.stringify({ type: "assistant", message: { role: "assistant", content: "Last complete message" } }) + "\n");
+  for (const args of [["render", "--session", session], ["find", "--root", root, "--query", "First complete message"]]) {
+    assert.throws(
+      () => runWithLimitedReads(args, session, Buffer.byteLength(first), true),
+      (error) => error.status === 1 && error.stdout === "" && /ended before the expected read/.test(error.stderr),
+    );
   }
 });
