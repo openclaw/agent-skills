@@ -147,14 +147,11 @@ export function cleanImageMarkerText(text: string, hasImages = false): string {
   if (!hasImages) {
     return text.trim();
   }
-  let cleaned = text.replace(/<image\s+name=\[Image\s+#\d+\]>\s*/giu, "").trim();
+  const cleaned = text.replace(/<image\s+name=\[Image\s+#\d+\]>\s*/giu, "").trim();
   if (/^<\/image>\s*$/iu.test(cleaned)) {
     return "";
   }
-  if (hasImages) {
-    cleaned = cleaned.replace(/^\s*(?:\[[^\]\n]*Image\s*#?\d+[^\]\n]*\]\s*)+/iu, "").trim();
-  }
-  return cleaned;
+  return cleaned.replace(/^\s*(?:\[[^\]\n]*Image\s*#?\d+[^\]\n]*\]\s*)+/iu, "").trim();
 }
 
 export function textFromContentBlocks(content: unknown): string {
