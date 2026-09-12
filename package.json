@@ -1,6 +1,7 @@
 {
   "name": "agent-skills-development",
   "private": true,
+  "type": "module",
   "scripts": {
     "typecheck": "tsc -p skills/session-viewer/tsconfig.json"
   },
