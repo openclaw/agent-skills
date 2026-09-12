@@ -62,6 +62,12 @@ whitespace. An empty present
 source uses line 1, column 1, and an empty excerpt; empty physical lines also
 use an empty excerpt at column 1. Source identity remains mandatory.
 
+Local selection honors `core.autocrlf` from external operator Git configuration,
+with repository-local values and attributes retaining precedence. Only its
+validated scalar value reaches diff/status; other global and system Git
+configuration stays disabled. Repository-owned or relative global-config
+overrides are not imported, and reviewed source bytes are not rewritten.
+
 ## Context and severity
 
 Use `--prompt` for task-specific guidance, or `--prompt-file` and `--dataset` for
