@@ -36,11 +36,7 @@ function uniqueRealFiles(files) {
 }
 
 function walkJsonl(root, match, state, out) {
-  if (!root || !fs.existsSync(root)) return;
-  if (state.files >= state.maxFiles) {
-    state.exhausted = true;
-    return;
-  }
+  if (state.exhausted || !root || !fs.existsSync(root)) return;
   let entries;
   try {
     entries = fs.readdirSync(root, { withFileTypes: true });
@@ -48,10 +44,7 @@ function walkJsonl(root, match, state, out) {
     return;
   }
   for (const entry of entries) {
-    if (state.files >= state.maxFiles) {
-      state.exhausted = true;
-      break;
-    }
+    if (state.exhausted) break;
     if (entry.name === ".git" || entry.name === "node_modules") continue;
     const candidate = path.join(root, entry.name);
     if (entry.isDirectory()) {
@@ -59,6 +52,10 @@ function walkJsonl(root, match, state, out) {
       continue;
     }
     if (!entry.isFile() || !entry.name.endsWith(".jsonl")) continue;
+    if (state.files >= state.maxFiles) {
+      state.exhausted = true;
+      break;
+    }
     state.files++;
     if (match(entry.name, candidate)) out.push(candidate);
   }
@@ -79,9 +76,7 @@ function readPrefix(file, maxBytes = TRANSCRIPT_HEAD_BYTES) {
   try {
     const stat = fs.fstatSync(fd);
     const size = Math.min(stat.size, maxBytes);
-    const buffer = Buffer.alloc(size);
-    fs.readSync(fd, buffer, 0, size, 0);
-    return buffer.toString("utf8");
+    return readRegion(fd, 0, size);
   } finally {
     fs.closeSync(fd);
   }
@@ -145,8 +140,15 @@ export function resolveCodexSession(threadId, env = process.env, options = {}) {
 
 function readRegion(fd, start, length) {
   const buffer = Buffer.alloc(length);
-  const read = fs.readSync(fd, buffer, 0, length, start);
-  return buffer.subarray(0, read).toString("utf8");
+  let offset = 0;
+  while (offset < length) {
+    const read = fs.readSync(fd, buffer, offset, length - offset, start + offset);
+    if (read === 0) {
+      throw new Error("session file ended before the expected read completed; retry publication");
+    }
+    offset += read;
+  }
+  return buffer.toString("utf8");
 }
 
 function completeHead(text) {
