@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -27,15 +28,17 @@ def load_frontmatter(text: str) -> tuple[dict[object, object] | None, str | None
     if not text.startswith("---\n"):
         return None, "missing YAML frontmatter"
 
-    close = text.find("\n---", 4)
-    if close == -1:
+    close = re.search(r"^---[ \t]*$", text[4:], re.MULTILINE)
+    if close is None:
         return None, "unterminated YAML frontmatter"
 
     try:
-        data = yaml.load(text[4:close], Loader=NoAliasSafeLoader) or {}
+        data = yaml.load(text[4:4 + close.start()], Loader=NoAliasSafeLoader)
     except yaml.YAMLError as error:
         return None, f"invalid YAML: {error}"
 
+    if data is None:
+        data = {}
     if not isinstance(data, dict):
         return None, "YAML frontmatter must be a mapping"
     return data, None
