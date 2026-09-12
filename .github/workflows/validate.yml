@@ -8,39 +8,51 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: validate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   validate:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '26'
-      - uses: actions/setup-python@v7
+          node-version: '26.8.2'
+          cache: npm
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: '3.x'
+          python-version: '3.14'
+          cache: pip
       - name: Install Python dependencies
         run: python -m pip install -r requirements-dev.txt
-      - name: Validate skill frontmatter
-        run: python scripts/validate-skills
-      - name: Check shell scripts
-        run: bash -n skills/autoreview/scripts/test-review-harness
-      - name: Check Python scripts
-        run: python -m py_compile scripts/install-skills scripts/install-skills.test.py scripts/validate-skills scripts/validate-skills.test.py skills/autoreview/scripts/autoreview skills/autoreview/scripts/test-review-harness.py skills/autoreview/scripts/autoreview_test.py
-      - name: Run repository script tests
+      - name: Install development typechecker
+        run: npm ci --ignore-scripts
+      - name: Check skills
+        run: python scripts/check-skills
+
+  macos-sandbox:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26.8.2'
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Install sandbox CLI
         run: |
-          python scripts/install-skills.test.py
-          python scripts/validate-skills.test.py
-      - name: Run Python tests
-        run: python -m unittest skills/autoreview/scripts/autoreview_test.py skills.autoreview.tests.test_autoreview_hardening skills.autoreview.tests.test_codex_sandbox skills.autoreview.tests.test_codex_inference_route
-      - name: Check Node scripts
+          npm install --prefix "$RUNNER_TEMP/autoreview-codex" --ignore-scripts --no-audit --no-fund @openai/codex@0.154.0
+          echo "$RUNNER_TEMP/autoreview-codex/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Exercise native sandbox without provider access
         run: |
-          node --check skills/agent-transcript/scripts/agent-transcript
-          node --check skills/beam/scripts/beam
-          node --check skills/beam/scripts/beam-session.js
-      - name: Run Node tests
-        run: node --test skills/agent-transcript/scripts/agent-transcript.test.mjs skills/beam/scripts/beam.test.mjs skills/session-viewer/scripts/session-viewer.test.ts
+          codex --version
+          python -m unittest skills.autoreview.tests.test_codex_sandbox

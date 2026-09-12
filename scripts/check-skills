@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""Run the same repository checks locally and in CI."""
+from __future__ import annotations
+
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+def main() -> int:
+    root = Path(__file__).resolve().parent.parent
+    python = sys.executable
+    commands = [
+        [python, "scripts/validate-skills"],
+        ["bash", "-n", "skills/autoreview/scripts/test-review-harness"],
+        [python, "-m", "py_compile",
+         "scripts/install-skills", "scripts/install-skills.test.py",
+         "scripts/validate-skills", "scripts/validate-skills.test.py",
+         "skills/autoreview/scripts/autoreview",
+         "skills/autoreview/scripts/test-review-harness.py",
+         "skills/autoreview/scripts/autoreview_test.py"],
+        [python, "scripts/install-skills.test.py"],
+        [python, "scripts/validate-skills.test.py"],
+        [python, "-m", "unittest",
+         "skills/autoreview/scripts/autoreview_test.py",
+         "skills.autoreview.tests.test_autoreview_hardening",
+         "skills.autoreview.tests.test_codex_sandbox",
+         "skills.autoreview.tests.test_codex_inference_route"],
+        ["node", "--check", "skills/agent-transcript/scripts/agent-transcript"],
+        ["node", "--check", "skills/beam/scripts/beam"],
+        ["node", "--check", "skills/beam/scripts/beam-session.js"],
+        ["npm", "run", "typecheck"],
+        ["node", "--test",
+         "skills/agent-transcript/scripts/agent-transcript.test.mjs",
+         "skills/beam/scripts/beam.test.mjs",
+         "skills/session-viewer/scripts/session-viewer.test.ts"],
+    ]
+    for command in commands:
+        print("+ " + " ".join(command), flush=True)
+        executable = shutil.which(command[0])
+        if executable is None:
+            print(f"required executable not found: {command[0]}", file=sys.stderr)
+            return 1
+        result = subprocess.run([executable, *command[1:]], cwd=root)
+        if result.returncode:
+            return result.returncode
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

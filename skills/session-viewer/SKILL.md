@@ -96,7 +96,8 @@ Importer ownership:
 Validate:
 
 ```bash
-pnpm exec tsgo -p skills/session-viewer/tsconfig.json
+npm ci --ignore-scripts
+npm run typecheck
 node --test skills/session-viewer/scripts/session-viewer.test.ts
 scripts/validate-skills
 ```
