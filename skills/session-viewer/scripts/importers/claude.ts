@@ -114,7 +114,7 @@ function parseContentBlocks(
   }
 
   const mergedText = compactText(textParts);
-  if (mergedText) {
+  if (mergedText || images.length > 0) {
     events.unshift({
       id: `${recordId}-text`,
       kind: "message",
@@ -122,16 +122,6 @@ function parseContentBlocks(
       title: fallbackRole,
       text: mergedText,
       images: images.length ? images : undefined,
-      timestamp,
-    });
-  } else if (images.length > 0) {
-    events.unshift({
-      id: `${recordId}-text`,
-      kind: "message",
-      role: fallbackRole,
-      title: fallbackRole,
-      text: "",
-      images,
       timestamp,
     });
   }

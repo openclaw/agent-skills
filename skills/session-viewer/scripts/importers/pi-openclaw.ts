@@ -1,4 +1,5 @@
 import {
+  compactText,
   expandMemoryCitationEvents,
   hasImageExtension,
   imageAttachmentsFromContent,
@@ -30,12 +31,12 @@ function timestampOf(
   entry: Record<string, unknown>,
   message?: Record<string, unknown>,
 ): string | undefined {
-  const raw =
+  return (
     stringValue(entry.timestamp) ??
     stringValue(entry.createdAt) ??
     stringValue(entry.updatedAt) ??
-    isoFromEpochMillis(message?.timestamp);
-  return raw;
+    isoFromEpochMillis(message?.timestamp)
+  );
 }
 
 function arrayOrSingle(value: unknown): unknown[] {
@@ -196,11 +197,8 @@ function eventsFromMessage(record: JsonlRecord, entry: Record<string, unknown>):
     }
   }
 
-  const text = textParts
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .join("\n\n");
-  if (text) {
+  const text = compactText(textParts);
+  if (text || images.length > 0) {
     events.unshift({
       id: baseId,
       kind: role === "system" ? "system" : "message",
@@ -208,17 +206,6 @@ function eventsFromMessage(record: JsonlRecord, entry: Record<string, unknown>):
       title: role,
       text,
       images: images.length ? images : undefined,
-      timestamp,
-      raw: entry,
-    });
-  } else if (images.length > 0) {
-    events.unshift({
-      id: baseId,
-      kind: role === "system" ? "system" : "message",
-      role,
-      title: role,
-      text: "",
-      images,
       timestamp,
       raw: entry,
     });
