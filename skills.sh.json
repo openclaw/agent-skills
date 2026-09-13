@@ -8,6 +8,11 @@
       "skills": ["autoreview", "behavior-validator", "crabbox"]
     },
     {
+      "title": "Runtime Safety",
+      "description": "Skills for protecting local agent runtimes before tool execution.",
+      "skills": ["hol-guard"]
+    },
+    {
       "title": "Handoff",
       "description": "Skills for sharing context across agents, PRs, and issues.",
       "skills": ["handoff", "agent-transcript"]
