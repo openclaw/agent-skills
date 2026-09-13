@@ -21,6 +21,11 @@
       "title": "Documentation",
       "description": "Skills for writing and reviewing project documentation.",
       "skills": ["readme-standard"]
+    },
+    {
+      "title": "Security & Audit",
+      "description": "Skills for cryptographic accountability and tamper-evident execution logging.",
+      "skills": ["guardclaw-audit"]
     }
   ]
 }
