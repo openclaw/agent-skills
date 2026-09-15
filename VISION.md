@@ -34,6 +34,11 @@ validation, transcript handling, and focused handoff workflows.
   automation require a narrow ownership model and end-to-end isolation proof.
 - Distribution infrastructure is not bundled merely to publish one skill.
   Prefer existing source-repository and community publication paths.
+- Third-party services and vendor runtimes are not endorsed here. The catalog
+  does not carry skills that install, wrap, or advertise a specific external
+  security, safety, or hosting product, nor compatibility suites or listings
+  for another company; those belong with the vendor or a community catalog.
+  Protocol-level fixes that benefit any provider remain welcome.
 
 ## Evolution
 
