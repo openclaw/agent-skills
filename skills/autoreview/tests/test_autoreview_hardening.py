@@ -1393,6 +1393,37 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.assertEqual(self.helper["choose_target"](repo, "auto", None), ("local", None))
             self.assertEqual(self.helper["local_bundle"](repo).paths, {".worktrees/notes.md"})
 
+    def test_auto_target_prefers_committed_branch_over_untracked_only_work(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            (repo / "source.md").write_text("base\n", encoding="utf-8")
+            git(repo, "add", "source.md")
+            git(repo, "commit", "-qm", "base")
+            git(repo, "branch", "review-base")
+            git(repo, "switch", "-qc", "feature")
+            (repo / "source.md").write_text("feature\n", encoding="utf-8")
+            git(repo, "commit", "-qam", "feature")
+            (repo / "screenshot.png").write_bytes(b"\x89PNG\r\n\x1a\n\0")
+
+            self.assertEqual(
+                self.helper["choose_target"](repo, "auto", "review-base"),
+                ("branch", "review-base"),
+            )
+
+    def test_auto_target_keeps_untracked_only_work_without_branch_commits_local(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            git(repo, "commit", "--allow-empty", "-qm", "base")
+            base = git(repo, "rev-parse", "HEAD").strip()
+            git(repo, "branch", "review-base")
+            git(repo, "switch", "-qc", "feature")
+            (repo / "notes.md").write_text("local work\n", encoding="utf-8")
+
+            self.assertEqual(
+                self.helper["choose_target"](repo, "auto", "review-base"),
+                ("local", base),
+            )
+
     def test_nested_worktree_snapshot_tracks_boundary_not_child_state(self):
         for linked_root in (False, True):
             with self.subTest(linked_root=linked_root), self.nested_worktree_fixture(

@@ -1739,15 +1739,53 @@ def is_dirty(repo: Path) -> bool:
     )
 
 
+def has_tracked_changes(repo: Path) -> bool:
+    return bool(git(repo, "status", "--porcelain", "--untracked-files=no").strip())
+
+
+def branch_has_commits(repo: Path, base_ref: str) -> bool:
+    base = validate_git_ref(repo, base_ref, "base", pin=True)
+    head = validate_git_ref(repo, "HEAD", "commit", pin=True)
+    return bool(
+        git(
+            repo,
+            "rev-list",
+            "--max-count=1",
+            "--end-of-options",
+            f"{base}..{head}",
+        ).strip()
+    )
+
+
 def choose_target(repo: Path, mode: str, base_ref: str | None) -> tuple[str, str | None]:
     mode = "local" if mode == "uncommitted" else mode
     branch = current_branch(repo)
-    if mode == "local" or (mode == "auto" and is_dirty(repo)):
+    if mode == "local":
         # Pin an explicit base once; later queries must not follow a moving branch.
         return "local", validate_git_ref(repo, base_ref, "base", pin=True) if base_ref is not None else None
     if mode == "commit":
         return "commit", None
-    if mode == "branch" or (mode == "auto" and branch != "main"):
+    if mode == "branch":
+        return "branch", base_ref or detect_pr_base(repo) or "origin/main"
+    if mode == "auto" and is_dirty(repo):
+        if has_tracked_changes(repo):
+            return "local", validate_git_ref(repo, base_ref, "base", pin=True) if base_ref is not None else None
+        if branch != "main":
+            branch_base = base_ref or detect_pr_base(repo)
+            if branch_base is None and git(
+                repo,
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                "origin/main^{commit}",
+                check=False,
+            ):
+                branch_base = "origin/main"
+            if branch_base is not None and branch_has_commits(repo, branch_base):
+                return "branch", branch_base
+        return "local", validate_git_ref(repo, base_ref, "base", pin=True) if base_ref is not None else None
+    if mode == "auto" and branch != "main":
         return "branch", base_ref or detect_pr_base(repo) or "origin/main"
     raise SystemExit("no review target: clean main checkout and no forced mode")
 

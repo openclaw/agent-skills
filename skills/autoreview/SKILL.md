@@ -35,8 +35,10 @@ Choose the Git target explicitly when the default is ambiguous:
 | Committed branch/PR            | `--mode branch --base <ref>`   | Merge-base → HEAD; excludes dirty work                      |
 | One commit                     | `--mode commit --commit <ref>` | Raw parent → commit; a root compares against the empty tree |
 
-`--mode auto` selects local work when dirty, otherwise a branch review using the
-PR base or `origin/main`. Clean main has no implicit review target.
+`--mode auto` selects local work when tracked files are dirty. On a non-main
+branch with only untracked files, it selects the branch when HEAD has commits
+ahead of the PR base, explicit base, or `origin/main`; otherwise it selects
+local work. Clean main has no implicit review target.
 `--mode uncommitted` is an alias for local. The helper does not fetch refs.
 
 Registered nested linked checkouts from the same repository are outside the
