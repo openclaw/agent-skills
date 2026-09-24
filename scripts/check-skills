@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import shutil
 import subprocess
 import sys
+import unittest
 from pathlib import Path
 
 
@@ -20,18 +22,54 @@ TEST_MODULES = {
         "skills.autoreview.tests.test_git_filter_collection",
     ),
 }
+HARDENING_SHARDS = ("hardening-1", "hardening-2")
+
+
+def hardening_test_ids(root: Path) -> list[str]:
+    name, = TEST_MODULES["hardening"]
+    path = root.joinpath(*name.split(".")).with_suffix(".py")
+    # Bind discovery to this checkout: namespace-package imports can otherwise
+    # select an unrelated installed `skills` package, even with root on sys.path.
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    loader = unittest.TestLoader()
+    suite = loader.loadTestsFromModule(module)
+    if loader.errors:
+        raise ValueError("; ".join(loader.errors))
+
+    def ids(suite: unittest.TestSuite):
+        for test in suite:
+            if isinstance(test, unittest.TestSuite):
+                yield from ids(test)
+            else:
+                yield test.id()
+
+    names = sorted(ids(suite))
+    if not names or len(names) != len(set(names)):
+        raise ValueError("hardening discovery returned empty or duplicate test IDs")
+    return names
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--group", choices=("all", *TEST_MODULES), default="all")
+    parser.add_argument("--group", choices=("all", *TEST_MODULES, *HARDENING_SHARDS), default="all")
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parent.parent
     python = sys.executable
-    groups = TEST_MODULES if args.group == "all" else (args.group,)
-    unittest_command = [python, "-m", "unittest", *(
-        module for group in groups for module in TEST_MODULES[group]
-    )]
+    if args.group in HARDENING_SHARDS:
+        try:
+            modules = hardening_test_ids(root)[HARDENING_SHARDS.index(args.group)::2]
+            if not modules:
+                raise ValueError("hardening shard has no test IDs")
+        except Exception as exc:
+            print(f"hardening test discovery failed: {exc}", file=sys.stderr)
+            return 1
+    else:
+        groups = TEST_MODULES if args.group == "all" else (args.group,)
+        modules = [module for group in groups for module in TEST_MODULES[group]]
+    unittest_command = [python, "-m", "unittest", *modules]
     commands = [
         [python, "scripts/validate-skills"],
         ["bash", "-n", "skills/autoreview/scripts/test-review-harness"],
