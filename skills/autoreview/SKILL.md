@@ -243,10 +243,12 @@ temporary directory. Other engines and platforms retain their normal isolation.
 Tools installed in shared scratch or requiring writes there will be denied too.
 
 Review files have no size/count cap and are never truncated. Large diffs and
-datasets are partitioned automatically. Intact instructions and required mixed
-source context must still fit the per-pass prompt budget. A failed pass does not
-produce a partial clean verdict.
-The planner compares a bounded set of evidence allocations and keeps the existing
+datasets are partitioned automatically. Change partitions retain complete
+datasets when they fit with sufficient change space. This preference may use more
+passes or prompt bytes than evidence batching; the explicit pass budget still applies.
+Intact instructions and required mixed source context must fit the per-pass
+prompt budget. A failed pass does not produce a partial clean verdict.
+Otherwise, the planner compares a bounded set of evidence allocations and keeps the existing
 plan unless total prompt bytes improve without more passes, or equal bytes need
 fewer passes. Every change is still reviewed against every evidence batch.
 

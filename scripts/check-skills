@@ -2,34 +2,50 @@
 """Run the same repository checks locally and in CI."""
 from __future__ import annotations
 
+import argparse
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 
-def main() -> int:
+TEST_MODULES = {
+    "core": ("skills/autoreview/scripts/autoreview_test.py",),
+    "hardening": ("skills.autoreview.tests.test_autoreview_hardening",),
+    "boundaries": (
+        "skills.autoreview.tests.test_codex_sandbox",
+        "skills.autoreview.tests.test_codex_inference_route",
+        "skills.autoreview.tests.test_git_line_endings",
+        "skills.autoreview.tests.test_git_boundary",
+        "skills.autoreview.tests.test_git_filter_collection",
+    ),
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--group", choices=("all", *TEST_MODULES), default="all")
+    args = parser.parse_args(argv)
     root = Path(__file__).resolve().parent.parent
     python = sys.executable
+    groups = TEST_MODULES if args.group == "all" else (args.group,)
+    unittest_command = [python, "-m", "unittest", *(
+        module for group in groups for module in TEST_MODULES[group]
+    )]
     commands = [
         [python, "scripts/validate-skills"],
         ["bash", "-n", "skills/autoreview/scripts/test-review-harness"],
         [python, "-m", "py_compile",
          "scripts/install-skills", "scripts/install-skills.test.py",
          "scripts/validate-skills", "scripts/validate-skills.test.py",
+         "scripts/check-skills", "scripts/check-skills.test.py",
          "skills/autoreview/scripts/autoreview",
          "skills/autoreview/scripts/test-review-harness.py",
          "skills/autoreview/scripts/autoreview_test.py"],
         [python, "scripts/install-skills.test.py"],
         [python, "scripts/validate-skills.test.py"],
-        [python, "-m", "unittest",
-         "skills/autoreview/scripts/autoreview_test.py",
-         "skills.autoreview.tests.test_autoreview_hardening",
-         "skills.autoreview.tests.test_codex_sandbox",
-         "skills.autoreview.tests.test_codex_inference_route",
-         "skills.autoreview.tests.test_git_line_endings",
-         "skills.autoreview.tests.test_git_boundary",
-         "skills.autoreview.tests.test_git_filter_collection"],
+        [python, "scripts/check-skills.test.py"],
+        unittest_command,
         ["node", "--check", "skills/agent-transcript/scripts/agent-transcript"],
         ["node", "--check", "skills/beam/scripts/beam"],
         ["node", "--check", "skills/beam/scripts/beam-session.js"],
@@ -39,6 +55,8 @@ def main() -> int:
          "skills/beam/scripts/beam.test.mjs",
          "skills/session-viewer/scripts/session-viewer.test.ts"],
     ]
+    if args.group not in ("all", "core"):
+        commands = [unittest_command]
     for command in commands:
         print("+ " + " ".join(command), flush=True)
         executable = shutil.which(command[0])

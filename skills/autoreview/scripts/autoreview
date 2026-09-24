@@ -143,6 +143,9 @@ TRACKED_TOKEN_CREDENTIAL_EXTENSIONS = {
     ".yml",
 }
 MAX_REVIEW_PROMPT_BYTES = 512_000
+# Rebatch evidence before eager planning repeats nearly full context for tiny
+# fragments. The fallback keeps its four-byte minimum.
+FULL_DATASET_CHANGE_DIVISOR = 16
 # Kimi takes the prompt as a single `--prompt` argv element (no stdin mode),
 # so its per-pass ceiling must respect platform argv limits: Linux caps one
 # argument at MAX_ARG_STRLEN (131,072 bytes) and Windows caps the whole
@@ -3858,7 +3861,7 @@ def mixed_capacity_error(record: MixedPath, required: int, limit: int) -> MixedC
     return MixedContextCapacityError(
         f"mixed source {display_escape(record.path, 500)} ({sizes}; "
         f"base removed={utf8_size(json.dumps(record.index_removed, ensure_ascii=False))} bytes): "
-        f"mandatory context/instructions/continuation and fragment require {required} bytes; "
+        f"mandatory context/instructions/continuation and change capacity require {required} bytes; "
         f"prompt limit {limit}; cannot split authoritative context"
     )
 
@@ -3867,6 +3870,7 @@ def build_mixed_change_passes(
     branch: str, target: str, target_ref: str | None, captured: CapturedBundle,
     extra_prompt: str, datasets: list[ReviewDataset], max_prompt_bytes: int,
     max_passes: int | None = None,
+    *, min_change_bytes: int = 4,
 ) -> list[ReviewPass]:
     rendered = render_datasets(datasets)
     full = mixed_bundle_chunk(captured)
@@ -3891,7 +3895,9 @@ def build_mixed_change_passes(
             branch, target, target_ref, template, extra_prompt, rendered, (999_999, 999_999),
         ))
         limit = max_prompt_bytes - overhead
-        while limit >= 4:
+        # A complete small span needs no repeated context; keep its evidence.
+        minimum = min(min_change_bytes, max(4, end - start))
+        while limit >= minimum:
             pieces = split_review_bundle(data[start:end].decode("utf-8"), limit)
             if max_passes is not None and len(chunks) + len(pieces) > max_passes:
                 raise MixedContextCapacityError("candidate exceeds retained plan's pass count")
@@ -3908,11 +3914,11 @@ def build_mixed_change_passes(
                 break
             limit -= largest - max_prompt_bytes
         else:
-            required = max_prompt_bytes - limit + 4
+            required = max_prompt_bytes - limit + minimum
             if sources:
                 raise mixed_capacity_error(sources[0], required, max_prompt_bytes)
             raise MixedContextCapacityError(
-                f"review instructions/evidence/continuation and fragment require {required} bytes; "
+                f"review instructions/evidence/continuation and change capacity require {required} bytes; "
                 f"prompt limit {max_prompt_bytes}"
             )
     if "".join(chunk.content for chunk in chunks) != captured.text:
@@ -3931,6 +3937,7 @@ def build_mixed_review_passes(
     prompt = render_review_prompt(branch, target, target_ref, full, extra_prompt, render_datasets(datasets))
     if utf8_size(prompt) <= max_prompt_bytes:
         return [ReviewPass(prompt, full, tuple(datasets))]
+    minimum_change = max(4, max_prompt_bytes // FULL_DATASET_CHANGE_DIVISOR) if datasets else 4
     # Establish that every mandatory record fits even with no evidence before
     # spending time rebatching. Source context is never scheduled independently.
     for record in captured.mixed:
@@ -3946,15 +3953,20 @@ def build_mixed_review_passes(
             return None
         passes = []
         for index, batch in enumerate(batches, 1):
-            instructions = extra_prompt + (
-                f"\n\nEvidence batch: {index}/{len(batches)}\n"
-                "Every original change byte appears once in this batch. Dataset fragments "
-                "are context only; missing evidence is not proof of missing behavior."
-            )
+            instructions = extra_prompt
+            if len(batches) > 1:
+                instructions += (
+                    f"\n\nEvidence batch: {index}/{len(batches)}\n"
+                    "Every original change byte appears once in this batch. Dataset fragments "
+                    "are context only; missing evidence is not proof of missing behavior."
+                )
             try:
                 batch_passes = build_mixed_change_passes(
                     branch, target, target_ref, captured, instructions, batch, max_prompt_bytes,
                     None if max_passes is None else max_passes - len(passes),
+                    min_change_bytes=minimum_change if len(batches) == 1 and (
+                        max_passes is not None or limit > minimum_evidence
+                    ) else 4,
                 )
             except MixedContextCapacityError:
                 # Preserve source sizing diagnostics when the baseline cannot fit.
@@ -3965,15 +3977,14 @@ def build_mixed_review_passes(
         return passes
 
     try:
-        baseline = build_mixed_change_passes(
+        return build_mixed_change_passes(
             branch, target, target_ref, captured, extra_prompt, datasets, max_prompt_bytes,
+            min_change_bytes=minimum_change,
         )
     except MixedContextCapacityError:
         if not datasets:
             raise
         baseline = None
-    if not datasets:
-        return baseline
     minimum_evidence = max(
         utf8_size(render_datasets([item._replace(content="", byte_offset=utf8_size(item.content))])) + 4
         for item in datasets
@@ -3997,6 +4008,7 @@ def build_change_review_prompts(
     datasets: str,
     max_prompt_bytes: int = MAX_REVIEW_PROMPT_BYTES,
     max_passes: int | None = None,
+    *, min_change_bytes: int = 4,
 ) -> list[str] | None:
     full_prompt = render_review_prompt(
         branch,
@@ -4023,9 +4035,7 @@ def build_change_review_prompts(
         - utf8_size(empty_chunk_prompt)
         - 4_096
     )
-    if content_limit < 4:
-        return None
-    while content_limit >= 4:
+    while content_limit >= min_change_bytes:
         chunks = split_review_bundle(bundle, content_limit)
         if max_passes is not None and len(chunks) > max_passes:
             return None
@@ -4063,11 +4073,13 @@ def build_review_prompts(
         bundle = bundle.text
     branch = current_branch(repo)
     rendered_datasets = render_datasets(datasets)
-    full_prompt = render_review_prompt(
-        branch, target, target_ref, ReviewChunk(bundle), extra_prompt, rendered_datasets,
+    minimum_change = max(4, max_prompt_bytes // FULL_DATASET_CHANGE_DIVISOR) if datasets else 4
+    change_prompts = build_change_review_prompts(
+        branch, target, target_ref, bundle, extra_prompt, rendered_datasets, max_prompt_bytes,
+        min_change_bytes=minimum_change,
     )
-    if utf8_size(full_prompt) <= max_prompt_bytes:
-        return [full_prompt]
+    if change_prompts is not None:
+        return change_prompts
     fixed_prompt = render_review_prompt(
         branch, target, target_ref, ReviewChunk(""), extra_prompt, "", (999_999, 999_999),
     )
@@ -4090,6 +4102,10 @@ def build_review_prompts(
             "review prompt files leave too little room for change chunks; "
             "reduce the review instructions or move source evidence to datasets"
         )
+    minimum_evidence = max((
+        utf8_size(render_datasets([item._replace(content="", byte_offset=utf8_size(item.content))])) + 4
+        for item in datasets
+    ), default=4)
     def build_batch_plan(limit: int, max_passes: int | None = None) -> list[str] | None:
         batches = split_review_datasets(datasets, limit)
         if max_passes is not None and len(batches) > max_passes:
@@ -4103,12 +4119,16 @@ def build_review_prompts(
                 branch, target, target_ref, bundle, batch_prompt,
                 render_datasets(batch), max_prompt_bytes,
                 None if max_passes is None else max_passes - len(prompts),
+                min_change_bytes=minimum_change if len(batches) == 1 and (
+                    max_passes is not None or limit > minimum_evidence
+                ) else 4,
             )
             if change_prompts is None:
                 return None
             prompts.extend(change_prompts)
         return prompts
 
+    evidence_limit = max(evidence_limit, minimum_evidence)
     while True:
         baseline = build_batch_plan(evidence_limit)
         if baseline is not None:
@@ -4117,11 +4137,11 @@ def build_review_prompts(
             )
         # Actual continuation headers may need more room than the initial
         # evidence allocation leaves. Rebatch before sending any partial pass.
-        evidence_limit //= 2
-        if not datasets or evidence_limit < 4:
+        if not datasets or evidence_limit == minimum_evidence:
             raise SystemExit(
                 "unable to partition the review bundle within the aggregate prompt limit"
             )
+        evidence_limit = max(minimum_evidence, evidence_limit // 2)
 
 
 def review_plan_bytes(prompts: list[str] | list[ReviewPass]) -> int:

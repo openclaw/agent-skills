@@ -14,12 +14,25 @@ concurrency:
 
 jobs:
   validate:
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            group: all
+            name: validate (ubuntu-latest)
+          - os: windows-latest
+            group: core
+            name: validate (windows-latest, core)
+          - os: windows-latest
+            group: hardening
+            name: validate (windows-latest, hardening)
+          - os: windows-latest
+            group: boundaries
+            name: validate (windows-latest, boundaries)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -36,7 +49,7 @@ jobs:
       - name: Install development typechecker
         run: npm ci --ignore-scripts
       - name: Check skills
-        run: python scripts/check-skills
+        run: python scripts/check-skills --group ${{ matrix.group }}
 
   macos-sandbox:
     runs-on: macos-latest
