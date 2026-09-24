@@ -1192,8 +1192,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
         ) as (repo, sends, *_):
             (repo / "evidence/copy.md").write_bytes((repo / "evidence/note.md").read_bytes())
             self.assertEqual(self.helper["main_impl"](), 0)
-            self.assertIn("# Dataset: evidence/note.md", sends[0])
-            self.assertIn("# Dataset: evidence/copy.md", sends[0])
+            self.assertIn(f"# Dataset: {Path('evidence/note.md')}", sends[0])
+            self.assertIn(f"# Dataset: {Path('evidence/copy.md')}", sends[0])
 
     def test_explicit_pass_budget_rejects_entire_plan_before_any_reviewer(self):
         for dry_run in (False, True):
