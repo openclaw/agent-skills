@@ -62,6 +62,11 @@ whitespace. An empty present
 source uses line 1, column 1, and an empty excerpt; empty physical lines also
 use an empty excerpt at column 1. Source identity remains mandatory.
 
+Binary deletions remain in scope as Git deletion metadata; their former contents
+are not included or reviewed. Binary additions, modifications, and type changes
+still refuse collection. Each local transition is checked independently: deleting
+a file in the working tree cannot hide a staged binary change.
+
 Local selection honors `core.autocrlf` from external operator Git configuration,
 with repository-local values and attributes retaining precedence. Only its
 validated scalar value reaches diff/status; other global and system Git
