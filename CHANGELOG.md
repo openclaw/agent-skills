@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Keep complete Autoreview evidence in every change partition when it leaves sufficient change space, before splitting datasets or optimizing their allocation.
+- Keep complete Autoreview evidence in every change partition when it leaves sufficient change space, before splitting datasets or optimizing their allocation; preserve feasible terminal plans when batch framing cannot fit.
 - Split Windows skill validation into core, hardening, and boundary jobs while retaining the complete default check sequence and existing job timeouts.
 - Reduce repeated Autoreview evidence without increasing passes or dropping change/evidence coverage; show planned work, add an explicit preflight pass budget, and aggregate observed Codex usage across passes and access retries with incomplete telemetry marked as a lower bound.
 - Default Autoreview to GPT-6 Sol with high reasoning and an account-access-only GPT-6 Luna retry; preserve explicit model choices and reject unsupported GPT-6 Sol/Luna minimal effort instead of selecting an older model.

@@ -524,41 +524,97 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
         budget, capacity = 12_000, 320
         render = self.helper["render_review_prompt"]
         render_data = self.helper["render_datasets"]
-        datasets = [self.helper["ReviewDataset"]("owner.py", "x")]
-        complete = render_data(datasets)
+        for evidence in ("x", "xxxxx"):
+            with self.subTest(evidence_bytes=len(evidence)):
+                datasets = [self.helper["ReviewDataset"]("owner.py", evidence)]
+                complete = render_data(datasets)
+                with tempfile.TemporaryDirectory() as tempdir:
+                    repo = init_repo(Path(tempdir))
+                    source = repo / "source.py"
+                    source.write_text("baseline()\n")
+                    git(repo, "add", ".")
+                    git(repo, "commit", "-qm", "synthetic base")
+                    source.write_text("indexed = '" + "x" * 200 + "'\n")
+                    git(repo, "add", ".")
+                    source.write_text("working = '" + "y" * 200 + "'\n")
+                    captured = self.helper["local_bundle"](repo)
+                    branch = self.helper["current_branch"](repo)
+                    record = captured.mixed[0]
+                    overhead = max(len(render(branch, "local", None, self.helper["ReviewChunk"](
+                        "", "", span.start, (record,), ((span.path, span.target),),
+                    ), "", complete, (999_999, 999_999)).encode()) for span in captured.spans)
+                    instructions = "i" * (budget - overhead - capacity)
+                    direct = self.helper["build_mixed_change_passes"](
+                        branch, "local", None, captured, instructions, datasets, budget,
+                    )
+                    self.assertTrue(any(item.chunk.context for item in direct))
+                    self.assertEqual("".join(item.chunk.content for item in direct), captured.text)
+                    passes = self.helper["build_review_prompts"](
+                        repo, "local", None, captured, instructions, datasets, budget,
+                    )
+                    self.assertEqual("".join(item.chunk.content for item in passes), captured.text)
+                    self.assertEqual(len(passes), len(direct))
+                    for item in passes:
+                        self.assertLessEqual(len(item.prompt.encode()), budget)
+                        self.assertNotIn("Evidence batch:", item.prompt)
+                        self.assertEqual(item.evidence_batch, 1)
+                        self.assertEqual(item.datasets, tuple(datasets))
+                        self.assertIn(complete, item.prompt)
+                        self.assertTrue(all(owner == record for owner in item.chunk.sources))
+
+    def test_ordinary_tiny_evidence_survives_terminal_batch_capacity_refusal(self):
+        budget = 12_000
+        bundle = "diff --git a/source.py b/source.py\n--- a/source.py\n+++ b/source.py\n@@ -0,0 +1 @@\n+" + "x" * 6_000 + "\n"
+        render = self.helper["render_review_prompt"]
+        render_data = self.helper["render_datasets"]
+        build = self.helper["build_change_review_prompts"]
+        split_data = self.helper["split_review_datasets"]
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
-            source = repo / "source.py"
-            source.write_text("baseline()\n")
-            git(repo, "add", ".")
-            git(repo, "commit", "-qm", "synthetic base")
-            source.write_text("indexed = '" + "x" * 200 + "'\n")
-            git(repo, "add", ".")
-            source.write_text("working = '" + "y" * 200 + "'\n")
-            captured = self.helper["local_bundle"](repo)
             branch = self.helper["current_branch"](repo)
-            record = captured.mixed[0]
-            overhead = max(len(render(branch, "local", None, self.helper["ReviewChunk"](
-                "", "", span.start, (record,), ((span.path, span.target),),
-            ), "", complete, (999_999, 999_999)).encode()) for span in captured.spans)
-            instructions = "i" * (budget - overhead - capacity)
-            direct = self.helper["build_mixed_change_passes"](
-                branch, "local", None, captured, instructions, datasets, budget,
-            )
-            self.assertTrue(any(item.chunk.context for item in direct))
-            self.assertEqual("".join(item.chunk.content for item in direct), captured.text)
-            passes = self.helper["build_review_prompts"](
-                repo, "local", None, captured, instructions, datasets, budget,
-            )
-            self.assertEqual("".join(item.chunk.content for item in passes), captured.text)
-            self.assertEqual(len(passes), len(direct))
-            for item in passes:
-                self.assertLessEqual(len(item.prompt.encode()), budget)
-                self.assertNotIn("Evidence batch:", item.prompt)
-                self.assertEqual(item.evidence_batch, 1)
-                self.assertEqual(item.datasets, tuple(datasets))
-                self.assertIn(complete, item.prompt)
-                self.assertTrue(all(owner == record for owner in item.chunk.sources))
+            for path, capacity, terminal_batch in (
+                ("owner.py", 320, False),
+                ("context/" * 87 + "owner.py", 200, True),
+            ):
+                with self.subTest(path_bytes=len(path), capacity=capacity):
+                    datasets = [self.helper["ReviewDataset"](path, "xxxxx")]
+                    complete = render_data(datasets)
+                    overhead = len(render(
+                        branch, "branch", None, self.helper["ReviewChunk"](""),
+                        "", complete, (999_999, 999_999),
+                    ).encode())
+                    instructions = "i" * (budget - overhead - capacity - 4_096)
+                    direct = build(branch, "branch", None, bundle, instructions, complete, budget)
+                    self.assertIsNotNone(direct)
+                    attempts = []
+
+                    def observe_batches(values, limit):
+                        batches = split_data(values, limit)
+                        attempts.append((limit, [len(item.content.encode()) for batch in batches for item in batch]))
+                        return batches
+
+                    with mock.patch.dict(self.helper["build_review_prompts"].__globals__, {
+                        "split_review_datasets": observe_batches,
+                    }):
+                        prompts = self.helper["build_review_prompts"](
+                            repo, "branch", None, bundle, instructions, datasets, budget,
+                        )
+                    self.assertEqual(bool(attempts), terminal_batch)
+                    if terminal_batch:
+                        minimum = len(render_data([datasets[0]._replace(content="", byte_offset=5)]).encode()) + 4
+                        self.assertEqual(attempts[-1], (minimum, [4, 1]))
+                    self.assertEqual(prompts, direct)
+                    self.assertEqual("".join(prompt.split("# Change Bundle\n", 1)[1] for prompt in prompts), bundle)
+                    for prompt in prompts:
+                        self.assertLessEqual(len(prompt.encode()), budget)
+                        self.assertIn(complete, prompt)
+                        self.assertNotIn("Evidence batch:", prompt)
+                    impossible = instructions + "i" * (capacity + len(complete.encode()))
+                    self.assertIsNone(build(branch, "branch", None, bundle, impossible, complete, budget))
+                    with self.assertRaisesRegex(SystemExit, "review prompt files leave too little room"):
+                        self.helper["build_review_prompts"](
+                            repo, "branch", None, bundle, impossible, datasets, budget,
+                        )
 
     def test_mixed_complete_spans_keep_datasets_below_preferred_split_capacity(self):
         budget = 512_000
@@ -1043,8 +1099,23 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                     self.helper["current_branch"](repo), "local", None, chunk, "", "", (999_999, 999_999),
                 ).encode()) + 1000
                 datasets = [self.helper["ReviewDataset"]("e" * 4000 + ".txt", "evidence")]
-                with self.assertRaisesRegex(SystemExit, r"mixed source src/migrate-\d.py .*prompt limit"):
-                    self.helper["prepare_review_prompts"](repo, "local", None, captured, "", datasets, budget)
+                build = self.helper["build_mixed_change_passes"]
+                failures = []
+
+                def observe_failure(*args, **kwargs):
+                    try:
+                        return build(*args, **kwargs)
+                    except self.helper["MixedContextCapacityError"] as error:
+                        failures.append(error)
+                        raise
+
+                with mock.patch.dict(self.helper["prepare_review_prompts"].__globals__, {
+                    "build_mixed_change_passes": observe_failure,
+                }):
+                    with self.assertRaisesRegex(SystemExit, r"mixed source src/migrate-\d.py .*prompt limit") as refused:
+                        self.helper["prepare_review_prompts"](repo, "local", None, captured, "", datasets, budget)
+                self.assertGreaterEqual(len(failures), 2)
+                self.assertIs(refused.exception, failures[-2], "retain the terminal batch error when whole evidence also fails")
             provider.assert_not_called()
 
 

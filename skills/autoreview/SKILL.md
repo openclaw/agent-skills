@@ -246,6 +246,7 @@ Review files have no size/count cap and are never truncated. Large diffs and
 datasets are partitioned automatically. Change partitions retain complete
 datasets when they fit with sufficient change space. This preference may use more
 passes or prompt bytes than evidence batching; the explicit pass budget still applies.
+Terminal fallbacks preserve a feasible complete-evidence plan when batch framing cannot fit.
 Intact instructions and required mixed source context must fit the per-pass
 prompt budget. A failed pass does not produce a partial clean verdict.
 Otherwise, the planner compares a bounded set of evidence allocations and keeps the existing

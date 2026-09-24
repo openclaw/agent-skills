@@ -3968,10 +3968,17 @@ def build_mixed_review_passes(
                         max_passes is not None or limit > minimum_evidence
                     ) else 4,
                 )
-            except MixedContextCapacityError:
+            except MixedContextCapacityError as error:
                 # Preserve source sizing diagnostics when the baseline cannot fit.
                 if max_passes is None and limit == minimum_evidence:
-                    raise
+                    # Tiny evidence may fit whole when batch framing does not.
+                    try:
+                        return build_mixed_change_passes(
+                            branch, target, target_ref, captured, extra_prompt, datasets,
+                            max_prompt_bytes, min_change_bytes=4,
+                        )
+                    except MixedContextCapacityError:
+                        raise error from None
                 return None
             passes.extend(item._replace(evidence_batch=index) for item in batch_passes)
         return passes
@@ -4098,6 +4105,13 @@ def build_review_prompts(
         - utf8_size(batch_policy.format(index=999_999, total=999_999))
     )
     if available < 4 or (datasets and evidence_limit < 4):
+        if available >= 4:
+            change_prompts = build_change_review_prompts(
+                branch, target, target_ref, bundle, extra_prompt, rendered_datasets,
+                max_prompt_bytes, min_change_bytes=4,
+            )
+            if change_prompts is not None:
+                return change_prompts
         raise SystemExit(
             "review prompt files leave too little room for change chunks; "
             "reduce the review instructions or move source evidence to datasets"
@@ -4138,6 +4152,13 @@ def build_review_prompts(
         # Actual continuation headers may need more room than the initial
         # evidence allocation leaves. Rebatch before sending any partial pass.
         if not datasets or evidence_limit == minimum_evidence:
+            if datasets:
+                change_prompts = build_change_review_prompts(
+                    branch, target, target_ref, bundle, extra_prompt, rendered_datasets,
+                    max_prompt_bytes, min_change_bytes=4,
+                )
+                if change_prompts is not None:
+                    return change_prompts
             raise SystemExit(
                 "unable to partition the review bundle within the aggregate prompt limit"
             )
