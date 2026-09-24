@@ -28,8 +28,11 @@ jobs:
             group: core
             name: validate (windows-latest, core)
           - os: windows-latest
-            group: hardening
-            name: validate (windows-latest, hardening)
+            group: hardening-1
+            name: validate (windows-latest, hardening-1)
+          - os: windows-latest
+            group: hardening-2
+            name: validate (windows-latest, hardening-2)
           - os: windows-latest
             group: boundaries
             name: validate (windows-latest, boundaries)
