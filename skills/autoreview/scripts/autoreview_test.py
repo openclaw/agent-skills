@@ -22,6 +22,7 @@ from unittest import mock
 
 
 SCRIPT_PATH = Path(__file__).with_name("autoreview")
+fixture_git = runpy.run_path(str(SCRIPT_PATH.with_name("test-review-harness.py")))["fixture_git"]
 LOADER = SourceFileLoader("autoreview_module", str(SCRIPT_PATH))
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 assert SPEC is not None
@@ -267,7 +268,9 @@ class AutoreviewImageGitTests(unittest.TestCase):
         self.base = self.git("rev-parse", "HEAD").strip()
 
     def git(self, *args):
-        return subprocess.check_output(["git", *args], cwd=self.repo, text=True)
+        return fixture_git(
+            self.repo, *args, check=True, stdout=subprocess.PIPE, text=True,
+        ).stdout
 
     def commit(self, path, content):
         file = self.repo / path
