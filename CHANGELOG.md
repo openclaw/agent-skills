@@ -2,17 +2,19 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-09-24
+
+**Highlights:** Native image review, committed source context, and more efficient multi-pass reviews.
+
 - Review added single-frame PNG, JPEG, and WebP assets in Codex branch reviews through native image attachments, with pinned bytes and per-pass manifests. Thanks @mgunnin.
-
 - Add Autoreview `--source-context-file` to keep explicitly selected committed source intact in every pass, with the existing provenance, mutation, path and finding-scope guards and unchanged prompt limits.
-- Split Windows Autoreview hardening validation into two deterministic test-ID shards, preserving the full test union, aggregate local commands and existing job timeouts.
-- Keep complete Autoreview evidence in every change partition when it leaves sufficient change space, before splitting datasets or optimizing their allocation; preserve feasible terminal plans when batch framing cannot fit.
-- Split Windows skill validation into core, hardening, and boundary jobs while retaining the complete default check sequence and existing job timeouts.
-- Reduce repeated Autoreview evidence without increasing passes or dropping change/evidence coverage; show planned work, add an explicit preflight pass budget, and aggregate observed Codex usage across passes and access retries with incomplete telemetry marked as a lower bound.
-- Default Autoreview to GPT-6 Sol with high reasoning and an account-access-only GPT-6 Luna retry; preserve explicit model choices and reject unsupported GPT-6 Sol/Luna minimal effort instead of selecting an older model.
 - Add Autoreview `--source-context` for complete source bytes bound to the reviewed commit and blob, with validated same-role deduplication and strict credential-path and mutation guards, without expanding finding scope or changing generic evidence restrictions.
-
+- Reduce repeated Autoreview evidence without increasing passes or dropping change/evidence coverage; show planned work, add an explicit preflight pass budget, and aggregate observed Codex usage across passes and access retries with incomplete telemetry marked as a lower bound.
+- Keep complete Autoreview evidence in every change partition when it leaves sufficient change space, before splitting datasets or optimizing their allocation; preserve feasible terminal plans when batch framing cannot fit.
+- Update Autoreview’s default Codex model and account-access-only fallback; preserve explicit model choices and validate supported reasoning levels.
 - Prefer OpenAI/Codex before Claude when choosing an Autoreview engine, including independent second opinions; retain explicit user choices and require a concrete Codex availability failure before switching.
+- Split Windows skill validation into core, hardening, and boundary jobs while retaining the complete default check sequence and existing job timeouts.
+- Split Windows Autoreview hardening validation into two deterministic test-ID shards, preserving the full test union, aggregate local commands and existing job timeouts.
 
 ## 0.1.0 - 2026-09-22
 
