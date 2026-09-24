@@ -6,7 +6,7 @@
     "typecheck": "tsc -p skills/session-viewer/tsconfig.json"
   },
   "devDependencies": {
-    "@types/node": "26.5.1",
+    "@types/node": "26.6.2",
     "typescript": "7.0.2"
   }
 }
