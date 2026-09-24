@@ -2159,7 +2159,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             path.write_text("TOKEN=changed-placeholder\n", encoding="utf-8")
             git(repo, "add", path.name)
 
-            bundle, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo)
+            bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
 
             self.assertIn(self.helper["REVIEW_SECURITY_OMISSION"], bundle)
 
@@ -2177,7 +2177,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 path.write_text("placeholder=true\n", encoding="utf-8")
                 (repo / "review.py").write_text("print('review me')\n", encoding="utf-8")
 
-                bundle, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo)
+                bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
 
                 self.assertIn("# Review Input Omissions", bundle)
                 self.assertIn(self.helper["REVIEW_SECURITY_OMISSION"], bundle)
@@ -2224,7 +2224,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.helper["local_bundle"].__globals__,
                 {"read_file_bytes": read_once},
             ):
-                bundle, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo)
+                bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
 
             expected_record = json.dumps("review me" + os.linesep)
             self.assertIn(
@@ -2516,7 +2516,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             snapshot = self.helper["source_tree_snapshot"](repo)
             git(repo, "update-ref", "refs/heads/review-base", "HEAD")
             self.assertEqual(self.helper["source_tree_snapshot"](repo), snapshot)
-            bundle, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo, pinned)
+            bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo, pinned)
             self.assertIn("+committed task change", bundle)
             self.assertEqual(
                 self.helper["build_bundle"](repo, target, pinned, "HEAD").paths,
@@ -2538,7 +2538,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 if staged:
                     git(repo, "add", safe)
                 with self.subTest(staged=staged):
-                    bundle, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo)
+                    bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
                     self.assertIn("struct CredentialFile", bundle)
                     self.assertIn(safe, self.helper["local_bundle"](repo).paths)
                     for label in ("--dataset", "--prompt-file"):
@@ -4188,14 +4188,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             (repo / ".env").write_text("placeholder=true\n", encoding="utf-8")
             (repo / "base.txt").write_text("base\nreview me\n", encoding="utf-8")
             git(repo, "add", ".env", "base.txt")
-            local, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo)
+            local, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
             self.assertIn(self.helper["REVIEW_SECURITY_OMISSION"], local)
             self.assertNotIn(".env", local)
             self.assertNotIn("placeholder=true", local)
             self.assertIn("+review me", local)
 
             git(repo, "commit", "-q", "-m", "sensitive path")
-            for bundle, paths, _mixed, _spans, _commit in (
+            for bundle, paths, _mixed, _spans, _commit, _images in (
                 self.helper["branch_bundle"](repo, base),
                 self.helper["commit_bundle"](repo, "HEAD"),
             ):
@@ -4215,16 +4215,16 @@ class AutoreviewHardeningTests(unittest.TestCase):
             workflow = repo / ".github" / "workflows" / "secret-scan.yml"
             workflow.parent.mkdir(parents=True)
             workflow.write_text("name: Secret scan\n", encoding="utf-8")
-            untracked_bundle, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo)
+            untracked_bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
             self.assertIn("secret-scan.yml", untracked_bundle)
 
             git(repo, "add", str(workflow.relative_to(repo)))
-            tracked_bundle, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo)
+            tracked_bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
             self.assertIn("secret-scan.yml", tracked_bundle)
 
             git(repo, "commit", "-q", "-m", "add secret scanner")
-            branch_bundle, _paths, _mixed, _spans, _commit = self.helper["branch_bundle"](repo, base)
-            commit_bundle, _paths, _mixed, _spans, _commit = self.helper["commit_bundle"](repo, "HEAD")
+            branch_bundle, _paths, _mixed, _spans, _commit, _images = self.helper["branch_bundle"](repo, base)
+            commit_bundle, _paths, _mixed, _spans, _commit, _images = self.helper["commit_bundle"](repo, "HEAD")
             self.assertIn("secret-scan.yml", branch_bundle)
             self.assertIn("secret-scan.yml", commit_bundle)
 
@@ -4292,7 +4292,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             path.parent.mkdir()
             path.write_text(source, encoding="utf-8")
 
-            bundle, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo)
+            bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
 
             self.assertIn("ordinary-hardcoded-value-12345", bundle)
 
@@ -4564,7 +4564,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             git(repo, "add", "-u")
             git(repo, "commit", "-q", "-m", "delete template")
 
-            bundle, _paths, _mixed, _spans, _commit = self.helper["branch_bundle"](repo, base)
+            bundle, _paths, _mixed, _spans, _commit, _images = self.helper["branch_bundle"](repo, base)
 
             self.assertIn("deleted file mode 100644", bundle)
             self.assertIn("------BEGIN [A-Z ]+-----", bundle)
@@ -4724,7 +4724,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
             path.write_text('const request = { token: String() };\n', encoding="utf-8")
 
-            bundle, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo)
+            bundle, _paths, _mixed, _spans, _commit, _images = self.helper["local_bundle"](repo)
 
             self.assertIn('-const request = { token: "test-token" };', bundle)
 

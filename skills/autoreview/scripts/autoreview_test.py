@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -182,6 +184,201 @@ class AutoreviewCursorTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as exc_info:
             AUTOREVIEW.extract_json(stream)
         self.assertIn("review engine result was not structured JSON", str(exc_info.exception))
+
+
+class AutoreviewImageEvidenceTests(unittest.TestCase):
+    PNG = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+
+    def test_supported_image_is_staged_with_exact_manifest_identity(self) -> None:
+        digest = hashlib.sha256(self.PNG).hexdigest()
+        image = AUTOREVIEW.ImageEvidence("assets/avatar.png", "image/png", digest, self.PNG)
+        self.assertEqual(AUTOREVIEW.image_media_type(image.path, image.content), "image/png")
+        manifest = AUTOREVIEW.image_manifest((image,))
+        self.assertIn('path="assets/avatar.png"', manifest)
+        self.assertIn(f"sha256={digest}", manifest)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = AUTOREVIEW.stage_review_images(Path(tmpdir), (image,))
+            self.assertEqual(paths[0].read_bytes(), self.PNG)
+
+    def test_oversized_dimensions_are_refused_before_pixel_decoding(self):
+        from PIL import Image
+        original_open = Image.open
+        def declared_large(*args, **kwargs):
+            image = original_open(*args, **kwargs)
+            image._size = (8192, 8192)
+            image.load = mock.Mock(side_effect=AssertionError("pixels must not be decoded"))
+            return image
+        with mock.patch.object(Image, "open", side_effect=declared_large):
+            with self.assertRaisesRegex(SystemExit, "decoder limits"):
+                AUTOREVIEW.image_media_type("large.png", self.PNG)
+
+    def test_decompression_bomb_warning_is_a_refusal(self):
+        from PIL import Image
+        with mock.patch.object(Image, "MAX_IMAGE_PIXELS", 0.75):
+            with self.assertRaisesRegex(SystemExit, "decoder limits"):
+                AUTOREVIEW.image_media_type("warning.png", self.PNG)
+
+    def test_missing_decoder_fails_closed(self):
+        with mock.patch.dict(sys.modules, {"PIL": None}):
+            with self.assertRaisesRegex(SystemExit, "requires Pillow"):
+                AUTOREVIEW.image_media_type("image.png", self.PNG)
+
+    def test_native_codex_command_attaches_images_before_stdin_separator(self):
+        args = argparse.Namespace(codex_bin="codex", web_search=False,
+            thinking="high", stream_engine_output=False, codex_config=None,
+            codex_speed=None)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex"
+        ):
+            root = Path(tmp)
+            images = [root / "attachment-1.webp", root / "attachment-2.png"]
+            command = AUTOREVIEW.codex_command(args, root, root, root,
+                root / "schema.json", root / "output.json", "vision-model",
+                auth_config=[], image_paths=images)
+        self.assertEqual(command[-6:], ["--image", str(images[0]),
+            "--image", str(images[1]), "--", "-"])
+        self.assertIn("--ignore-user-config", command)
+        self.assertIn("--ignore-rules", command)
+        self.assertIn("features.plugins=false", command)
+
+    def test_tampered_image_fails_closed_before_reviewer_launch(self) -> None:
+        image = AUTOREVIEW.ImageEvidence(
+            "assets/avatar.png", "image/png", "0" * 64, self.PNG,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir, self.assertRaisesRegex(
+            SystemExit, "captured image bytes changed"
+        ):
+            AUTOREVIEW.stage_review_images(Path(tmpdir), (image,))
+
+
+class AutoreviewImageGitTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name)
+        self.git("init", "-q")
+        self.git("config", "user.email", "test@example.invalid")
+        self.git("config", "user.name", "Test")
+        (self.repo / "text.txt").write_text("old\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "base")
+        self.base = self.git("rev-parse", "HEAD").strip()
+
+    def git(self, *args):
+        return subprocess.check_output(["git", *args], cwd=self.repo, text=True)
+
+    def commit(self, path, content):
+        file = self.repo / path
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_bytes(content)
+        self.git("add", ".")
+        self.git("commit", "-qm", "change")
+
+    def test_branch_captures_commit_bytes_not_dirty_worktree(self):
+        path = "assets/portrait.png"
+        self.commit(path, AutoreviewImageEvidenceTests.PNG)
+        (self.repo / path).write_bytes(b"dirty replacement")
+        captured = AUTOREVIEW.branch_bundle(self.repo, self.base)
+        self.assertEqual(captured.images[0].content, AutoreviewImageEvidenceTests.PNG)
+        self.assertIn(path, captured.paths)
+        self.assertIn("Binary files", captured.text)
+        self.assertEqual(len(captured.images), 1)
+
+    def test_image_capture_preserves_literal_paths_and_ignores_dirty_filters(self):
+        path = "assets/[literal]\timage.png" if os.name != "nt" else "assets/[literal]image.png"
+        self.commit(path, AutoreviewImageEvidenceTests.PNG)
+        self.git("config", "filter.denied.clean", "exit 91")
+        self.git("config", "filter.denied.required", "true")
+        (self.repo / ".gitattributes").write_text("* filter=denied\n")
+        (self.repo / path).write_bytes(b"uncommitted replacement")
+        captured = AUTOREVIEW.branch_bundle(self.repo, self.base)
+        self.assertEqual(captured.images[0].path, path)
+        self.assertEqual(captured.images[0].content, AutoreviewImageEvidenceTests.PNG)
+        self.assertEqual(captured.commit, self.git("rev-parse", "HEAD").strip())
+
+    def test_unsupported_binary_and_spoofed_extension_are_rejected(self):
+        for name, data in [("payload.bin", b"\x00opaque"),
+                           ("fake.png", b"\x89PNG\r\n\x1a\n\x00truncated")]:
+            with self.subTest(name=name):
+                self.git("reset", "--hard", self.base)
+                self.commit(name, data)
+                with self.assertRaisesRegex(SystemExit, "unsupported or malformed"):
+                    AUTOREVIEW.branch_bundle(self.repo, self.base)
+
+    def test_attributes_cannot_hide_opaque_blobs_or_image_attachments(self):
+        self.commit(".gitattributes", "* diff\n".encode())
+        self.commit("hidden.bin", b"opaque\0payload")
+        with self.assertRaisesRegex(SystemExit, "unsupported or malformed"):
+            AUTOREVIEW.branch_bundle(self.repo, self.base)
+        self.git("rm", "hidden.bin")
+        self.git("commit", "-qm", "remove opaque")
+        self.commit("portrait.png", AutoreviewImageEvidenceTests.PNG)
+        # Forced textual image patches must never be lossily decoded or
+        # silently reviewed without pixels. The existing UTF-8 gate refuses.
+        with self.assertRaisesRegex(SystemExit, "non-UTF-8 Git output"):
+            AUTOREVIEW.branch_bundle(self.repo, self.base)
+
+    def test_modified_and_deleted_images_remain_rejected(self):
+        self.commit("portrait.png", AutoreviewImageEvidenceTests.PNG)
+        base = self.git("rev-parse", "HEAD").strip()
+        self.commit("portrait.png", AutoreviewImageEvidenceTests.PNG + b"x")
+        with self.assertRaisesRegex(SystemExit, "only added images"):
+            AUTOREVIEW.branch_bundle(self.repo, base)
+        self.git("rm", "portrait.png")
+        self.git("commit", "-qm", "delete")
+        with self.assertRaisesRegex(SystemExit, "only added images"):
+            AUTOREVIEW.branch_bundle(self.repo, base)
+
+    def test_sensitive_images_are_not_attached(self):
+        self.commit(".ssh/portrait.png", AutoreviewImageEvidenceTests.PNG)
+        with self.assertRaisesRegex(SystemExit, "sensitive binary"):
+            AUTOREVIEW.branch_bundle(self.repo, self.base)
+
+    def test_local_and_commit_modes_still_fail_closed(self):
+        self.commit("portrait.png", AutoreviewImageEvidenceTests.PNG)
+        with self.assertRaisesRegex(SystemExit, "refusing binary changes"):
+            AUTOREVIEW.commit_bundle(self.repo, "HEAD")
+        (self.repo / "portrait.png").write_bytes(AutoreviewImageEvidenceTests.PNG + b"x")
+        with self.assertRaisesRegex(SystemExit, "refusing binary changes"):
+            AUTOREVIEW.local_bundle(self.repo)
+
+    def test_other_engine_cannot_get_clean_image_verdict(self):
+        self.commit("portrait.png", AutoreviewImageEvidenceTests.PNG)
+        captured = AUTOREVIEW.branch_bundle(self.repo, self.base)
+        for engine in ("claude", "amp", "pi", "kimi"):
+            with self.subTest(engine=engine), mock.patch.object(AUTOREVIEW, "run_engine") as run:
+                with self.assertRaisesRegex(SystemExit, "only by the Codex"):
+                    AUTOREVIEW.run_reviewer(argparse.Namespace(engine=engine), self.repo, "review", captured, [])
+                run.assert_not_called()
+
+    def test_manifest_and_attachments_travel_on_every_pass(self):
+        self.commit("portrait.png", AutoreviewImageEvidenceTests.PNG)
+        captured = AUTOREVIEW.branch_bundle(self.repo, self.base)
+        with mock.patch.object(AUTOREVIEW, "build_review_prompts", return_value=["one", "two"]) as build:
+            AUTOREVIEW.prepare_review_prompts(self.repo, "branch", self.base, captured, "instructions", [], 512000)
+        self.assertIn(captured.images[0].sha256, build.call_args.args[4])
+        args = argparse.Namespace(engine="codex", max_priority="P0")
+        with mock.patch.object(AUTOREVIEW, "run_engine", return_value=json.dumps({**FINAL_REPORT, "review_completion": "complete"})) as run:
+            AUTOREVIEW.run_review_passes(args, [args], self.repo, ["one", "two"], captured)
+        self.assertEqual(run.call_count, 2)
+        for call in run.call_args_list:
+            self.assertEqual(call.args[0].review_images, captured.images)
+            self.assertIs(call.args[0].review_usage, args.review_usage)
+        self.assertFalse(hasattr(args, "review_images"))
+
+    def test_valid_webp_jpeg_and_png_decode_but_animation_does_not(self):
+        from PIL import Image
+        for fmt, suffix in [("WEBP", "webp"), ("JPEG", "jpg"), ("PNG", "png")]:
+            out = io.BytesIO()
+            Image.new("RGB", (4, 4), "red").save(out, format=fmt)
+            self.assertIsNotNone(AUTOREVIEW.image_media_type("image." + suffix, out.getvalue()))
+        out = io.BytesIO()
+        Image.new("RGB", (4, 4), "red").save(out, format="WEBP", save_all=True,
+            append_images=[Image.new("RGB", (4, 4), "blue")], duration=100)
+        with self.assertRaisesRegex(SystemExit, "animated"):
+            AUTOREVIEW.image_media_type("image.webp", out.getvalue())
 
 
 class AutoreviewPriorityTests(unittest.TestCase):
