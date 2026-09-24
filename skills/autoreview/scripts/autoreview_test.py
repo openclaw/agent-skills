@@ -298,6 +298,34 @@ class AutoreviewImageGitTests(unittest.TestCase):
         self.assertEqual(captured.images[0].content, AutoreviewImageEvidenceTests.PNG)
         self.assertEqual(captured.commit, self.git("rev-parse", "HEAD").strip())
 
+    def test_encoded_image_budget_is_checked_before_blob_capture(self):
+        self.commit("oversized.png", AutoreviewImageEvidenceTests.PNG)
+        original = AUTOREVIEW.git_bytes
+        def limited(repo, *args, **kwargs):
+            if args[:2] == ("cat-file", "-s"):
+                return subprocess.CompletedProcess(args, 0, b"20971521\n", b"")
+            if args[:2] == ("cat-file", "blob"):
+                raise AssertionError("oversized image bytes must not be captured")
+            return original(repo, *args, **kwargs)
+        with mock.patch.object(AUTOREVIEW, "git_bytes", side_effect=limited):
+            with self.assertRaisesRegex(SystemExit, "encoded image"):
+                AUTOREVIEW.branch_bundle(self.repo, self.base)
+
+    def test_aggregate_image_budget_is_checked_before_next_blob(self):
+        self.commit("first.png", AutoreviewImageEvidenceTests.PNG)
+        self.commit("second.png", AutoreviewImageEvidenceTests.PNG)
+        original = AUTOREVIEW.git_bytes
+        reads = []
+        def observe(repo, *args, **kwargs):
+            if args[:2] == ("cat-file", "blob"):
+                reads.append(args)
+            return original(repo, *args, **kwargs)
+        with mock.patch.object(AUTOREVIEW, "MAX_REVIEW_IMAGE_TOTAL_BYTES", len(AutoreviewImageEvidenceTests.PNG), create=True), \
+                mock.patch.object(AUTOREVIEW, "git_bytes", side_effect=observe):
+            with self.assertRaisesRegex(SystemExit, "encoded image"):
+                AUTOREVIEW.branch_bundle(self.repo, self.base)
+        self.assertEqual(len(reads), 1)
+
     def test_unsupported_binary_and_spoofed_extension_are_rejected(self):
         for name, data in [("payload.bin", b"\x00opaque"),
                            ("fake.png", b"\x89PNG\r\n\x1a\n\x00truncated")]:

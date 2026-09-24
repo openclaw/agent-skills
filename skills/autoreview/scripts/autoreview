@@ -144,6 +144,8 @@ TRACKED_TOKEN_CREDENTIAL_EXTENSIONS = {
     ".yml",
 }
 MAX_REVIEW_PROMPT_BYTES = 512_000
+MAX_REVIEW_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_REVIEW_IMAGE_TOTAL_BYTES = 100 * 1024 * 1024
 # Rebatch evidence before eager planning repeats nearly full context for tiny
 # fragments. The fallback keeps its four-byte minimum.
 FULL_DATASET_CHANGE_DIVISOR = 16
@@ -2462,6 +2464,7 @@ def capture_added_branch_images(
 ) -> tuple[ImageEvidence, ...]:
     images: list[ImageEvidence] = []
     binary_paths = set(binary_diff_paths(numstat))
+    image_bytes = 0
     # Raw no-renames records bind both sides to their committed modes and blobs.
     # Inspect bytes even when attributes force an opaque blob into textual numstat.
     records = raw_diff.split("\0")
@@ -2473,6 +2476,23 @@ def capture_added_branch_images(
             if binary:
                 raise SystemExit("refusing sensitive binary image path")
             continue
+        image_path = PurePosixPath(path).suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        if binary and (change != "A" or new_mode not in {"100644", "100755"}):
+            raise SystemExit(
+                "refusing binary changes in branch diff "
+                f"(only added images are supported):\n- {display_escape(path, 500)}"
+            )
+        if binary and not image_path:
+            raise SystemExit(
+                f"refusing unsupported or malformed image in branch diff:\n- {display_escape(path, 500)}"
+            )
+        if change == "A" and new_mode in {"100644", "100755"} and image_path:
+            encoded_size = int(git(repo, "cat-file", "-s", new_oid).strip())
+            if (encoded_size > MAX_REVIEW_IMAGE_BYTES
+                    or image_bytes + encoded_size > MAX_REVIEW_IMAGE_TOTAL_BYTES):
+                raise SystemExit(
+                    "encoded image evidence exceeds the 20 MiB per-image or 100 MiB total limit"
+                )
         content = b""
         for mode, oid in ((old_mode, old_oid), (new_mode, new_oid)):
             if mode not in {"100644", "100755"}:
@@ -2497,6 +2517,7 @@ def capture_added_branch_images(
             raise SystemExit(
                 f"refusing unsupported or malformed image in branch diff:\n- {display_escape(path, 500)}"
             )
+        image_bytes += len(content)
         images.append(ImageEvidence(path, media_type, hashlib.sha256(content).hexdigest(), content))
     return tuple(images)
 

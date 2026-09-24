@@ -220,7 +220,9 @@ Install Pillow in the Python environment running the helper (`python -m pip inst
 Use a vision-capable Codex model and a CLI supporting `codex exec --image`.
 No new bypass flag is required. Full decoding rejects corrupt and animated files.
 Images must have at most 16,777,216 pixels and no dimension above 16,384 pixels;
-decoder bomb warnings fail closed before pixel loading.
+decoder bomb warnings fail closed before pixel loading. Added image paths are
+limited to 20 MiB of encoded bytes each and 100 MiB total, checked against Git
+object sizes before capture. Exceeding a limit fails the entire review.
 
 The helper captures exact bytes from the pinned HEAD, stages only those images
 in its isolated workspace, and attaches them through Codex's native image input.
@@ -270,7 +272,8 @@ roots before workspace, runtime, or authentication setup; unset a shared
 temporary directory. Other engines and platforms retain their normal isolation.
 Tools installed in shared scratch or requiring writes there will be denied too.
 
-Review files have no size/count cap and are never truncated. Large diffs and
+Text review files have no size/count cap and are never truncated; image inputs
+use the explicit safety limits above. Large diffs and
 datasets are partitioned automatically. Change partitions retain complete
 datasets when they fit with sufficient change space. This preference may use more
 passes or prompt bytes than evidence batching; the explicit pass budget still applies.
