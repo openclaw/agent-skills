@@ -3299,26 +3299,36 @@ def capture_source_context(repo: Path, raw_path: str, commit: str) -> SourceCont
 def capture_source_context_inputs(
     args: argparse.Namespace, repo: Path, captured: CapturedBundle, evidence: EvidenceInputs,
 ) -> EvidenceInputs:
-    paths = getattr(args, "source_context", None) or []
-    if paths and captured.commit is None:
-        raise SystemExit("--source-context requires a committed branch or commit review; local mode is unsupported")
+    roles = (("--source-context", getattr(args, "source_context", None)),
+             ("--source-context-file", getattr(args, "source_context_file", None)))
     datasets, files = list(evidence.datasets), list(evidence.files)
-    sources: dict[str, SourceContext] = {}
-    for path in paths:
-        assert captured.commit is not None
-        record = capture_source_context(repo, path, captured.commit)
-        # Validate every alias before sharing this role's frozen source capture.
-        if record.raw_path in sources:
-            if sources[record.raw_path] != record:
-                raise SystemExit("source context changed while being captured")
-            continue
-        sources[record.raw_path] = record
-        files.append(record)
-        _, oid, mode = record.source.identity.split(":")
-        assert record.source.content is not None
-        datasets.append(ReviewDataset(record.raw_path, record.source.content,
-                                      provenance=(record.commit, oid, mode)))
-    return EvidenceInputs(evidence.prompt, datasets, files)
+    chunks = [evidence.prompt] if evidence.prompt else []
+    sources: dict[tuple[str, str], SourceContext] = {}
+    for role, paths in roles:
+        if paths and captured.commit is None:
+            raise SystemExit(f"{role} requires a committed branch or commit review; local mode is unsupported")
+        for path in paths or []:
+            assert captured.commit is not None
+            record = capture_source_context(repo, path, captured.commit)
+            # Validate every alias before sharing this role's frozen source capture.
+            key = (role, record.raw_path)
+            if key in sources:
+                if sources[key] != record:
+                    raise SystemExit("source context changed while being captured")
+                continue
+            sources[key] = record
+            files.append(record)
+            _, oid, mode = record.source.identity.split(":")
+            assert record.source.content is not None
+            dataset = ReviewDataset(record.raw_path, record.source.content,
+                                    provenance=(record.commit, oid, mode))
+            if role == "--source-context-file":
+                # Prompt evidence stays intact in every pass, with source provenance
+                # and the same revalidation fences as partitionable source context.
+                chunks.append(render_datasets([dataset]))
+            else:
+                datasets.append(dataset)
+    return EvidenceInputs("\n\n".join(chunks), datasets, files)
 
 
 def verify_evidence(repo: Path, files: list[EvidenceFile | SourceContext]) -> None:
@@ -4113,8 +4123,8 @@ def build_review_prompts(
             if change_prompts is not None:
                 return change_prompts
         raise SystemExit(
-            "review prompt files leave too little room for change chunks; "
-            "reduce the review instructions or move source evidence to datasets"
+            "review instructions or intact context leave too little room for change chunks; "
+            "reduce optional instructions or context without omitting required evidence"
         )
     minimum_evidence = max((
         utf8_size(render_datasets([item._replace(content="", byte_offset=utf8_size(item.content))])) + 4
@@ -6901,6 +6911,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-file", action="append", help="Additional review instruction file inside the repo (relative or absolute path).")
     parser.add_argument("--dataset", action="append", help="Extra evidence file to include in the review bundle.")
     parser.add_argument("--source-context", action="append", help="Repo-relative source path from the reviewed commit; branch/commit modes only, context without finding authority.")
+    parser.add_argument("--source-context-file", action="append", help="Repo-relative source from the reviewed commit, kept intact in every pass; branch/commit modes only, context without finding authority.")
     parser.add_argument(
         "--max-priority",
         choices=["P0", "P1", "P2", "P3"],

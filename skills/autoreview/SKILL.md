@@ -95,23 +95,28 @@ Repeated paths in the same evidence role share one validated capture. Equal
 content at different paths and prompt-file versus dataset roles stay distinct.
 
 For unchanged committed source, use repeatable `--source-context <repo-relative-path>`
-with branch or commit mode. It reads the exact regular-file blob from the frozen
-reviewed commit (branch HEAD or `--commit`), including executable source files.
+with branch or commit mode. Use `--source-context-file <repo-relative-path>` when
+that source must stay intact in every review pass. Both read the exact regular-file
+blob from the frozen reviewed commit (branch HEAD or `--commit`), including executable source files.
 Local mode, including an auto-selected local target, is unsupported. No separate
 context revision or working-copy substitution is accepted. The checkout path must
 remain a regular file; its bytes and path topology are revalidated throughout review.
 Repeated normalized source-context paths share one capture after every argument
 is validated; different paths and evidence roles remain distinct.
 
-This role uses tracked-source filename classification, so source names such as
+Both roles use tracked-source filename classification, so source names such as
 `src/token_count.py` are accepted. Credential directories, stores and keyfiles
 remain forbidden. Existing prompt-file and dataset restrictions are unchanged.
-Every source fragment carries path, commit, blob and mode provenance. Complete
-bytes are partitioned with the change when needed; context never adds finding
-targets. This is a source-provenance contract, not secret-content scanning.
+Every source block carries path, commit, blob and mode provenance. `--source-context`
+bytes are partitioned with the change when needed. `--source-context-file` blocks
+stay complete in every pass and must fit with the instructions and change framing;
+the helper refuses an over-capacity plan without dropping required evidence.
+Context never adds finding targets or instruction authority. This is a
+source-provenance contract, not secret-content scanning.
 
 ```bash
 "$AUTOREVIEW" --mode branch --base origin/main --source-context src/token_count.py
+"$AUTOREVIEW" --mode branch --base origin/main --source-context-file src/token_count.py
 ```
 
 The default threshold is **P0 only**: material blockers to normal operation or
@@ -247,8 +252,8 @@ datasets are partitioned automatically. Change partitions retain complete
 datasets when they fit with sufficient change space. This preference may use more
 passes or prompt bytes than evidence batching; the explicit pass budget still applies.
 Terminal fallbacks preserve a feasible complete-evidence plan when batch framing cannot fit.
-Intact instructions and required mixed source context must fit the per-pass
-prompt budget. A failed pass does not produce a partial clean verdict.
+Intact instructions, source-context files and required mixed source context must
+fit the per-pass prompt budget. A failed pass does not produce a partial clean verdict.
 Otherwise, the planner compares a bounded set of evidence allocations and keeps the existing
 plan unless total prompt bytes improve without more passes, or equal bytes need
 fewer passes. Every change is still reviewed against every evidence batch.

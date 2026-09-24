@@ -611,7 +611,7 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                         self.assertNotIn("Evidence batch:", prompt)
                     impossible = instructions + "i" * (capacity + len(complete.encode()))
                     self.assertIsNone(build(branch, "branch", None, bundle, impossible, complete, budget))
-                    with self.assertRaisesRegex(SystemExit, "review prompt files leave too little room"):
+                    with self.assertRaisesRegex(SystemExit, "intact context leave too little room"):
                         self.helper["build_review_prompts"](
                             repo, "branch", None, bundle, impossible, datasets, budget,
                         )
@@ -1363,10 +1363,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 yield repo, sends, stdout, stderr
 
     @contextlib.contextmanager
-    def committed_context_fixture(self, *options, path="src/token_count.py",
+    def committed_context_fixture(self, *options, path="src/token_count.py", role="--source-context",
                                   content=b"def count_tokens(): return 7\r\n", setup=None):
         with self.preparation_fixture(
-            "--mode", "branch", "--base", "HEAD^", "--source-context", path, *options,
+            "--mode", "branch", "--base", "HEAD^", role, path, *options,
         ) as fixture:
             repo = fixture[0]
             source = repo / path
@@ -1381,8 +1381,9 @@ class AutoreviewHardeningTests(unittest.TestCase):
             yield fixture
 
     def test_source_context_uses_reviewed_blob_not_working_copy_or_current_head(self):
-        for mode in ("branch", "commit"):
-            with self.subTest(mode=mode), self.committed_context_fixture() as (repo, sends, *_):
+        for role, mode in ((role, mode) for role in ("--source-context", "--source-context-file")
+                           for mode in ("branch", "commit")):
+            with self.subTest(role=role, mode=mode), self.committed_context_fixture(role=role) as (repo, sends, *_):
                 commit = git(repo, "rev-parse", "HEAD").strip()
                 oid = git(repo, "rev-parse", "HEAD:src/token_count.py").strip()
                 source = repo / "src/token_count.py"
@@ -1403,20 +1404,22 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
     def test_source_context_duplicates_keep_full_source_in_one_planned_pass(self):
         content = b"# context\n" * 30_000
-        with self.committed_context_fixture(
-            "--source-context", "./src/token_count.py", "--max-review-passes", "1",
-            content=content,
-        ) as (_repo, sends, out, _err):
-            self.assertEqual(self.helper["main_impl"](), 0)
-            self.assertEqual(len(sends), 1)
-            self.assertEqual(sends[0].count(content.decode()), 1)
-            self.assertEqual(sends[0].count('# Source context: "src/token_count.py"'), 1)
-            self.assertIn("review plan: 1 passes;", out.getvalue())
+        for role in ("--source-context", "--source-context-file"):
+            with self.subTest(role=role), self.committed_context_fixture(
+                role, "./src/token_count.py", "--max-review-passes", "1",
+                role=role, content=content,
+            ) as (_repo, sends, out, _err):
+                self.assertEqual(self.helper["main_impl"](), 0)
+                self.assertEqual(len(sends), 1)
+                self.assertEqual(sends[0].count(content.decode()), 1)
+                self.assertEqual(sends[0].count('# Source context: "src/token_count.py"'), 1)
+                self.assertIn("review plan: 1 passes;", out.getvalue())
 
     def test_source_context_duplicate_capture_refuses_changed_bytes_or_topology(self):
-        for change in ("bytes", "topology"):
-            with self.subTest(change=change), self.committed_context_fixture(
-                "--source-context", "./src/token_count.py",
+        for role, change in ((role, change) for role in ("--source-context", "--source-context-file")
+                             for change in ("bytes", "topology")):
+            with self.subTest(role=role, change=change), self.committed_context_fixture(
+                role, "./src/token_count.py", role=role,
             ) as (repo, sends, *_):
                 source = repo / "src/token_count.py"
                 original = self.helper["capture_source_context"]
@@ -1451,16 +1454,18 @@ class AutoreviewHardeningTests(unittest.TestCase):
         with self.committed_context_fixture(
             "--source-context", "./src/owner.py", "--source-context", "src/copy.py",
             "--dataset", "src/owner.py", "--prompt-file", "src/owner.py",
+            "--source-context-file", "src/owner.py", "--source-context-file", "./src/owner.py",
+            "--source-context-file", "src/copy.py",
             path="src/owner.py", content=content, setup=copy_source,
         ) as (_repo, sends, *_):
             self.assertEqual(self.helper["main_impl"](), 0)
             self.assertEqual(len(sends), 1)
-            self.assertEqual(sends[0].count(content.decode()), 4)
-            for header in (
-                '# Source context: "src/owner.py"', '# Source context: "src/copy.py"',
-                f"# Dataset: {Path('src/owner.py')}", f"# Prompt file: {Path('src/owner.py')}",
+            self.assertEqual(sends[0].count(content.decode()), 6)
+            for header, count in (
+                ('# Source context: "src/owner.py"', 2), ('# Source context: "src/copy.py"', 2),
+                (f"# Dataset: {Path('src/owner.py')}", 1), (f"# Prompt file: {Path('src/owner.py')}", 1),
             ):
-                self.assertEqual(sends[0].count(header), 1)
+                self.assertEqual(sends[0].count(header), count)
 
     def test_source_context_does_not_relax_existing_evidence_roles(self):
         for role in ("--dataset", "--prompt-file"):
@@ -1472,9 +1477,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertFalse(sends)
 
     def test_source_context_requires_committed_review_mode(self):
-        for mode in ("local", "uncommitted", "auto"):
-            with self.subTest(mode=mode), self.committed_context_fixture(
-                "--mode", mode,
+        for role, mode in ((role, mode) for role in ("--source-context", "--source-context-file")
+                           for mode in ("local", "uncommitted", "auto")):
+            with self.subTest(role=role, mode=mode), self.committed_context_fixture(
+                "--mode", mode, role=role,
             ) as (repo, sends, *_):
                 (repo / "source.md").write_text("dirty source\n")
                 with self.assertRaisesRegex(SystemExit, "requires a committed branch or commit review"):
@@ -1482,14 +1488,17 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertFalse(sends)
 
     def test_source_context_retains_strict_directories_stores_and_keyfiles(self):
-        for path in (
+        paths = (
             "private/parser.py", "credentials/prod.py", "src/secrets/runtime.ts",
             "service-account/client.ts", ".aws/config", ".ssh/client.py",
             ".docker/Dockerfile", ".config/gcloud/client.py", "tokens/session.json",
             "src/auth-token.json", "src/.env", "src/.netrc", "src/.git-credentials",
             "keys/id_ed25519", "keys/signing.pem", "keys/signing.p12", "keys/signing.key",
-        ):
-            with self.subTest(path=path), self.committed_context_fixture(path=path) as (_repo, sends, *_):
+        )
+        cases = [("--source-context", path) for path in paths]
+        cases.append(("--source-context-file", "credentials/prod.py"))
+        for role, path in cases:
+            with self.subTest(role=role, path=path), self.committed_context_fixture(path=path, role=role) as (_repo, sends, *_):
                 with self.assertRaisesRegex(SystemExit, "sensitive --source-context"):
                     self.helper["main_impl"]()
                 self.assertFalse(sends)
@@ -1552,8 +1561,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.assertFalse(sends)
 
     def test_source_context_revalidation_rejects_stale_publication_and_later_passes(self):
-        for timing in ("capture", "preparation", "review", "between passes"):
-            with self.subTest(timing=timing), self.committed_context_fixture() as (repo, sends, out, _err):
+        for role, timing in (
+            *(("--source-context", timing) for timing in ("capture", "preparation", "review", "between passes")),
+            ("--source-context-file", "review"), ("--source-context-file", "between passes"),
+        ):
+            with self.subTest(role=role, timing=timing), self.committed_context_fixture(role=role) as (repo, sends, out, _err):
                 source = repo / "src/token_count.py"
                 original_bytes = source.read_bytes()
                 output = repo.parent / "result.json"
@@ -1645,6 +1657,54 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     self.assertEqual(len(sends), int(timing == "review"))
                     self.assertFalse(output.exists())
 
+    def test_source_context_file_stays_whole_in_every_pass_and_refuses_insufficient_capacity(self):
+        content = ("# context \U0001f99e\r\n" * 300 + "tail without newline \t").encode()
+        with self.committed_context_fixture(role="--source-context-file", content=content) as (repo, sends, *_):
+            (repo / "source.md").write_text("selected change\n" * 4_000)
+            git(repo, "commit", "-qam", "large selected change")
+            captured = self.helper["branch_bundle"](repo, "HEAD^")
+            record = self.helper["capture_source_context"](repo, "src/token_count.py", captured.commit)
+            _, oid, mode = record.source.identity.split(":")
+            block = self.helper["render_datasets"]([self.helper["ReviewDataset"](
+                record.raw_path, content.decode(), provenance=(record.commit, oid, mode),
+            )])
+            with mock.patch.dict(self.helper["main_impl"].__globals__, {
+                "max_prompt_bytes_for_reviewers": lambda _reviewers: 30_000,
+            }):
+                self.assertEqual(self.helper["main_impl"](), 0)
+            self.assertGreater(len(sends), 1)
+            changes = []
+            for prompt in sends:
+                self.assertLessEqual(len(prompt.encode()), 30_000)
+                self.assertEqual(prompt.count(block), 1)
+                prefix, change = prompt.rsplit("\n\n# Change Bundle\n", 1)
+                self.assertIn(block, prefix)
+                self.assertIn("Source-context paths are not finding targets", prefix)
+                changes.append(change)
+            self.assertEqual("".join(changes), captured.text)
+            sends.clear()
+            evidence = self.helper["capture_source_context_inputs"](
+                argparse.Namespace(source_context_file=[record.raw_path]), repo, captured,
+                self.helper["EvidenceInputs"]("complete instructions", [
+                    self.helper["ReviewDataset"]("large-evidence.txt", "partitionable evidence\n" * 3_000),
+                ], []),
+            )
+            prompts = self.helper["prepare_review_prompts"](
+                repo, "branch", "HEAD^", captured, evidence.prompt, evidence.datasets, 30_000,
+            )
+            self.assertTrue(all("Evidence batch:" in prompt for prompt in prompts))
+            for prompt in prompts:
+                self.assertLessEqual(len(prompt.encode()), 30_000)
+                self.assertEqual(prompt.count(block), 1)
+            with self.assertRaisesRegex(SystemExit, "--max-review-passes allows 1"):
+                self.helper["check_review_plan"](argparse.Namespace(max_review_passes=1), prompts)
+            self.assertFalse(sends)
+            with mock.patch.dict(self.helper["main_impl"].__globals__, {
+                "max_prompt_bytes_for_reviewers": lambda _reviewers: len(content),
+            }), self.assertRaisesRegex(SystemExit, "intact context leave too little room"):
+                self.helper["main_impl"]()
+            self.assertFalse(sends)
+
     def test_source_context_partitioning_preserves_full_bytes_and_provenance(self):
         content = ("# context \U0001f99e\r\n" * 10_000 + "tail without newline \t").encode()
         with self.committed_context_fixture(content=content) as (repo, _sends, *_):
@@ -1700,39 +1760,41 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.helper["verify_evidence"](repo, [record])
 
     def test_source_context_dry_run_uses_blob_without_executable_conversion(self):
-        with self.committed_context_fixture("--dry-run") as (repo, sends, out, _err):
-            converter = repo / "converter.py"
-            marker = repo.parent / "converter-ran"
-            converter.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
-            command = f'"{sys.executable}" "{converter}"'
-            for key in ("clean", "smudge", "process"):
-                git(repo, "config", f"filter.test.{key}", command)
-            git(repo, "config", "filter.test.required", "true")
-            (repo / ".gitattributes").write_text("src/token_count.py filter=test\n")
-            self.assertEqual(self.helper["main_impl"](), 0)
-            self.assertIn("prompt: OK", out.getvalue())
-            self.assertFalse(sends)
-            self.assertFalse(marker.exists())
+        for role in ("--source-context", "--source-context-file"):
+            with self.subTest(role=role), self.committed_context_fixture("--dry-run", role=role) as (repo, sends, out, _err):
+                converter = repo / "converter.py"
+                marker = repo.parent / "converter-ran"
+                converter.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
+                command = f'"{sys.executable}" "{converter}"'
+                for key in ("clean", "smudge", "process"):
+                    git(repo, "config", f"filter.test.{key}", command)
+                git(repo, "config", "filter.test.required", "true")
+                (repo / ".gitattributes").write_text("src/token_count.py filter=test\n")
+                self.assertEqual(self.helper["main_impl"](), 0)
+                self.assertIn("prompt: OK", out.getvalue())
+                self.assertFalse(sends)
+                self.assertFalse(marker.exists())
 
     def test_source_context_never_expands_finding_authority(self):
-        with self.committed_context_fixture() as (repo, _sends, *_):
-            output = repo.parent / "report.json"
-            finding = {
-                "title": "Context-only defect", "body": "This is outside the change.",
-                "priority": "P0", "confidence": 0.99, "category": "bug",
-                "code_location": {"file_path": "src/token_count.py", "line": 1},
-            }
-            report = {"findings": [finding], "overall_correctness": "patch is incorrect",
-                      "overall_explanation": "Context-only observation", "overall_confidence": 0.9,
-                      "review_completion": "complete"}
-            with mock.patch.dict(self.helper["main_impl"].__globals__, {
-                "run_engine": lambda *_args: json.dumps(report),
-            }), mock.patch.object(sys, "argv", [*sys.argv, "--json-output", str(output)]):
-                self.assertEqual(self.helper["main_impl"](), 2)
-            result = json.loads(output.read_text())
-            self.assertEqual(result["findings"], [])
-            self.assertEqual(result["scope_rejected_findings"], [finding])
-            self.assertEqual(result["review_status"], "incomplete")
+        for role in ("--source-context", "--source-context-file"):
+            with self.subTest(role=role), self.committed_context_fixture(role=role) as (repo, _sends, *_):
+                output = repo.parent / "report.json"
+                finding = {
+                    "title": "Context-only defect", "body": "This is outside the change.",
+                    "priority": "P0", "confidence": 0.99, "category": "bug",
+                    "code_location": {"file_path": "src/token_count.py", "line": 1},
+                }
+                report = {"findings": [finding], "overall_correctness": "patch is incorrect",
+                          "overall_explanation": "Context-only observation", "overall_confidence": 0.9,
+                          "review_completion": "complete"}
+                with mock.patch.dict(self.helper["main_impl"].__globals__, {
+                    "run_engine": lambda *_args: json.dumps(report),
+                }), mock.patch.object(sys, "argv", [*sys.argv, "--json-output", str(output)]):
+                    self.assertEqual(self.helper["main_impl"](), 2)
+                result = json.loads(output.read_text())
+                self.assertEqual(result["findings"], [])
+                self.assertEqual(result["scope_rejected_findings"], [finding])
+                self.assertEqual(result["review_status"], "incomplete")
 
     def test_preparation_reuses_untracked_capture_and_keeps_three_full_snapshots(self):
         for explicit in (False, True):
