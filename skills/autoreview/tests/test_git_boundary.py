@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import runpy
 import subprocess
@@ -67,7 +68,7 @@ class GitFixtureIsolationTests(unittest.TestCase):
 
     def native(self, repo, *args):
         return subprocess.check_output(
-            [self.native_git, *args], cwd=repo, env=self.oracle_env,
+            [self.native_git, "-c", "maintenance.auto=false", *args], cwd=repo, env=self.oracle_env,
             stderr=subprocess.PIPE,
         ).decode("utf-8")
 
@@ -86,6 +87,16 @@ class GitFixtureIsolationTests(unittest.TestCase):
             repo.mkdir()
             self.harness["create_fixture_repo"](repo, "benign")
         return repo
+
+    def test_native_oracle_does_not_launch_background_maintenance(self):
+        trace = self.root / "maintenance-trace.jsonl"
+        (self.sentinel / "sentinel.txt").write_text("updated synthetic content\n")
+        self.native(self.sentinel, "add", ".")
+        with mock.patch.dict(self.oracle_env, {"GIT_TRACE2_EVENT": str(trace)}):
+            self.native(self.sentinel, "commit", "-qm", "observe maintenance")
+        events = [json.loads(line) for line in trace.read_text().splitlines()]
+        children = [event["argv"] for event in events if event.get("event") == "child_start"]
+        self.assertFalse(any("maintenance" in argv for argv in children), children)
 
     def test_fixture_mutations_ignore_inherited_git_routing(self):
         dotgit = self.sentinel / ".git"
