@@ -2,8 +2,9 @@
 
 ## Unreleased
 
+- Reduce repeated Autoreview evidence without increasing passes or dropping change/evidence coverage; show planned work, add an explicit preflight pass budget, and aggregate observed Codex usage across passes and access retries with incomplete telemetry marked as a lower bound.
 - Default Autoreview to GPT-6 Sol with high reasoning and an account-access-only GPT-6 Luna retry; preserve explicit model choices and reject unsupported GPT-6 Sol/Luna minimal effort instead of selecting an older model.
-- Add Autoreview `--source-context` for complete source bytes bound to the reviewed commit and blob, with strict credential-path and mutation guards, without expanding finding scope or changing generic evidence restrictions.
+- Add Autoreview `--source-context` for complete source bytes bound to the reviewed commit and blob, with validated same-role deduplication and strict credential-path and mutation guards, without expanding finding scope or changing generic evidence restrictions.
 
 - Prefer OpenAI/Codex before Claude when choosing an Autoreview engine, including independent second opinions; retain explicit user choices and require a concrete Codex availability failure before switching.
 

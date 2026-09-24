@@ -328,6 +328,18 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                 expected = record.staged if span.target == "index" else record.unstaged
                 self.assertEqual(captured.text.encode()[span.start:span.end], expected.encode())
 
+    def test_mixed_planner_never_increases_passes_or_aggregate_prompt_bytes(self):
+        with self.migration() as (repo, *_):
+            captured = self.helper["local_bundle"](repo)
+            datasets = [self.helper["ReviewDataset"]("evidence.txt", "evidence π\r\n" * 5000)]
+            with mock.patch.dict(self.helper["build_review_prompts"].__globals__, {
+                "optimize_evidence_plan": lambda plan, *args: plan,
+            }):
+                legacy = self.helper["build_review_prompts"](repo, "local", None, captured, "", datasets, 30_000)
+            planned = self.helper["build_review_prompts"](repo, "local", None, captured, "", datasets, 30_000)
+            self.assertLessEqual(len(planned), len(legacy))
+            self.assertLessEqual(self.helper["review_plan_bytes"](planned), self.helper["review_plan_bytes"](legacy))
+
     def test_file_hunk_long_line_boundaries_and_evidence_batches_keep_authority(self):
         # Force each partition dimension independently of prompt overhead. All
         # fixtures are synthetic; five files migrate thirteen obsolete calls.
@@ -1054,6 +1066,67 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertNotIn("newer committed bytes", sends[0])
                 self.assertNotIn("src/token_count.py", sends[0].split("# Change Bundle\n", 1)[1])
 
+    def test_source_context_duplicates_keep_full_source_in_one_planned_pass(self):
+        content = b"# context\n" * 30_000
+        with self.committed_context_fixture(
+            "--source-context", "./src/token_count.py", "--max-review-passes", "1",
+            content=content,
+        ) as (_repo, sends, out, _err):
+            self.assertEqual(self.helper["main_impl"](), 0)
+            self.assertEqual(len(sends), 1)
+            self.assertEqual(sends[0].count(content.decode()), 1)
+            self.assertEqual(sends[0].count('# Source context: "src/token_count.py"'), 1)
+            self.assertIn("review plan: 1 passes;", out.getvalue())
+
+    def test_source_context_duplicate_capture_refuses_changed_bytes_or_topology(self):
+        for change in ("bytes", "topology"):
+            with self.subTest(change=change), self.committed_context_fixture(
+                "--source-context", "./src/token_count.py",
+            ) as (repo, sends, *_):
+                source = repo / "src/token_count.py"
+                original = self.helper["capture_source_context"]
+                seen = []
+
+                def capture(repo, path, commit):
+                    record = original(repo, path, commit)
+                    seen.append(path)
+                    if len(seen) == 1:
+                        if change == "bytes":
+                            source.write_bytes(source.read_bytes().replace(b"7", b"8"))
+                        else:
+                            replacement = source.with_suffix(".replacement")
+                            replacement.write_bytes(source.read_bytes())
+                            replacement.replace(source)
+                    return record
+
+                with mock.patch.dict(self.helper["main_impl"].__globals__, {
+                    "capture_source_context": capture,
+                }), self.assertRaisesRegex(SystemExit, "source context changed while being captured"):
+                    self.helper["main_impl"]()
+                self.assertEqual(seen, ["src/token_count.py", "./src/token_count.py"])
+                self.assertFalse(sends)
+
+    def test_source_context_deduplication_preserves_distinct_paths_and_evidence_roles(self):
+        content = b"# distinct role and path context\n"
+
+        def copy_source(repo, source):
+            (source.parent / "copy.py").write_bytes(source.read_bytes())
+            git(repo, "add", "src/copy.py")
+
+        with self.committed_context_fixture(
+            "--source-context", "./src/owner.py", "--source-context", "src/copy.py",
+            "--dataset", "src/owner.py", "--prompt-file", "src/owner.py",
+            path="src/owner.py", content=content, setup=copy_source,
+        ) as (_repo, sends, *_):
+            self.assertEqual(self.helper["main_impl"](), 0)
+            self.assertEqual(len(sends), 1)
+            self.assertEqual(sends[0].count(content.decode()), 4)
+            for header in (
+                '# Source context: "src/owner.py"', '# Source context: "src/copy.py"',
+                f"# Dataset: {Path('src/owner.py')}", f"# Prompt file: {Path('src/owner.py')}",
+            ):
+                self.assertEqual(sends[0].count(header), 1)
+
     def test_source_context_does_not_relax_existing_evidence_roles(self):
         for role in ("--dataset", "--prompt-file"):
             with self.subTest(role=role), self.committed_context_fixture(
@@ -1473,7 +1546,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_duplicate_evidence_keeps_exact_frozen_bytes_across_passes(self):
         with self.preparation_fixture(
             "--prompt-file", "evidence/note.md", "--dataset", "evidence/note.md",
-            "--dataset", "evidence/note.md",
+            "--dataset", "./evidence/note.md",
         ) as (repo, sends, *_):
             evidence = (repo / "evidence/note.md").read_bytes().decode()
             original = self.helper["prepare_review_prompts"]
@@ -1483,7 +1556,79 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertEqual(self.helper["main_impl"](), 0)
             self.assertEqual(len(sends), 2)
             for prompt in sends:
-                self.assertEqual(prompt.count(evidence), 3)
+                self.assertEqual(prompt.count(evidence), 2)
+
+    def test_equal_evidence_at_different_paths_retains_provenance(self):
+        with self.preparation_fixture(
+            "--dataset", "evidence/note.md", "--dataset", "evidence/copy.md",
+        ) as (repo, sends, *_):
+            (repo / "evidence/copy.md").write_bytes((repo / "evidence/note.md").read_bytes())
+            self.assertEqual(self.helper["main_impl"](), 0)
+            self.assertIn(f"# Dataset: {Path('evidence/note.md')}", sends[0])
+            self.assertIn(f"# Dataset: {Path('evidence/copy.md')}", sends[0])
+
+    def test_explicit_pass_budget_rejects_entire_plan_before_any_reviewer(self):
+        for dry_run in (False, True):
+            options = ("--dry-run",) if dry_run else ()
+            with self.subTest(dry_run=dry_run), self.preparation_fixture(
+                "--max-review-passes", "1", *options,
+            ) as (_repo, sends, out, _err):
+                original = self.helper["prepare_review_prompts"]
+                with mock.patch.dict(self.helper["main_impl"].__globals__, {
+                    "prepare_review_prompts": lambda *args: original(*args) * 2,
+                }):
+                    if dry_run:
+                        self.assertEqual(self.helper["main_impl"](), 1)
+                        self.assertIn("no reviewer was started", out.getvalue())
+                    else:
+                        with self.assertRaisesRegex(SystemExit, "no reviewer was started"):
+                            self.helper["main_impl"]()
+                self.assertIn("review plan: 2 passes;", out.getvalue())
+                self.assertFalse(sends)
+
+    def test_usage_survives_later_failed_pass_without_publishing_partial_report(self):
+        for failure in (None, "invalid", "timeout"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as output_dir, self.preparation_fixture(
+                "--json-output", str(Path(output_dir) / "report.json"),
+                "--status-output", str(Path(output_dir) / "status.json"),
+            ) as (_repo, sends, out, _err):
+                original_plan = self.helper["prepare_review_prompts"]
+                original_engine = self.helper["main_impl"].__globals__["run_engine"]
+
+                def engine(args, repo, prompt):
+                    failed = bool(sends) and failure is not None
+                    event = json.dumps({"type": "turn.completed", "usage": {
+                        "input_tokens": 100, "cached_input_tokens": 20,
+                        "output_tokens": 30, "reasoning_output_tokens": 10,
+                    }})
+                    self.helper["record_codex_usage"](args, "" if failed else event, completed=not failed)
+                    result = original_engine(args, repo, prompt)
+                    if failed and failure == "timeout":
+                        process = self.helper["TimedOutEngineProcess"]([], 124, "", "timed out")
+                        raise self.helper["ReviewerUnavailable"]("timed out", result=process)
+                    return "invalid report" if failed else result
+
+                with mock.patch.dict(self.helper["main_impl"].__globals__, {
+                    "prepare_review_prompts": lambda *args: original_plan(*args) * 2,
+                    "run_engine": engine,
+                }):
+                    if failure:
+                        with self.assertRaises(self.helper["ReviewerUnavailable"]):
+                            self.helper["main_impl"]()
+                    else:
+                        self.assertEqual(self.helper["main_impl"](), 0)
+                status = json.loads((Path(output_dir) / "status.json").read_text())
+                self.assertEqual(status["usage"]["attempts"], 2)
+                self.assertEqual(status["usage"]["complete"], failure is None)
+                self.assertEqual(status["usage"]["unknown_attempts"], 1 if failure else 0)
+                self.assertEqual(status["usage"]["tokens"]["input_tokens"], 100 if failure else 200)
+                report = Path(output_dir) / "report.json"
+                if failure:
+                    self.assertEqual(status["status"], "reviewer_unavailable")
+                    self.assertFalse(report.exists())
+                else:
+                    self.assertEqual(json.loads(report.read_text())["usage"], status["usage"])
+                self.assertIn("review usage:", out.getvalue())
 
     def test_tracked_source_permission_never_authorizes_evidence(self):
         with self.preparation_fixture("--dataset", "private/source.swift") as (repo, sends, *_):
@@ -6155,9 +6300,10 @@ os.execv(target, [str(target), *sys.argv[1:]])
             env = os.environ.copy()
             env.update(
                 {
+                    # Select this PATH fixture even when the caller pins CODEX_BIN.
+                    "CODEX_BIN": "codex",
                     "CODEX_HOME": str(source_home),
                     "PATH": f"{launcher_dir}{os.pathsep}{env['PATH']}",
-                    "CODEX_BIN": "codex",
                 }
             )
 
