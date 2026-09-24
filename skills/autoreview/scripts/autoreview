@@ -1539,6 +1539,159 @@ def timeout_output_text(value: str | bytes | None) -> str:
     return value or ""
 
 
+class EngineStage:
+    """Closed, spoofable local observations for the first streamed Codex process."""
+
+    _BOOLEANS = (
+        "launch_returned", "stdout_text_read", "stderr_text_read",
+        "stdout_delivered_to_display", "stderr_delivered_to_display",
+        "stdout_json_object_seen", "stdout_stage_type_seen",
+    )
+    _MASKS = ("none", "stdout", "stderr", "both")
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._claimed = False
+        self._frozen: dict[str, Any] | None = None
+        self._seen = dict.fromkeys(self._BOOLEANS, False)
+        self._generated = 0
+        self._flushed = 0
+        self._reader_failed = False
+
+    def claim(self) -> EngineStage | None:
+        with self._lock:
+            if self._claimed:
+                return None
+            self._claimed = True
+            return self
+
+    def seen(self, name: str) -> None:
+        with self._lock:
+            if self._frozen is None and name in self._seen:
+                self._seen[name] = True
+
+    def display(self, stream: str, *, flushed: bool = False) -> None:
+        bit = {"stdout": 1, "stderr": 2}.get(stream, 0)
+        with self._lock:
+            if self._frozen is None:
+                if flushed:
+                    self._flushed |= bit
+                else:
+                    self._generated |= bit
+
+    def reader_failed(self) -> None:
+        with self._lock:
+            if self._frozen is None:
+                self._reader_failed = True
+
+    def finish(self, terminal: str) -> None:
+        with self._lock:
+            if self._frozen is not None:
+                return
+            if terminal not in {"returned", "engine_timeout", "interrupted", "collector_failure"}:
+                return
+            if terminal == "returned" and self._reader_failed:
+                terminal = "collector_failure"
+            self._frozen = {
+                "schema_version": 1,
+                "observation_kind": "helper_local_stage",
+                "spoofable": True,
+                "provider_receipt": False,
+                "acceptance": False,
+                **self._seen,
+                "stage_display_generated_streams": self._MASKS[self._generated],
+                "stage_display_flushed_streams": self._MASKS[self._flushed],
+                "terminal": terminal,
+            }
+
+    def snapshot(self) -> dict[str, Any] | None:
+        with self._lock:
+            return dict(self._frozen) if self._frozen is not None else None
+
+
+
+def persist_engine_stage(directory: str, stage: EngineStage) -> None:
+    """Best effort only on responsive private local POSIX storage; never overwrite."""
+    directory_fd = file_fd = None
+    temporary = ".engine-stage.partial"
+    created = False
+    try:
+        snapshot = stage.snapshot()
+        if snapshot is None:
+            return
+        payload = (json.dumps(snapshot, separators=(",", ":")) + "\n").encode("ascii")
+        if len(payload) > 4096 or len(directory) > 4096:
+            return
+        path = Path(directory)
+        if not path.is_absolute() or ".." in path.parts or len(path.parts) > 64:
+            return
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+        directory_fd = os.open("/", flags)
+        # The host root owner may be remapped in a user namespace. A private
+        # user-owned ancestor excludes other users from writable descendants.
+        root_owner = os.fstat(directory_fd).st_uid
+        private_ancestor = False
+        for component in path.parts[1:]:
+            info = os.fstat(directory_fd)
+            if info.st_uid not in {root_owner, os.geteuid()}:
+                return
+            if not private_ancestor and info.st_mode & 0o022:
+                return
+            if info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700:
+                private_ancestor = True
+            previous_fd = directory_fd
+            # Take custody before the fallible release of the previous directory.
+            # If open fails, directory_fd still owns the previous directory; if
+            # close fails, finalization owns the child. Never retry an ambiguous
+            # close using its possibly reused descriptor number.
+            directory_fd = os.open(component, flags, dir_fd=previous_fd)
+            os.close(previous_fd)
+        info = os.fstat(directory_fd)
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            return
+        file_fd = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600, dir_fd=directory_fd,
+        )
+        created = True
+        info = os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid():
+            return
+        if os.write(file_fd, payload) != len(payload):
+            return
+        # No fsync or retry: this is diagnostic evidence, not a durable receipt.
+        os.link(temporary, "engine-stage.json", src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd, follow_symlinks=False)
+    except Exception:
+        # Diagnostic storage never replaces a report failure or exposes error text.
+        pass
+    finally:
+        try:
+            if created and directory_fd is not None and file_fd is not None:
+                try:
+                    held = os.fstat(file_fd)
+                    named = os.stat(temporary, dir_fd=directory_fd, follow_symlinks=False)
+                    if (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino):
+                        os.unlink(temporary, dir_fd=directory_fd)
+                except Exception:
+                    pass  # Failed name cleanup must not replace the primary outcome.
+        finally:
+            # Descriptor ownership is independent of successful name cleanup.
+            try:
+                if file_fd is not None:
+                    try:
+                        os.close(file_fd)
+                    except Exception:
+                        pass
+            finally:
+                if directory_fd is not None:
+                    try:
+                        os.close(directory_fd)
+                    except Exception:
+                        pass
+
+
+
 def run_with_heartbeat(
     args: list[str],
     cwd: Path,
@@ -1550,6 +1703,7 @@ def run_with_heartbeat(
     stream_output: bool = False,
     stream_display: Callable[[str, str], str | None] | None = None,
     env: dict[str, str] | None = None,
+    engine_stage: EngineStage | None = None,
 ) -> subprocess.CompletedProcess[str]:
     deadline = EngineRuntimeDeadline(label, max_runtime_seconds)
     if stream_output:
@@ -1562,6 +1716,7 @@ def run_with_heartbeat(
             deadline=deadline,
             stream_display=stream_display,
             env=env,
+            engine_stage=engine_stage,
         )
     started = time.monotonic()
     with deferred_owned_process_signals():
@@ -1628,42 +1783,92 @@ def run_with_stream(
     deadline: EngineRuntimeDeadline | None = None,
     stream_display: Callable[[str, str], str | None] | None,
     env: dict[str, str] | None = None,
+    engine_stage: EngineStage | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    deadline = deadline or EngineRuntimeDeadline(label, None)
-    with deferred_owned_process_signals():
-        proc = subprocess.Popen(
-            args,
-            cwd=cwd,
-            stdin=subprocess.PIPE if input_text is not None else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding=SUBPROCESS_TEXT_ENCODING,
-            errors=SUBPROCESS_TEXT_ERRORS,
-            bufsize=1,
-            env=env,
-            **process_group_popen_kwargs(),
-        )
-        register_owned_process(proc)
     stdout_parts: list[str] = []
+    terminal = "collector_failure"
     try:
-        return collect_streamed_process(
-            proc,
-            args,
-            input_text=input_text,
-            label=label,
-            heartbeat_seconds=heartbeat_seconds,
-            deadline=deadline,
-            stream_display=stream_display,
-            stdout_parts=stdout_parts,
-        )
-    except EngineInterrupted as exc:
-        exc.stdout = "".join(stdout_parts)
+        deadline = deadline or EngineRuntimeDeadline(label, None)
+        with deferred_owned_process_signals():
+            proc = subprocess.Popen(
+                args,
+                cwd=cwd,
+                stdin=subprocess.PIPE if input_text is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding=SUBPROCESS_TEXT_ENCODING,
+                errors=SUBPROCESS_TEXT_ERRORS,
+                bufsize=1,
+                env=env,
+                **process_group_popen_kwargs(),
+            )
+            register_owned_process(proc)
+        collection_entered = False
+        try:
+            if engine_stage is not None:
+                try:
+                    engine_stage.seen("launch_returned")
+                except Exception:
+                    pass  # Optional observation cannot bypass owned-process cleanup.
+            collection_entered = True
+            result = collect_streamed_process(
+                proc,
+                args,
+                input_text=input_text,
+                label=label,
+                heartbeat_seconds=heartbeat_seconds,
+                deadline=deadline,
+                stream_display=stream_display,
+                engine_stage=engine_stage,
+                stdout_parts=stdout_parts,
+            )
+            terminal = "engine_timeout" if isinstance(result, TimedOutEngineProcess) else "returned"
+            return result
+        except EngineInterrupted as exc:
+            exc.stdout = "".join(stdout_parts)
+            raise
+        finally:
+            try:
+                if not deadline.terminated:
+                    terminate_process_group(proc)
+            finally:
+                try:
+                    if not collection_entered:
+                        # No collector readers/writer took ownership of these pipes.
+                        try:
+                            if proc.stdin is not None:
+                                try:
+                                    proc.stdin.close()
+                                except Exception:
+                                    pass
+                        finally:
+                            try:
+                                if proc.stdout is not None:
+                                    try:
+                                        proc.stdout.close()
+                                    except Exception:
+                                        pass
+                            finally:
+                                if proc.stderr is not None:
+                                    try:
+                                        proc.stderr.close()
+                                    except Exception:
+                                        pass
+                finally:
+                    unregister_owned_process(proc)
+    except (EngineInterrupted, KeyboardInterrupt):
+        terminal = "interrupted"
+        raise
+    except Exception:
+        terminal = "collector_failure"
         raise
     finally:
-        if not deadline.terminated:
-            terminate_process_group(proc)
-        unregister_owned_process(proc)
+        if engine_stage is not None:
+            try:
+                engine_stage.finish(terminal)
+            except Exception:
+                pass  # Preserve the primary result or active exception.
 
 
 def collect_streamed_process(
@@ -1676,6 +1881,7 @@ def collect_streamed_process(
     deadline: EngineRuntimeDeadline,
     stream_display: Callable[[str, str], str | None] | None,
     stdout_parts: list[str] | None = None,
+    engine_stage: EngineStage | None = None,
 ) -> subprocess.CompletedProcess[str]:
     started = time.monotonic()
     events: queue.Queue[tuple[str, str | None]] = queue.Queue()
@@ -1685,7 +1891,19 @@ def collect_streamed_process(
     def read_stream(name: str, stream: Any) -> None:
         try:
             for line in iter(stream.readline, ""):
+                if engine_stage is not None:
+                    try:
+                        engine_stage.seen(name + "_text_read")
+                    except Exception:
+                        pass
                 events.put((name, line))
+        except Exception:
+            if engine_stage is not None:
+                try:
+                    engine_stage.reader_failed()
+                except Exception:
+                    pass  # Re-raise the original reader error below.
+            raise
         finally:
             stream.close()
             events.put((name, None))
@@ -1728,11 +1946,28 @@ def collect_streamed_process(
             stdout_parts.append(line)
         else:
             stderr_parts.append(line)
+        if engine_stage is not None and stream_display is not None:
+            try:
+                engine_stage.seen(name + "_delivered_to_display")
+            except Exception:
+                pass
         display = stream_display(name, line) if stream_display else line
         if display:
             target = sys.stdout if name == "stdout" else sys.stderr
-            target.write(stream_display_escape(display))
+            display_text = stream_display_escape(display)
+            written = target.write(display_text)
             target.flush()
+            try:
+                # ProxyRedactedOutput acknowledges input even for suppression or
+                # downstream short writes. Its return cannot prove full delivery.
+                if (not isinstance(target, ProxyRedactedOutput)
+                        and written == len(display_text) and engine_stage is not None
+                        and isinstance(stream_display, CodexStreamDisplay)
+                        and stream_display.engine_stage is engine_stage
+                        and stream_display.stage_generated):
+                    engine_stage.display(name, flushed=True)
+            except Exception:
+                pass
 
     if not deadline.terminated:
         for thread in threads:
@@ -5529,6 +5764,15 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                     auth_config=auth_config,
                     image_paths=image_paths,
                 )
+                carrier = getattr(args, "_engine_stage", None)
+                engine_stage = None
+                if carrier is not None and args.stream_engine_output:
+                    try:
+                        engine_stage = carrier.claim()
+                    except Exception:
+                        # A failed claim still consumes the first-process scope.
+                        # The carrier is shared by later reviewer namespace copies.
+                        carrier._claimed = True
                 result = None
                 interrupted_stdout = ""
                 try:
@@ -5539,7 +5783,8 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                         label="codex",
                         max_runtime_seconds=getattr(args, "engine_timeout_seconds", None),
                         stream_output=args.stream_engine_output,
-                        stream_display=CodexStreamDisplay(suppress_diagnostics=command_auth) if args.stream_engine_output else None,
+                        stream_display=CodexStreamDisplay(suppress_diagnostics=command_auth, engine_stage=engine_stage) if args.stream_engine_output else None,
+                        engine_stage=engine_stage,
                         env=codex_runtime_env(
                             repo,
                             runtime_root,
@@ -6329,13 +6574,18 @@ def run_kimi(args: argparse.Namespace, repo: Path, prompt: str) -> str:
 
 
 class CodexStreamDisplay:
-    def __init__(self, *, activity_seconds: int = 20, suppress_diagnostics: bool = False) -> None:
+    def __init__(self, *, activity_seconds: int = 20, suppress_diagnostics: bool = False, engine_stage: EngineStage | None = None) -> None:
+        self.engine_stage = engine_stage
+        self.stage_generated = False
+        self.stage_stream = "stdout"
         self.activity_seconds = activity_seconds
         self.suppress_diagnostics = suppress_diagnostics
         self.hidden_events = 0
         self.last_visible = time.monotonic()
 
     def __call__(self, name: str, line: str) -> str | None:
+        self.stage_generated = False
+        self.stage_stream = name
         if name != "stdout":
             return self.hidden_activity() if self.suppress_diagnostics else stream_display_escape(line)
         try:
@@ -6344,15 +6594,32 @@ class CodexStreamDisplay:
             return self.hidden_activity() if self.suppress_diagnostics else self.visible(line)
         if not isinstance(event, dict):
             return self.hidden_activity()
+        if self.engine_stage is not None:
+            try:
+                self.engine_stage.seen("stdout_json_object_seen")
+            except Exception:
+                pass
         event_type = event.get("type")
         if event_type == "thread.started":
-            return self.visible(f"codex thread: {event.get('thread_id', '<unknown>')}\n")
+            try:
+                self.recognized_stage()
+            except Exception:
+                pass
+            return self.stage_visible(f"codex thread: {event.get('thread_id', '<unknown>')}\n")
         if event_type == "turn.started":
-            return self.visible("codex turn started\n")
+            try:
+                self.recognized_stage()
+            except Exception:
+                pass
+            return self.stage_visible("codex turn started\n")
         if event_type == "turn.completed":
+            try:
+                self.recognized_stage()
+            except Exception:
+                pass
             usage = event.get("usage")
             message = format_codex_usage(usage) + "\n" if isinstance(usage, dict) else "codex turn completed\n"
-            return self.visible(self.flush_hidden() + message)
+            return self.stage_visible(self.flush_hidden() + message)
         item = event.get("item")
         if isinstance(item, dict) and item.get("type") == "agent_message" and isinstance(item.get("text"), str):
             return self.visible(self.flush_hidden() + item["text"].rstrip() + "\n")
@@ -6369,7 +6636,35 @@ class CodexStreamDisplay:
             return ""
         count = self.hidden_events
         self.hidden_events = 0
-        return f"codex activity: {count} hidden tool/status events\n"
+        text = f"codex activity: {count} hidden tool/status events\n"
+        try:
+            self.generated_stage()
+        except Exception:
+            pass
+        return text
+
+    def recognized_stage(self) -> None:
+        if self.engine_stage is not None:
+            try:
+                self.engine_stage.seen("stdout_stage_type_seen")
+            except Exception:
+                pass
+
+    def stage_visible(self, text: str) -> str:
+        display = self.visible(text)
+        try:
+            self.generated_stage()
+        except Exception:
+            pass
+        return display
+
+    def generated_stage(self) -> None:
+        self.stage_generated = True
+        if self.engine_stage is not None:
+            try:
+                self.engine_stage.display(self.stage_stream)
+            except Exception:
+                pass
 
     def visible(self, text: str) -> str:
         self.last_visible = time.monotonic()
@@ -7069,6 +7364,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", help="Write human output to a file as well as stdout.")
     parser.add_argument("--json-output", help="Write validated structured review JSON.")
+    parser.add_argument("--engine-stage-dir", help="Opt in to a closed local diagnostic for the first streamed Codex process; requires a fresh private local directory. Never a provider receipt or review verdict.")
     parser.add_argument("--status-output", help="Write a versioned status sidecar, including reviewer_unavailable; does not change report JSON or exit codes.")
     parser.add_argument(
         "--stream-engine-output",
@@ -7590,6 +7886,7 @@ def reject_repo_output_paths(args: argparse.Namespace, repo: Path) -> None:
         ("--json-output", getattr(args, "json_output", None)),
         ("--output", getattr(args, "output", None)),
         ("--status-output", getattr(args, "status_output", None)),
+        ("--engine-stage-dir", getattr(args, "engine_stage_dir", None)),
     ):
         if not value:
             continue
@@ -7676,6 +7973,26 @@ def main() -> int:
 
 def main_impl() -> int:
     args = parse_args()
+    stage = None
+    if (getattr(args, "engine_stage_dir", None) and args.engine == "codex"
+            and args.stream_engine_output and not args.dry_run):
+        try:
+            stage = EngineStage()
+            args._engine_stage = stage
+        except Exception:
+            stage = None  # Optional allocation must not prevent primary work.
+    try:
+        return main_with_args(args)
+    finally:
+        if stage is not None:
+            try:
+                persist_engine_stage(args.engine_stage_dir, stage)
+            except Exception:
+                pass  # Also isolate failures in persistence finalization.
+
+
+
+def main_with_args(args: argparse.Namespace) -> int:
     reviewers = reviewer_args(args)
     if not preflight_git():
         return 2

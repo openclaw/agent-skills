@@ -299,6 +299,37 @@ There is no default pass ceiling. `--engine-timeout-seconds` remains an optional
 deadline per process attempt. Pass counts, prompt bytes, and deadlines are not
 token hard caps; they do not bound model reasoning or tool use.
 
+## Local stage diagnostic
+
+Use `--engine-stage-dir /outside/repo/fresh-private-directory` with
+`--stream-engine-output` to observe the first streamed Codex process. The caller
+must create and exclusively hold a fresh directory with mode `0700` on responsive
+local POSIX storage. The helper never creates the directory or overwrites an
+existing `engine-stage.json`. The option has no environment-variable activation
+and produces no observation for other engines, buffered output or dry runs.
+
+The separate sidecar contains only closed booleans and enums, at most 4096 bytes.
+It reports local launch, read, parser and display observations plus that first
+process's terminal state. Later retries and passes do not update it. Its terminal
+can differ from the overall review outcome. `spoofable` is always true;
+`provider_receipt` and `acceptance` are always false. Missing or false observations
+mean unknown. They never prove provider activity, native initialization or review
+acceptance. The normal redaction wrapper conservatively leaves flushed-display
+observations unknown, even when visible output succeeds.
+
+Ordinary observation and persistence failures preserve the primary result.
+Persistence rejects repository paths, symlinks, unsafe ownership and permissions,
+and publishes without overwriting existing names. Failed name cleanup can leave
+a private `.engine-stage.partial`; failed descriptor closure can remain unresolved.
+Ambiguous closes are not retried. Cancellation still propagates, and a new cleanup
+cancellation can replace a pending exception after remaining cleanup attempts.
+The contract assumes ordinary descriptor acquisition and assignment, trusted
+caller custody and responsive local storage. It does not cover hostile same-user
+interference, concurrent descriptor reuse, arbitrary instruction interruption,
+stalled or network filesystems, or crash durability. Keep custody when clearing a
+failed partial file. This diagnostic does not change reports, usage, deadlines,
+exit codes or reviewer isolation.
+
 ## Results
 
 `--output`, `--json-output`, and `--status-output` paths must be outside the
