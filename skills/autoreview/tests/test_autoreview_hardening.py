@@ -5927,6 +5927,8 @@ os.execv(target, [str(target), *sys.argv[1:]])
             env = os.environ.copy()
             env.update(
                 {
+                    # Select this PATH fixture even when the caller pins CODEX_BIN.
+                    "CODEX_BIN": "codex",
                     "CODEX_HOME": str(source_home),
                     "PATH": f"{launcher_dir}{os.pathsep}{env['PATH']}",
                 }
