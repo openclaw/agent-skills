@@ -1015,6 +1015,317 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 yield repo, sends, stdout, stderr
 
+    @contextlib.contextmanager
+    def committed_context_fixture(self, *options, path="src/token_count.py",
+                                  content=b"def count_tokens(): return 7\r\n", setup=None):
+        with self.preparation_fixture(
+            "--mode", "branch", "--base", "HEAD^", "--source-context", path, *options,
+        ) as fixture:
+            repo = fixture[0]
+            source = repo / path
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(content)
+            git(repo, "add", "--", path)
+            if setup:
+                setup(repo, source)
+            git(repo, "commit", "--allow-empty", "-qm", "source context")
+            git(repo, "add", "source.md")
+            git(repo, "commit", "-qm", "selected change")
+            yield fixture
+
+    def test_source_context_uses_reviewed_blob_not_working_copy_or_current_head(self):
+        for mode in ("branch", "commit"):
+            with self.subTest(mode=mode), self.committed_context_fixture() as (repo, sends, *_):
+                commit = git(repo, "rev-parse", "HEAD").strip()
+                oid = git(repo, "rev-parse", "HEAD:src/token_count.py").strip()
+                source = repo / "src/token_count.py"
+                original = source.read_bytes().decode()
+                if mode == "commit":
+                    source.write_text("newer committed bytes\n")
+                    git(repo, "commit", "-qam", "later commit outside selected target")
+                source.write_text("dirty checkout bytes must never be context\n")
+                options = ["--mode", mode, "--commit", commit]
+                with mock.patch.object(sys, "argv", [*sys.argv, *options]):
+                    self.assertEqual(self.helper["main_impl"](), 0)
+                self.assertEqual(len(sends), 1)
+                self.assertIn(original, sends[0])
+                self.assertIn(f"commit={commit} blob={oid} mode=100644; context only", sends[0])
+                self.assertNotIn("dirty checkout bytes", sends[0])
+                self.assertNotIn("newer committed bytes", sends[0])
+                self.assertNotIn("src/token_count.py", sends[0].split("# Change Bundle\n", 1)[1])
+
+    def test_source_context_does_not_relax_existing_evidence_roles(self):
+        for role in ("--dataset", "--prompt-file"):
+            with self.subTest(role=role), self.committed_context_fixture(
+                role, "src/token_count.py",
+            ) as (_repo, sends, *_):
+                with self.assertRaisesRegex(SystemExit, "sensitive filename"):
+                    self.helper["main_impl"]()
+                self.assertFalse(sends)
+
+    def test_source_context_requires_committed_review_mode(self):
+        for mode in ("local", "uncommitted", "auto"):
+            with self.subTest(mode=mode), self.committed_context_fixture(
+                "--mode", mode,
+            ) as (repo, sends, *_):
+                (repo / "source.md").write_text("dirty source\n")
+                with self.assertRaisesRegex(SystemExit, "requires a committed branch or commit review"):
+                    self.helper["main_impl"]()
+                self.assertFalse(sends)
+
+    def test_source_context_retains_strict_directories_stores_and_keyfiles(self):
+        for path in (
+            "private/parser.py", "credentials/prod.py", "src/secrets/runtime.ts",
+            "service-account/client.ts", ".aws/config", ".ssh/client.py",
+            ".docker/Dockerfile", ".config/gcloud/client.py", "tokens/session.json",
+            "src/auth-token.json", "src/.env", "src/.netrc", "src/.git-credentials",
+            "keys/id_ed25519", "keys/signing.pem", "keys/signing.p12", "keys/signing.key",
+        ):
+            with self.subTest(path=path), self.committed_context_fixture(path=path) as (_repo, sends, *_):
+                with self.assertRaisesRegex(SystemExit, "sensitive --source-context"):
+                    self.helper["main_impl"]()
+                self.assertFalse(sends)
+
+    def test_source_context_rejects_unsafe_or_absent_committed_inputs_before_engine(self):
+        for kind, diagnostic in (
+            ("untracked", "absent from the reviewed commit"),
+            ("staged only", "absent from the reviewed commit"),
+            ("missing", "evidence changed or became unreadable"),
+            ("tree", "regular checkout path"),
+            ("symlink mode", "unsafe mixed source mode"),
+            ("gitlink mode", "unsafe mixed source mode"),
+            ("binary", "binary file"), ("non-UTF8", "non-UTF-8 file"),
+        ):
+            def setup(repo, source):
+                if kind in ("untracked", "staged only"):
+                    git(repo, "rm", "--cached", "--", "src/token_count.py")
+                elif kind in ("symlink mode", "gitlink mode"):
+                    mode = "120000" if kind == "symlink mode" else "160000"
+                    oid = git(repo, "rev-parse", ":src/token_count.py" if mode == "120000" else "HEAD").strip()
+                    git(repo, "update-index", "--cacheinfo", f"{mode},{oid},src/token_count.py")
+
+            content = {"binary": b"source\0data", "non-UTF8": b"source\xffdata"}.get(kind, b"safe source\n")
+            with self.subTest(kind=kind), self.committed_context_fixture(
+                content=content, setup=setup,
+            ) as (repo, sends, *_):
+                source = repo / "src/token_count.py"
+                if kind == "missing":
+                    source.unlink()
+                elif kind == "tree":
+                    source.unlink()
+                    source.mkdir()
+                elif kind == "staged only":
+                    git(repo, "add", "src/token_count.py")
+                with self.assertRaisesRegex(SystemExit, diagnostic):
+                    self.helper["main_impl"]()
+                self.assertFalse(sends)
+
+    def test_source_context_rejects_nonrelative_paths_and_wrong_provenance(self):
+        with self.committed_context_fixture() as (repo, sends, *_):
+            capture = self.helper["capture_source_context"]
+            commit = git(repo, "rev-parse", "HEAD").strip()
+            for path in (str(repo / "src/token_count.py"), "../src/token_count.py", ""):
+                with self.subTest(path=path), self.assertRaisesRegex(SystemExit, "repo-relative"):
+                    capture(repo, path, commit)
+            for ref in ("HEAD", "HEAD^", "0" * 40, git(repo, "rev-parse", "HEAD^{tree}").strip()):
+                with self.subTest(ref=ref), self.assertRaises(SystemExit):
+                    capture(repo, "src/token_count.py", ref)
+            absent_commit = git(repo, "rev-parse", "HEAD^^").strip()
+            with self.assertRaisesRegex(SystemExit, "absent from the reviewed commit"):
+                capture(repo, "src/token_count.py", absent_commit)
+            original = self.helper["read_git_source"]
+
+            def corrupt(*args):
+                return original(*args)._replace(content="wrong object bytes\n")
+
+            with mock.patch.dict(capture.__globals__, {"read_git_source": corrupt}):
+                with self.assertRaisesRegex(SystemExit, "do not match the committed blob"):
+                    self.helper["main_impl"]()
+            self.assertFalse(sends)
+
+    def test_source_context_revalidation_rejects_stale_publication_and_later_passes(self):
+        for timing in ("capture", "preparation", "review", "between passes"):
+            with self.subTest(timing=timing), self.committed_context_fixture() as (repo, sends, out, _err):
+                source = repo / "src/token_count.py"
+                original_bytes = source.read_bytes()
+                output = repo.parent / "result.json"
+
+                def mutate():
+                    info = source.stat()
+                    source.write_bytes(original_bytes.replace(b"7", b"8"))
+                    os.utime(source, ns=(info.st_atime_ns, info.st_mtime_ns))
+
+                name = {"capture": "read_git_source", "preparation": "prepare_review_prompts"}.get(timing, "run_engine")
+                original = self.helper["main_impl"].__globals__[name]
+
+                def mutation(*args):
+                    result = original(*args)
+                    mutate()
+                    return result
+
+                patches = {name: mutation}
+                if timing == "between passes":
+                    prepare = self.helper["prepare_review_prompts"]
+                    patches["prepare_review_prompts"] = lambda *args: prepare(*args) * 2
+                with mock.patch.dict(self.helper["main_impl"].__globals__, patches), \
+                        mock.patch.object(sys, "argv", [*sys.argv, "--json-output", str(output)]):
+                    with self.assertRaisesRegex(SystemExit, "context changed|evidence changed"):
+                        self.helper["main_impl"]()
+                self.assertEqual(len(sends), int(timing in ("review", "between passes")))
+                self.assertFalse(output.exists())
+                self.assertNotIn("autoreview scoped-clean", out.getvalue())
+
+    def test_source_context_rejects_anchored_and_resolved_external_paths_before_read(self):
+        with self.committed_context_fixture() as (repo, _sends, *_):
+            capture = self.helper["capture_source_context"]
+            commit = git(repo, "rev-parse", "HEAD").strip()
+            # Drive-relative and root-relative Windows paths are not absolute,
+            # but joining them can discard the repository anchor.
+            with mock.patch.dict(capture.__globals__, {"Path": PureWindowsPath}):
+                for path in ("C:token_count.py", r"\src\token_count.py"):
+                    with self.subTest(path=path), self.assertRaisesRegex(SystemExit, "repo-relative"):
+                        capture(repo, path, commit)
+            original_resolve = Path.resolve
+            source = repo / "src/token_count.py"
+
+            def resolve(path, *args, **kwargs):
+                # A junction/reparse-point escape must not reach the content reader.
+                return repo.parent / "outside.py" if path == source else original_resolve(path, *args, **kwargs)
+
+            fingerprint = mock.Mock(side_effect=AssertionError("must not read an external file"))
+            with mock.patch.object(Path, "resolve", resolve), \
+                    mock.patch.dict(capture.__globals__, {"source_file_fingerprint": fingerprint}):
+                with self.assertRaisesRegex(SystemExit, "inside the reviewed repository"):
+                    capture(repo, "src/token_count.py", commit)
+            fingerprint.assert_not_called()
+
+    def test_source_context_revalidates_topology_before_send_and_publication(self):
+        for change in ("replace", "replace parent", "leaf symlink", "parent symlink"):
+            if "symlink" in change and os.name == "nt":
+                continue
+            for timing in ("preparation", "review"):
+                with self.subTest(change=change, timing=timing), self.committed_context_fixture() as (repo, sends, *_):
+                    source = repo / "src/token_count.py"
+                    output = repo.parent / "result.json"
+                    name = "prepare_review_prompts" if timing == "preparation" else "run_engine"
+                    original = self.helper["main_impl"].__globals__[name]
+
+                    def swap(*args):
+                        result = original(*args)
+                        if change == "replace":
+                            replacement = repo.parent / "same.py"
+                            replacement.write_bytes(source.read_bytes())
+                            replacement.replace(source)
+                        elif change == "replace parent":
+                            source.parent.rename(repo.parent / "old-src")
+                            source.parent.mkdir()
+                            (repo.parent / "old-src/token_count.py").rename(source)
+                        elif change == "leaf symlink":
+                            destination = repo.parent / "same.py"
+                            source.rename(destination)
+                            source.symlink_to(destination)
+                        else:
+                            destination = repo.parent / "same-src"
+                            source.parent.rename(destination)
+                            source.parent.symlink_to(destination, target_is_directory=True)
+                        return result
+
+                    with mock.patch.dict(self.helper["main_impl"].__globals__, {name: swap}), \
+                            mock.patch.object(sys, "argv", [*sys.argv, "--json-output", str(output)]):
+                        with self.assertRaisesRegex(SystemExit, "evidence changed"):
+                            self.helper["main_impl"]()
+                    self.assertEqual(len(sends), int(timing == "review"))
+                    self.assertFalse(output.exists())
+
+    def test_source_context_partitioning_preserves_full_bytes_and_provenance(self):
+        content = ("# context \U0001f99e\r\n" * 10_000 + "tail without newline \t").encode()
+        with self.committed_context_fixture(content=content) as (repo, _sends, *_):
+            captured = self.helper["branch_bundle"](repo, "HEAD^")
+            evidence = self.helper["capture_source_context_inputs"](
+                argparse.Namespace(source_context=["src/token_count.py"]), repo, captured,
+                self.helper["EvidenceInputs"]("", [], []),
+            )
+            batches = self.helper["split_review_datasets"](evidence.datasets, 600)
+            recovered = b""
+            for batch in batches:
+                self.assertLessEqual(len(self.helper["render_datasets"](batch).encode()), 600)
+                for item in batch:
+                    self.assertEqual(item.byte_offset, len(recovered))
+                    self.assertEqual(item.provenance, evidence.datasets[0].provenance)
+                    recovered += item.content.encode()
+            self.assertEqual(recovered, content)
+            prepare = self.helper["prepare_review_prompts"]
+            prompts = prepare(repo, "branch", "HEAD^", captured, "complete instructions", evidence.datasets, 30_000)
+            self.assertGreater(len(prompts), 1)
+            recovered = []
+            for prompt in prompts:
+                self.assertLessEqual(len(prompt.encode()), 30_000)
+                self.assertIn("complete instructions", prompt)
+                self.assertIn("Source-context paths are not finding targets", prompt)
+                self.assertIn(f"commit={captured.commit}", prompt)
+                self.assertIn("[Committed source:", prompt)
+                prefix, change = prompt.split("\n\n# Change Bundle\n", 1)
+                self.assertEqual(change, captured.text)
+                recovered.append(prefix.split("]\n", 2)[-1])
+            # Fragment boundaries come from owned metadata, never source headings.
+            self.assertEqual("".join(recovered).encode(), content)
+
+    def test_source_context_sha256_empty_executable_blob(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = Path(tempdir) / "repo"
+            repo.mkdir()
+            initialized = fixture_git(repo, "init", "-q", "--object-format=sha256", check=False,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if initialized.returncode:
+                self.skipTest("Git does not support SHA-256 repositories")
+            git(repo, "config", "user.name", "Autoreview Test")
+            git(repo, "config", "user.email", "autoreview@example.invalid")
+            (repo / "token_count.py").write_bytes(b"")
+            git(repo, "add", "token_count.py")
+            git(repo, "update-index", "--chmod=+x", "token_count.py")
+            git(repo, "commit", "-qm", "empty executable source")
+            captured = self.helper["commit_bundle"](repo, "HEAD")
+            record = self.helper["capture_source_context"](repo, "token_count.py", captured.commit)
+            self.assertEqual(len(record.commit), 64)
+            self.assertEqual(record.source.identity, "git:" + git(repo, "rev-parse", "HEAD:token_count.py").strip() + ":100755")
+            self.assertEqual(record.source.content, "")
+            self.helper["verify_evidence"](repo, [record])
+
+    def test_source_context_dry_run_uses_blob_without_executable_conversion(self):
+        with self.committed_context_fixture("--dry-run") as (repo, sends, out, _err):
+            converter = repo / "converter.py"
+            marker = repo.parent / "converter-ran"
+            converter.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
+            command = f'"{sys.executable}" "{converter}"'
+            for key in ("clean", "smudge", "process"):
+                git(repo, "config", f"filter.test.{key}", command)
+            git(repo, "config", "filter.test.required", "true")
+            (repo / ".gitattributes").write_text("src/token_count.py filter=test\n")
+            self.assertEqual(self.helper["main_impl"](), 0)
+            self.assertIn("prompt: OK", out.getvalue())
+            self.assertFalse(sends)
+            self.assertFalse(marker.exists())
+
+    def test_source_context_never_expands_finding_authority(self):
+        with self.committed_context_fixture() as (repo, _sends, *_):
+            output = repo.parent / "report.json"
+            finding = {
+                "title": "Context-only defect", "body": "This is outside the change.",
+                "priority": "P0", "confidence": 0.99, "category": "bug",
+                "code_location": {"file_path": "src/token_count.py", "line": 1},
+            }
+            report = {"findings": [finding], "overall_correctness": "patch is incorrect",
+                      "overall_explanation": "Context-only observation", "overall_confidence": 0.9,
+                      "review_completion": "complete"}
+            with mock.patch.dict(self.helper["main_impl"].__globals__, {
+                "run_engine": lambda *_args: json.dumps(report),
+            }), mock.patch.object(sys, "argv", [*sys.argv, "--json-output", str(output)]):
+                self.assertEqual(self.helper["main_impl"](), 2)
+            result = json.loads(output.read_text())
+            self.assertEqual(result["findings"], [])
+            self.assertEqual(result["scope_rejected_findings"], [finding])
+            self.assertEqual(result["review_status"], "incomplete")
+
     def test_preparation_reuses_untracked_capture_and_keeps_three_full_snapshots(self):
         for explicit in (False, True):
             options = ("--dataset", "note.md") if explicit else ()
@@ -1293,6 +1604,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     captured = self.helper["build_bundle"](repo, target, "moving-base", "HEAD")
                 self.assertEqual(captured.paths, {"task.md"})
                 self.assertIn("+task change", captured.text)
+                self.assertEqual(captured.commit, head)
 
 
     def test_local_bundle_preserves_boundary_when_sensitive_diff_is_omitted(self) -> None:
@@ -1305,7 +1617,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             path.write_text("TOKEN=changed-placeholder\n", encoding="utf-8")
             git(repo, "add", path.name)
 
-            bundle, _paths, _mixed, _spans = self.helper["local_bundle"](repo)
+            bundle, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo)
 
             self.assertIn(self.helper["REVIEW_SECURITY_OMISSION"], bundle)
 
@@ -1323,7 +1635,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 path.write_text("placeholder=true\n", encoding="utf-8")
                 (repo / "review.py").write_text("print('review me')\n", encoding="utf-8")
 
-                bundle, _paths, _mixed, _spans = self.helper["local_bundle"](repo)
+                bundle, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo)
 
                 self.assertIn("# Review Input Omissions", bundle)
                 self.assertIn(self.helper["REVIEW_SECURITY_OMISSION"], bundle)
@@ -1370,7 +1682,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.helper["local_bundle"].__globals__,
                 {"read_file_bytes": read_once},
             ):
-                bundle, _paths, _mixed, _spans = self.helper["local_bundle"](repo)
+                bundle, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo)
 
             expected_record = json.dumps("review me" + os.linesep)
             self.assertIn(
@@ -1662,7 +1974,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             snapshot = self.helper["source_tree_snapshot"](repo)
             git(repo, "update-ref", "refs/heads/review-base", "HEAD")
             self.assertEqual(self.helper["source_tree_snapshot"](repo), snapshot)
-            bundle, _paths, _mixed, _spans = self.helper["local_bundle"](repo, pinned)
+            bundle, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo, pinned)
             self.assertIn("+committed task change", bundle)
             self.assertEqual(
                 self.helper["build_bundle"](repo, target, pinned, "HEAD").paths,
@@ -1684,7 +1996,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 if staged:
                     git(repo, "add", safe)
                 with self.subTest(staged=staged):
-                    bundle, _paths, _mixed, _spans = self.helper["local_bundle"](repo)
+                    bundle, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo)
                     self.assertIn("struct CredentialFile", bundle)
                     self.assertIn(safe, self.helper["local_bundle"](repo).paths)
                     for label in ("--dataset", "--prompt-file"):
@@ -3142,14 +3454,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             (repo / ".env").write_text("placeholder=true\n", encoding="utf-8")
             (repo / "base.txt").write_text("base\nreview me\n", encoding="utf-8")
             git(repo, "add", ".env", "base.txt")
-            local, _paths, _mixed, _spans = self.helper["local_bundle"](repo)
+            local, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo)
             self.assertIn(self.helper["REVIEW_SECURITY_OMISSION"], local)
             self.assertNotIn(".env", local)
             self.assertNotIn("placeholder=true", local)
             self.assertIn("+review me", local)
 
             git(repo, "commit", "-q", "-m", "sensitive path")
-            for bundle, paths, _mixed, _spans in (
+            for bundle, paths, _mixed, _spans, _commit in (
                 self.helper["branch_bundle"](repo, base),
                 self.helper["commit_bundle"](repo, "HEAD"),
             ):
@@ -3169,16 +3481,16 @@ class AutoreviewHardeningTests(unittest.TestCase):
             workflow = repo / ".github" / "workflows" / "secret-scan.yml"
             workflow.parent.mkdir(parents=True)
             workflow.write_text("name: Secret scan\n", encoding="utf-8")
-            untracked_bundle, _paths, _mixed, _spans = self.helper["local_bundle"](repo)
+            untracked_bundle, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo)
             self.assertIn("secret-scan.yml", untracked_bundle)
 
             git(repo, "add", str(workflow.relative_to(repo)))
-            tracked_bundle, _paths, _mixed, _spans = self.helper["local_bundle"](repo)
+            tracked_bundle, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo)
             self.assertIn("secret-scan.yml", tracked_bundle)
 
             git(repo, "commit", "-q", "-m", "add secret scanner")
-            branch_bundle, _paths, _mixed, _spans = self.helper["branch_bundle"](repo, base)
-            commit_bundle, _paths, _mixed, _spans = self.helper["commit_bundle"](repo, "HEAD")
+            branch_bundle, _paths, _mixed, _spans, _commit = self.helper["branch_bundle"](repo, base)
+            commit_bundle, _paths, _mixed, _spans, _commit = self.helper["commit_bundle"](repo, "HEAD")
             self.assertIn("secret-scan.yml", branch_bundle)
             self.assertIn("secret-scan.yml", commit_bundle)
 
@@ -3246,7 +3558,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             path.parent.mkdir()
             path.write_text(source, encoding="utf-8")
 
-            bundle, _paths, _mixed, _spans = self.helper["local_bundle"](repo)
+            bundle, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo)
 
             self.assertIn("ordinary-hardcoded-value-12345", bundle)
 
@@ -3518,7 +3830,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             git(repo, "add", "-u")
             git(repo, "commit", "-q", "-m", "delete template")
 
-            bundle, _paths, _mixed, _spans = self.helper["branch_bundle"](repo, base)
+            bundle, _paths, _mixed, _spans, _commit = self.helper["branch_bundle"](repo, base)
 
             self.assertIn("deleted file mode 100644", bundle)
             self.assertIn("------BEGIN [A-Z ]+-----", bundle)
@@ -3678,7 +3990,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
             path.write_text('const request = { token: String() };\n', encoding="utf-8")
 
-            bundle, _paths, _mixed, _spans = self.helper["local_bundle"](repo)
+            bundle, _paths, _mixed, _spans, _commit = self.helper["local_bundle"](repo)
 
             self.assertIn('-const request = { token: "test-token" };', bundle)
 
@@ -5845,6 +6157,7 @@ os.execv(target, [str(target), *sys.argv[1:]])
                 {
                     "CODEX_HOME": str(source_home),
                     "PATH": f"{launcher_dir}{os.pathsep}{env['PATH']}",
+                    "CODEX_BIN": "codex",
                 }
             )
 
