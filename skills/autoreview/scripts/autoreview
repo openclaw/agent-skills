@@ -1709,14 +1709,18 @@ def collect_streamed_process(
     stdin_thread = threading.Thread(target=write_stdin, daemon=True)
     stdin_thread.start()
     open_streams = 2
-    while open_streams:
+    while open_streams or proc.poll() is None:
         if deadline.expired():
             deadline.terminate(proc)
         if deadline.drain_expired():
             break
         try:
+            if not open_streams:
+                # Pipe EOF does not end the reviewer's process deadline.
+                proc.wait(timeout=deadline.wait_seconds(heartbeat_seconds))
+                continue
             name, line = events.get(timeout=deadline.wait_seconds(heartbeat_seconds))
-        except queue.Empty:
+        except (queue.Empty, subprocess.TimeoutExpired):
             if deadline.terminated or deadline.expired():
                 continue
             emit_heartbeat(label, started, proc)
@@ -5767,7 +5771,8 @@ def amp_review_plugin_source(
 
 def attest_amp_stream(output: str, review_root: Path) -> bool:
     events: list[dict[str, Any]] = []
-    for line_number, raw_line in enumerate(output.splitlines(), 1):
+    # JSONL uses LF; Unicode line separators may be JSON string data.
+    for line_number, raw_line in enumerate(output.split("\n"), 1):
         if not raw_line.strip():
             continue
         try:
@@ -6665,7 +6670,8 @@ def _report_from_events(events: list[Any]) -> dict[str, Any] | None:
 
 def extract_json_from_jsonl(text: str) -> dict[str, Any] | None:
     events: list[Any] = []
-    for line in text.splitlines():
+    # Keep Unicode string content intact while splitting protocol records.
+    for line in text.split("\n"):
         line = line.strip()
         if not line:
             continue

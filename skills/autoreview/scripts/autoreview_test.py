@@ -710,6 +710,8 @@ def amp_test_stream(
     tool_result_id: str = "amp-tool-use",
     tool_error: bool = False,
     tool_result_content: str | None = None,
+    final_text: str = "Completed.",
+    ensure_ascii: bool = True,
 ) -> str:
     if tool_input is None:
         tool_input = {}
@@ -728,7 +730,8 @@ def amp_test_stream(
                     "tools": ["autoreview_generate"] if tools is None else tools,
                     "mcp_servers": [] if mcp_servers is None else mcp_servers,
                     "agent_mode": "medium",
-                }
+                },
+                ensure_ascii=ensure_ascii,
             ),
             json.dumps(
                 {
@@ -739,7 +742,8 @@ def amp_test_stream(
                     },
                     "parent_tool_use_id": None,
                     "session_id": "amp-test-session",
-                }
+                },
+                ensure_ascii=ensure_ascii,
             ),
             json.dumps(
                 {
@@ -757,7 +761,8 @@ def amp_test_stream(
                     },
                     "parent_tool_use_id": None,
                     "session_id": "amp-test-session",
-                }
+                },
+                ensure_ascii=ensure_ascii,
             ),
             json.dumps(
                 {
@@ -775,27 +780,30 @@ def amp_test_stream(
                     },
                     "parent_tool_use_id": None,
                     "session_id": "amp-test-session",
-                }
+                },
+                ensure_ascii=ensure_ascii,
             ),
             json.dumps(
                 {
                     "type": "assistant",
                     "message": {
                         "role": "assistant",
-                        "content": [{"type": "text", "text": "Completed."}],
+                        "content": [{"type": "text", "text": final_text}],
                     },
                     "parent_tool_use_id": None,
                     "session_id": "amp-test-session",
-                }
+                },
+                ensure_ascii=ensure_ascii,
             ),
             json.dumps(
                 {
                     "type": "result",
                     "subtype": "success",
                     "is_error": False,
-                    "result": "Completed.",
+                    "result": final_text,
                     "session_id": "amp-test-session",
-                }
+                },
+                ensure_ascii=ensure_ascii,
             ),
         ]
     ) + "\n"
@@ -1103,6 +1111,64 @@ class AutoreviewAmpTests(unittest.TestCase):
         self.assertFalse(
             AUTOREVIEW.attest_amp_stream(amp_test_stream(cwd, tool_error=True), cwd)
         )
+
+    def test_amp_stream_attestation_preserves_unicode_json_strings(self) -> None:
+        cwd = Path("/tmp/amp-review-empty")
+        for separator in ("\u0085", "\u2028", "\u2029"):
+            final_text = f"Completed.{separator}Synthetic response."
+            escaped = amp_test_stream(cwd, final_text=final_text)
+            literal = amp_test_stream(cwd, final_text=final_text, ensure_ascii=False)
+            self.assertNotIn(separator, escaped)
+            self.assertIn(separator, literal)
+            escaped_events = [json.loads(line) for line in escaped.split("\n") if line]
+            literal_events = [json.loads(line) for line in literal.split("\n") if line]
+            self.assertEqual(len(escaped_events), 6)
+            self.assertEqual(escaped_events, literal_events)
+            for encoding, stream in (("escaped", escaped), ("literal", literal)):
+                with self.subTest(separator=f"U+{ord(separator):04X}", encoding=encoding):
+                    self.assertTrue(AUTOREVIEW.attest_amp_stream(stream, cwd))
+
+    def test_amp_stream_attestation_keeps_line_framing_and_noise_guards(self) -> None:
+        cwd = Path("/tmp/amp-review-empty")
+        records = amp_test_stream(cwd).split("\n")[:-1]
+        for line_ending in ("\n", "\r\n"):
+            for blank_line in ("", " \t"):
+                framed = (line_ending + blank_line + line_ending).join(records)
+                framed = blank_line + line_ending + framed + line_ending + blank_line
+                with self.subTest(line_ending=repr(line_ending), blank_line=blank_line):
+                    self.assertTrue(AUTOREVIEW.attest_amp_stream(framed, cwd))
+                noisy = line_ending.join([blank_line, *records[:2], "not-json", *records[2:]])
+                with self.subTest(line_ending=repr(line_ending), noise=True), self.assertRaisesRegex(
+                    SystemExit, "amp isolation attestation failed: malformed stream JSON",
+                ):
+                    AUTOREVIEW.attest_amp_stream(noisy, cwd)
+
+    @unittest.skipIf(os.name == "nt", "Amp runtime is unsupported on native Windows")
+    def test_amp_review_result_preserves_unicode_stream_and_private_report(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-amp-unicode-test.") as tmpdir:
+            root = Path(tmpdir)
+            result_path = root / "result.json"
+            for separator in ("\u0085", "\u2028", "\u2029"):
+                explanation = f"Completed.{separator}Synthetic response."
+                report = {
+                    **FINAL_REPORT,
+                    "overall_explanation": explanation,
+                    "review_completion": "complete",
+                }
+                raw_report = json.dumps(report, ensure_ascii=False)
+                result_path.write_text(raw_report, encoding="utf-8")
+                result_path.chmod(0o600)
+                for ensure_ascii in (True, False):
+                    stream = amp_test_stream(
+                        root, final_text=explanation, ensure_ascii=ensure_ascii,
+                    )
+                    process = subprocess.CompletedProcess([], 0, stream, "")
+                    with self.subTest(separator=f"U+{ord(separator):04X}", ensure_ascii=ensure_ascii):
+                        output = AUTOREVIEW.amp_review_result(
+                            process, root, root / "error", result_path,
+                        )
+                        self.assertEqual(output, raw_report)
+                        self.assertEqual(json.loads(output), report)
 
     @unittest.skipIf(os.name == "nt", "Amp runtime is unsupported on native Windows")
     def test_amp_run_reports_timeout_before_stream_attestation(self) -> None:
