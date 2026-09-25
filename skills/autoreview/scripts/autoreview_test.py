@@ -410,10 +410,10 @@ class AutoreviewImageGitTests(unittest.TestCase):
 
 
 class AutoreviewPriorityTests(unittest.TestCase):
-    def test_default_priority_is_p0(self) -> None:
+    def test_default_priority_is_p2(self) -> None:
         with mock.patch.object(sys, "argv", ["autoreview"]):
             args = AUTOREVIEW.parse_args()
-        self.assertEqual(args.max_priority, "P0")
+        self.assertEqual(args.max_priority, "P2")
 
     def test_priority_filter_preserves_lower_findings_and_provider_verdict(self) -> None:
         report = copy.deepcopy(DRAFT_REPORT)

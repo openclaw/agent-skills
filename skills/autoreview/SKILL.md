@@ -119,9 +119,9 @@ source-provenance contract, not secret-content scanning.
 "$AUTOREVIEW" --mode branch --base origin/main --source-context-file src/token_count.py
 ```
 
-The default threshold is **P0 only**: material blockers to normal operation or
-safety. Use `--max-priority P1`, `P2`, or `P3` when the caller requests a wider
-review. Do not add unrelated redesign goals or prescribe file counts, reading
+The default threshold is **P2**: report actionable findings from P0 through P2.
+Use `--max-priority P0` or `P1` for a narrower review, or `P3` when the caller
+requests a wider review. Do not add unrelated redesign goals or prescribe file counts, reading
 sequences, or ritual extra passes. Historical blame requires a verified
 parent-relative patch; otherwise leave the attribution unknown.
 

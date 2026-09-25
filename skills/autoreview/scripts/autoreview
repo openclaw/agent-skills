@@ -7084,8 +7084,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-priority",
         choices=["P0", "P1", "P2", "P3"],
-        default=os.environ.get("AUTOREVIEW_MAX_PRIORITY", "P0"),
-        help="Widest finding priority to accept. Default: P0; lower priorities remain in audit output.",
+        default=os.environ.get("AUTOREVIEW_MAX_PRIORITY", "P2"),
+        help="Widest finding priority to accept. Default: P2; lower priorities remain in audit output.",
     )
     parser.add_argument("--output", help="Write human output to a file as well as stdout.")
     parser.add_argument("--json-output", help="Write validated structured review JSON.")
