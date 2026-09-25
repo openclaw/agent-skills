@@ -839,6 +839,50 @@ def amp_test_mcp_denial_result(
 
 
 class AutoreviewAmpTests(unittest.TestCase):
+    def test_amp_dry_run_and_runtime_reject_the_same_model_grammar(self) -> None:
+        for model, diagnostic in (
+            (None, "amp engine requires a model"),
+            ("", "amp engine requires a model"),
+            ("synthetic-model", "amp engine model must use a supported provider/model format"),
+            ("unsupported/synthetic-model", "amp engine model must use a supported provider/model format"),
+        ):
+            args = argparse.Namespace(engine="amp", amp_bin="amp", model=model, thinking="high")
+            with self.subTest(model=model), mock.patch.object(
+                AUTOREVIEW, "find_command", return_value="/usr/bin/amp",
+            ), mock.patch.dict(AUTOREVIEW.ENGINE_ISOLATION_PROBES, {
+                "amp": lambda *_args: "/usr/bin/amp",
+            }), mock.patch.object(
+                AUTOREVIEW, "ensure_amp_isolation_supported", return_value="/usr/bin/amp",
+            ), mock.patch.object(AUTOREVIEW, "safe_temp_root") as staging:
+                self.assertEqual(AUTOREVIEW.resolve_engine_binary(args, Path.cwd()), (False, diagnostic))
+                with self.assertRaises(SystemExit) as caught:
+                    AUTOREVIEW.run_amp(args, Path.cwd(), "synthetic prompt")
+                self.assertEqual(str(caught.exception.code), diagnostic)
+                staging.assert_not_called()
+
+    def test_amp_dry_run_validates_the_resolved_model_without_changing_precedence(self) -> None:
+        valid, invalid = "openai/synthetic-model", "synthetic-model"
+        cases = (
+            ({}, [], "openai/gpt-5.6-sol", True),
+            ({}, ["--model", valid], valid, True),
+            ({}, ["--model", invalid], invalid, False),
+            ({"AUTOREVIEW_MODEL": invalid}, [], invalid, False),
+            ({"AUTOREVIEW_AMP_MODEL": invalid}, [], invalid, False),
+            ({"AUTOREVIEW_MODEL": invalid, "AUTOREVIEW_AMP_MODEL": valid}, [], valid, True),
+            ({"AUTOREVIEW_AMP_MODEL": invalid}, ["--model", valid], valid, True),
+            ({"AUTOREVIEW_AMP_MODEL": valid}, ["--model", invalid], invalid, False),
+            ({}, ["--model", invalid, "--model", "amp=" + valid], valid, True),
+        )
+        for env, options, expected_model, available in cases:
+            with self.subTest(env=env, options=options), mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(sys, "argv", ["autoreview", "--engine", "amp", "--dry-run", *options]), \
+                    mock.patch.object(AUTOREVIEW, "find_command", return_value="/usr/bin/amp"), \
+                    mock.patch.dict(AUTOREVIEW.ENGINE_ISOLATION_PROBES, {"amp": lambda *_args: "/usr/bin/amp"}):
+                reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+                self.assertEqual(reviewer.model, expected_model)
+                expected_error = None if available else "amp engine model must use a supported provider/model format"
+                self.assertEqual(AUTOREVIEW.resolve_engine_binary(reviewer, Path.cwd()), (available, expected_error))
+
     def test_amp_bin_cli_option_and_defaults(self) -> None:
         with mock.patch.object(
             sys,
