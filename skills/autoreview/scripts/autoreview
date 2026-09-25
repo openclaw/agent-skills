@@ -1709,14 +1709,18 @@ def collect_streamed_process(
     stdin_thread = threading.Thread(target=write_stdin, daemon=True)
     stdin_thread.start()
     open_streams = 2
-    while open_streams:
+    while open_streams or proc.poll() is None:
         if deadline.expired():
             deadline.terminate(proc)
         if deadline.drain_expired():
             break
         try:
+            if not open_streams:
+                # Pipe EOF does not end the reviewer's process deadline.
+                proc.wait(timeout=deadline.wait_seconds(heartbeat_seconds))
+                continue
             name, line = events.get(timeout=deadline.wait_seconds(heartbeat_seconds))
-        except queue.Empty:
+        except (queue.Empty, subprocess.TimeoutExpired):
             if deadline.terminated or deadline.expired():
                 continue
             emit_heartbeat(label, started, proc)
