@@ -4148,7 +4148,7 @@ def build_change_review_prompts(
     datasets: str,
     max_prompt_bytes: int = MAX_REVIEW_PROMPT_BYTES,
     max_passes: int | None = None,
-    *, min_change_bytes: int = 4,
+    *, min_change_bytes: int = 4, continuation_reserve: int = 4_096,
 ) -> list[str] | None:
     full_prompt = render_review_prompt(
         branch,
@@ -4173,7 +4173,7 @@ def build_change_review_prompts(
     content_limit = (
         max_prompt_bytes
         - utf8_size(empty_chunk_prompt)
-        - 4_096
+        - continuation_reserve
     )
     while content_limit >= min_change_bytes:
         chunks = split_review_bundle(bundle, content_limit)
@@ -4194,7 +4194,7 @@ def build_change_review_prompts(
         largest = max(utf8_size(prompt) for prompt in prompts)
         if largest <= max_prompt_bytes:
             return prompts
-        content_limit -= largest - max_prompt_bytes + 1_024
+        content_limit -= largest - max_prompt_bytes + (1_024 if continuation_reserve else 0)
     return None
 
 
@@ -4245,6 +4245,14 @@ def build_review_prompts(
             )
             if change_prompts is not None:
                 return change_prompts
+        # The reserve estimates continuation size; measured small chunks can
+        # still fit when intact evidence leaves less room than that estimate.
+        change_prompts = build_change_review_prompts(
+            branch, target, target_ref, bundle, extra_prompt, rendered_datasets,
+            max_prompt_bytes, min_change_bytes=4, continuation_reserve=0,
+        )
+        if change_prompts is not None:
+            return change_prompts
         raise SystemExit(
             "review instructions or intact context leave too little room for change chunks; "
             "reduce optional instructions or context without omitting required evidence"
@@ -4292,6 +4300,12 @@ def build_review_prompts(
                 )
                 if change_prompts is not None:
                     return change_prompts
+            change_prompts = build_change_review_prompts(
+                branch, target, target_ref, bundle, extra_prompt, rendered_datasets,
+                max_prompt_bytes, min_change_bytes=4, continuation_reserve=0,
+            )
+            if change_prompts is not None:
+                return change_prompts
             raise SystemExit(
                 "unable to partition the review bundle within the aggregate prompt limit"
             )
