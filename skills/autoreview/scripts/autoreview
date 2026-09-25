@@ -6563,19 +6563,8 @@ def extract_json(text: str) -> dict[str, Any]:
         raise SystemExit(f"review engine returned non-JSON output: {exc}\n{stripped[:2000]}")
     if isinstance(parsed, dict) and "findings" in parsed:
         return parsed
-    if isinstance(parsed, dict) and isinstance(parsed.get("structured_output"), dict):
-        return parsed["structured_output"]
-    if isinstance(parsed, dict) and isinstance(parsed.get("result"), dict):
-        result_object = parsed["result"]
-        if "findings" in result_object:
-            return result_object
-    if isinstance(parsed, dict) and isinstance(parsed.get("result"), str):
-        result_json = parse_json_candidate(parsed["result"])
-        if isinstance(result_json, dict) and "findings" in result_json:
-            return result_json
-        raise SystemExit(f"review engine result was not structured JSON:\n{parsed['result'][:2000]}")
-    if isinstance(parsed, list):
-        events_report = _report_from_events(parsed)
+    if isinstance(parsed, (dict, list)):
+        events_report = _report_from_events([parsed] if isinstance(parsed, dict) else parsed)
         if events_report:
             return events_report
     jsonl_report = extract_json_from_jsonl(stripped)
@@ -6591,13 +6580,15 @@ def _report_from_events(events: list[Any]) -> dict[str, Any] | None:
     (e.g. some `claude --output-format json` versions/configurations return
     [{type:system,init}, ..., {type:result,...}] rather than a bare object).
     """
-    terminal_candidates: list[str | dict[str, Any]] = []
+    terminal_event: dict[str, Any] | None = None
     candidates: list[str | dict[str, Any]] = []
     assistant_candidates: list[str] = []
     text_fragments: list[str] = []
     for event in events:
         if not isinstance(event, dict):
             continue
+        if event.get("type") == "result" or "result" in event or "structured_output" in event:
+            terminal_event = event
         part = event.get("part")
         if isinstance(part, dict) and isinstance(part.get("text"), str):
             candidates.append(part["text"])
@@ -6612,32 +6603,25 @@ def _report_from_events(events: list[Any]) -> dict[str, Any] | None:
                 for item in content:
                     if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
                         assistant_candidates.append(item["text"])
-        if isinstance(event.get("result"), str):
-            terminal_candidates.append(event["result"])
-        if isinstance(event.get("result"), dict):
-            terminal_candidates.append(event["result"])
         if isinstance(event.get("text"), str):
             candidates.append(event["text"])
         if isinstance(event.get("finalText"), str):
             candidates.append(event["finalText"])
-        if isinstance(event.get("structured_output"), dict):
-            terminal_candidates.append(event["structured_output"])
         if event.get("type") == "text":
             part = event.get("part")
             if isinstance(part, dict) and isinstance(part.get("text"), str):
                 candidates.append(part["text"])
     if text_fragments:
         candidates.append("".join(text_fragments))
-    for candidate in reversed(terminal_candidates):
-        if isinstance(candidate, dict):
-            if "findings" in candidate:
-                return candidate
-            continue
-        parsed = parse_json_candidate(candidate)
+    if terminal_event is not None:
+        parsed = terminal_event.get("structured_output")
+        if parsed is None:
+            parsed = terminal_event.get("result")
+            if isinstance(parsed, str):
+                parsed = parse_json_candidate(parsed)
         if isinstance(parsed, dict) and "findings" in parsed:
             return parsed
-    if terminal_candidates:
-        raise SystemExit("review engine result was not structured JSON:\n" + str(terminal_candidates[-1])[:2000])
+        raise SystemExit("review engine result was not structured JSON: invalid final terminal event")
     for candidate in reversed(candidates):
         if isinstance(candidate, dict):
             if "findings" in candidate:
@@ -7583,20 +7567,21 @@ def run_review_passes(
     return chunk_reports
 
 
-def reject_repo_output_paths(args: argparse.Namespace, repo: Path) -> None:
+def prepare_output_paths(args: argparse.Namespace, repo: Path) -> None:
+    """Validate all destinations, then freeze their original cwd/tilde meaning."""
     repo_root_path = repo.resolve()
     outputs: list[tuple[str, Path]] = []
-    for option, value in (
-        ("--json-output", getattr(args, "json_output", None)),
-        ("--output", getattr(args, "output", None)),
-        ("--status-output", getattr(args, "status_output", None)),
+    destinations: dict[str, str] = {}
+    for option, attribute in (
+        ("--json-output", "json_output"),
+        ("--output", "output"),
+        ("--status-output", "status_output"),
     ):
+        value = getattr(args, attribute, None)
         if not value:
             continue
-        path = Path(value).expanduser()
-        resolved = (
-            path if path.is_absolute() else Path.cwd() / path
-        ).resolve()
+        path = Path(value).expanduser().absolute()
+        resolved = path.resolve()
         if getattr(args, "status_output", None):
             for previous_option, previous in outputs:
                 # Refuse spelling aliases even before files exist, including
@@ -7621,12 +7606,15 @@ def reject_repo_output_paths(args: argparse.Namespace, repo: Path) -> None:
                         break
                 except OSError:
                     continue
-        if not inside_repo:
-            continue
-        raise SystemExit(
-            f"{option} must point outside the reviewed repository: "
-            f"{display_escape(value, 500)}"
-        )
+        if inside_repo:
+            raise SystemExit(
+                f"{option} must point outside the reviewed repository: "
+                f"{display_escape(value, 500)}"
+            )
+        # Retain lexical destinations so atomic writes replace final symlinks.
+        destinations[attribute] = str(path)
+    for attribute, destination in destinations.items():
+        setattr(args, attribute, destination)
 
 
 def atomic_write_text(path: Path, content: str) -> None:
@@ -7660,7 +7648,7 @@ def write_review_status(args: argparse.Namespace, status: str, exit_code: int,
     }
     if usage := review_usage_summary(args):
         envelope["usage"] = usage
-    atomic_write_text(Path(args.status_output).expanduser(), json.dumps(envelope, indent=2) + "\n")
+    atomic_write_text(Path(args.status_output), json.dumps(envelope, indent=2) + "\n")
 
 
 def main() -> int:
@@ -7681,9 +7669,9 @@ def main_impl() -> int:
         return 2
     with PreparationProgress("target selection"):
         repo = repo_root()
-        reject_repo_output_paths(args, repo)
+        prepare_output_paths(args, repo)
         if getattr(args, "status_output", None):
-            Path(args.status_output).expanduser().unlink(missing_ok=True)
+            Path(args.status_output).unlink(missing_ok=True)
         target, target_ref = choose_target(repo, args.mode, args.base)
         branch = current_branch(repo)
     print(f"autoreview target: {target}", flush=True)

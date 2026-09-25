@@ -305,6 +305,15 @@ token hard caps; they do not bound model reasoning or tool use.
 reviewed repository. When using `--status-output`, all output paths must differ;
 case-only and Unicode normalization aliases are conservatively refused on every
 platform, even when the filesystem would permit distinct files.
+Tilde and relative destinations are expanded once before validation and remain
+anchored to the invocation directory. Atomic report writes replace a final
+symlink instead of modifying its target.
+
+For event-stream results, the last terminal event is authoritative. An invalid
+final result fails the review, even if an earlier event or review pass contained
+a valid report; earlier reports are never published as a partial clean result.
+A non-null `structured_output` must contain the report object; only an absent
+or null field permits using the event's `result` instead.
 
 | Exit | Meaning                                                                            |
 | ---- | ---------------------------------------------------------------------------------- |

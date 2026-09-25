@@ -24,6 +24,8 @@ MODULES = [
     "skills.autoreview.tests.test_git_line_endings",
     "skills.autoreview.tests.test_git_boundary",
     "skills.autoreview.tests.test_git_filter_collection",
+    "skills.autoreview.tests.test_terminal_report_authority",
+    "skills.autoreview.tests.test_output_path_interpretation",
 ]
 
 

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Reject invalid final Autoreview terminal results without reusing earlier reports, and keep validated output paths consistent through status cleanup and atomic report publication.
+
 ## 0.2.0 - 2026-09-24
 
 **Highlights:** Native image review, committed source context, and more efficient multi-pass reviews.

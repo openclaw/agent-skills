@@ -2950,6 +2950,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
         public = {"findings": [], "overall_correctness": "patch is correct",
                   "overall_explanation": "Synthetic review.", "overall_confidence": 0.9}
         clean = json.dumps({**public, "review_completion": "complete"})
+        earlier_terminal = {"type": "result", "result": json.loads(clean)}
+        broken_terminal = {"type": "result", "result": None}
         unavailable = self.helper["ReviewerUnavailable"]
         cases = (
             ("engine", unavailable("DIAGNOSTIC_SENTINEL", result=subprocess.CompletedProcess([], 7, "", "")), "engine_failed"),
@@ -2960,6 +2962,9 @@ class AutoreviewHardeningTests(unittest.TestCase):
                                                "overall_explanation": "Invalid enum", "overall_confidence": 0.9,
                                                "review_completion": "complete"}), "invalid_report"),
             ("invalid-event-type", '[{"type":"assistant","message":{"content":null}}]', "invalid_report"),
+            ("invalid-final-jsonl", "\n".join(json.dumps(event) for event in
+                                             (earlier_terminal, broken_terminal)), "invalid_report"),
+            ("invalid-final-array", json.dumps([earlier_terminal, broken_terminal]), "invalid_report"),
             ("missing-completion", json.dumps(public), "invalid_report"),
             *((f"invalid-completion-{index}", json.dumps({**public, "review_completion": value}), "invalid_report")
               for index, value in enumerate(("", "deferred", [], {}, None, 42, False))),
@@ -2974,23 +2979,27 @@ class AutoreviewHardeningTests(unittest.TestCase):
             for count in (1, 2):
                 for label, failure, reason in cases:
                     with self.subTest(count=count, label=label):
-                        sidecar = root / "status.json"
-                        report = root / "result.json"
-                        human = root / "result.txt"
+                        outputs = root / f"case-{count}-{label}"
+                        outputs.mkdir()
+                        sidecar = outputs / "status.json"
+                        report = outputs / "result.json"
+                        human = outputs / "result.txt"
                         sidecar.write_text('{"status":"scoped-clean"}')
                         argv = [str(SCRIPT), "--mode", "local", "--engine", "codex",
                                 "--status-output", str(sidecar), "--json-output", str(report),
                                 "--output", str(human)]
                         engine = mock.Mock(side_effect=[clean] * (count - 1) + [failure])
+                        stdout = io.StringIO()
                         with mock.patch.dict(self.helper["main_impl"].__globals__, {
                             "repo_root": lambda: repo,
                             "build_review_prompts": lambda *_args: ["synthetic pack"] * count,
                             "run_engine": engine,
-                        }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                            with self.assertRaises((SystemExit, OSError)):
+                        }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                            with self.assertRaises((SystemExit, OSError)) as caught:
                                 self.helper["main_impl"]()
                         self.assertFalse(report.exists())
                         self.assertFalse(human.exists())
+                        self.assertNotIn("scoped-clean:", stdout.getvalue())
                         self.assertEqual(engine.call_count, count)
                         self.assertEqual(sidecar.exists(), reason is not None)
                         if reason:
@@ -3002,6 +3011,15 @@ class AutoreviewHardeningTests(unittest.TestCase):
                             self.assertEqual(outcome["timed_out"], label == "timeout")
                             self.assertEqual(outcome["reviewer_exit_code"], {"engine": 7, "timeout": 124}.get(label))
                             self.assertNotIn("DIAGNOSTIC_SENTINEL", text)
+                            if label.startswith("invalid-final-"):
+                                self.assertIsInstance(caught.exception, unavailable)
+                                self.assertEqual(caught.exception.reason, "invalid_report")
+                                self.assertEqual(outcome, {
+                                    "schema_version": 1, "status": "reviewer_unavailable", "exit_code": 1,
+                                    "engine": "codex", "report_produced": False, "reason": "invalid_report",
+                                    "reviewer_exit_code": None, "timed_out": False,
+                                })
+                                self.assertEqual({path.name for path in outputs.iterdir()}, {"status.json"})
 
     def test_status_paths_reject_repo_and_aliases_before_removing_files(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -3012,23 +3030,23 @@ class AutoreviewHardeningTests(unittest.TestCase):
             for first, second in (("result.json", "RESULT.json"), ("caf\u00e9.json", "cafe\u0301.json")):
                 args = argparse.Namespace(status_output=str(root / first), output=None, json_output=str(root / second))
                 with self.assertRaises(SystemExit):
-                    self.helper["reject_repo_output_paths"](args, repo)
+                    self.helper["prepare_output_paths"](args, repo)
                 self.assertFalse((root / first).exists())
             for value in (str(repo / "result.json"), str(existing)):
                 args = argparse.Namespace(status_output=value, output=None, json_output=str(existing))
                 with self.assertRaises(SystemExit):
-                    self.helper["reject_repo_output_paths"](args, repo)
+                    self.helper["prepare_output_paths"](args, repo)
                 self.assertEqual(existing.read_text(), "keep existing output")
             if os.name != "nt":
                 alias = root / "alias.json"
                 alias.symlink_to(existing)
                 args.status_output = str(alias)
                 with self.assertRaises(SystemExit):
-                    self.helper["reject_repo_output_paths"](args, repo)
+                    self.helper["prepare_output_paths"](args, repo)
                 alias.unlink()
                 os.link(existing, alias)
                 with self.assertRaises(SystemExit):
-                    self.helper["reject_repo_output_paths"](args, repo)
+                    self.helper["prepare_output_paths"](args, repo)
 
     @unittest.skipUnless(sys.platform == "darwin", "macOS firmlink alias")
     def test_status_rejects_absent_outputs_under_same_parent_inode(self) -> None:
@@ -3041,7 +3059,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             args = argparse.Namespace(status_output=str(root / "result.json"),
                                       json_output=str(alias / "result.json"), output=None)
             with self.assertRaises(SystemExit):
-                self.helper["reject_repo_output_paths"](args, repo)
+                self.helper["prepare_output_paths"](args, repo)
             self.assertFalse((root / "result.json").exists())
 
     @unittest.skipIf(os.name == "nt", "the executable fixtures are POSIX-only")
@@ -5357,7 +5375,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 SystemExit,
                 "--json-output must point outside",
             ):
-                self.helper["reject_repo_output_paths"](
+                self.helper["prepare_output_paths"](
                     argparse.Namespace(
                         json_output=str(repo / "review.json"),
                         output=None,
@@ -5368,7 +5386,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 SystemExit,
                 "--output must point outside",
             ):
-                self.helper["reject_repo_output_paths"](
+                self.helper["prepare_output_paths"](
                     argparse.Namespace(
                         json_output=None,
                         output=str(repo / "review.txt"),
@@ -5376,7 +5394,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     repo,
                 )
 
-            self.helper["reject_repo_output_paths"](
+            self.helper["prepare_output_paths"](
                 argparse.Namespace(
                     json_output=str(outside),
                     output=None,
@@ -5397,7 +5415,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     "--json-output must point outside",
                 ),
             ):
-                self.helper["reject_repo_output_paths"](
+                self.helper["prepare_output_paths"](
                     argparse.Namespace(
                         json_output=str(alternate_repo / "review.json"),
                         output=None,
