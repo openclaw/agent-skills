@@ -6026,14 +6026,18 @@ def read_amp_private_file(path: Path, *, label: str, max_chars: int) -> str:
     return value
 
 
-def run_amp(args: argparse.Namespace, repo: Path, prompt: str) -> str:
-    amp_bin = ensure_amp_isolation_supported(args, repo)
-    model = args.model
-    thinking = args.thinking
+def validate_amp_model(model: object) -> None:
     if not isinstance(model, str) or not model:
         raise SystemExit("amp engine requires a model")
     if AMP_MODEL_PATTERN.fullmatch(model) is None:
         raise SystemExit("amp engine model must use a supported provider/model format")
+
+
+def run_amp(args: argparse.Namespace, repo: Path, prompt: str) -> str:
+    amp_bin = ensure_amp_isolation_supported(args, repo)
+    model = args.model
+    thinking = args.thinking
+    validate_amp_model(model)
     if thinking not in AMP_THINKING_VALUES:
         raise SystemExit(
             f"invalid amp thinking value {thinking!r}; expected one of {', '.join(sorted(AMP_THINKING_VALUES))}"
@@ -7252,10 +7256,10 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
     reported unavailable with that same reason, and the selected engine is
     checked for a resolvable CLI binary on PATH.
 
-    Once a binary resolves, codex/claude/pi/kimi are also put through the same
+    Once a binary resolves, codex/claude/amp/pi/kimi are also put through the same
     local version and required-flag probes their real runners perform
     before contacting the engine (ensure_codex_isolation_supported,
-    ensure_claude_isolation_supported, ensure_pi_isolation_supported,
+    ensure_claude_isolation_supported, ensure_amp_isolation_supported, ensure_pi_isolation_supported,
     ensure_kimi_isolation_supported), so a dry run cannot report OK for a
     configuration a real run would reject immediately (unsupported CLI
     version, missing required flag, or a launcher that fails under the
@@ -7289,8 +7293,9 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
     invokes the CLI (see run_claude, gated on args.tools); that is a pure,
     non-mutating computation over --claude-allowed-tools/--no-web-search
     with no I/O, so it is replayed here too and can reject a non-read-only
-    or malformed tool rule the same way the real run would. pi and other
-    engines have no equivalent raising callable between their isolation
+    or malformed tool rule the same way the real run would. Amp reuses its
+    pure provider/model grammar check before runtime preparation. pi has
+    no equivalent raising callable between its isolation
     probe and engine spawn (see run_pi): pi only builds an argv list, and
     write_kimi_review_files (kimi's file-write staging step) only fails on
     tmp-state errors (e.g. disk full), never on user setup, so it is not
@@ -7318,6 +7323,11 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
     if probe is not None:
         try:
             probe(reviewer, repo)
+        except SystemExit as exc:
+            return False, str(exc.code)
+    if engine == "amp":
+        try:
+            validate_amp_model(reviewer.model)
         except SystemExit as exc:
             return False, str(exc.code)
     if engine == "kimi":

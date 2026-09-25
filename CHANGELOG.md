@@ -6,6 +6,7 @@
 - Refuse Autoreview output symlinks inside the reviewed repository even when their referents are outside, preserving repository entries and stale status on validation failure.
 - Keep Autoreview's configured reviewer deadline active after streamed output closes, so a still-running reviewer cannot overrun the limit and return a successful review.
 - Preserve literal Unicode separators inside Autoreview JSONL records so final reports remain authoritative and valid Amp streams are accepted.
+- Reject invalid Amp model names during Autoreview dry runs with the same provider/model diagnostic used for execution.
 - Preserve feasible Autoreview partitions when intact context leaves less room than the estimated continuation reserve, while retaining complete evidence and the prompt limit.
 
 ## 0.2.0 - 2026-09-24
