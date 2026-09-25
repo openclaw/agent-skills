@@ -1354,12 +1354,13 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     "review_completion": "complete",
                 })
 
-            with mock.patch.dict(self.helper["main_impl"].__globals__, {
+            with mock.patch.dict(os.environ), mock.patch.dict(self.helper["main_impl"].__globals__, {
                 "repo_root": lambda: repo,
                 "run_engine": engine,
                 "resolve_engine_binary": lambda *_args: (True, None),
-            }), mock.patch.object(sys, "argv", [str(SCRIPT), "--mode", "local", *options]), \
+            }), mock.patch.object(sys, "argv", [str(SCRIPT), "--engine", "codex", "--mode", "local", *options]), \
                     contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                os.environ.pop("AUTOREVIEW_MAX_REVIEW_PASSES", None)
                 yield repo, sends, stdout, stderr
 
     @contextlib.contextmanager
@@ -2683,6 +2684,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                             "overall_explanation": "Synthetic provider explanation.", "overall_confidence": 0.61,
                         }
                         argv = [str(SCRIPT), "--engine", "codex", "--mode", "local", "--max-priority", priority,
+                                "--max-review-passes", str(count),
                                 "--output", str(root / "result.txt"), "--json-output", str(root / "result.json"),
                                 "--status-output", str(root / "status.json")]
                         for needle in required:
