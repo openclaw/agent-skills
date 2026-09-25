@@ -8060,17 +8060,24 @@ class AuthenticatedProxyTests(unittest.TestCase):
             certificate = repo / "trust.pem"
             certificate.touch()
             external_link = root / "trust-link.pem"
-            external_link.symlink_to(certificate)
-            for engine in self.helper["ENGINES"]:
-                for value in (str(certificate), str(external_link)):
-                    with self.subTest(engine=engine, value=value), mock.patch.dict(os.environ, {
-                        key: value for key in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
-                                              "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE")
-                    }, clear=True):
-                        env = self.helper["safe_engine_env"](repo, engine=engine)
-                        for key in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
-                                    "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
-                            self.assertNotIn(key, env)
+            for path in (certificate, external_link):
+                with self.subTest(path=path.name):
+                    if path == external_link:
+                        try:
+                            external_link.symlink_to(certificate)
+                        except OSError as exc:
+                            if getattr(exc, "winerror", None) != 1314:  # ERROR_PRIVILEGE_NOT_HELD
+                                raise
+                            self.skipTest("Windows symlink privilege is unavailable")
+                    for engine in self.helper["ENGINES"]:
+                        with self.subTest(engine=engine), mock.patch.dict(os.environ, {
+                            key: str(path) for key in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+                                                      "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE")
+                        }, clear=True):
+                            env = self.helper["safe_engine_env"](repo, engine=engine)
+                            for key in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+                                        "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
+                                self.assertNotIn(key, env)
 
     def proxy_fixture(self):
         username = "u"

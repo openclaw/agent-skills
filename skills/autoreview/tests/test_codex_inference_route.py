@@ -454,11 +454,16 @@ class CodexInferenceRouteTests(unittest.TestCase):
                 repo_file.write_bytes(original)
                 repo_file.chmod(0o755)
                 source.unlink()
-                source.symlink_to(repo_file)
                 try:
+                    try:
+                        source.symlink_to(repo_file)
+                    except OSError as exc:
+                        if getattr(exc, "winerror", None) != 1314:  # ERROR_PRIVILEGE_NOT_HELD
+                            raise
+                        self.skipTest("Windows symlink privilege is unavailable")
                     self.assert_route_refused()
                 finally:
-                    source.unlink()
+                    source.unlink(missing_ok=True)
                     source.write_bytes(original)
                     source.chmod(0o755)
 
