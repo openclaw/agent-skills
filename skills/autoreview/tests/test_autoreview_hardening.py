@@ -1327,6 +1327,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.helper = load_helper()
 
     @contextlib.contextmanager
+    def without_reviewer_defaults(self):
+        with mock.patch.dict(os.environ):
+            for name in tuple(os.environ):
+                if name.startswith("AUTOREVIEW_") and name != "AUTOREVIEW_GIT":
+                    os.environ.pop(name)
+            yield
+
+    @contextlib.contextmanager
     def preparation_fixture(self, *options):
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
@@ -1354,13 +1362,12 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     "review_completion": "complete",
                 })
 
-            with mock.patch.dict(os.environ), mock.patch.dict(self.helper["main_impl"].__globals__, {
+            with self.without_reviewer_defaults(), mock.patch.dict(self.helper["main_impl"].__globals__, {
                 "repo_root": lambda: repo,
                 "run_engine": engine,
                 "resolve_engine_binary": lambda *_args: (True, None),
             }), mock.patch.object(sys, "argv", [str(SCRIPT), "--engine", "codex", "--mode", "local", *options]), \
                     contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                os.environ.pop("AUTOREVIEW_MAX_REVIEW_PASSES", None)
                 yield repo, sends, stdout, stderr
 
     @contextlib.contextmanager
@@ -2691,7 +2698,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                             argv.extend(["--require-finding", needle])
                         if expect:
                             argv.append("--expect-findings")
-                        with mock.patch.dict(self.helper["main_impl"].__globals__, {
+                        with self.without_reviewer_defaults(), mock.patch.dict(self.helper["main_impl"].__globals__, {
                             "repo_root": lambda: repo,
                             "build_review_prompts": lambda *_args: ["synthetic pack"] * count,
                             "run_engine": lambda *_args: json.dumps({**provider, "review_completion": "complete"}),
