@@ -226,6 +226,7 @@ class OutputPathInterpretationTests(unittest.TestCase):
                 self.skipTest("Windows symlink privilege is unavailable")
             raise
         self.assertTrue(os.path.samefile(alias, outputs))
+        original_target = os.readlink(alias)
         destination = outputs / "report.json"
         original = b"existing report must remain unchanged\n"
         destination.write_bytes(original)
@@ -246,7 +247,7 @@ class OutputPathInterpretationTests(unittest.TestCase):
             self.assertEqual(destination.stat().st_ino, inode)
             self.assertEqual(status.read_bytes(), stale)
             self.assertTrue(alias.is_symlink())
-            self.assertEqual(os.readlink(alias), str(outputs))
+            self.assertEqual(os.readlink(alias), original_target)
         engine.assert_not_called()
 
     def test_distinct_report_entries_publish_without_status_even_when_hardlinked(self):
