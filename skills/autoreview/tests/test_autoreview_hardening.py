@@ -609,12 +609,42 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                         self.assertLessEqual(len(prompt.encode()), budget)
                         self.assertIn(complete, prompt)
                         self.assertNotIn("Evidence batch:", prompt)
-                    impossible = instructions + "i" * (capacity + len(complete.encode()))
+                    empty_prompt = render(branch, "branch", None, self.helper["ReviewChunk"](""), "", "")
+                    impossible = "i" * (budget - len(empty_prompt.encode()))
+                    self.assertEqual(len(render(
+                        branch, "branch", None, self.helper["ReviewChunk"](""), impossible, "",
+                    ).encode()), budget)
                     self.assertIsNone(build(branch, "branch", None, bundle, impossible, complete, budget))
                     with self.assertRaisesRegex(SystemExit, "intact context leave too little room"):
                         self.helper["build_review_prompts"](
                             repo, "branch", None, bundle, impossible, datasets, budget,
                         )
+
+    def test_zero_reserve_stops_sizing_at_first_oversized_prompt(self):
+        budget, branch = 12_000, "synthetic-capacity"
+        bundle = "# Branch Diff\ndiff --git a/source.py b/source.py\n@@ -0,0 +1 @@\n+" + "x" * 8_000
+        render = self.helper["render_review_prompt"]
+        fixed = render(branch, "branch", None, self.helper["ReviewChunk"](""), "", "", (999_999, 999_999))
+        instructions = "i" * (budget - len(fixed.encode()) - 4)
+        measured = []
+
+        def observe(*args):
+            prompt = render(*args)
+            if len(args) == 7 and args[6] != (999_999, 999_999) and args[3].content:
+                measured.append(len(prompt.encode()))
+                self.assertLessEqual(len(measured), 2, "continued rendering after the first oversized prompt")
+            return prompt
+
+        with mock.patch.dict(self.helper["build_change_review_prompts"].__globals__, {
+            "render_review_prompt": observe,
+        }):
+            result = self.helper["build_change_review_prompts"](
+                branch, "branch", None, bundle, instructions, "", budget, continuation_reserve=0,
+            )
+        self.assertIsNone(result)
+        self.assertEqual(len(measured), 2)
+        self.assertLessEqual(measured[0], budget)
+        self.assertGreater(measured[1], budget)
 
     def test_mixed_complete_spans_keep_datasets_below_preferred_split_capacity(self):
         budget = 512_000
@@ -1704,6 +1734,89 @@ class AutoreviewHardeningTests(unittest.TestCase):
             }), self.assertRaisesRegex(SystemExit, "intact context leave too little room"):
                 self.helper["main_impl"]()
             self.assertFalse(sends)
+
+    def test_near_capacity_intact_source_context_keeps_complete_bounded_review(self):
+        budget, remaining, pass_limit = 512_000, 3_000, 32
+        path = "src/token_count.py"
+        render = self.helper["render_review_prompt"]
+        threshold = argparse.Namespace(max_priority="P0")
+        with self.committed_context_fixture(
+            "--max-review-passes", str(pass_limit), "--max-priority", "P0",
+            role="--source-context-file", content=b"",
+        ) as (repo, sends, *_):
+            branch = self.helper["current_branch"](repo)
+
+            def context_inputs(captured):
+                return self.helper["capture_source_context_inputs"](
+                    argparse.Namespace(source_context_file=[path]), repo, captured,
+                    self.helper["EvidenceInputs"]("", [], []),
+                )
+
+            empty = context_inputs(self.helper["branch_bundle"](repo, "HEAD^"))
+            fixed = render(
+                branch, "branch", "HEAD^", self.helper["ReviewChunk"](""),
+                self.helper["apply_finding_threshold_prompt"](threshold, empty.prompt),
+                "", (999_999, 999_999),
+            )
+            line, tail = "# committed context \U0001f99e\r\n", "end of context \t"
+            repeats, padding = divmod(
+                budget - len(fixed.encode()) - remaining - len(tail.encode()), len(line.encode()),
+            )
+            content = line * repeats + "x" * padding + tail
+            (repo / path).write_bytes(content.encode())
+            git(repo, "add", "--", path)
+            git(repo, "commit", "-qm", "intact source context")
+            (repo / "source.md").write_text("small selected change\n")
+            git(repo, "commit", "-qam", "small selected change")
+            self.assertEqual(self.helper["main_impl"](), 0)
+            self.assertEqual(len(sends), 1)
+            self.assertNotIn("Oversized review bundle chunk:", sends[0])
+            self.assertEqual(sends[0].count(content), 1)
+            sends.clear()
+
+            (repo / "source.md").write_bytes(
+                ("changed = '\U0001f99e'\r\n" * 400 + "end of selected change \t").encode(),
+            )
+            git(repo, "commit", "-qam", "larger selected change")
+            captured = self.helper["branch_bundle"](repo, "HEAD^")
+            evidence = context_inputs(captured)
+            extra = self.helper["apply_finding_threshold_prompt"](threshold, evidence.prompt)
+            fixed = render(
+                branch, "branch", "HEAD^", self.helper["ReviewChunk"](""),
+                extra, "", (999_999, 999_999),
+            )
+            self.assertEqual(budget - len(fixed.encode()), remaining)
+            self.assertGreater(len(captured.text.encode()), remaining)
+            self.assertEqual(captured.paths, {"source.md"})
+            self.assertFalse(captured.mixed or captured.images or evidence.datasets)
+            self.assertEqual(len(evidence.files), 1)
+            oid = git(repo, "rev-parse", f"HEAD:{path}").strip()
+            self.assertIn(f"commit={captured.commit} blob={oid} mode=100644; context only", evidence.prompt)
+
+            observed_render = mock.Mock(wraps=render)
+            with mock.patch.dict(self.helper["main_impl"].__globals__, {"render_review_prompt": observed_render}), \
+                    mock.patch.object(sys, "argv", [*sys.argv, "--max-review-passes", "1"]), \
+                    self.assertRaisesRegex(SystemExit, "no reviewer was started"):
+                self.helper["main_impl"]()
+            self.assertFalse(sends)
+            numbered = [call for call in observed_render.call_args_list
+                        if len(call.args) == 7 and call.args[6] != (999_999, 999_999)]
+            self.assertEqual(len(numbered), 0, "explicit pass budget must reject before duplicating intact context")
+            self.assertEqual(self.helper["main_impl"](), 0)
+            self.assertGreater(len(sends), 1)
+            self.assertLessEqual(len(sends), pass_limit)
+            changes = []
+            for prompt in sends:
+                self.assertLessEqual(len(prompt.encode()), budget)
+                prefix, change = prompt.rsplit("\n\n# Change Bundle\n", 1)
+                self.assertEqual(prefix.count(evidence.prompt), 1)
+                self.assertIn("Finding threshold: report only P0.", prefix)
+                self.assertIn("Source-context paths are not finding targets", prefix)
+                self.assertNotIn("Evidence batch:", prefix)
+                changes.append(change)
+            self.assertEqual("".join(changes).encode(), captured.text.encode())
+            self.assertEqual((repo / path).read_bytes(), content.encode())
+            self.helper["verify_evidence"](repo, evidence.files)
 
     def test_source_context_partitioning_preserves_full_bytes_and_provenance(self):
         content = ("# context \U0001f99e\r\n" * 10_000 + "tail without newline \t").encode()

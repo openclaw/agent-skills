@@ -4152,7 +4152,8 @@ def build_change_review_prompts(
     datasets: str,
     max_prompt_bytes: int = MAX_REVIEW_PROMPT_BYTES,
     max_passes: int | None = None,
-    *, min_change_bytes: int = 4,
+    *, min_change_bytes: int = 4, continuation_reserve: int = 4_096,
+    review_pass_budget: int | None = None,
 ) -> list[str] | None:
     full_prompt = render_review_prompt(
         branch,
@@ -4177,28 +4178,35 @@ def build_change_review_prompts(
     content_limit = (
         max_prompt_bytes
         - utf8_size(empty_chunk_prompt)
-        - 4_096
+        - continuation_reserve
     )
     while content_limit >= min_change_bytes:
         chunks = split_review_bundle(bundle, content_limit)
         if max_passes is not None and len(chunks) > max_passes:
             return None
-        prompts = [
-            render_review_prompt(
-                branch,
-                target,
-                target_ref,
-                chunk,
-                extra_prompt,
-                datasets,
-                (index, len(chunks)),
-            )
-            for index, chunk in enumerate(chunks, start=1)
-        ]
+        def rendered_prompts():
+            for index, chunk in enumerate(chunks, start=1):
+                yield render_review_prompt(
+                    branch, target, target_ref, chunk, extra_prompt, datasets, (index, len(chunks)),
+                )
+
+        if not continuation_reserve:
+            check_review_pass_budget(review_pass_budget, len(chunks))
+            # Tiny chunks can repeat large intact context. Prove fit before
+            # retaining any prefix of the complete prompt list.
+            largest = 0
+            for prompt in rendered_prompts():
+                largest = max(largest, utf8_size(prompt))
+                if largest > max_prompt_bytes:
+                    break
+            if largest > max_prompt_bytes:
+                content_limit -= largest - max_prompt_bytes
+                continue
+        prompts = list(rendered_prompts())
         largest = max(utf8_size(prompt) for prompt in prompts)
         if largest <= max_prompt_bytes:
             return prompts
-        content_limit -= largest - max_prompt_bytes + 1_024
+        content_limit -= largest - max_prompt_bytes + (1_024 if continuation_reserve else 0)
     return None
 
 
@@ -4210,6 +4218,7 @@ def build_review_prompts(
     extra_prompt: str,
     datasets: list[ReviewDataset],
     max_prompt_bytes: int = MAX_REVIEW_PROMPT_BYTES,
+    max_review_passes: int | None = None,
 ) -> list[str] | list[ReviewPass]:
     if isinstance(bundle, CapturedBundle):
         if bundle.mixed:
@@ -4249,6 +4258,15 @@ def build_review_prompts(
             )
             if change_prompts is not None:
                 return change_prompts
+        # The reserve estimates continuation size; measured small chunks can
+        # still fit when intact evidence leaves less room than that estimate.
+        change_prompts = build_change_review_prompts(
+            branch, target, target_ref, bundle, extra_prompt, rendered_datasets,
+            max_prompt_bytes, min_change_bytes=4, continuation_reserve=0,
+            review_pass_budget=max_review_passes,
+        )
+        if change_prompts is not None:
+            return change_prompts
         raise SystemExit(
             "review instructions or intact context leave too little room for change chunks; "
             "reduce optional instructions or context without omitting required evidence"
@@ -4296,6 +4314,13 @@ def build_review_prompts(
                 )
                 if change_prompts is not None:
                     return change_prompts
+            change_prompts = build_change_review_prompts(
+                branch, target, target_ref, bundle, extra_prompt, rendered_datasets,
+                max_prompt_bytes, min_change_bytes=4, continuation_reserve=0,
+                review_pass_budget=max_review_passes,
+            )
+            if change_prompts is not None:
+                return change_prompts
             raise SystemExit(
                 "unable to partition the review bundle within the aggregate prompt limit"
             )
@@ -4344,11 +4369,12 @@ def prepare_review_prompts(
     extra_prompt: str,
     datasets: list[ReviewDataset],
     max_prompt_bytes: int,
+    max_review_passes: int | None = None,
 ) -> list[str] | list[ReviewPass]:
     if isinstance(bundle, CapturedBundle) and bundle.images:
         extra_prompt += "\n\n" + image_manifest(bundle.images)
     return build_review_prompts(
-        repo, target, target_ref, bundle, extra_prompt, datasets, max_prompt_bytes,
+        repo, target, target_ref, bundle, extra_prompt, datasets, max_prompt_bytes, max_review_passes,
     )
 
 
@@ -7358,14 +7384,17 @@ def apply_finding_threshold_prompt(args: argparse.Namespace, extra_prompt: str) 
     return threshold_prompt + ("\n\n" + extra_prompt if extra_prompt.strip() else "")
 
 
-def check_review_plan(args: argparse.Namespace, prompts: list[str] | list[ReviewPass]) -> None:
-    print(f"review plan: {len(prompts)} passes; {review_plan_bytes(prompts)} total prompt bytes", flush=True)
-    limit = getattr(args, "max_review_passes", None)
-    if limit is not None and len(prompts) > limit:
+def check_review_pass_budget(limit: int | None, pass_count: int) -> None:
+    if limit is not None and pass_count > limit:
         raise SystemExit(
-            f"planned review has {len(prompts)} passes; --max-review-passes allows {limit}. "
+            f"planned review has {pass_count} passes; --max-review-passes allows {limit}. "
             "Narrow the target/evidence or raise the explicit pass budget; no reviewer was started."
         )
+
+
+def check_review_plan(args: argparse.Namespace, prompts: list[str] | list[ReviewPass]) -> None:
+    print(f"review plan: {len(prompts)} passes; {review_plan_bytes(prompts)} total prompt bytes", flush=True)
+    check_review_pass_budget(getattr(args, "max_review_passes", None), len(prompts))
 
 
 def dry_run_preflight(
@@ -7414,6 +7443,7 @@ def dry_run_preflight(
                 prompts = prepare_review_prompts(
                     repo, target, target_ref, captured, threshold_extra_prompt,
                     evidence.datasets, max_prompt_bytes_for_reviewers(reviewers),
+                    getattr(args, "max_review_passes", None),
                 )
                 check_review_plan(args, prompts)
             with PreparationProgress("evidence verification"):
@@ -7732,6 +7762,7 @@ def main_impl() -> int:
         prompts = prepare_review_prompts(
             repo, target, target_ref, captured, extra_prompt, evidence.datasets,
             max_prompt_bytes_for_reviewers(reviewers),
+            getattr(args, "max_review_passes", None),
         )
     print(f"bundle: {utf8_size(captured.text)} bytes; review passes: {len(prompts)}", flush=True)
     check_review_plan(args, prompts)
