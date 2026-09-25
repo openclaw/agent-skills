@@ -7616,6 +7616,7 @@ def run_review_passes(
 def prepare_output_paths(args: argparse.Namespace, repo: Path) -> None:
     """Validate all destinations, then freeze their original cwd/tilde meaning."""
     repo_root_path = repo.resolve()
+    distinct_referents = bool(getattr(args, "status_output", None))
     outputs: list[tuple[str, Path]] = []
     destinations: dict[str, str] = {}
     for option, attribute in (
@@ -7628,23 +7629,23 @@ def prepare_output_paths(args: argparse.Namespace, repo: Path) -> None:
             continue
         path = Path(value).expanduser().absolute()
         resolved = path.resolve()
-        if getattr(args, "status_output", None):
-            for previous_option, previous in outputs:
-                # Refuse spelling aliases even before files exist, including
-                # macOS case/decomposition aliases and Windows case aliases.
-                same = (unicodedata.normalize("NFD", str(resolved)).casefold()
-                        == unicodedata.normalize("NFD", str(previous)).casefold())
-                if (not same and resolved.parent.exists() and previous.parent.exists()
-                        and unicodedata.normalize("NFD", resolved.name).casefold()
-                        == unicodedata.normalize("NFD", previous.name).casefold()):
-                    same = os.path.samefile(resolved.parent, previous.parent)
-                if not same and resolved.exists() and previous.exists():
-                    same = os.path.samefile(resolved, previous)
-                if same:
-                    raise SystemExit(f"{option} must use a different path from {previous_option}")
-            outputs.append((option, resolved))
-        # Publication replaces the final entry; parent symlinks still apply.
+        # Publication replaces final entries; status keeps its stricter referent rule.
         entry = path.parent.resolve() / path.name
+        comparison_path = resolved if distinct_referents else entry
+        for previous_option, previous in outputs:
+            # Refuse spelling aliases even before files exist, including
+            # macOS case/decomposition aliases and Windows case aliases.
+            same = (unicodedata.normalize("NFD", str(comparison_path)).casefold()
+                    == unicodedata.normalize("NFD", str(previous)).casefold())
+            if (not same and comparison_path.parent.exists() and previous.parent.exists()
+                    and unicodedata.normalize("NFD", comparison_path.name).casefold()
+                    == unicodedata.normalize("NFD", previous.name).casefold()):
+                same = os.path.samefile(comparison_path.parent, previous.parent)
+            if distinct_referents and not same and comparison_path.exists() and previous.exists():
+                same = os.path.samefile(comparison_path, previous)
+            if same:
+                raise SystemExit(f"{option} must use a different path from {previous_option}")
+        outputs.append((option, comparison_path))
         for candidate in (entry, resolved):
             inside_repo = candidate.is_relative_to(repo_root_path)
             if not inside_repo:
