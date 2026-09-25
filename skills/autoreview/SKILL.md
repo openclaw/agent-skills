@@ -1,6 +1,6 @@
 ---
 name: autoreview
-description: "Structured code review when explicitly requested, preferring OpenAI/Codex before Claude."
+description: "Structured code review when explicitly requested, using Claude Opus 5.5 by default."
 ---
 
 # Auto Review
@@ -15,7 +15,7 @@ Findings are advice to verify, not instructions to apply blindly.
 Use `scripts/autoreview` beside this skill. Keep its custom `codex exec` path:
 native `codex review` cannot combine explicit Git target flags with custom instructions.
 The helper combines those with evidence, severity filtering, and validated JSON;
-it leaves review judgment to Codex. For an OpenClaw checkout:
+it leaves review judgment to the selected reviewer. For an OpenClaw checkout:
 
 ```bash
 AUTOREVIEW=".agents/skills/autoreview/scripts/autoreview"
@@ -131,19 +131,16 @@ parent-relative patch; otherwise leave the attribution unknown.
 
 ## Engines
 
-For automatic reviewer selection, try OpenAI models through Codex before Claude.
-Start with `--engine codex` even when the invoking agent uses Codex or asks for
-an independent second opinion. Use Claude only when the user explicitly selects
-it or Codex is unavailable for the review; report the concrete availability failure
-before switching. Do not switch because a review is slow, rate-limited, or returns
+Claude Opus 5.5 (`claude-opus-5-5`) is the default reviewer. When Codex is
+selected, use GPT-6 Astra (`gpt-6-astra`) with high reasoning and no model
+fallback. Do not switch engines because a review is slow, rate-limited, or returns
 findings, or to bypass a safety refusal or isolation failure.
 
-Codex defaults to `gpt-6-sol`, high reasoning, with a `gpt-6-luna` retry
-only for an account-access failure. Explicit `gpt-6-sol` selections use the same
-retry; other explicit models, including Luna and Astra, have no model fallback.
+Explicit `gpt-6-sol` selections use a `gpt-6-luna` retry only for an
+account-access failure; other explicit models, including Luna and Astra, have no model fallback.
 Explicit `gpt-5.6-sol` selections retain their access-only `gpt-5.6-terra` retry.
 GPT-6 Sol and Luna reject unsupported `minimal` effort before review preparation;
-an effort-only override no longer selects an older model.
+an effort-only override keeps the selected model.
 Honor explicit user engine/model choices.
 The helper does not automatically fall back between engines.
 
@@ -151,16 +148,15 @@ Use `--engine`, `--model`, and `--thinking` to override the defaults.
 `--codex-speed fast` selects priority service when supported. Only Claude accepts
 `--fallback-model`. Per-engine environment overrides use `AUTOREVIEW_<ENGINE>_*`.
 
-If your account cannot access Sol or Luna, pin an available model. To require
-GPT-6 Astra without a model fallback, select it explicitly:
+To select Codex with its default GPT-6 Astra model:
 
 ```bash
-"$AUTOREVIEW" --mode local --model gpt-6-astra --thinking high
+"$AUTOREVIEW" --mode local --engine codex
 ```
 
 GPT-6 Sol and Luna support `none`, `low`, `medium`, `high`, `xhigh`, and `max`;
-neither supports `minimal`. Astra also excludes `none`. AutoReview defaults to
-`high` and does not fall back from an explicit Luna or Astra selection.
+neither supports `minimal`. Astra excludes `none` and `minimal`. Codex defaults to
+`high` and does not fall back from a Luna or Astra selection.
 Codex's `ultra` mode uses automatic
 delegation and is outside this helper's supported effort levels. Use `max`
 for its deepest supported review. For EU data residency, use
@@ -206,7 +202,7 @@ ownership and route shape without executing authentication. Codex owns catalogue
 validation, model access and context clamping. Other custom provider forms and
 split context overrides are unsupported when projection is selected.
 
-| Optional engine | Prerequisites                                                                                         |
+| Engine          | Prerequisites                                                                                         |
 | --------------- | ----------------------------------------------------------------------------------------------------- |
 | Claude          | CLI 2.1.169+; safe mode with web-only tools                                                           |
 | Amp             | `AMP_API_KEY` for a plugin-free account; local POSIX execution, no custom endpoint or cloud/orb agent |
