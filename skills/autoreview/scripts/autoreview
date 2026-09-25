@@ -7597,20 +7597,23 @@ def prepare_output_paths(args: argparse.Namespace, repo: Path) -> None:
                 if same:
                     raise SystemExit(f"{option} must use a different path from {previous_option}")
             outputs.append((option, resolved))
-        inside_repo = resolved.is_relative_to(repo_root_path)
-        if not inside_repo:
-            for ancestor in (resolved, *resolved.parents):
-                try:
-                    if os.path.samefile(ancestor, repo_root_path):
-                        inside_repo = True
-                        break
-                except OSError:
-                    continue
-        if inside_repo:
-            raise SystemExit(
-                f"{option} must point outside the reviewed repository: "
-                f"{display_escape(value, 500)}"
-            )
+        # Publication replaces the final entry; parent symlinks still apply.
+        entry = path.parent.resolve() / path.name
+        for candidate in (entry, resolved):
+            inside_repo = candidate.is_relative_to(repo_root_path)
+            if not inside_repo:
+                for ancestor in (candidate, *candidate.parents):
+                    try:
+                        if os.path.samefile(ancestor, repo_root_path):
+                            inside_repo = True
+                            break
+                    except OSError:
+                        continue
+            if inside_repo:
+                raise SystemExit(
+                    f"{option} must point outside the reviewed repository: "
+                    f"{display_escape(value, 500)}"
+                )
         # Retain lexical destinations so atomic writes replace final symlinks.
         destinations[attribute] = str(path)
     for attribute, destination in destinations.items():

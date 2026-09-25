@@ -302,9 +302,10 @@ token hard caps; they do not bound model reasoning or tool use.
 ## Results
 
 `--output`, `--json-output`, and `--status-output` paths must be outside the
-reviewed repository. When using `--status-output`, all output paths must differ;
-case-only and Unicode normalization aliases are conservatively refused on every
-platform, even when the filesystem would permit distinct files.
+reviewed repository, both for the final directory entry after resolving parent
+symlinks and for the resolved referent. When using `--status-output`, all output
+paths must differ; case-only and Unicode normalization aliases are conservatively
+refused on every platform, even when the filesystem would permit distinct files.
 Tilde and relative destinations are expanded once before validation and remain
 anchored to the invocation directory. Atomic report writes replace a final
 symlink instead of modifying its target.

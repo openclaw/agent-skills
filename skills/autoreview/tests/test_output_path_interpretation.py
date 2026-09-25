@@ -184,6 +184,73 @@ class OutputPathInterpretationTests(unittest.TestCase):
                 self.assertEqual(status.read_bytes(), stale, "validation failure removed stale status")
                 self.assertEqual({path.name for path in self.home.iterdir()}, {"status.json"})
 
+    @unittest.skipIf(os.name == "nt", "final symlink creation requires Windows developer mode")
+    def test_inside_final_symlinks_are_refused_before_any_mutation(self):
+        stale = b'{"status":"scoped-clean","stale":true}\n'
+        for flag, name in self.names.items():
+            with self.subTest(destination=flag):
+                status = self.home / "status.json"
+                status.write_bytes(stale)
+                target = self.root / f"keep-{name}"
+                original = f"untouched external referent: {name}\n".encode("utf-8")
+                target.write_bytes(original)
+                destination = self.repo / name
+                destination.symlink_to(target)
+                self.addCleanup(destination.unlink, missing_ok=True)
+                link = os.readlink(destination)
+                inode = destination.lstat().st_ino
+                before = self.snapshot()
+                engine = mock.Mock(side_effect=AssertionError("invalid destination reached reviewer"))
+                with self.assertRaisesRegex(SystemExit, f"{flag} must point outside"):
+                    self.invoke(engine, overrides={flag: name})
+                engine.assert_not_called()
+                self.assertEqual(self.snapshot(), before)
+                self.assertTrue(destination.is_symlink())
+                self.assertEqual(os.readlink(destination), link)
+                self.assertEqual(destination.lstat().st_ino, inode)
+                self.assertEqual(target.read_bytes(), original)
+                self.assertEqual(status.read_bytes(), stale, "validation failure removed stale status")
+
+    @unittest.skipIf(os.name == "nt", "final symlink creation requires Windows developer mode")
+    def test_external_final_symlinks_into_repo_are_refused_before_any_mutation(self):
+        source = self.repo / "source.txt"
+        for flag, name in self.names.items():
+            with self.subTest(destination=flag):
+                destination = self.root / name
+                destination.symlink_to(source)
+                status = self.home / "status.json"
+                stale = b'{"status":"scoped-clean","stale":true}\n'
+                status.write_bytes(stale)
+                before = self.snapshot()
+                engine = mock.Mock(side_effect=AssertionError("invalid destination reached reviewer"))
+                with self.assertRaisesRegex(SystemExit, f"{flag} must point outside"):
+                    self.invoke(engine, overrides={flag: str(destination)})
+                engine.assert_not_called()
+                self.assertEqual(self.snapshot(), before)
+                self.assertTrue(destination.is_symlink())
+                self.assertEqual(os.readlink(destination), str(source))
+                self.assertEqual(status.read_bytes(), stale)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS firmlink alias")
+    def test_inside_final_symlink_through_repository_firmlink_is_refused(self):
+        alias = Path("/System/Volumes/Data") / self.repo.relative_to("/")
+        if not alias.exists() or not os.path.samefile(self.repo, alias):
+            self.skipTest("temporary repository has no data-volume alias")
+        target = self.home / "status.json"
+        stale = b'{"status":"scoped-clean","stale":true}\n'
+        target.write_bytes(stale)
+        destination = self.repo / "status.json"
+        destination.symlink_to(target)
+        engine = mock.Mock(side_effect=AssertionError("invalid destination reached reviewer"))
+        before = self.snapshot()
+        with self.assertRaisesRegex(SystemExit, "--status-output must point outside"):
+            self.invoke(engine, overrides={"--status-output": str(alias / "status.json")})
+        engine.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(os.readlink(destination), str(target))
+        self.assertEqual(target.read_bytes(), stale)
+
     def test_relative_external_destinations_keep_the_current_directory_interpretation(self):
         external = self.root / "relative-outputs"
         external.mkdir()
@@ -210,6 +277,47 @@ class OutputPathInterpretationTests(unittest.TestCase):
             self.helper["prepare_output_paths"](args, self.repo)
         self.assertEqual(vars(args), original)
 
+    @unittest.skipIf(os.name == "nt", "final symlink creation requires Windows developer mode")
+    def test_invalid_later_final_symlink_leaves_all_arguments_unchanged(self):
+        destination = self.repo / "status.json"
+        destination.symlink_to(self.home / "status.json")
+        args = argparse.Namespace(
+            json_output="~/report.json", output="../operator/human.txt", status_output="status.json",
+        )
+        original = vars(args).copy()
+        with self.assertRaisesRegex(SystemExit, "--status-output must point outside"):
+            self.helper["prepare_output_paths"](args, self.repo)
+        self.assertEqual(vars(args), original)
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(os.readlink(destination), str(self.home / "status.json"))
+        self.assertFalse((self.home / "status.json").exists())
+
+    @unittest.skipIf(os.name == "nt", "directory symlink creation requires Windows developer mode")
+    def test_parent_symlinks_and_following_dotdot_keep_external_entry_semantics(self):
+        external = self.root / "external-outputs"
+        nested = external / "nested"
+        nested.mkdir(parents=True)
+        parent = self.repo / "outputs"
+        parent.symlink_to(nested, target_is_directory=True)
+        git(self.repo, "add", "--", "outputs")
+        git(self.repo, "commit", "-qm", "synthetic parent-directory symlink")
+        for prefix, directory in (("outputs", nested), ("outputs/..", external)):
+            with self.subTest(parent=prefix):
+                status = directory / "status.json"
+                status.write_bytes(b'{"status":"scoped-clean","stale":true}\n')
+                overrides = {flag: f"{prefix}/{name}" for flag, name in self.names.items()}
+                before = self.snapshot()
+                engine = self.clean_engine(status)
+                try:
+                    self.assertEqual(self.invoke(engine, overrides=overrides), 0)
+                finally:
+                    self.assertEqual(self.snapshot(), before)
+                engine.assert_called_once()
+                self.assert_clean_outputs(directory)
+                self.assertTrue(parent.is_symlink())
+                self.assertEqual(os.readlink(parent), str(nested))
+                self.assertEqual(list(self.home.iterdir()), [])
+
     def test_publication_keeps_prepared_paths_after_cwd_and_home_change(self):
         status = self.home / "status.json"
         status.write_bytes(b'{"status":"scoped-clean","stale":true}\n')
@@ -234,9 +342,9 @@ class OutputPathInterpretationTests(unittest.TestCase):
         self.assertEqual(list(shifted_home.iterdir()), [])
 
     @unittest.skipIf(os.name == "nt", "final symlink creation requires Windows developer mode")
-    def test_main_replaces_final_json_and_status_symlinks_without_writing_referents(self):
+    def test_main_replaces_final_output_symlinks_without_writing_referents(self):
         targets = {}
-        for name in ("report.json", "status.json"):
+        for name in self.names.values():
             target = self.root / f"keep-{name}"
             original = f"untouched external referent: {name}\n".encode("utf-8")
             target.write_bytes(original)
