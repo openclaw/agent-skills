@@ -620,6 +620,32 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                             repo, "branch", None, bundle, impossible, datasets, budget,
                         )
 
+    def test_zero_reserve_stops_sizing_at_first_oversized_prompt(self):
+        budget, branch = 12_000, "synthetic-capacity"
+        bundle = "# Branch Diff\ndiff --git a/source.py b/source.py\n@@ -0,0 +1 @@\n+" + "x" * 8_000
+        render = self.helper["render_review_prompt"]
+        fixed = render(branch, "branch", None, self.helper["ReviewChunk"](""), "", "", (999_999, 999_999))
+        instructions = "i" * (budget - len(fixed.encode()) - 4)
+        measured = []
+
+        def observe(*args):
+            prompt = render(*args)
+            if len(args) == 7 and args[6] != (999_999, 999_999) and args[3].content:
+                measured.append(len(prompt.encode()))
+                self.assertLessEqual(len(measured), 2, "continued rendering after the first oversized prompt")
+            return prompt
+
+        with mock.patch.dict(self.helper["build_change_review_prompts"].__globals__, {
+            "render_review_prompt": observe,
+        }):
+            result = self.helper["build_change_review_prompts"](
+                branch, "branch", None, bundle, instructions, "", budget, continuation_reserve=0,
+            )
+        self.assertIsNone(result)
+        self.assertEqual(len(measured), 2)
+        self.assertLessEqual(measured[0], budget)
+        self.assertGreater(measured[1], budget)
+
     def test_mixed_complete_spans_keep_datasets_below_preferred_split_capacity(self):
         budget = 512_000
         render = self.helper["render_review_prompt"]
@@ -1767,10 +1793,15 @@ class AutoreviewHardeningTests(unittest.TestCase):
             oid = git(repo, "rev-parse", f"HEAD:{path}").strip()
             self.assertIn(f"commit={captured.commit} blob={oid} mode=100644; context only", evidence.prompt)
 
-            with mock.patch.object(sys, "argv", [*sys.argv, "--max-review-passes", "1"]), \
+            observed_render = mock.Mock(wraps=render)
+            with mock.patch.dict(self.helper["main_impl"].__globals__, {"render_review_prompt": observed_render}), \
+                    mock.patch.object(sys, "argv", [*sys.argv, "--max-review-passes", "1"]), \
                     self.assertRaisesRegex(SystemExit, "no reviewer was started"):
                 self.helper["main_impl"]()
             self.assertFalse(sends)
+            numbered = [call for call in observed_render.call_args_list
+                        if len(call.args) == 7 and call.args[6] != (999_999, 999_999)]
+            self.assertEqual(len(numbered), 0, "explicit pass budget must reject before duplicating intact context")
             self.assertEqual(self.helper["main_impl"](), 0)
             self.assertGreater(len(sends), 1)
             self.assertLessEqual(len(sends), pass_limit)
