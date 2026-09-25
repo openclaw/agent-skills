@@ -147,7 +147,8 @@ class CodexInferenceRouteTests(unittest.TestCase):
         self.assertEqual(flags.get("model_provider"), '"review_api"')
         self.assertEqual(flags.get("model_providers.review_api.base_url"), '"https://api.openai.com/v1"')
         self.assert_auth_command(observed, self.runtime_helper)
-        self.assertEqual(flags.get("model_providers.review_api.auth.cwd"), json.dumps(str(self.home.resolve())))
+        auth_cwd = tomllib.loads(f'value = {flags["model_providers.review_api.auth.cwd"]}')["value"]
+        self.assertEqual(auth_cwd, str(self.home.resolve()))
         self.assertEqual(flags.get("model_providers.review_api.auth.timeout_ms"), "5000")
         self.assertEqual(flags.get("model_providers.review_api.auth.refresh_interval_ms"), "300000")
         self.assertEqual(flags.get("model_context_window"), "120000")
@@ -396,7 +397,8 @@ class CodexInferenceRouteTests(unittest.TestCase):
                 self.auth["cwd"] = cwd
                 self.write_config()
                 observed = self.run_review()
-                self.assertEqual(observed["flags"]["model_providers.review_api.auth.cwd"], json.dumps(str(expected.resolve())))
+                auth_cwd = tomllib.loads(f'value = {observed["flags"]["model_providers.review_api.auth.cwd"]}')["value"]
+                self.assertEqual(auth_cwd, str(expected.resolve()))
                 self.assertEqual(observed["catalogue"], self.catalogue_bytes)
                 self.assertEqual(self.available(), (True, None))
         repo_catalogue = self.repo / "models.json"
