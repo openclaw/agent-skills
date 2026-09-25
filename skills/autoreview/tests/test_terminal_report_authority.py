@@ -25,6 +25,7 @@ FINAL_REPORT = {
     "overall_confidence": 0.7,
     "review_completion": "complete",
 }
+JSON_STRING_SEPARATORS = ("\u0085", "\u2028", "\u2029")
 
 
 class TerminalReportAuthorityTests(unittest.TestCase):
@@ -154,6 +155,96 @@ class TerminalReportAuthorityTests(unittest.TestCase):
         self.assert_both_equal([
             {"type": "result", "result": FINAL_REPORT, "structured_output": None},
         ], FINAL_REPORT)
+
+    @staticmethod
+    def final_report_with_unicode(separator):
+        return {
+            **FINAL_REPORT,
+            "findings": [{
+                "title": "Final synthetic defect",
+                "body": f"The final finding retains Unicode{separator}inside a JSON string.",
+                "priority": "P0",
+                "confidence": 0.9,
+                "category": "bug",
+                "code_location": {"file_path": "source.txt", "line": 1},
+                "source_attribution": None,
+            }],
+            "overall_explanation": f"Final synthetic report{separator}with a P0 finding.",
+        }
+
+    def test_jsonl_unicode_strings_match_escaped_encoding(self):
+        for separator in JSON_STRING_SEPARATORS:
+            payload = self.final_report_with_unicode(separator)
+            for ensure_ascii in (True, False):
+                with self.subTest(separator=ascii(separator), ensure_ascii=ensure_ascii):
+                    raw = json.dumps(self.terminal(payload), ensure_ascii=ensure_ascii)
+                    self.assertEqual(self.helper["extract_json_from_jsonl"](raw), payload)
+
+    def test_jsonl_lf_and_crlf_keep_blank_and_noise_behavior(self):
+        for ending in ("\n", "\r\n"):
+            with self.subTest(ending=repr(ending)):
+                raw = ending.join([
+                    "", " \t", "synthetic startup noise",
+                    json.dumps(self.terminal(EARLIER_REPORT)), "",
+                    json.dumps({"type": "progress", "text": "synthetic progress"}),
+                    json.dumps(self.terminal(FINAL_REPORT)), "not JSON", " \t", "",
+                ])
+                self.assertEqual(self.helper["extract_json_from_jsonl"](raw), FINAL_REPORT)
+                self.assertEqual(self.helper["extract_json"](raw), FINAL_REPORT)
+
+    def test_single_record_and_array_unicode_controls_remain_supported(self):
+        payload = self.final_report_with_unicode("".join(JSON_STRING_SEPARATORS))
+        for events in (self.terminal(payload), [self.terminal(payload)]):
+            with self.subTest(array=isinstance(events, list)):
+                raw = json.dumps(events, ensure_ascii=False)
+                self.assertEqual(self.helper["extract_json"](raw), payload)
+
+    def test_final_unicode_p0_jsonl_remains_authoritative_and_completion_private(self):
+        for completion in ("complete", "incomplete"):
+            payload = {
+                **self.final_report_with_unicode("".join(JSON_STRING_SEPARATORS)),
+                "review_completion": completion,
+            }
+            public = {key: value for key, value in payload.items() if key != "review_completion"}
+            for ensure_ascii in (True, False):
+                raw = "\n".join(json.dumps(event, ensure_ascii=ensure_ascii) for event in (
+                    self.terminal(EARLIER_REPORT), self.terminal(payload),
+                ))
+                args = argparse.Namespace(engine="codex", max_priority="P0")
+                with self.subTest(completion=completion, ensure_ascii=ensure_ascii), mock.patch.dict(
+                    self.helper["run_reviewer"].__globals__, {"run_engine": lambda *_args: raw},
+                ):
+                    result = self.helper["run_reviewer"](
+                        args, Path.cwd(), "synthetic prompt", {"source.txt"}, [],
+                    )
+                    self.assertEqual(result.report, {**public, "provider_report": public})
+                    self.assertEqual(result.complete, completion == "complete")
+                    self.assertEqual(
+                        self.helper["review_status"](result.report, complete=result.complete),
+                        "findings" if completion == "complete" else "incomplete",
+                    )
+
+    def test_final_unicode_jsonl_still_requires_valid_completion(self):
+        for completion in (None, "deferred"):
+            payload = self.final_report_with_unicode("".join(JSON_STRING_SEPARATORS))
+            if completion is None:
+                payload.pop("review_completion")
+            else:
+                payload["review_completion"] = completion
+            for ensure_ascii in (True, False):
+                raw = "\n".join(json.dumps(event, ensure_ascii=ensure_ascii) for event in (
+                    self.terminal(EARLIER_REPORT), self.terminal(payload),
+                ))
+                args = argparse.Namespace(engine="codex", max_priority="P0")
+                with self.subTest(completion=completion, ensure_ascii=ensure_ascii), mock.patch.dict(
+                    self.helper["run_reviewer"].__globals__, {"run_engine": lambda *_args: raw},
+                ):
+                    with self.assertRaises(self.helper["ReviewerUnavailable"]) as caught:
+                        self.helper["run_reviewer"](
+                            args, Path.cwd(), "synthetic prompt", {"source.txt"}, [],
+                        )
+                    self.assertEqual(caught.exception.reason, "invalid_report")
+                    self.assertIn("review_completion", str(caught.exception))
 
     def test_shared_gateway_keeps_completion_private_for_valid_final_report(self):
         for completion in ("complete", "incomplete"):
