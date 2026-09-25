@@ -6583,6 +6583,59 @@ else:
 
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_reviewer_exit_after_output_eof_preserves_deadline_and_exit_status(self) -> None:
+        script = (
+            "import os,sys,time; from pathlib import Path; "
+            "print('retained stdout', flush=True); "
+            "print('retained stderr', file=sys.stderr, flush=True); "
+            "Path(sys.argv[1]).touch(); os.close(1); os.close(2); "
+            "time.sleep(float(sys.argv[2])); Path(sys.argv[3]).touch(); os._exit(7)"
+        )
+        cases = (
+            ("no deadline", None, 0.75, 7),
+            ("quick exit", 0.5, 0.05, 7),
+            ("deadline exceeded", 0.5, 2, 124),
+        )
+        for stream_output in (False, True):
+            for case, max_runtime_seconds, hold_seconds, expected_code in cases:
+                with self.subTest(stream_output=stream_output, case=case), tempfile.TemporaryDirectory() as tempdir:
+                    root = Path(tempdir)
+                    ready = root / "ready"
+                    finished = root / "finished"
+                    deadline_context = (
+                        deadline_after_reviewer_ready(self.helper, ready)
+                        if max_runtime_seconds is not None else contextlib.nullcontext()
+                    )
+                    registered = mock.Mock(wraps=self.helper["register_owned_process"])
+                    with deadline_context, mock.patch.dict(
+                        self.helper["run_with_heartbeat"].__globals__,
+                        {"register_owned_process": registered},
+                    ):
+                        result = self.helper["run_with_heartbeat"](
+                            [sys.executable, "-c", script, str(ready), str(hold_seconds), str(finished)],
+                            root,
+                            label="early-eof-reviewer",
+                            heartbeat_seconds=0.01,
+                            max_runtime_seconds=max_runtime_seconds,
+                            stream_output=stream_output,
+                            stream_display=lambda _name, _line: None,
+                        )
+
+                    registered.assert_called_once()
+                    proc = registered.call_args.args[0]
+                    self.assertIsNotNone(proc.returncode)
+                    self.assertNotIn(proc.pid, self.helper["_OWNED_PROCESSES"])
+                    self.assertTrue(proc.stdout.closed)
+                    self.assertTrue(proc.stderr.closed)
+                    self.assertEqual(result.stdout, "retained stdout\n")
+                    self.assertTrue(result.stderr.startswith("retained stderr\n"))
+                    self.assertEqual(result.returncode, expected_code, result.stderr)
+                    timed_out = expected_code == 124
+                    self.assertEqual(isinstance(result, self.helper["TimedOutEngineProcess"]), timed_out)
+                    self.assertEqual(finished.exists(), not timed_out)
+                    if timed_out:
+                        self.assertIn("early-eof-reviewer engine timed out after 0.5s", result.stderr)
+
     @unittest.skipUnless(os.name == "posix", "process groups require POSIX")
     def test_streaming_deadline_kills_sigterm_resistant_continuous_output(self) -> None:
         child = (
