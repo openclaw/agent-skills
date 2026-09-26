@@ -7052,6 +7052,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.engine not in ENGINES:
         raise SystemExit(f"invalid --engine/AUTOREVIEW_ENGINE: {args.engine}")
+    if args.max_priority not in ("P0", "P1", "P2", "P3"):
+        parser.error(f"invalid --max-priority/AUTOREVIEW_MAX_PRIORITY: {args.max_priority!r}")
     return args
 
 

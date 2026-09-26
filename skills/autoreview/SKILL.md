@@ -124,7 +124,10 @@ source-provenance contract, not secret-content scanning.
 
 The default threshold is **P0 only**: material blockers to normal operation or
 safety. Use `--max-priority P1`, `P2`, or `P3` when the caller requests a wider
-review. Do not add unrelated redesign goals or prescribe file counts, reading
+review. `AUTOREVIEW_MAX_PRIORITY` accepts the same `P0`–`P3` values; an explicit
+flag overrides it. Invalid resolved priorities fail during argument parsing,
+before preparation or reviewer startup.
+Do not add unrelated redesign goals or prescribe file counts, reading
 sequences, or ritual extra passes. Historical blame requires a verified
 parent-relative patch; otherwise leave the attribution unknown.
 

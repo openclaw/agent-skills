@@ -414,9 +414,61 @@ class AutoreviewImageGitTests(unittest.TestCase):
 
 class AutoreviewPriorityTests(unittest.TestCase):
     def test_default_priority_is_p0(self) -> None:
-        with mock.patch.object(sys, "argv", ["autoreview"]):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(sys, "argv", ["autoreview"]):
             args = AUTOREVIEW.parse_args()
         self.assertEqual(args.max_priority, "P0")
+
+    def test_priority_environment_values_and_explicit_overrides(self) -> None:
+        for priority in ("P0", "P1", "P2", "P3"):
+            for env_priority, options in (
+                (priority, []),
+                ("P4", ["--max-priority", priority]),
+                ("", ["--max-priority", priority]),
+            ):
+                with self.subTest(priority=priority, env=env_priority), mock.patch.dict(
+                    os.environ, {"AUTOREVIEW_MAX_PRIORITY": env_priority}, clear=True,
+                ), mock.patch.object(sys, "argv", ["autoreview", *options]):
+                    self.assertEqual(AUTOREVIEW.parse_args().max_priority, priority)
+
+    def test_invalid_priority_defaults_refuse_before_preparation(self) -> None:
+        for priority in ("P4", "", " ", "p2"):
+            for dry_run in (False, True):
+                with self.subTest(priority=priority, dry_run=dry_run), tempfile.TemporaryDirectory() as tmp:
+                    status = Path(tmp) / "status.json"
+                    status.write_text("existing status\n")
+                    activity = {
+                        name: mock.Mock(side_effect=AssertionError(f"unexpected {name}"))
+                        for name in (
+                            "EngineStage", "persist_engine_stage", "reviewer_args", "preflight_git",
+                            "prepare_output_paths", "run_engine",
+                        )
+                    }
+                    argv = [
+                        "autoreview", "--status-output", str(status), "--stream-engine-output",
+                        "--engine-stage-dir", str(Path(tmp) / "stage"),
+                        *(["--dry-run"] if dry_run else []),
+                    ]
+                    stderr = io.StringIO()
+                    with mock.patch.dict(os.environ, {"AUTOREVIEW_MAX_PRIORITY": priority}, clear=True), \
+                            mock.patch.object(sys, "argv", argv), \
+                            mock.patch.multiple(AUTOREVIEW, **activity), contextlib.redirect_stderr(stderr):
+                        with self.assertRaises(SystemExit) as caught:
+                            AUTOREVIEW.main_impl()
+                    self.assertEqual(caught.exception.code, 2)
+                    self.assertIn("invalid --max-priority/AUTOREVIEW_MAX_PRIORITY", stderr.getvalue())
+                    for call in activity.values():
+                        call.assert_not_called()
+                    self.assertEqual(status.read_text(), "existing status\n")
+                    self.assertEqual(sorted(item.name for item in Path(tmp).iterdir()), ["status.json"])
+
+    def test_priority_help_ignores_invalid_environment_default(self) -> None:
+        with mock.patch.dict(os.environ, {"AUTOREVIEW_MAX_PRIORITY": "P4"}, clear=True), \
+                mock.patch.object(sys, "argv", ["autoreview", "--help"]), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout:
+            with self.assertRaises(SystemExit) as caught:
+                AUTOREVIEW.parse_args()
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn("--max-priority {P0,P1,P2,P3}", stdout.getvalue())
 
     def test_priority_filter_preserves_lower_findings_and_provider_verdict(self) -> None:
         report = copy.deepcopy(DRAFT_REPORT)
