@@ -211,7 +211,15 @@ split context overrides are unsupported when projection is selected.
 | Claude          | CLI 2.1.169+; safe mode with web-only tools                                                           |
 | Amp             | `AMP_API_KEY` for a plugin-free account; local POSIX execution, no custom endpoint or cloud/orb agent |
 | Pi              | CLI 0.79.0+; configured model; no tools or project resources                                          |
-| Kimi            | CLI 0.30.0+; configured model; Python 3.11+ or `tomli` for TOML config                                |
+
+`--engine kimi` remains recognized but is refused for reviews and `--dry-run`
+before any Kimi process, configuration read or authentication setup. The supported
+Kimi Code prompt mode accepts review content only as a command-line argument;
+the helper has no supported private prompt input channel for it. This intentionally
+retires the previous Kimi execution path rather than exposing the bundle in process
+arguments. Existing `--kimi-bin` arguments remain accepted for the same clear refusal;
+the helper never silently selects another engine. A custom agent file is not an
+equivalent replacement because it changes the input into a templated system prompt.
 
 ## Image review
 
