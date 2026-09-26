@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Reject invalid final Autoreview terminal results without reusing earlier reports, and keep validated output paths consistent through status cleanup and atomic report publication.
+- Refuse Autoreview output symlinks inside the reviewed repository even when their referents are outside, preserving repository entries and stale status on validation failure.
+- Keep Autoreview's configured reviewer deadline active after streamed output closes, so a still-running reviewer cannot overrun the limit and return a successful review.
+- Preserve literal Unicode separators inside Autoreview JSONL records so final reports remain authoritative and valid Amp streams are accepted.
+- Reject invalid Amp model names during Autoreview dry runs with the same provider/model diagnostic used for execution.
+- Preserve feasible Autoreview partitions when intact context leaves less room than the estimated continuation reserve, while retaining complete evidence and the prompt limit.
+- Reject colliding Autoreview JSON and human output entries before review, while preserving separate symlink and hardlink destinations when no status sidecar is requested.
+
 ## 0.2.0 - 2026-09-24
 
 **Highlights:** Native image review, committed source context, and more efficient multi-pass reviews.

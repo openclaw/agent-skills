@@ -262,7 +262,7 @@ class AutoreviewImageGitTests(unittest.TestCase):
         self.git("init", "-q")
         self.git("config", "user.email", "test@example.invalid")
         self.git("config", "user.name", "Test")
-        (self.repo / "text.txt").write_text("old\n")
+        (self.repo / "text.txt").write_bytes(b"old\n")
         self.git("add", ".")
         self.git("commit", "-qm", "base")
         self.base = self.git("rev-parse", "HEAD").strip()
@@ -713,6 +713,8 @@ def amp_test_stream(
     tool_result_id: str = "amp-tool-use",
     tool_error: bool = False,
     tool_result_content: str | None = None,
+    final_text: str = "Completed.",
+    ensure_ascii: bool = True,
 ) -> str:
     if tool_input is None:
         tool_input = {}
@@ -731,7 +733,8 @@ def amp_test_stream(
                     "tools": ["autoreview_generate"] if tools is None else tools,
                     "mcp_servers": [] if mcp_servers is None else mcp_servers,
                     "agent_mode": "medium",
-                }
+                },
+                ensure_ascii=ensure_ascii,
             ),
             json.dumps(
                 {
@@ -742,7 +745,8 @@ def amp_test_stream(
                     },
                     "parent_tool_use_id": None,
                     "session_id": "amp-test-session",
-                }
+                },
+                ensure_ascii=ensure_ascii,
             ),
             json.dumps(
                 {
@@ -760,7 +764,8 @@ def amp_test_stream(
                     },
                     "parent_tool_use_id": None,
                     "session_id": "amp-test-session",
-                }
+                },
+                ensure_ascii=ensure_ascii,
             ),
             json.dumps(
                 {
@@ -778,27 +783,30 @@ def amp_test_stream(
                     },
                     "parent_tool_use_id": None,
                     "session_id": "amp-test-session",
-                }
+                },
+                ensure_ascii=ensure_ascii,
             ),
             json.dumps(
                 {
                     "type": "assistant",
                     "message": {
                         "role": "assistant",
-                        "content": [{"type": "text", "text": "Completed."}],
+                        "content": [{"type": "text", "text": final_text}],
                     },
                     "parent_tool_use_id": None,
                     "session_id": "amp-test-session",
-                }
+                },
+                ensure_ascii=ensure_ascii,
             ),
             json.dumps(
                 {
                     "type": "result",
                     "subtype": "success",
                     "is_error": False,
-                    "result": "Completed.",
+                    "result": final_text,
                     "session_id": "amp-test-session",
-                }
+                },
+                ensure_ascii=ensure_ascii,
             ),
         ]
     ) + "\n"
@@ -834,6 +842,50 @@ def amp_test_mcp_denial_result(
 
 
 class AutoreviewAmpTests(unittest.TestCase):
+    def test_amp_dry_run_and_runtime_reject_the_same_model_grammar(self) -> None:
+        for model, diagnostic in (
+            (None, "amp engine requires a model"),
+            ("", "amp engine requires a model"),
+            ("synthetic-model", "amp engine model must use a supported provider/model format"),
+            ("unsupported/synthetic-model", "amp engine model must use a supported provider/model format"),
+        ):
+            args = argparse.Namespace(engine="amp", amp_bin="amp", model=model, thinking="high")
+            with self.subTest(model=model), mock.patch.object(
+                AUTOREVIEW, "find_command", return_value="/usr/bin/amp",
+            ), mock.patch.dict(AUTOREVIEW.ENGINE_ISOLATION_PROBES, {
+                "amp": lambda *_args: "/usr/bin/amp",
+            }), mock.patch.object(
+                AUTOREVIEW, "ensure_amp_isolation_supported", return_value="/usr/bin/amp",
+            ), mock.patch.object(AUTOREVIEW, "safe_temp_root") as staging:
+                self.assertEqual(AUTOREVIEW.resolve_engine_binary(args, Path.cwd()), (False, diagnostic))
+                with self.assertRaises(SystemExit) as caught:
+                    AUTOREVIEW.run_amp(args, Path.cwd(), "synthetic prompt")
+                self.assertEqual(str(caught.exception.code), diagnostic)
+                staging.assert_not_called()
+
+    def test_amp_dry_run_validates_the_resolved_model_without_changing_precedence(self) -> None:
+        valid, invalid = "openai/synthetic-model", "synthetic-model"
+        cases = (
+            ({}, [], "openai/gpt-5.6-sol", True),
+            ({}, ["--model", valid], valid, True),
+            ({}, ["--model", invalid], invalid, False),
+            ({"AUTOREVIEW_MODEL": invalid}, [], invalid, False),
+            ({"AUTOREVIEW_AMP_MODEL": invalid}, [], invalid, False),
+            ({"AUTOREVIEW_MODEL": invalid, "AUTOREVIEW_AMP_MODEL": valid}, [], valid, True),
+            ({"AUTOREVIEW_AMP_MODEL": invalid}, ["--model", valid], valid, True),
+            ({"AUTOREVIEW_AMP_MODEL": valid}, ["--model", invalid], invalid, False),
+            ({}, ["--model", invalid, "--model", "amp=" + valid], valid, True),
+        )
+        for env, options, expected_model, available in cases:
+            with self.subTest(env=env, options=options), mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(sys, "argv", ["autoreview", "--engine", "amp", "--dry-run", *options]), \
+                    mock.patch.object(AUTOREVIEW, "find_command", return_value="/usr/bin/amp"), \
+                    mock.patch.dict(AUTOREVIEW.ENGINE_ISOLATION_PROBES, {"amp": lambda *_args: "/usr/bin/amp"}):
+                reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+                self.assertEqual(reviewer.model, expected_model)
+                expected_error = None if available else "amp engine model must use a supported provider/model format"
+                self.assertEqual(AUTOREVIEW.resolve_engine_binary(reviewer, Path.cwd()), (available, expected_error))
+
     def test_amp_bin_cli_option_and_defaults(self) -> None:
         with mock.patch.object(
             sys,
@@ -1106,6 +1158,64 @@ class AutoreviewAmpTests(unittest.TestCase):
         self.assertFalse(
             AUTOREVIEW.attest_amp_stream(amp_test_stream(cwd, tool_error=True), cwd)
         )
+
+    def test_amp_stream_attestation_preserves_unicode_json_strings(self) -> None:
+        cwd = Path("/tmp/amp-review-empty")
+        for separator in ("\u0085", "\u2028", "\u2029"):
+            final_text = f"Completed.{separator}Synthetic response."
+            escaped = amp_test_stream(cwd, final_text=final_text)
+            literal = amp_test_stream(cwd, final_text=final_text, ensure_ascii=False)
+            self.assertNotIn(separator, escaped)
+            self.assertIn(separator, literal)
+            escaped_events = [json.loads(line) for line in escaped.split("\n") if line]
+            literal_events = [json.loads(line) for line in literal.split("\n") if line]
+            self.assertEqual(len(escaped_events), 6)
+            self.assertEqual(escaped_events, literal_events)
+            for encoding, stream in (("escaped", escaped), ("literal", literal)):
+                with self.subTest(separator=f"U+{ord(separator):04X}", encoding=encoding):
+                    self.assertTrue(AUTOREVIEW.attest_amp_stream(stream, cwd))
+
+    def test_amp_stream_attestation_keeps_line_framing_and_noise_guards(self) -> None:
+        cwd = Path("/tmp/amp-review-empty")
+        records = amp_test_stream(cwd).split("\n")[:-1]
+        for line_ending in ("\n", "\r\n"):
+            for blank_line in ("", " \t"):
+                framed = (line_ending + blank_line + line_ending).join(records)
+                framed = blank_line + line_ending + framed + line_ending + blank_line
+                with self.subTest(line_ending=repr(line_ending), blank_line=blank_line):
+                    self.assertTrue(AUTOREVIEW.attest_amp_stream(framed, cwd))
+                noisy = line_ending.join([blank_line, *records[:2], "not-json", *records[2:]])
+                with self.subTest(line_ending=repr(line_ending), noise=True), self.assertRaisesRegex(
+                    SystemExit, "amp isolation attestation failed: malformed stream JSON",
+                ):
+                    AUTOREVIEW.attest_amp_stream(noisy, cwd)
+
+    @unittest.skipIf(os.name == "nt", "Amp runtime is unsupported on native Windows")
+    def test_amp_review_result_preserves_unicode_stream_and_private_report(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="autoreview-amp-unicode-test.") as tmpdir:
+            root = Path(tmpdir)
+            result_path = root / "result.json"
+            for separator in ("\u0085", "\u2028", "\u2029"):
+                explanation = f"Completed.{separator}Synthetic response."
+                report = {
+                    **FINAL_REPORT,
+                    "overall_explanation": explanation,
+                    "review_completion": "complete",
+                }
+                raw_report = json.dumps(report, ensure_ascii=False)
+                result_path.write_text(raw_report, encoding="utf-8")
+                result_path.chmod(0o600)
+                for ensure_ascii in (True, False):
+                    stream = amp_test_stream(
+                        root, final_text=explanation, ensure_ascii=ensure_ascii,
+                    )
+                    process = subprocess.CompletedProcess([], 0, stream, "")
+                    with self.subTest(separator=f"U+{ord(separator):04X}", ensure_ascii=ensure_ascii):
+                        output = AUTOREVIEW.amp_review_result(
+                            process, root, root / "error", result_path,
+                        )
+                        self.assertEqual(output, raw_report)
+                        self.assertEqual(json.loads(output), report)
 
     @unittest.skipIf(os.name == "nt", "Amp runtime is unsupported on native Windows")
     def test_amp_run_reports_timeout_before_stream_attestation(self) -> None:

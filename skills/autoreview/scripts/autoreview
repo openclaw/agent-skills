@@ -1927,14 +1927,18 @@ def collect_streamed_process(
     stdin_thread = threading.Thread(target=write_stdin, daemon=True)
     stdin_thread.start()
     open_streams = 2
-    while open_streams:
+    while open_streams or proc.poll() is None:
         if deadline.expired():
             deadline.terminate(proc)
         if deadline.drain_expired():
             break
         try:
+            if not open_streams:
+                # Pipe EOF does not end the reviewer's process deadline.
+                proc.wait(timeout=deadline.wait_seconds(heartbeat_seconds))
+                continue
             name, line = events.get(timeout=deadline.wait_seconds(heartbeat_seconds))
-        except queue.Empty:
+        except (queue.Empty, subprocess.TimeoutExpired):
             if deadline.terminated or deadline.expired():
                 continue
             emit_heartbeat(label, started, proc)
@@ -4383,7 +4387,8 @@ def build_change_review_prompts(
     datasets: str,
     max_prompt_bytes: int = MAX_REVIEW_PROMPT_BYTES,
     max_passes: int | None = None,
-    *, min_change_bytes: int = 4,
+    *, min_change_bytes: int = 4, continuation_reserve: int = 4_096,
+    review_pass_budget: int | None = None,
 ) -> list[str] | None:
     full_prompt = render_review_prompt(
         branch,
@@ -4408,28 +4413,35 @@ def build_change_review_prompts(
     content_limit = (
         max_prompt_bytes
         - utf8_size(empty_chunk_prompt)
-        - 4_096
+        - continuation_reserve
     )
     while content_limit >= min_change_bytes:
         chunks = split_review_bundle(bundle, content_limit)
         if max_passes is not None and len(chunks) > max_passes:
             return None
-        prompts = [
-            render_review_prompt(
-                branch,
-                target,
-                target_ref,
-                chunk,
-                extra_prompt,
-                datasets,
-                (index, len(chunks)),
-            )
-            for index, chunk in enumerate(chunks, start=1)
-        ]
+        def rendered_prompts():
+            for index, chunk in enumerate(chunks, start=1):
+                yield render_review_prompt(
+                    branch, target, target_ref, chunk, extra_prompt, datasets, (index, len(chunks)),
+                )
+
+        if not continuation_reserve:
+            check_review_pass_budget(review_pass_budget, len(chunks))
+            # Tiny chunks can repeat large intact context. Prove fit before
+            # retaining any prefix of the complete prompt list.
+            largest = 0
+            for prompt in rendered_prompts():
+                largest = max(largest, utf8_size(prompt))
+                if largest > max_prompt_bytes:
+                    break
+            if largest > max_prompt_bytes:
+                content_limit -= largest - max_prompt_bytes
+                continue
+        prompts = list(rendered_prompts())
         largest = max(utf8_size(prompt) for prompt in prompts)
         if largest <= max_prompt_bytes:
             return prompts
-        content_limit -= largest - max_prompt_bytes + 1_024
+        content_limit -= largest - max_prompt_bytes + (1_024 if continuation_reserve else 0)
     return None
 
 
@@ -4441,6 +4453,7 @@ def build_review_prompts(
     extra_prompt: str,
     datasets: list[ReviewDataset],
     max_prompt_bytes: int = MAX_REVIEW_PROMPT_BYTES,
+    max_review_passes: int | None = None,
 ) -> list[str] | list[ReviewPass]:
     if isinstance(bundle, CapturedBundle):
         if bundle.mixed:
@@ -4480,6 +4493,15 @@ def build_review_prompts(
             )
             if change_prompts is not None:
                 return change_prompts
+        # The reserve estimates continuation size; measured small chunks can
+        # still fit when intact evidence leaves less room than that estimate.
+        change_prompts = build_change_review_prompts(
+            branch, target, target_ref, bundle, extra_prompt, rendered_datasets,
+            max_prompt_bytes, min_change_bytes=4, continuation_reserve=0,
+            review_pass_budget=max_review_passes,
+        )
+        if change_prompts is not None:
+            return change_prompts
         raise SystemExit(
             "review instructions or intact context leave too little room for change chunks; "
             "reduce optional instructions or context without omitting required evidence"
@@ -4527,6 +4549,13 @@ def build_review_prompts(
                 )
                 if change_prompts is not None:
                     return change_prompts
+            change_prompts = build_change_review_prompts(
+                branch, target, target_ref, bundle, extra_prompt, rendered_datasets,
+                max_prompt_bytes, min_change_bytes=4, continuation_reserve=0,
+                review_pass_budget=max_review_passes,
+            )
+            if change_prompts is not None:
+                return change_prompts
             raise SystemExit(
                 "unable to partition the review bundle within the aggregate prompt limit"
             )
@@ -4575,11 +4604,12 @@ def prepare_review_prompts(
     extra_prompt: str,
     datasets: list[ReviewDataset],
     max_prompt_bytes: int,
+    max_review_passes: int | None = None,
 ) -> list[str] | list[ReviewPass]:
     if isinstance(bundle, CapturedBundle) and bundle.images:
         extra_prompt += "\n\n" + image_manifest(bundle.images)
     return build_review_prompts(
-        repo, target, target_ref, bundle, extra_prompt, datasets, max_prompt_bytes,
+        repo, target, target_ref, bundle, extra_prompt, datasets, max_prompt_bytes, max_review_passes,
     )
 
 
@@ -5986,7 +6016,8 @@ def amp_review_plugin_source(
 
 def attest_amp_stream(output: str, review_root: Path) -> bool:
     events: list[dict[str, Any]] = []
-    for line_number, raw_line in enumerate(output.splitlines(), 1):
+    # JSONL uses LF; Unicode line separators may be JSON string data.
+    for line_number, raw_line in enumerate(output.split("\n"), 1):
         if not raw_line.strip():
             continue
         try:
@@ -6240,14 +6271,18 @@ def read_amp_private_file(path: Path, *, label: str, max_chars: int) -> str:
     return value
 
 
-def run_amp(args: argparse.Namespace, repo: Path, prompt: str) -> str:
-    amp_bin = ensure_amp_isolation_supported(args, repo)
-    model = args.model
-    thinking = args.thinking
+def validate_amp_model(model: object) -> None:
     if not isinstance(model, str) or not model:
         raise SystemExit("amp engine requires a model")
     if AMP_MODEL_PATTERN.fullmatch(model) is None:
         raise SystemExit("amp engine model must use a supported provider/model format")
+
+
+def run_amp(args: argparse.Namespace, repo: Path, prompt: str) -> str:
+    amp_bin = ensure_amp_isolation_supported(args, repo)
+    model = args.model
+    thinking = args.thinking
+    validate_amp_model(model)
     if thinking not in AMP_THINKING_VALUES:
         raise SystemExit(
             f"invalid amp thinking value {thinking!r}; expected one of {', '.join(sorted(AMP_THINKING_VALUES))}"
@@ -6858,19 +6893,8 @@ def extract_json(text: str) -> dict[str, Any]:
         raise SystemExit(f"review engine returned non-JSON output: {exc}\n{stripped[:2000]}")
     if isinstance(parsed, dict) and "findings" in parsed:
         return parsed
-    if isinstance(parsed, dict) and isinstance(parsed.get("structured_output"), dict):
-        return parsed["structured_output"]
-    if isinstance(parsed, dict) and isinstance(parsed.get("result"), dict):
-        result_object = parsed["result"]
-        if "findings" in result_object:
-            return result_object
-    if isinstance(parsed, dict) and isinstance(parsed.get("result"), str):
-        result_json = parse_json_candidate(parsed["result"])
-        if isinstance(result_json, dict) and "findings" in result_json:
-            return result_json
-        raise SystemExit(f"review engine result was not structured JSON:\n{parsed['result'][:2000]}")
-    if isinstance(parsed, list):
-        events_report = _report_from_events(parsed)
+    if isinstance(parsed, (dict, list)):
+        events_report = _report_from_events([parsed] if isinstance(parsed, dict) else parsed)
         if events_report:
             return events_report
     jsonl_report = extract_json_from_jsonl(stripped)
@@ -6886,13 +6910,15 @@ def _report_from_events(events: list[Any]) -> dict[str, Any] | None:
     (e.g. some `claude --output-format json` versions/configurations return
     [{type:system,init}, ..., {type:result,...}] rather than a bare object).
     """
-    terminal_candidates: list[str | dict[str, Any]] = []
+    terminal_event: dict[str, Any] | None = None
     candidates: list[str | dict[str, Any]] = []
     assistant_candidates: list[str] = []
     text_fragments: list[str] = []
     for event in events:
         if not isinstance(event, dict):
             continue
+        if event.get("type") == "result" or "result" in event or "structured_output" in event:
+            terminal_event = event
         part = event.get("part")
         if isinstance(part, dict) and isinstance(part.get("text"), str):
             candidates.append(part["text"])
@@ -6907,32 +6933,25 @@ def _report_from_events(events: list[Any]) -> dict[str, Any] | None:
                 for item in content:
                     if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
                         assistant_candidates.append(item["text"])
-        if isinstance(event.get("result"), str):
-            terminal_candidates.append(event["result"])
-        if isinstance(event.get("result"), dict):
-            terminal_candidates.append(event["result"])
         if isinstance(event.get("text"), str):
             candidates.append(event["text"])
         if isinstance(event.get("finalText"), str):
             candidates.append(event["finalText"])
-        if isinstance(event.get("structured_output"), dict):
-            terminal_candidates.append(event["structured_output"])
         if event.get("type") == "text":
             part = event.get("part")
             if isinstance(part, dict) and isinstance(part.get("text"), str):
                 candidates.append(part["text"])
     if text_fragments:
         candidates.append("".join(text_fragments))
-    for candidate in reversed(terminal_candidates):
-        if isinstance(candidate, dict):
-            if "findings" in candidate:
-                return candidate
-            continue
-        parsed = parse_json_candidate(candidate)
+    if terminal_event is not None:
+        parsed = terminal_event.get("structured_output")
+        if parsed is None:
+            parsed = terminal_event.get("result")
+            if isinstance(parsed, str):
+                parsed = parse_json_candidate(parsed)
         if isinstance(parsed, dict) and "findings" in parsed:
             return parsed
-    if terminal_candidates:
-        raise SystemExit("review engine result was not structured JSON:\n" + str(terminal_candidates[-1])[:2000])
+        raise SystemExit("review engine result was not structured JSON: invalid final terminal event")
     for candidate in reversed(candidates):
         if isinstance(candidate, dict):
             if "findings" in candidate:
@@ -6950,7 +6969,8 @@ def _report_from_events(events: list[Any]) -> dict[str, Any] | None:
 
 def extract_json_from_jsonl(text: str) -> dict[str, Any] | None:
     events: list[Any] = []
-    for line in text.splitlines():
+    # Keep Unicode string content intact while splitting protocol records.
+    for line in text.split("\n"):
         line = line.strip()
         if not line:
             continue
@@ -7532,10 +7552,10 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
     reported unavailable with that same reason, and the selected engine is
     checked for a resolvable CLI binary on PATH.
 
-    Once a binary resolves, codex/claude/pi/kimi are also put through the same
+    Once a binary resolves, codex/claude/amp/pi/kimi are also put through the same
     local version and required-flag probes their real runners perform
     before contacting the engine (ensure_codex_isolation_supported,
-    ensure_claude_isolation_supported, ensure_pi_isolation_supported,
+    ensure_claude_isolation_supported, ensure_amp_isolation_supported, ensure_pi_isolation_supported,
     ensure_kimi_isolation_supported), so a dry run cannot report OK for a
     configuration a real run would reject immediately (unsupported CLI
     version, missing required flag, or a launcher that fails under the
@@ -7569,8 +7589,9 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
     invokes the CLI (see run_claude, gated on args.tools); that is a pure,
     non-mutating computation over --claude-allowed-tools/--no-web-search
     with no I/O, so it is replayed here too and can reject a non-read-only
-    or malformed tool rule the same way the real run would. pi and other
-    engines have no equivalent raising callable between their isolation
+    or malformed tool rule the same way the real run would. Amp reuses its
+    pure provider/model grammar check before runtime preparation. pi has
+    no equivalent raising callable between its isolation
     probe and engine spawn (see run_pi): pi only builds an argv list, and
     write_kimi_review_files (kimi's file-write staging step) only fails on
     tmp-state errors (e.g. disk full), never on user setup, so it is not
@@ -7598,6 +7619,11 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
     if probe is not None:
         try:
             probe(reviewer, repo)
+        except SystemExit as exc:
+            return False, str(exc.code)
+    if engine == "amp":
+        try:
+            validate_amp_model(reviewer.model)
         except SystemExit as exc:
             return False, str(exc.code)
     if engine == "kimi":
@@ -7654,14 +7680,17 @@ def apply_finding_threshold_prompt(args: argparse.Namespace, extra_prompt: str) 
     return threshold_prompt + ("\n\n" + extra_prompt if extra_prompt.strip() else "")
 
 
-def check_review_plan(args: argparse.Namespace, prompts: list[str] | list[ReviewPass]) -> None:
-    print(f"review plan: {len(prompts)} passes; {review_plan_bytes(prompts)} total prompt bytes", flush=True)
-    limit = getattr(args, "max_review_passes", None)
-    if limit is not None and len(prompts) > limit:
+def check_review_pass_budget(limit: int | None, pass_count: int) -> None:
+    if limit is not None and pass_count > limit:
         raise SystemExit(
-            f"planned review has {len(prompts)} passes; --max-review-passes allows {limit}. "
+            f"planned review has {pass_count} passes; --max-review-passes allows {limit}. "
             "Narrow the target/evidence or raise the explicit pass budget; no reviewer was started."
         )
+
+
+def check_review_plan(args: argparse.Namespace, prompts: list[str] | list[ReviewPass]) -> None:
+    print(f"review plan: {len(prompts)} passes; {review_plan_bytes(prompts)} total prompt bytes", flush=True)
+    check_review_pass_budget(getattr(args, "max_review_passes", None), len(prompts))
 
 
 def dry_run_preflight(
@@ -7710,6 +7739,7 @@ def dry_run_preflight(
                 prompts = prepare_review_prompts(
                     repo, target, target_ref, captured, threshold_extra_prompt,
                     evidence.datasets, max_prompt_bytes_for_reviewers(reviewers),
+                    getattr(args, "max_review_passes", None),
                 )
                 check_review_plan(args, prompts)
             with PreparationProgress("evidence verification"):
@@ -7879,51 +7909,60 @@ def run_review_passes(
     return chunk_reports
 
 
-def reject_repo_output_paths(args: argparse.Namespace, repo: Path) -> None:
+def prepare_output_paths(args: argparse.Namespace, repo: Path) -> None:
+    """Validate all destinations, then freeze their original cwd/tilde meaning."""
     repo_root_path = repo.resolve()
+    distinct_referents = bool(getattr(args, "status_output", None))
     outputs: list[tuple[str, Path]] = []
-    for option, value in (
-        ("--json-output", getattr(args, "json_output", None)),
-        ("--output", getattr(args, "output", None)),
-        ("--status-output", getattr(args, "status_output", None)),
-        ("--engine-stage-dir", getattr(args, "engine_stage_dir", None)),
+    destinations: dict[str, str] = {}
+    for option, attribute in (
+        ("--json-output", "json_output"),
+        ("--output", "output"),
+        ("--status-output", "status_output"),
+        ("--engine-stage-dir", "engine_stage_dir"),
     ):
+        value = getattr(args, attribute, None)
         if not value:
             continue
-        path = Path(value).expanduser()
-        resolved = (
-            path if path.is_absolute() else Path.cwd() / path
-        ).resolve()
-        if getattr(args, "status_output", None):
-            for previous_option, previous in outputs:
-                # Refuse spelling aliases even before files exist, including
-                # macOS case/decomposition aliases and Windows case aliases.
-                same = (unicodedata.normalize("NFD", str(resolved)).casefold()
-                        == unicodedata.normalize("NFD", str(previous)).casefold())
-                if (not same and resolved.parent.exists() and previous.parent.exists()
-                        and unicodedata.normalize("NFD", resolved.name).casefold()
-                        == unicodedata.normalize("NFD", previous.name).casefold()):
-                    same = os.path.samefile(resolved.parent, previous.parent)
-                if not same and resolved.exists() and previous.exists():
-                    same = os.path.samefile(resolved, previous)
-                if same:
-                    raise SystemExit(f"{option} must use a different path from {previous_option}")
-            outputs.append((option, resolved))
-        inside_repo = resolved.is_relative_to(repo_root_path)
-        if not inside_repo:
-            for ancestor in (resolved, *resolved.parents):
-                try:
-                    if os.path.samefile(ancestor, repo_root_path):
-                        inside_repo = True
-                        break
-                except OSError:
-                    continue
-        if not inside_repo:
-            continue
-        raise SystemExit(
-            f"{option} must point outside the reviewed repository: "
-            f"{display_escape(value, 500)}"
-        )
+        path = Path(value).expanduser().absolute()
+        resolved = path.resolve()
+        # Publication replaces final entries; status keeps its stricter referent rule.
+        entry = path.parent.resolve() / path.name
+        comparison_path = resolved if distinct_referents else entry
+        for previous_option, previous in outputs:
+            # Refuse spelling aliases even before files exist, including
+            # macOS case/decomposition aliases and Windows case aliases.
+            same = (unicodedata.normalize("NFD", str(comparison_path)).casefold()
+                    == unicodedata.normalize("NFD", str(previous)).casefold())
+            if (not same and comparison_path.parent.exists() and previous.parent.exists()
+                    and unicodedata.normalize("NFD", comparison_path.name).casefold()
+                    == unicodedata.normalize("NFD", previous.name).casefold()):
+                same = os.path.samefile(comparison_path.parent, previous.parent)
+            if distinct_referents and not same and comparison_path.exists() and previous.exists():
+                same = os.path.samefile(comparison_path, previous)
+            if same:
+                raise SystemExit(f"{option} must use a different path from {previous_option}")
+        outputs.append((option, comparison_path))
+        for candidate in (entry, resolved):
+            inside_repo = candidate.is_relative_to(repo_root_path)
+            if not inside_repo:
+                for ancestor in (candidate, *candidate.parents):
+                    try:
+                        if os.path.samefile(ancestor, repo_root_path):
+                            inside_repo = True
+                            break
+                    except OSError:
+                        continue
+            if inside_repo:
+                raise SystemExit(
+                    f"{option} must point outside the reviewed repository: "
+                    f"{display_escape(value, 500)}"
+                )
+        # Retain lexical destinations so atomic writes replace final symlinks.
+        if attribute != "engine_stage_dir":
+            destinations[attribute] = str(path)
+    for attribute, destination in destinations.items():
+        setattr(args, attribute, destination)
 
 
 def atomic_write_text(path: Path, content: str) -> None:
@@ -7957,7 +7996,7 @@ def write_review_status(args: argparse.Namespace, status: str, exit_code: int,
     }
     if usage := review_usage_summary(args):
         envelope["usage"] = usage
-    atomic_write_text(Path(args.status_output).expanduser(), json.dumps(envelope, indent=2) + "\n")
+    atomic_write_text(Path(args.status_output), json.dumps(envelope, indent=2) + "\n")
 
 
 def main() -> int:
@@ -7998,9 +8037,9 @@ def main_with_args(args: argparse.Namespace) -> int:
         return 2
     with PreparationProgress("target selection"):
         repo = repo_root()
-        reject_repo_output_paths(args, repo)
+        prepare_output_paths(args, repo)
         if getattr(args, "status_output", None):
-            Path(args.status_output).expanduser().unlink(missing_ok=True)
+            Path(args.status_output).unlink(missing_ok=True)
         target, target_ref = choose_target(repo, args.mode, args.base)
         branch = current_branch(repo)
     print(f"autoreview target: {target}", flush=True)
@@ -8042,6 +8081,7 @@ def main_with_args(args: argparse.Namespace) -> int:
         prompts = prepare_review_prompts(
             repo, target, target_ref, captured, extra_prompt, evidence.datasets,
             max_prompt_bytes_for_reviewers(reviewers),
+            getattr(args, "max_review_passes", None),
         )
     print(f"bundle: {utf8_size(captured.text)} bytes; review passes: {len(prompts)}", flush=True)
     check_review_plan(args, prompts)

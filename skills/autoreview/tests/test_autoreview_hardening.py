@@ -609,12 +609,42 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                         self.assertLessEqual(len(prompt.encode()), budget)
                         self.assertIn(complete, prompt)
                         self.assertNotIn("Evidence batch:", prompt)
-                    impossible = instructions + "i" * (capacity + len(complete.encode()))
+                    empty_prompt = render(branch, "branch", None, self.helper["ReviewChunk"](""), "", "")
+                    impossible = "i" * (budget - len(empty_prompt.encode()))
+                    self.assertEqual(len(render(
+                        branch, "branch", None, self.helper["ReviewChunk"](""), impossible, "",
+                    ).encode()), budget)
                     self.assertIsNone(build(branch, "branch", None, bundle, impossible, complete, budget))
                     with self.assertRaisesRegex(SystemExit, "intact context leave too little room"):
                         self.helper["build_review_prompts"](
                             repo, "branch", None, bundle, impossible, datasets, budget,
                         )
+
+    def test_zero_reserve_stops_sizing_at_first_oversized_prompt(self):
+        budget, branch = 12_000, "synthetic-capacity"
+        bundle = "# Branch Diff\ndiff --git a/source.py b/source.py\n@@ -0,0 +1 @@\n+" + "x" * 8_000
+        render = self.helper["render_review_prompt"]
+        fixed = render(branch, "branch", None, self.helper["ReviewChunk"](""), "", "", (999_999, 999_999))
+        instructions = "i" * (budget - len(fixed.encode()) - 4)
+        measured = []
+
+        def observe(*args):
+            prompt = render(*args)
+            if len(args) == 7 and args[6] != (999_999, 999_999) and args[3].content:
+                measured.append(len(prompt.encode()))
+                self.assertLessEqual(len(measured), 2, "continued rendering after the first oversized prompt")
+            return prompt
+
+        with mock.patch.dict(self.helper["build_change_review_prompts"].__globals__, {
+            "render_review_prompt": observe,
+        }):
+            result = self.helper["build_change_review_prompts"](
+                branch, "branch", None, bundle, instructions, "", budget, continuation_reserve=0,
+            )
+        self.assertIsNone(result)
+        self.assertEqual(len(measured), 2)
+        self.assertLessEqual(measured[0], budget)
+        self.assertGreater(measured[1], budget)
 
     def test_mixed_complete_spans_keep_datasets_below_preferred_split_capacity(self):
         budget = 512_000
@@ -1327,6 +1357,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.helper = load_helper()
 
     @contextlib.contextmanager
+    def without_reviewer_defaults(self):
+        with mock.patch.dict(os.environ):
+            for name in tuple(os.environ):
+                if name.startswith("AUTOREVIEW_") and name != "AUTOREVIEW_GIT":
+                    os.environ.pop(name)
+            yield
+
+    @contextlib.contextmanager
     def preparation_fixture(self, *options):
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
@@ -1354,11 +1392,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     "review_completion": "complete",
                 })
 
-            with mock.patch.dict(self.helper["main_impl"].__globals__, {
+            with self.without_reviewer_defaults(), mock.patch.dict(self.helper["main_impl"].__globals__, {
                 "repo_root": lambda: repo,
                 "run_engine": engine,
                 "resolve_engine_binary": lambda *_args: (True, None),
-            }), mock.patch.object(sys, "argv", [str(SCRIPT), "--mode", "local", *options]), \
+            }), mock.patch.object(sys, "argv", [str(SCRIPT), "--engine", "codex", "--mode", "local", *options]), \
                     contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 yield repo, sends, stdout, stderr
 
@@ -1704,6 +1742,89 @@ class AutoreviewHardeningTests(unittest.TestCase):
             }), self.assertRaisesRegex(SystemExit, "intact context leave too little room"):
                 self.helper["main_impl"]()
             self.assertFalse(sends)
+
+    def test_near_capacity_intact_source_context_keeps_complete_bounded_review(self):
+        budget, remaining, pass_limit = 512_000, 3_000, 32
+        path = "src/token_count.py"
+        render = self.helper["render_review_prompt"]
+        threshold = argparse.Namespace(max_priority="P0")
+        with self.committed_context_fixture(
+            "--max-review-passes", str(pass_limit), "--max-priority", "P0",
+            role="--source-context-file", content=b"",
+        ) as (repo, sends, *_):
+            branch = self.helper["current_branch"](repo)
+
+            def context_inputs(captured):
+                return self.helper["capture_source_context_inputs"](
+                    argparse.Namespace(source_context_file=[path]), repo, captured,
+                    self.helper["EvidenceInputs"]("", [], []),
+                )
+
+            empty = context_inputs(self.helper["branch_bundle"](repo, "HEAD^"))
+            fixed = render(
+                branch, "branch", "HEAD^", self.helper["ReviewChunk"](""),
+                self.helper["apply_finding_threshold_prompt"](threshold, empty.prompt),
+                "", (999_999, 999_999),
+            )
+            line, tail = "# committed context \U0001f99e\r\n", "end of context \t"
+            repeats, padding = divmod(
+                budget - len(fixed.encode()) - remaining - len(tail.encode()), len(line.encode()),
+            )
+            content = line * repeats + "x" * padding + tail
+            (repo / path).write_bytes(content.encode())
+            git(repo, "add", "--", path)
+            git(repo, "commit", "-qm", "intact source context")
+            (repo / "source.md").write_text("small selected change\n")
+            git(repo, "commit", "-qam", "small selected change")
+            self.assertEqual(self.helper["main_impl"](), 0)
+            self.assertEqual(len(sends), 1)
+            self.assertNotIn("Oversized review bundle chunk:", sends[0])
+            self.assertEqual(sends[0].count(content), 1)
+            sends.clear()
+
+            (repo / "source.md").write_bytes(
+                ("changed = '\U0001f99e'\r\n" * 400 + "end of selected change \t").encode(),
+            )
+            git(repo, "commit", "-qam", "larger selected change")
+            captured = self.helper["branch_bundle"](repo, "HEAD^")
+            evidence = context_inputs(captured)
+            extra = self.helper["apply_finding_threshold_prompt"](threshold, evidence.prompt)
+            fixed = render(
+                branch, "branch", "HEAD^", self.helper["ReviewChunk"](""),
+                extra, "", (999_999, 999_999),
+            )
+            self.assertEqual(budget - len(fixed.encode()), remaining)
+            self.assertGreater(len(captured.text.encode()), remaining)
+            self.assertEqual(captured.paths, {"source.md"})
+            self.assertFalse(captured.mixed or captured.images or evidence.datasets)
+            self.assertEqual(len(evidence.files), 1)
+            oid = git(repo, "rev-parse", f"HEAD:{path}").strip()
+            self.assertIn(f"commit={captured.commit} blob={oid} mode=100644; context only", evidence.prompt)
+
+            observed_render = mock.Mock(wraps=render)
+            with mock.patch.dict(self.helper["main_impl"].__globals__, {"render_review_prompt": observed_render}), \
+                    mock.patch.object(sys, "argv", [*sys.argv, "--max-review-passes", "1"]), \
+                    self.assertRaisesRegex(SystemExit, "no reviewer was started"):
+                self.helper["main_impl"]()
+            self.assertFalse(sends)
+            numbered = [call for call in observed_render.call_args_list
+                        if len(call.args) == 7 and call.args[6] != (999_999, 999_999)]
+            self.assertEqual(len(numbered), 0, "explicit pass budget must reject before duplicating intact context")
+            self.assertEqual(self.helper["main_impl"](), 0)
+            self.assertGreater(len(sends), 1)
+            self.assertLessEqual(len(sends), pass_limit)
+            changes = []
+            for prompt in sends:
+                self.assertLessEqual(len(prompt.encode()), budget)
+                prefix, change = prompt.rsplit("\n\n# Change Bundle\n", 1)
+                self.assertEqual(prefix.count(evidence.prompt), 1)
+                self.assertIn("Finding threshold: report only P0.", prefix)
+                self.assertIn("Source-context paths are not finding targets", prefix)
+                self.assertNotIn("Evidence batch:", prefix)
+                changes.append(change)
+            self.assertEqual("".join(changes).encode(), captured.text.encode())
+            self.assertEqual((repo / path).read_bytes(), content.encode())
+            self.helper["verify_evidence"](repo, evidence.files)
 
     def test_source_context_partitioning_preserves_full_bytes_and_provenance(self):
         content = ("# context \U0001f99e\r\n" * 10_000 + "tail without newline \t").encode()
@@ -2683,13 +2804,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
                             "overall_explanation": "Synthetic provider explanation.", "overall_confidence": 0.61,
                         }
                         argv = [str(SCRIPT), "--engine", "codex", "--mode", "local", "--max-priority", priority,
+                                "--max-review-passes", str(count),
                                 "--output", str(root / "result.txt"), "--json-output", str(root / "result.json"),
                                 "--status-output", str(root / "status.json")]
                         for needle in required:
                             argv.extend(["--require-finding", needle])
                         if expect:
                             argv.append("--expect-findings")
-                        with mock.patch.dict(self.helper["main_impl"].__globals__, {
+                        with self.without_reviewer_defaults(), mock.patch.dict(self.helper["main_impl"].__globals__, {
                             "repo_root": lambda: repo,
                             "build_review_prompts": lambda *_args: ["synthetic pack"] * count,
                             "run_engine": lambda *_args: json.dumps({**provider, "review_completion": "complete"}),
@@ -2950,6 +3072,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
         public = {"findings": [], "overall_correctness": "patch is correct",
                   "overall_explanation": "Synthetic review.", "overall_confidence": 0.9}
         clean = json.dumps({**public, "review_completion": "complete"})
+        earlier_terminal = {"type": "result", "result": json.loads(clean)}
+        broken_terminal = {"type": "result", "result": None}
         unavailable = self.helper["ReviewerUnavailable"]
         cases = (
             ("engine", unavailable("DIAGNOSTIC_SENTINEL", result=subprocess.CompletedProcess([], 7, "", "")), "engine_failed"),
@@ -2960,6 +3084,9 @@ class AutoreviewHardeningTests(unittest.TestCase):
                                                "overall_explanation": "Invalid enum", "overall_confidence": 0.9,
                                                "review_completion": "complete"}), "invalid_report"),
             ("invalid-event-type", '[{"type":"assistant","message":{"content":null}}]', "invalid_report"),
+            ("invalid-final-jsonl", "\n".join(json.dumps(event) for event in
+                                             (earlier_terminal, broken_terminal)), "invalid_report"),
+            ("invalid-final-array", json.dumps([earlier_terminal, broken_terminal]), "invalid_report"),
             ("missing-completion", json.dumps(public), "invalid_report"),
             *((f"invalid-completion-{index}", json.dumps({**public, "review_completion": value}), "invalid_report")
               for index, value in enumerate(("", "deferred", [], {}, None, 42, False))),
@@ -2974,23 +3101,27 @@ class AutoreviewHardeningTests(unittest.TestCase):
             for count in (1, 2):
                 for label, failure, reason in cases:
                     with self.subTest(count=count, label=label):
-                        sidecar = root / "status.json"
-                        report = root / "result.json"
-                        human = root / "result.txt"
+                        outputs = root / f"case-{count}-{label}"
+                        outputs.mkdir()
+                        sidecar = outputs / "status.json"
+                        report = outputs / "result.json"
+                        human = outputs / "result.txt"
                         sidecar.write_text('{"status":"scoped-clean"}')
                         argv = [str(SCRIPT), "--mode", "local", "--engine", "codex",
                                 "--status-output", str(sidecar), "--json-output", str(report),
                                 "--output", str(human)]
                         engine = mock.Mock(side_effect=[clean] * (count - 1) + [failure])
+                        stdout = io.StringIO()
                         with mock.patch.dict(self.helper["main_impl"].__globals__, {
                             "repo_root": lambda: repo,
                             "build_review_prompts": lambda *_args: ["synthetic pack"] * count,
                             "run_engine": engine,
-                        }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                            with self.assertRaises((SystemExit, OSError)):
+                        }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                            with self.assertRaises((SystemExit, OSError)) as caught:
                                 self.helper["main_impl"]()
                         self.assertFalse(report.exists())
                         self.assertFalse(human.exists())
+                        self.assertNotIn("scoped-clean:", stdout.getvalue())
                         self.assertEqual(engine.call_count, count)
                         self.assertEqual(sidecar.exists(), reason is not None)
                         if reason:
@@ -3002,6 +3133,15 @@ class AutoreviewHardeningTests(unittest.TestCase):
                             self.assertEqual(outcome["timed_out"], label == "timeout")
                             self.assertEqual(outcome["reviewer_exit_code"], {"engine": 7, "timeout": 124}.get(label))
                             self.assertNotIn("DIAGNOSTIC_SENTINEL", text)
+                            if label.startswith("invalid-final-"):
+                                self.assertIsInstance(caught.exception, unavailable)
+                                self.assertEqual(caught.exception.reason, "invalid_report")
+                                self.assertEqual(outcome, {
+                                    "schema_version": 1, "status": "reviewer_unavailable", "exit_code": 1,
+                                    "engine": "codex", "report_produced": False, "reason": "invalid_report",
+                                    "reviewer_exit_code": None, "timed_out": False,
+                                })
+                                self.assertEqual({path.name for path in outputs.iterdir()}, {"status.json"})
 
     def test_status_paths_reject_repo_and_aliases_before_removing_files(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -3012,23 +3152,23 @@ class AutoreviewHardeningTests(unittest.TestCase):
             for first, second in (("result.json", "RESULT.json"), ("caf\u00e9.json", "cafe\u0301.json")):
                 args = argparse.Namespace(status_output=str(root / first), output=None, json_output=str(root / second))
                 with self.assertRaises(SystemExit):
-                    self.helper["reject_repo_output_paths"](args, repo)
+                    self.helper["prepare_output_paths"](args, repo)
                 self.assertFalse((root / first).exists())
             for value in (str(repo / "result.json"), str(existing)):
                 args = argparse.Namespace(status_output=value, output=None, json_output=str(existing))
                 with self.assertRaises(SystemExit):
-                    self.helper["reject_repo_output_paths"](args, repo)
+                    self.helper["prepare_output_paths"](args, repo)
                 self.assertEqual(existing.read_text(), "keep existing output")
             if os.name != "nt":
                 alias = root / "alias.json"
                 alias.symlink_to(existing)
                 args.status_output = str(alias)
                 with self.assertRaises(SystemExit):
-                    self.helper["reject_repo_output_paths"](args, repo)
+                    self.helper["prepare_output_paths"](args, repo)
                 alias.unlink()
                 os.link(existing, alias)
                 with self.assertRaises(SystemExit):
-                    self.helper["reject_repo_output_paths"](args, repo)
+                    self.helper["prepare_output_paths"](args, repo)
 
     @unittest.skipUnless(sys.platform == "darwin", "macOS firmlink alias")
     def test_status_rejects_absent_outputs_under_same_parent_inode(self) -> None:
@@ -3041,7 +3181,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             args = argparse.Namespace(status_output=str(root / "result.json"),
                                       json_output=str(alias / "result.json"), output=None)
             with self.assertRaises(SystemExit):
-                self.helper["reject_repo_output_paths"](args, repo)
+                self.helper["prepare_output_paths"](args, repo)
             self.assertFalse((root / "result.json").exists())
 
     @unittest.skipIf(os.name == "nt", "the executable fixtures are POSIX-only")
@@ -5357,7 +5497,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 SystemExit,
                 "--json-output must point outside",
             ):
-                self.helper["reject_repo_output_paths"](
+                self.helper["prepare_output_paths"](
                     argparse.Namespace(
                         json_output=str(repo / "review.json"),
                         output=None,
@@ -5368,7 +5508,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 SystemExit,
                 "--output must point outside",
             ):
-                self.helper["reject_repo_output_paths"](
+                self.helper["prepare_output_paths"](
                     argparse.Namespace(
                         json_output=None,
                         output=str(repo / "review.txt"),
@@ -5376,7 +5516,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     repo,
                 )
 
-            self.helper["reject_repo_output_paths"](
+            self.helper["prepare_output_paths"](
                 argparse.Namespace(
                     json_output=str(outside),
                     output=None,
@@ -5397,7 +5537,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     "--json-output must point outside",
                 ),
             ):
-                self.helper["reject_repo_output_paths"](
+                self.helper["prepare_output_paths"](
                     argparse.Namespace(
                         json_output=str(alternate_repo / "review.json"),
                         output=None,
@@ -6564,6 +6704,59 @@ else:
             )
 
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_reviewer_exit_after_output_eof_preserves_deadline_and_exit_status(self) -> None:
+        script = (
+            "import os,sys,time; from pathlib import Path; "
+            "print('retained stdout', flush=True); "
+            "print('retained stderr', file=sys.stderr, flush=True); "
+            "Path(sys.argv[1]).touch(); os.close(1); os.close(2); "
+            "time.sleep(float(sys.argv[2])); Path(sys.argv[3]).touch(); os._exit(7)"
+        )
+        cases = (
+            ("no deadline", None, 0.75, 7),
+            ("quick exit", 0.5, 0.05, 7),
+            ("deadline exceeded", 0.5, 2, 124),
+        )
+        for stream_output in (False, True):
+            for case, max_runtime_seconds, hold_seconds, expected_code in cases:
+                with self.subTest(stream_output=stream_output, case=case), tempfile.TemporaryDirectory() as tempdir:
+                    root = Path(tempdir)
+                    ready = root / "ready"
+                    finished = root / "finished"
+                    deadline_context = (
+                        deadline_after_reviewer_ready(self.helper, ready)
+                        if max_runtime_seconds is not None else contextlib.nullcontext()
+                    )
+                    registered = mock.Mock(wraps=self.helper["register_owned_process"])
+                    with deadline_context, mock.patch.dict(
+                        self.helper["run_with_heartbeat"].__globals__,
+                        {"register_owned_process": registered},
+                    ):
+                        result = self.helper["run_with_heartbeat"](
+                            [sys.executable, "-c", script, str(ready), str(hold_seconds), str(finished)],
+                            root,
+                            label="early-eof-reviewer",
+                            heartbeat_seconds=0.01,
+                            max_runtime_seconds=max_runtime_seconds,
+                            stream_output=stream_output,
+                            stream_display=lambda _name, _line: None,
+                        )
+
+                    registered.assert_called_once()
+                    proc = registered.call_args.args[0]
+                    self.assertIsNotNone(proc.returncode)
+                    self.assertNotIn(proc.pid, self.helper["_OWNED_PROCESSES"])
+                    self.assertTrue(proc.stdout.closed)
+                    self.assertTrue(proc.stderr.closed)
+                    self.assertEqual(result.stdout, "retained stdout\n")
+                    self.assertTrue(result.stderr.startswith("retained stderr\n"))
+                    self.assertEqual(result.returncode, expected_code, result.stderr)
+                    timed_out = expected_code == 124
+                    self.assertEqual(isinstance(result, self.helper["TimedOutEngineProcess"]), timed_out)
+                    self.assertEqual(finished.exists(), not timed_out)
+                    if timed_out:
+                        self.assertIn("early-eof-reviewer engine timed out after 0.5s", result.stderr)
 
     @unittest.skipUnless(os.name == "posix", "process groups require POSIX")
     def test_streaming_deadline_kills_sigterm_resistant_continuous_output(self) -> None:
@@ -7989,17 +8182,24 @@ class AuthenticatedProxyTests(unittest.TestCase):
             certificate = repo / "trust.pem"
             certificate.touch()
             external_link = root / "trust-link.pem"
-            external_link.symlink_to(certificate)
-            for engine in self.helper["ENGINES"]:
-                for value in (str(certificate), str(external_link)):
-                    with self.subTest(engine=engine, value=value), mock.patch.dict(os.environ, {
-                        key: value for key in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
-                                              "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE")
-                    }, clear=True):
-                        env = self.helper["safe_engine_env"](repo, engine=engine)
-                        for key in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
-                                    "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
-                            self.assertNotIn(key, env)
+            for path in (certificate, external_link):
+                with self.subTest(path=path.name):
+                    if path == external_link:
+                        try:
+                            external_link.symlink_to(certificate)
+                        except OSError as exc:
+                            if getattr(exc, "winerror", None) != 1314:  # ERROR_PRIVILEGE_NOT_HELD
+                                raise
+                            self.skipTest("Windows symlink privilege is unavailable")
+                    for engine in self.helper["ENGINES"]:
+                        with self.subTest(engine=engine), mock.patch.dict(os.environ, {
+                            key: str(path) for key in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+                                                      "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE")
+                        }, clear=True):
+                            env = self.helper["safe_engine_env"](repo, engine=engine)
+                            for key in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+                                        "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
+                                self.assertNotIn(key, env)
 
     def proxy_fixture(self):
         username = "u"

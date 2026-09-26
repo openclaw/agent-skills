@@ -390,7 +390,7 @@ class StageTests(unittest.TestCase):
         replacements={'preflight_git':lambda:True,
           'capture_source_context_inputs':lambda *a:evidence,
           'require_image_engine':lambda *a:None,
-          'parse_args':lambda:args,'repo_root':lambda:self.root,'reject_repo_output_paths':lambda *a:None,
+          'parse_args':lambda:args,'repo_root':lambda:self.root,'prepare_output_paths':lambda *a:None,
           'choose_target':lambda *a:('diff',None),'current_branch':lambda *a:'synthetic','codex_config_keys':lambda *a:[],
           'codex_speed_override':lambda *a:None,'capture_evidence_inputs':lambda *a:evidence,
           'source_tree_snapshot':lambda *a:'same','build_bundle':lambda *a:captured,
@@ -527,16 +527,33 @@ class StageTests(unittest.TestCase):
     def test_stage_directory_cannot_mutate_reviewed_repository(self):
         args=self.parse(['--engine-stage-dir',str(self.output)])
         with self.assertRaisesRegex(SystemExit,'--engine-stage-dir must point outside'):
-            M.reject_repo_output_paths(args,self.root)
+            M.prepare_output_paths(args,self.root)
         self.assertEqual(list(self.output.iterdir()),[])
     def test_stage_directory_alias_into_repository_refused(self):
         alias=self.root/'alias'; alias.symlink_to(self.home,target_is_directory=True)
         args=self.parse(['--engine-stage-dir',str(alias)])
         with self.assertRaisesRegex(SystemExit,'--engine-stage-dir must point outside'):
-            M.reject_repo_output_paths(args,self.home)
+            M.prepare_output_paths(args,self.home)
     def test_stage_directory_outside_repository_allowed(self):
         args=self.parse(['--engine-stage-dir',str(self.output)])
-        M.reject_repo_output_paths(args,self.home)
+        M.prepare_output_paths(args,self.home)
+
+    def test_stage_directory_cannot_alias_report_destinations(self):
+        for option in ('--output', '--json-output', '--status-output'):
+            with self.subTest(option=option):
+                args=self.parse(['--engine-stage-dir',str(self.output),option,str(self.output)])
+                before=vars(args).copy()
+                with self.assertRaisesRegex(SystemExit,'--engine-stage-dir must use a different path'):
+                    M.prepare_output_paths(args,self.home)
+                self.assertEqual(vars(args),before)
+                self.assertEqual(list(self.output.iterdir()),[])
+
+    def test_stage_path_spelling_is_not_normalized_by_output_preflight(self):
+        for value in ('relative', str(self.root / '..' / 'output')):
+            with self.subTest(value=value):
+                args=self.parse(['--engine-stage-dir',value])
+                M.prepare_output_paths(args,self.home)
+                self.assertEqual(args.engine_stage_dir,value)
 
     def test_stream_interruption_preserves_caller_stdout(self):
         for enabled in (False, True):

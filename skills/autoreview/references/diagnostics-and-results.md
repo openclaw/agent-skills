@@ -34,9 +34,24 @@ exit codes or reviewer isolation.
 ## Results
 
 `--output`, `--json-output`, and `--status-output` paths must be outside the
-reviewed repository. When using `--status-output`, all output paths must differ;
-case-only and Unicode normalization aliases are conservatively refused on every
-platform, even when the filesystem would permit distinct files.
+reviewed repository, both for the final directory entry after resolving parent
+symlinks and for the resolved referent. Without `--status-output`, `--output` and
+`--json-output` must name different final directory entries after resolving parent
+symlinks. Distinct final symlinks or hardlinks may share an existing referent because
+publication replaces their separate entries. With `--status-output`, all output
+paths must have distinct resolved referents; hardlink aliases are refused too.
+Case-only and Unicode normalization aliases at the applicable boundary are
+conservatively refused on every platform, even when the filesystem would permit
+distinct files.
+Tilde and relative destinations are expanded once before validation and remain
+anchored to the invocation directory. Atomic report writes replace a final
+symlink instead of modifying its target.
+
+For event-stream results, the last terminal event is authoritative. An invalid
+final result fails the review, even if an earlier event or review pass contained
+a valid report; earlier reports are never published as a partial clean result.
+A non-null `structured_output` must contain the report object; only an absent
+or null field permits using the event's `result` instead.
 
 | Exit | Meaning                                                                            |
 | ---- | ---------------------------------------------------------------------------------- |
