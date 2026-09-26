@@ -9,6 +9,7 @@
 - Reject invalid Amp model names during Autoreview dry runs with the same provider/model diagnostic used for execution.
 - Preserve feasible Autoreview partitions when intact context leaves less room than the estimated continuation reserve, while retaining complete evidence and the prompt limit.
 - Reject colliding Autoreview JSON and human output entries before review, while preserving separate symlink and hardlink destinations when no status sidecar is requested.
+- Refuse Kimi reviews and dry runs before startup until a private prompt input channel is supported, preventing review bundles from entering process arguments without silently changing engines.
 
 ## 0.2.0 - 2026-09-24
 
