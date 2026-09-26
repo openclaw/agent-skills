@@ -9,6 +9,8 @@ import io
 import json
 from pathlib import Path
 import queue
+import runpy
+import shlex
 import signal
 import stat
 import subprocess
@@ -726,8 +728,13 @@ class StageTests(unittest.TestCase):
             self.skipTest('synthetic executable requires POSIX')
         repo = self.root / 'repo'
         repo.mkdir(mode=0o700)
+        git_fixture = runpy.run_path(str(SOURCE.with_name('test-review-harness.py')))
+        git_roots = git_fixture['fixture_git_roots'](repo)
+        git_bin = git_fixture['fixture_git_binary'](git_roots)
+        git_path = git_fixture['fixture_git_path'](
+            git_roots, git_bin, os.environ.get('PATH', os.defpath))
         env = {'HOME': str(self.home), 'TMPDIR': str(self.home),
-               'PATH': os.environ.get('PATH', os.defpath), 'LANG': 'C.UTF-8',
+               'PATH': git_path, 'LANG': 'C.UTF-8',
                'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull,
                'GIT_OPTIONAL_LOCKS': '0', 'GIT_NO_LAZY_FETCH': '1'}
         for args in (['init', '-q'], ['add', 'source.txt']):
@@ -737,7 +744,9 @@ class StageTests(unittest.TestCase):
         producer = self.root / 'synthetic-producer'
         # The only engine executable is this owned local fixture. Its Python
         # interpreter disables site loading, inherited paths and bytecode writes.
-        producer.write_text('#!/usr/bin/env -S ' + sys.executable + ' -I -S -B\n' + '''
+        producer.write_text('#!/bin/sh\n'
+            f"'''exec' {shlex.quote(sys.executable)} -I -S -B \"$0\" \"$@\"\n"
+            "' '''\n" + '''
 import json, pathlib, sys
 if '--version' in sys.argv:
     print('codex-cli 0.0.0-test')
