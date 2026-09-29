@@ -6777,6 +6777,15 @@ def _validate_report(
         line = location.get("line")
         if not isinstance(line, int) or isinstance(line, bool) or line < 1:
             raise SystemExit(f"finding {index} has invalid location: {location}")
+        if Path(rel).is_absolute():
+            # Engines such as Codex report absolute paths; keep those inside the repo.
+            try:
+                inside = Path(rel).resolve().relative_to(repo.resolve())
+            except (OSError, RuntimeError, ValueError):
+                inside = None
+            if inside is not None:
+                rel_path = PurePosixPath(inside.as_posix())
+                rel = rel_path.as_posix()
         if rel_path.is_absolute() or ".." in rel_path.parts or re.match(r"^[A-Za-z]:/", rel):
             raise SystemExit(f"finding {index} uses invalid file path: {rel}")
         location["file_path"] = rel

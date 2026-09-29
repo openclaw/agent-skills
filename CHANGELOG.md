@@ -11,6 +11,7 @@
 - Reject colliding Autoreview JSON and human output entries before review, while preserving separate symlink and hardlink destinations when no status sidecar is requested.
 - Refuse Kimi reviews and dry runs before startup until a private prompt input channel is supported, preventing review bundles from entering process arguments without silently changing engines.
 - Reject invalid Autoreview priority environment defaults before preparation or reviewer startup, while preserving explicit priority overrides.
+- Normalize Autoreview findings whose absolute file paths resolve inside the reviewed repository, so an engine reporting absolute locations no longer aborts validation and discards every finding, while still refusing paths outside the repository.
 
 ## 0.2.0 - 2026-09-24
 

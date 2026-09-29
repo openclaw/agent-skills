@@ -6335,6 +6335,57 @@ else:
                 self.helper["find_command"](str(repo_link), repo),
             )
 
+    def test_validate_report_normalizes_absolute_in_repo_finding_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            report = {
+                "findings": [
+                    {
+                        "title": "First",
+                        "body": "Body",
+                        "priority": "P1",
+                        "confidence": 0.9,
+                        "category": "bug",
+                        "code_location": {
+                            "file_path": str(repo / "src" / "index.ts"),
+                            "line": 1,
+                        },
+                    },
+                    {
+                        "title": "Second",
+                        "body": "Body",
+                        "priority": "P2",
+                        "confidence": 0.9,
+                        "category": "bug",
+                        "code_location": {"file_path": "src/other.ts", "line": 2},
+                    },
+                ],
+                "overall_correctness": "patch is incorrect",
+                "overall_explanation": "Explanation",
+                "overall_confidence": 0.9,
+            }
+
+            self.helper["validate_report"](
+                report, repo, {"src/index.ts", "src/other.ts"}, []
+            )
+
+            self.assertEqual(
+                report["findings"][0]["code_location"]["file_path"], "src/index.ts"
+            )
+            self.assertEqual(
+                [finding["title"] for finding in report["findings"]],
+                ["First", "Second"],
+            )
+
+            outside = copy.deepcopy(report)
+            outside["findings"][0]["code_location"]["file_path"] = str(
+                Path(tempdir).parent / "elsewhere" / "secret.txt"
+            )
+            with self.assertRaisesRegex(SystemExit, "invalid file path"):
+                self.helper["validate_report"](
+                    outside, repo, {"src/index.ts", "src/other.ts"}, []
+                )
+
     def test_validate_report_normalizes_relative_finding_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
