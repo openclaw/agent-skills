@@ -6379,7 +6379,7 @@ else:
 
             outside = copy.deepcopy(report)
             outside["findings"][0]["code_location"]["file_path"] = str(
-                Path(tempdir).parent / "elsewhere" / "secret.txt"
+                Path(tempdir).parent / "elsewhere" / "outside.ts"
             )
             with self.assertRaisesRegex(SystemExit, "invalid file path"):
                 self.helper["validate_report"](
