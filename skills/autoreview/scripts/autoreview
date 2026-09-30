@@ -6769,7 +6769,29 @@ def _validate_report(
         if not isinstance(raw_file_path, str) or not raw_file_path:
             raise SystemExit(f"finding {index} has invalid location: {location}")
         raw_rel = raw_file_path
-        normalized_rel = raw_rel if raw_rel in changed_paths else raw_rel.replace("\\", "/")
+        native_path = Path(raw_rel)
+        if native_path.is_absolute():
+            # Check traversal before resolve() erases it; keep literal POSIX names.
+            try:
+                if ".." in native_path.parts:
+                    raise ValueError("parent traversal")
+                repo_root = repo.resolve()
+                raw_rel = native_path.resolve().relative_to(repo_root).as_posix()
+                # Prefer a changed symlink's identity over its resolved target.
+                for candidate_root in reversed(native_path.parents):
+                    try:
+                        prefix = candidate_root.resolve().relative_to(repo_root)
+                    except ValueError:
+                        continue
+                    candidate_rel = (prefix / native_path.relative_to(candidate_root)).as_posix()
+                    if candidate_rel in changed_paths:
+                        raw_rel = candidate_rel
+                    break
+            except (OSError, RuntimeError, ValueError):
+                raise SystemExit(f"finding {index} uses invalid file path: {raw_file_path}") from None
+            normalized_rel = raw_rel
+        else:
+            normalized_rel = raw_rel if raw_rel in changed_paths else raw_rel.replace("\\", "/")
         while normalized_rel.startswith("./"):
             normalized_rel = normalized_rel[2:]
         rel_path = PurePosixPath(normalized_rel)
@@ -6777,15 +6799,6 @@ def _validate_report(
         line = location.get("line")
         if not isinstance(line, int) or isinstance(line, bool) or line < 1:
             raise SystemExit(f"finding {index} has invalid location: {location}")
-        if Path(rel).is_absolute():
-            # Engines such as Codex report absolute paths; keep those inside the repo.
-            try:
-                inside = Path(rel).resolve().relative_to(repo.resolve())
-            except (OSError, RuntimeError, ValueError):
-                inside = None
-            if inside is not None:
-                rel_path = PurePosixPath(inside.as_posix())
-                rel = rel_path.as_posix()
         if rel_path.is_absolute() or ".." in rel_path.parts or re.match(r"^[A-Za-z]:/", rel):
             raise SystemExit(f"finding {index} uses invalid file path: {rel}")
         location["file_path"] = rel

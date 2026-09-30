@@ -6377,14 +6377,85 @@ else:
                 ["First", "Second"],
             )
 
-            outside = copy.deepcopy(report)
-            outside["findings"][0]["code_location"]["file_path"] = str(
-                Path(tempdir).parent / "elsewhere" / "outside.ts"
-            )
-            with self.assertRaisesRegex(SystemExit, "invalid file path"):
+            for invalid in (
+                Path(tempdir) / "elsewhere" / "outside.ts",
+                repo.with_name(repo.name + "-neighbor") / "src" / "index.ts",
+                repo / "src" / ".." / "src" / "index.ts",
+            ):
+                with self.subTest(invalid=invalid):
+                    outside = copy.deepcopy(report)
+                    outside["findings"][0]["code_location"]["file_path"] = str(invalid)
+                    with self.assertRaisesRegex(SystemExit, "invalid file path"):
+                        self.helper["validate_report"](
+                            outside, repo, {"src/index.ts", "src/other.ts"}, []
+                        )
+
+            unscoped = copy.deepcopy(report)
+            unscoped["findings"][0]["code_location"]["file_path"] = str(repo / "unchanged.ts")
+            with contextlib.redirect_stderr(io.StringIO()):
                 self.helper["validate_report"](
-                    outside, repo, {"src/index.ts", "src/other.ts"}, []
+                    unscoped, repo, {"src/index.ts", "src/other.ts"}, []
                 )
+            self.assertEqual([item["title"] for item in unscoped["findings"]], ["Second"])
+            self.assertEqual(unscoped["scope_rejected_findings"][0]["code_location"]["file_path"],
+                             "unchanged.ts")
+            self.assertEqual(self.helper["review_status"](unscoped, complete=True), "incomplete")
+
+            if os.name != "nt":
+                target = repo / "unchanged.ts"
+                target.write_text("unchanged\n", encoding="utf-8")
+                inside_link = repo / "changed-link.ts"
+                inside_link.symlink_to(target.name)
+                repo_alias = Path(tempdir) / "repo-alias"
+                repo_alias.symlink_to(repo, target_is_directory=True)
+                for root in (repo, repo_alias):
+                    with self.subTest(symlink_root=root):
+                        linked = copy.deepcopy(report)
+                        linked["findings"][0]["code_location"]["file_path"] = str(root / inside_link.name)
+                        self.helper["validate_report"](linked, repo, {inside_link.name, "src/other.ts"}, [])
+                        self.assertEqual(linked["findings"][0]["code_location"]["file_path"], inside_link.name)
+
+                (repo / "src").mkdir()
+                (repo / "src" / inside_link.name).symlink_to("../unchanged.ts")
+                subdir_alias = Path(tempdir) / "src-alias"
+                subdir_alias.symlink_to(repo / "src", target_is_directory=True)
+                file_alias = Path(tempdir) / "file-alias.ts"
+                file_alias.symlink_to(target)
+                for path, expected in (
+                    (subdir_alias / "index.ts", "src/index.ts"),
+                    (subdir_alias / inside_link.name, "src/changed-link.ts"),
+                    (file_alias, "unchanged.ts"),
+                ):
+                    with self.subTest(alias=path):
+                        aliased = copy.deepcopy(report)
+                        aliased["findings"][0]["code_location"]["file_path"] = str(path)
+                        self.helper["validate_report"](aliased, repo, {expected, "src/other.ts"}, [])
+                        self.assertEqual(aliased["findings"][0]["code_location"]["file_path"], expected)
+
+                (repo / "alias").symlink_to("src", target_is_directory=True)
+                for path, expected in (
+                    (repo / "alias" / "index.ts", "src/index.ts"),
+                    (inside_link, "unchanged.ts"),
+                ):
+                    with self.subTest(unchanged_alias=path):
+                        aliased = copy.deepcopy(report)
+                        aliased["findings"][0]["code_location"]["file_path"] = str(path)
+                        self.helper["validate_report"](aliased, repo, {expected, "src/other.ts"}, [])
+                        self.assertEqual(aliased["findings"][0]["code_location"]["file_path"], expected)
+
+                for name in (r"src\index.ts", " spaced \tname.ts"):
+                    with self.subTest(literal=name):
+                        literal = copy.deepcopy(report)
+                        literal["findings"][0]["code_location"]["file_path"] = str(repo / name)
+                        self.helper["validate_report"](literal, repo, {name, "src/other.ts"}, [])
+                        self.assertEqual(literal["findings"][0]["code_location"]["file_path"], name)
+
+                link = repo / "escape"
+                link.symlink_to(Path(tempdir), target_is_directory=True)
+                outside = copy.deepcopy(report)
+                outside["findings"][0]["code_location"]["file_path"] = str(link / "outside.ts")
+                with self.assertRaisesRegex(SystemExit, "invalid file path"):
+                    self.helper["validate_report"](outside, repo, {"escape/outside.ts"}, [])
 
     def test_validate_report_normalizes_relative_finding_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

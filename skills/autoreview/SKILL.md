@@ -65,6 +65,12 @@ whitespace. An empty present
 source uses line 1, column 1, and an empty excerpt; empty physical lines also
 use an empty excerpt at column 1. Source identity remains mandatory.
 
+Finding locations may use native absolute paths that resolve inside the reviewed
+repository; these become repository-relative paths before scope and attribution
+checks, preserving a changed symlink's path when its target is also inside.
+Parent traversal and paths resolving outside the repository remain invalid.
+An invalid location still fails the report; findings are never silently dropped.
+
 Local selection honors `core.autocrlf` from external operator Git configuration,
 with repository-local values and attributes retaining precedence. Only its
 validated scalar value reaches diff/status; other global and system Git
