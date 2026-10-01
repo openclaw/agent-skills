@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.4.0 - 2026-09-30
+
+**Highlights:** Review with GPT-6.1 Sol by default, with early effort validation and an access-only GPT-6 Sol retry.
+
 - Default Autoreview's Codex reviewer to GPT-6.1 Sol at high reasoning, reject unsupported efforts before preparation, and retry GPT-6 Sol only on account-access failure while preserving explicit older-model behavior. Thanks @coygeek.
 
 ## 0.3.0 - 2026-09-30
