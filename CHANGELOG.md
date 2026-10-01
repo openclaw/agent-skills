@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-09-30
+
+**Highlights:** Review deleted binary assets safely, with stronger result validation and reviewer deadlines.
+
 - Review deleted binary assets as Git deletion metadata in local, branch, and commit reviews, while preserving added-image review and refusing unsupported binary content changes. Thanks @roboclaw-bot.
 - Reject invalid final Autoreview terminal results without reusing earlier reports, and keep validated output paths consistent through status cleanup and atomic report publication.
 - Refuse Autoreview output symlinks inside the reviewed repository even when their referents are outside, preserving repository entries and stale status on validation failure.
@@ -13,6 +17,7 @@
 - Refuse Kimi reviews and dry runs before startup until a private prompt input channel is supported, preventing review bundles from entering process arguments without silently changing engines.
 - Reject invalid Autoreview priority environment defaults before preparation or reviewer startup, while preserving explicit priority overrides.
 - Normalize absolute in-repository Autoreview finding paths without losing other findings, while preserving literal filenames and refusing traversal and outside paths. Thanks @kennykankush.
+- Update the native macOS sandbox-test Codex CLI to 0.159.3.
 
 ## 0.2.0 - 2026-09-24
 
