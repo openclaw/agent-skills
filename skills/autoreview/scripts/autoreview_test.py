@@ -8,6 +8,7 @@ import copy
 import hashlib
 import importlib.util
 import io
+import itertools
 import json
 import os
 import runpy
@@ -1681,46 +1682,56 @@ class AutoreviewKimiRefusalTests(unittest.TestCase):
 
 
 class AutoreviewCompatibilityTests(unittest.TestCase):
-    def test_default_reviewer_uses_sol_high_with_luna_access_retry(self) -> None:
+    def test_default_reviewer_uses_sol_61_high_with_sol_6_access_retry(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(sys, "argv", ["autoreview"]):
             reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
         self.assertEqual(reviewer.engine, "codex")
-        self.assertEqual(reviewer.model, "gpt-6-sol")
+        self.assertEqual(reviewer.model, "gpt-6.1-sol")
         self.assertEqual(reviewer.thinking, "high")
-        self.assertEqual(reviewer.fallback_model, "gpt-6-luna")
+        self.assertEqual(reviewer.fallback_model, "gpt-6-sol")
 
-    def test_astra_rejects_unsupported_effort_from_cli_and_environment(self) -> None:
+    def test_sol_61_and_astra_reject_unsupported_effort_before_preparation(self) -> None:
         with tempfile.TemporaryDirectory(prefix="autoreview-invalid-effort.") as tempdir:
-            for effort in ("none", "minimal", "ultra"):
-                sources = ("cli", "keyed-cli", "environment", "global-environment")
-                for source in sources:
-                    with self.subTest(effort=effort, source=source):
-                        argv = [sys.executable, str(SCRIPT_PATH), "--engine", "codex",
-                                "--codex-bin", str(Path(tempdir) / "missing-codex")]
-                        env = {key: value for key, value in os.environ.items()
-                               if not key.startswith("AUTOREVIEW_")}
-                        if source in {"cli", "keyed-cli"}:
-                            prefix = "codex=" if source == "keyed-cli" else ""
-                            argv += ["--model", prefix + "gpt-6-astra", "--thinking", prefix + effort]
-                        else:
-                            prefix = "AUTOREVIEW_CODEX_" if source == "environment" else "AUTOREVIEW_"
-                            env.update({prefix + "MODEL": "gpt-6-astra", prefix + "THINKING": effort})
-                        # No Git repository or engine exists: rejection must precede preparation.
-                        result = subprocess.run(argv, cwd=tempdir, env=env, text=True,
-                                                capture_output=True, timeout=30)
-                        self.assertEqual(result.returncode, 1, result.stderr)
-                        self.assertEqual(result.stdout, "")
-                        self.assertEqual(result.stderr.strip(),
-                                         f"invalid thinking level for codex model gpt-6-astra: {effort} "
-                                         "(valid: high, low, max, medium, xhigh)")
+            for model, effort, source in itertools.product(
+                (None, "gpt-6.1-sol", "gpt-6-astra"),
+                ("none", "minimal", "ultra"),
+                ("cli", "keyed-cli", "environment", "global-environment"),
+            ):
+                with self.subTest(model=model, effort=effort, source=source):
+                    argv = [sys.executable, str(SCRIPT_PATH), "--engine", "codex",
+                            "--codex-bin", str(Path(tempdir) / "missing-codex")]
+                    env = {key: value for key, value in os.environ.items()
+                           if not key.startswith("AUTOREVIEW_")}
+                    if source in {"cli", "keyed-cli"}:
+                        prefix = "codex=" if source == "keyed-cli" else ""
+                        argv += ["--thinking", prefix + effort]
+                        if model:
+                            argv += ["--model", prefix + model]
+                    else:
+                        prefix = "AUTOREVIEW_CODEX_" if source == "environment" else "AUTOREVIEW_"
+                        env[prefix + "THINKING"] = effort
+                        if model:
+                            env[prefix + "MODEL"] = model
+                    # No Git repository or engine exists: rejection must precede preparation.
+                    result = subprocess.run(argv, cwd=tempdir, env=env, text=True,
+                                            capture_output=True, timeout=30)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(result.stderr.strip(),
+                                     f"invalid thinking level for codex model {model or 'gpt-6.1-sol'}: {effort} "
+                                     "(valid: high, low, max, medium, xhigh)")
 
     def test_model_validation_uses_effective_cli_overrides(self) -> None:
         cases = (
-            ({}, ["--thinking", "minimal", "--thinking", "codex=high"], "gpt-6-sol", "high"),
+            ({}, ["--thinking", "minimal", "--thinking", "codex=high"], "gpt-6.1-sol", "high"),
             ({"AUTOREVIEW_THINKING": "none", "AUTOREVIEW_CODEX_THINKING": "high"},
-             [], "gpt-6-sol", "high"),
+             [], "gpt-6.1-sol", "high"),
             ({"AUTOREVIEW_CODEX_THINKING": "minimal"},
-             ["--thinking", "high"], "gpt-6-sol", "high"),
+             ["--thinking", "high"], "gpt-6.1-sol", "high"),
+            ({"AUTOREVIEW_CODEX_MODEL": "gpt-6.1-sol", "AUTOREVIEW_CODEX_THINKING": "none"},
+             ["--thinking", "high"], "gpt-6.1-sol", "high"),
+            ({"AUTOREVIEW_CODEX_MODEL": "gpt-6.1-sol", "AUTOREVIEW_CODEX_THINKING": "none"},
+             ["--model", "gpt-6-sol"], "gpt-6-sol", "none"),
             ({"AUTOREVIEW_CODEX_MODEL": "gpt-6-astra", "AUTOREVIEW_CODEX_THINKING": "none"},
              ["--thinking", "high"], "gpt-6-astra", "high"),
             ({"AUTOREVIEW_CODEX_MODEL": "gpt-6-astra", "AUTOREVIEW_CODEX_THINKING": "minimal"},
@@ -1746,17 +1757,17 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                     with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
                         sys, "argv", ["autoreview", *thinking_args],
                     ):
-                        if effort == "minimal":
-                            with self.assertRaisesRegex(SystemExit, "invalid thinking level for codex model gpt-6-sol"):
+                        if effort in {"none", "minimal"}:
+                            with self.assertRaisesRegex(SystemExit, "invalid thinking level for codex model gpt-6.1-sol"):
                                 AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())
                             continue
                         reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
-                    self.assertEqual(reviewer.model, "gpt-6-sol")
+                    self.assertEqual(reviewer.model, "gpt-6.1-sol")
                     self.assertEqual(reviewer.thinking, effort)
-                    self.assertEqual(reviewer.fallback_model, "gpt-6-luna")
+                    self.assertEqual(reviewer.fallback_model, "gpt-6-sol")
 
     def test_sol_and_luna_validate_effort_and_explicit_model_selections(self) -> None:
-        for model, fallback in (("gpt-6-sol", "gpt-6-luna"), ("gpt-6-luna", None)):
+        for model, fallback in (("gpt-6.1-sol", "gpt-6-sol"), ("gpt-6-sol", "gpt-6-luna"), ("gpt-6-luna", None)):
             selections = (
                 (["--model", model], {}),
                 (["--model", "codex=" + model], {}),
@@ -1770,7 +1781,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                         if effort:
                             argv += ["--thinking", effort]
                         with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(sys, "argv", argv):
-                            if effort in {"minimal", "ultra"}:
+                            if effort in {"minimal", "ultra"} or (model == "gpt-6.1-sol" and effort == "none"):
                                 with self.assertRaisesRegex(SystemExit, f"invalid thinking level for codex model {model}"):
                                     AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())
                                 continue
@@ -1843,7 +1854,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         args = argparse.Namespace(codex_config=['model_verbosity="low"'])
         self.assertEqual(AUTOREVIEW.codex_config_keys(args), ["model_verbosity"])
 
-    def test_codex_retries_luna_after_default_sol_access_failure(self) -> None:
+    def test_codex_retries_sol_6_after_default_sol_61_access_failure(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             sys, "argv", ["autoreview", "--no-web-search"],
         ):
@@ -1857,10 +1868,10 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                 model = command[command.index("--model") + 1]
                 events.append(model)
                 self.assertIn('model_reasoning_effort="high"', command)
-                if model == "gpt-6-sol":
+                if model == "gpt-6.1-sol":
                     return subprocess.CompletedProcess(
                         command, 1, AutoreviewEfficiencyTests.usage_event(),
-                        "The model `gpt-6-sol` does not exist or you do not have access to it.",
+                        "The model `gpt-6.1-sol` does not exist or you do not have access to it.",
                     )
                 output_path = Path(command[command.index("--output-last-message") + 1])
                 output_path.write_text(json.dumps({**FINAL_REPORT, "review_completion": "complete"}))
@@ -1875,12 +1886,43 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                 result = AUTOREVIEW.run_reviewer(args, Path(tmpdir), prompt, set(), [])
                 self.assertTrue(result.complete)
                 self.assertEqual(result.report["findings"], [])
-            self.assertEqual(events, ["gpt-6-sol", "gpt-6-luna"])
+            self.assertEqual(events, ["gpt-6.1-sol", "gpt-6-sol"])
             usage = AUTOREVIEW.review_usage_summary(args)
             self.assertEqual(usage["attempts"], 2)
             self.assertEqual(usage["tokens"]["input_tokens"], 300)
             self.assertEqual(usage["partial_attempts"], 1)
             self.assertFalse(usage["complete"])
+
+    def test_default_sol_61_retries_only_access_failure_without_chaining(self) -> None:
+        failures = (
+            ("network timeout", False),
+            ("rate limit exceeded for {model}", False),
+            ("model_not_available: {model} is temporarily unavailable due to capacity", False),
+            ("Unsupported value: 'none' is not supported with the '{model}' model", False),
+            ("The '{model}' model is not supported when using Codex with a ChatGPT account.", True),
+        )
+        for message, retries in failures:
+            with self.subTest(message=message), mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                sys, "argv", ["autoreview", "--no-web-search"],
+            ):
+                args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+                models = []
+
+                def fake_run(command, *_args, **_kwargs):
+                    model = command[command.index("--model") + 1]
+                    models.append(model)
+                    event = {"type": "error", "message": message.format(model=model)}
+                    return subprocess.CompletedProcess(command, 1, json.dumps(event), "")
+
+                with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, \
+                        mock.patch.object(AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex"), \
+                        mock.patch.object(AUTOREVIEW, "ensure_codex_isolation_supported", return_value="/usr/bin/codex"), \
+                        mock.patch.object(AUTOREVIEW, "codex_auth_config_flags", return_value=[]), \
+                        mock.patch.object(AUTOREVIEW, "prepare_codex_runtime_auth", return_value=None), \
+                        mock.patch.object(AUTOREVIEW, "run_with_heartbeat", side_effect=fake_run):
+                    with self.assertRaises(AUTOREVIEW.ReviewerUnavailable):
+                        AUTOREVIEW.run_codex(args, Path(tmpdir), "review")
+                self.assertEqual(models, ["gpt-6.1-sol", "gpt-6-sol"] if retries else ["gpt-6.1-sol"])
 
     def test_codex_runs_outside_repo_with_bundle_only_workspace(self) -> None:
         args = argparse.Namespace(

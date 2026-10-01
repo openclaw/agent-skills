@@ -154,12 +154,13 @@ it or Codex is unavailable for the review; report the concrete availability fail
 before switching. Do not switch because a review is slow, rate-limited, or returns
 findings, or to bypass a safety refusal or isolation failure.
 
-Codex defaults to `gpt-6-sol`, high reasoning, with a `gpt-6-luna` retry
-only for an account-access failure. Explicit `gpt-6-sol` selections use the same
-retry; other explicit models, including Luna and Astra, have no model fallback.
+Codex defaults to `gpt-6.1-sol`, high reasoning, with a single `gpt-6-sol` retry
+only for an account-access failure. Explicit `gpt-6.1-sol` selections use the same
+retry. Explicit `gpt-6-sol` selections retain their access-only `gpt-6-luna` retry;
+other explicit models, including Luna and Astra, have no model fallback.
 Explicit `gpt-5.6-sol` selections retain their access-only `gpt-5.6-terra` retry.
-GPT-6 Sol and Luna reject unsupported `minimal` effort before review preparation;
-an effort-only override no longer selects an older model.
+GPT-6.1 Sol rejects `none` and `minimal` effort before review preparation;
+GPT-6 Sol and Luna reject `minimal`. An effort-only override keeps the default model.
 Honor explicit user engine/model choices.
 The helper does not automatically fall back between engines.
 
@@ -174,14 +175,16 @@ GPT-6 Astra without a model fallback, select it explicitly:
 "$AUTOREVIEW" --mode local --model gpt-6-astra --thinking high
 ```
 
-GPT-6 Sol and Luna support `none`, `low`, `medium`, `high`, `xhigh`, and `max`;
-neither supports `minimal`. Astra also excludes `none`. AutoReview defaults to
+GPT-6.1 Sol and GPT-6 Astra support `low`, `medium`, `high`, `xhigh`, and `max`;
+neither supports `none` or `minimal`. GPT-6 Sol and Luna additionally support `none`,
+but not `minimal`. AutoReview defaults to
 `high` and does not fall back from an explicit Luna or Astra selection.
 Codex's `ultra` mode uses automatic
 delegation and is outside this helper's supported effort levels. Use `max`
 for its deepest supported review. For EU data residency, use
 `--codex-speed default`; GPT-6 fast mode is unavailable there.
-See the [GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol) and
+See the [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol),
+[GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol), and
 [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) model docs
 and [Codex reasoning modes](https://learn.chatgpt.com/docs/models#know-when-to-use-max-or-ultra).
 
