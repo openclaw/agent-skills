@@ -351,7 +351,7 @@ class AutoreviewImageGitTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "non-UTF-8 Git output"):
             AUTOREVIEW.branch_bundle(self.repo, self.base)
 
-    def test_modified_and_deleted_images_remain_rejected(self):
+    def test_modified_images_refuse_but_deletions_keep_only_metadata(self):
         self.commit("portrait.png", AutoreviewImageEvidenceTests.PNG)
         base = self.git("rev-parse", "HEAD").strip()
         self.commit("portrait.png", AutoreviewImageEvidenceTests.PNG + b"x")
@@ -359,8 +359,11 @@ class AutoreviewImageGitTests(unittest.TestCase):
             AUTOREVIEW.branch_bundle(self.repo, base)
         self.git("rm", "portrait.png")
         self.git("commit", "-qm", "delete")
-        with self.assertRaisesRegex(SystemExit, "only added images"):
-            AUTOREVIEW.branch_bundle(self.repo, base)
+        with mock.patch.object(AUTOREVIEW, "image_media_type", side_effect=AssertionError("decoded deletion")):
+            captured = AUTOREVIEW.branch_bundle(self.repo, base)
+        self.assertEqual(captured.images, ())
+        self.assertIn("portrait.png", captured.paths)
+        self.assertIn("Binary files ", captured.text)
 
     def test_sensitive_images_are_not_attached(self):
         self.commit(".ssh/portrait.png", AutoreviewImageEvidenceTests.PNG)

@@ -65,6 +65,10 @@ whitespace. An empty present
 source uses line 1, column 1, and an empty excerpt; empty physical lines also
 use an empty excerpt at column 1. Source identity remains mandatory.
 
+Binary deletions remain in scope as Git deletion metadata; their former contents
+are not included or reviewed. Each local transition is checked independently:
+deleting a file in the working tree cannot hide a staged binary change.
+
 Finding locations may use native absolute paths that resolve inside the reviewed
 repository; these become repository-relative paths before scope and attribution
 checks, preserving a changed symlink's path when its target is also inside.
@@ -250,8 +254,10 @@ Every pass receives the path, media type, byte count and SHA-256 manifest alongs
 the image attachments and text diff. Image findings use the original path and line 1.
 Text-only review does not require Pillow.
 
-Other binaries, modified/deleted images, local/commit image changes and image review
-with other engines remain unsupported and fail closed. Missing Pillow or provider
+Binary deletions, including images, are reviewed as deletion metadata in every
+mode without image attachments or Pillow. Other binaries, modified images,
+local/commit image additions or modifications, and image review with other engines
+remain unsupported and fail closed. Missing Pillow or provider
 image limits fail the review rather than silently dropping assets. Sensitive-path,
 source-mutation, authentication and sandbox controls remain enabled.
 
