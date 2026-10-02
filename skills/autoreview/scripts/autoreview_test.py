@@ -1681,19 +1681,203 @@ class AutoreviewKimiRefusalTests(unittest.TestCase):
             guard.assert_not_called()
 
 
+class CodexOperatorModelTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="autoreview-operator-model.")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.operator = self.root / "operator"
+        self.operator.mkdir()
+        env = mock.patch.dict(os.environ, {"CODEX_HOME": str(self.operator)}, clear=True)
+        env.start()
+        self.addCleanup(env.stop)
+
+    def command(self, model=None, thinking="high"):
+        with mock.patch.object(sys, "argv", ["autoreview", "--thinking", thinking]):
+            args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+        with mock.patch.object(AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex"):
+            return AUTOREVIEW.codex_command(
+                args, self.repo, self.root / "review", self.root / "runtime",
+                self.root / "schema", self.root / "output", model, auth_config=[],
+            )
+
+    def test_default_inherits_only_operator_model_with_isolation(self) -> None:
+        (self.operator / "config.toml").write_text(
+            'model = "selected-sol"\nmodel_provider = "untrusted-provider"\n'
+            'developer_instructions = "must not enter review"\n'
+            '[mcp_servers.unrelated]\ncommand = "must-not-execute"\n'
+        )
+        command = self.command()
+        self.assertEqual(command[command.index("--model") + 1], "selected-sol")
+        self.assertIn("--ignore-user-config", command)
+        self.assertIn("--ignore-rules", command)
+        self.assertNotIn("untrusted-provider", " ".join(command))
+        self.assertNotIn("must-not", " ".join(command))
+
+    def test_missing_operator_model_leaves_native_default_unpinned(self) -> None:
+        self.assertNotIn("--model", self.command())
+
+    def test_parser_free_auth_only_config_keeps_auth_without_pinning_model(self) -> None:
+        (self.operator / "config.toml").write_text(
+            '# Authentication only\ncli_auth_credentials_store = "file"\n'
+            'forced_login_method = "chatgpt"\nforced_chatgpt_workspace_id = [\n'
+            '  "workspace-a",\n  "workspace-b",\n]\n'
+        )
+        with mock.patch.dict(sys.modules, {"tomllib": None, "tomli": None}):
+            self.assertNotIn("--model", self.command())
+            flags = AUTOREVIEW.codex_auth_config_flags(self.repo)
+        self.assertIn('cli_auth_credentials_store="file"', flags)
+        self.assertIn('forced_login_method="chatgpt"', flags)
+        self.assertIn('forced_chatgpt_workspace_id=["workspace-a", "workspace-b"]', flags)
+
+    def test_parser_free_inheritance_refuses_unrecognized_config_without_guessing(self) -> None:
+        for declaration in (
+            'model = "selected-sol"', '"model" = "selected-sol"',
+            '"\\u006dodel" = "selected-sol"', '[profile]',
+            'profile = "operator-profile"', 'forced_login_method = chatgpt',
+            'forced_chatgpt_workspace_id = [',
+        ):
+            with self.subTest(declaration=declaration):
+                (self.operator / "config.toml").write_text(declaration + "\n")
+                with mock.patch.dict(sys.modules, {"tomllib": None, "tomli": None}):
+                    with self.assertRaisesRegex(SystemExit, "Python 3.11 or tomli.*--model") as caught:
+                        self.command()
+                self.assertNotIn("selected-sol", str(caught.exception))
+
+    def test_explicit_model_keeps_parser_free_auth_with_unrelated_config(self) -> None:
+        (self.operator / "config.toml").write_text(
+            'model = "selected-sol"\nforced_login_method = "chatgpt"\n[profile]\n'
+        )
+        with mock.patch.dict(sys.modules, {"tomllib": None, "tomli": None}):
+            command = self.command("explicit-model")
+            self.assertIn('forced_login_method="chatgpt"', AUTOREVIEW.codex_auth_config_flags(self.repo))
+        self.assertEqual(command[command.index("--model") + 1], "explicit-model")
+
+    def test_inherited_thinking_is_validated_in_preflight_and_command(self) -> None:
+        for model, effort in (
+            ("gpt-6.1-sol", "none"), ("gpt-6.1-sol", "minimal"),
+            ("gpt-6-astra", "none"), ("gpt-6-sol", "minimal"),
+            ("gpt-6-luna", "minimal"),
+        ):
+            with self.subTest(model=model, effort=effort):
+                (self.operator / "config.toml").write_text(f'model = "{model}"\n')
+                with mock.patch.object(sys, "argv", ["autoreview", "--thinking", effort]):
+                    args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+                with mock.patch.object(AUTOREVIEW, "find_command", return_value="/usr/bin/codex"), \
+                        mock.patch.object(AUTOREVIEW, "ENGINE_ISOLATION_PROBES", {"codex": mock.Mock()}):
+                    available, reason = AUTOREVIEW.resolve_engine_binary(args, self.repo)
+                self.assertFalse(available)
+                self.assertIn(f"invalid thinking level for codex model {model}: {effort}", reason)
+                with self.assertRaisesRegex(SystemExit, f"invalid thinking level for codex model {model}"):
+                    self.command(thinking=effort)
+
+    def test_supported_inherited_effort_and_explicit_override_remain_available(self) -> None:
+        for model, effort in (("gpt-6.1-sol", "high"), ("gpt-6-sol", "none")):
+            with self.subTest(model=model, effort=effort):
+                (self.operator / "config.toml").write_text(f'model = "{model}"\n')
+                command = self.command(thinking=effort)
+                self.assertEqual(command[command.index("--model") + 1], model)
+                self.assertIn(f'model_reasoning_effort="{effort}"', command)
+        (self.operator / "config.toml").write_text('model = "gpt-6.1-sol"\n')
+        command = self.command("gpt-6-sol", thinking="none")
+        self.assertEqual(command[command.index("--model") + 1], "gpt-6-sol")
+
+    def test_invalid_inherited_thinking_stops_before_review_preparation(self) -> None:
+        (self.operator / "config.toml").write_text('model = "gpt-6.1-sol"\n')
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run), mock.patch.object(
+                sys, "argv", ["autoreview", "--thinking", "none", *(["--dry-run"] if dry_run else [])],
+            ):
+                args = AUTOREVIEW.parse_args()
+            guards = {name: mock.Mock(side_effect=AssertionError(f"unexpected {name}"))
+                      for name in ("prepare_output_paths", "capture_evidence_inputs", "run_engine")}
+            with mock.patch.object(AUTOREVIEW, "preflight_git", return_value=True), \
+                    mock.patch.object(AUTOREVIEW, "repo_root", return_value=self.repo), \
+                    mock.patch.multiple(AUTOREVIEW, **guards):
+                with self.assertRaisesRegex(SystemExit, "invalid thinking level for codex model gpt-6.1-sol"):
+                    AUTOREVIEW.main_with_args(args)
+            for guard in guards.values():
+                guard.assert_not_called()
+
+    def test_invalid_inherited_thinking_stops_before_runtime_preparation(self) -> None:
+        (self.operator / "config.toml").write_text('model = "gpt-6.1-sol"\n')
+        with mock.patch.object(sys, "argv", ["autoreview", "--thinking", "none"]):
+            args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+        with mock.patch.object(AUTOREVIEW, "ensure_codex_isolation_supported"), \
+                mock.patch.object(AUTOREVIEW, "safe_temp_root", side_effect=AssertionError("runtime preparation")):
+            with self.assertRaisesRegex(SystemExit, "invalid thinking level for codex model gpt-6.1-sol"):
+                AUTOREVIEW.run_codex(args, self.repo, "synthetic review")
+
+    def test_explicit_model_wins_over_operator_model(self) -> None:
+        (self.operator / "config.toml").write_text('model = "selected-sol"\n')
+        command = self.command("explicit-model")
+        self.assertEqual(command[command.index("--model") + 1], "explicit-model")
+
+    def test_repo_owned_model_is_never_projected(self) -> None:
+        (self.repo / "config.toml").write_text('model = "repository-model"\n')
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.repo)}):
+            self.assertNotIn("--model", self.command())
+        (self.operator / "config.toml").symlink_to(self.repo / "config.toml")
+        with self.assertRaisesRegex(SystemExit, "operator config must be outside"):
+            self.command()
+
+    def test_invalid_operator_model_fails_closed_without_echoing_value(self) -> None:
+        for value in (123, ["selected-sol"], "", "selected-sol\nmalicious", "--malicious"):
+            with self.subTest(value=value):
+                (self.operator / "config.toml").write_text("model = " + json.dumps(value) + "\n")
+                with self.assertRaisesRegex(SystemExit, "operator model must be a single identifier") as caught:
+                    self.command()
+                self.assertNotIn("malicious", str(caught.exception))
+
+    def test_inherited_model_has_no_automatic_retry(self) -> None:
+        (self.operator / "config.toml").write_text('model = "selected-sol"\n')
+        with mock.patch.object(sys, "argv", ["autoreview"]):
+            args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+        self.assertIsNone(args.model)
+        self.assertIsNone(args.fallback_model)
+
+    def test_inherited_access_failure_launches_once_without_model_retry(self) -> None:
+        (self.operator / "config.toml").write_text('model = "gpt-6.1-sol"\n')
+        with mock.patch.object(sys, "argv", ["autoreview", "--no-web-search"]):
+            args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+        def failed(command, *_args, **_kwargs):
+            self.assertEqual(command[command.index("--model") + 1], "gpt-6.1-sol")
+            return subprocess.CompletedProcess(command, 1, "",
+                "The model gpt-6.1-sol does not exist or you do not have access to it.")
+        with mock.patch.object(AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex"), \
+                mock.patch.object(AUTOREVIEW, "ensure_codex_isolation_supported"), \
+                mock.patch.object(AUTOREVIEW, "prepare_codex_runtime_auth", return_value=None), \
+                mock.patch.object(AUTOREVIEW, "run_with_heartbeat", side_effect=failed) as run:
+            with self.assertRaises(AUTOREVIEW.ReviewerUnavailable):
+                AUTOREVIEW.run_codex(args, self.repo, "synthetic review")
+        self.assertEqual(run.call_count, 1)
+
+    def test_invalid_operator_model_is_refused_during_preflight(self) -> None:
+        (self.operator / "config.toml").write_text('model = ["invalid"]\n')
+        with mock.patch.object(sys, "argv", ["autoreview"]):
+            args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+        with mock.patch.object(AUTOREVIEW, "find_command", return_value="/usr/bin/codex"), \
+                mock.patch.object(AUTOREVIEW, "ENGINE_ISOLATION_PROBES", {"codex": mock.Mock()}):
+            available, reason = AUTOREVIEW.resolve_engine_binary(args, self.repo)
+        self.assertFalse(available)
+        self.assertIn("operator model must be a single identifier", reason)
+
+
 class AutoreviewCompatibilityTests(unittest.TestCase):
-    def test_default_reviewer_uses_sol_61_high_with_sol_6_access_retry(self) -> None:
+    def test_default_reviewer_selects_codex_without_model_pin_or_retry(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(sys, "argv", ["autoreview"]):
             reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
         self.assertEqual(reviewer.engine, "codex")
-        self.assertEqual(reviewer.model, "gpt-6.1-sol")
+        self.assertIsNone(reviewer.model)
         self.assertEqual(reviewer.thinking, "high")
-        self.assertEqual(reviewer.fallback_model, "gpt-6-sol")
+        self.assertIsNone(reviewer.fallback_model)
 
     def test_sol_61_and_astra_reject_unsupported_effort_before_preparation(self) -> None:
         with tempfile.TemporaryDirectory(prefix="autoreview-invalid-effort.") as tempdir:
             for model, effort, source in itertools.product(
-                (None, "gpt-6.1-sol", "gpt-6-astra"),
+                ("gpt-6.1-sol", "gpt-6-astra"),
                 ("none", "minimal", "ultra"),
                 ("cli", "keyed-cli", "environment", "global-environment"),
             ):
@@ -1718,16 +1902,16 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 1, result.stderr)
                     self.assertEqual(result.stdout, "")
                     self.assertEqual(result.stderr.strip(),
-                                     f"invalid thinking level for codex model {model or 'gpt-6.1-sol'}: {effort} "
+                                     f"invalid thinking level for codex model {model}: {effort} "
                                      "(valid: high, low, max, medium, xhigh)")
 
     def test_model_validation_uses_effective_cli_overrides(self) -> None:
         cases = (
-            ({}, ["--thinking", "minimal", "--thinking", "codex=high"], "gpt-6.1-sol", "high"),
+            ({}, ["--thinking", "minimal", "--thinking", "codex=high"], None, "high"),
             ({"AUTOREVIEW_THINKING": "none", "AUTOREVIEW_CODEX_THINKING": "high"},
-             [], "gpt-6.1-sol", "high"),
+             [], None, "high"),
             ({"AUTOREVIEW_CODEX_THINKING": "minimal"},
-             ["--thinking", "high"], "gpt-6.1-sol", "high"),
+             ["--thinking", "high"], None, "high"),
             ({"AUTOREVIEW_CODEX_MODEL": "gpt-6.1-sol", "AUTOREVIEW_CODEX_THINKING": "none"},
              ["--thinking", "high"], "gpt-6.1-sol", "high"),
             ({"AUTOREVIEW_CODEX_MODEL": "gpt-6.1-sol", "AUTOREVIEW_CODEX_THINKING": "none"},
@@ -1757,14 +1941,10 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                     with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
                         sys, "argv", ["autoreview", *thinking_args],
                     ):
-                        if effort in {"none", "minimal"}:
-                            with self.assertRaisesRegex(SystemExit, "invalid thinking level for codex model gpt-6.1-sol"):
-                                AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())
-                            continue
                         reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
-                    self.assertEqual(reviewer.model, "gpt-6.1-sol")
+                    self.assertIsNone(reviewer.model)
                     self.assertEqual(reviewer.thinking, effort)
-                    self.assertEqual(reviewer.fallback_model, "gpt-6-sol")
+                    self.assertIsNone(reviewer.fallback_model)
 
     def test_sol_and_luna_validate_effort_and_explicit_model_selections(self) -> None:
         for model, fallback in (("gpt-6.1-sol", "gpt-6-sol"), ("gpt-6-sol", "gpt-6-luna"), ("gpt-6-luna", None)):
@@ -1854,9 +2034,9 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         args = argparse.Namespace(codex_config=['model_verbosity="low"'])
         self.assertEqual(AUTOREVIEW.codex_config_keys(args), ["model_verbosity"])
 
-    def test_codex_retries_sol_6_after_default_sol_61_access_failure(self) -> None:
+    def test_codex_retries_sol_6_after_explicit_sol_61_access_failure(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
-            sys, "argv", ["autoreview", "--no-web-search"],
+            sys, "argv", ["autoreview", "--no-web-search", "--model", "gpt-6.1-sol"],
         ):
             args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
         prompt = "complete retry pack: unicode \u03c0\r\n-deleted line\n unchanged context\n"
@@ -1893,7 +2073,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             self.assertEqual(usage["partial_attempts"], 1)
             self.assertFalse(usage["complete"])
 
-    def test_default_sol_61_retries_only_access_failure_without_chaining(self) -> None:
+    def test_explicit_sol_61_retries_only_access_failure_without_chaining(self) -> None:
         failures = (
             ("network timeout", False),
             ("rate limit exceeded for {model}", False),
@@ -1903,7 +2083,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         )
         for message, retries in failures:
             with self.subTest(message=message), mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
-                sys, "argv", ["autoreview", "--no-web-search"],
+                sys, "argv", ["autoreview", "--no-web-search", "--model", "gpt-6.1-sol"],
             ):
                 args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
                 models = []

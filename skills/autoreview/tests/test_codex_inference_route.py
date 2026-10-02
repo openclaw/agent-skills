@@ -189,16 +189,16 @@ class CodexInferenceRouteTests(unittest.TestCase):
         prepare_auth.assert_not_called()
         self.assertEqual(self.available(), (False, str(caught.exception.code)))
 
-    def use_default_models(self):
+    def use_explicit_retry_model(self):
         args = copy.copy(self.args)
-        args.model, args.thinking, args.fallback_model = [], [], []
+        args.model, args.thinking, args.fallback_model = ["gpt-6.1-sol"], [], []
         with mock.patch.dict(self.helper["reviewer_args"].__globals__, {
             "env_defaults_for": lambda _: (None, {}),
         }):
             self.args = self.helper["reviewer_args"](args)[0]
 
     def test_primary_only_catalogue_keeps_normal_fallback_and_frozen_route(self):
-        self.use_default_models()
+        self.use_explicit_retry_model()
         self.write_config()
         original = self.catalogue_bytes
         events = []
@@ -225,7 +225,7 @@ class CodexInferenceRouteTests(unittest.TestCase):
         self.assertEqual(launchers[0], launchers[1])
 
     def test_primary_only_catalogue_does_not_block_successful_primary(self):
-        self.use_default_models()
+        self.use_explicit_retry_model()
         self.write_config()
         attempts = []
         self.run_review(during_run=lambda observed: attempts.append(observed["command"]))
@@ -654,7 +654,7 @@ class CodexInferenceRouteTests(unittest.TestCase):
                         self.run_review(during_run=no_report)
                     self.assertEqual(str(caught.exception), "codex engine failed: missing-report; provider diagnostics suppressed")
 
-        self.use_default_models()
+        self.use_explicit_retry_model()
         attempts = []
         def fail_retry(observed):
             attempts.append(observed["command"])

@@ -410,10 +410,8 @@ PROVIDER_CREDENTIAL_PATH_ENV_KEYS = {
 }
 DEFAULT_MODEL_BY_ENGINE = {
     "amp": "openai/gpt-5.6-sol",
-    "codex": "gpt-6.1-sol",
     "claude": "claude-fable-5",
 }
-DEFAULT_CODEX_ACCESS_FALLBACK_MODEL = "gpt-6-sol"
 AMP_THINKING_VALUES = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
 DEFAULT_THINKING_BY_ENGINE = {
     "amp": "high",
@@ -4674,7 +4672,13 @@ def codex_config_isolation_flags(repo: Path, runtime_root: Path) -> list[str]:
     ]
 
 
-def parse_codex_auth_config_fallback(text: str) -> dict[str, Any]:
+CODEX_MODEL_PARSER_REQUIRED = (
+    "Codex inference configuration refused: model inheritance requires Python 3.11 or tomli "
+    "unless config contains only supported authentication settings; install tomli or select --model explicitly"
+)
+
+
+def parse_codex_auth_config_fallback(text: str, *, require_auth_only: bool = False) -> dict[str, Any]:
     config: dict[str, Any] = {}
     pending_key: str | None = None
     pending_value: list[str] = []
@@ -4687,6 +4691,8 @@ def parse_codex_auth_config_fallback(text: str) -> dict[str, Any]:
             except SyntaxError:
                 continue
             except ValueError:
+                if require_auth_only:
+                    raise SystemExit(CODEX_MODEL_PARSER_REQUIRED)
                 pending_key = None
                 pending_value = []
                 continue
@@ -4696,12 +4702,16 @@ def parse_codex_auth_config_fallback(text: str) -> dict[str, Any]:
         if not line or line.startswith("#"):
             continue
         if line.startswith("["):
+            if require_auth_only:
+                raise SystemExit(CODEX_MODEL_PARSER_REQUIRED)
             break
         match = re.fullmatch(
             r"(cli_auth_credentials_store|forced_login_method|forced_chatgpt_workspace_id)\s*=\s*(.+)",
             line,
         )
         if not match:
+            if require_auth_only:
+                raise SystemExit(CODEX_MODEL_PARSER_REQUIRED)
             continue
         key, value_text = match.groups()
         try:
@@ -4710,12 +4720,20 @@ def parse_codex_auth_config_fallback(text: str) -> dict[str, Any]:
             if value_text.lstrip().startswith("["):
                 pending_key = key
                 pending_value = [value_text]
+            elif require_auth_only:
+                raise SystemExit(CODEX_MODEL_PARSER_REQUIRED)
         except ValueError:
+            if require_auth_only:
+                raise SystemExit(CODEX_MODEL_PARSER_REQUIRED)
             continue
+    if require_auth_only and pending_key is not None:
+        raise SystemExit(CODEX_MODEL_PARSER_REQUIRED)
     return config
 
 
-def load_codex_auth_config(path: Path, *, strict: bool = False) -> dict[str, Any]:
+def load_codex_auth_config(
+    path: Path, *, strict: bool = False, allow_auth_only_fallback: bool = False,
+) -> dict[str, Any]:
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -4732,9 +4750,9 @@ def load_codex_auth_config(path: Path, *, strict: bool = False) -> dict[str, Any
         except ModuleNotFoundError:
             import tomli as tomllib
     except ModuleNotFoundError:
-        if strict:
+        if strict and not allow_auth_only_fallback:
             raise SystemExit("Codex inference configuration refused: reading an operator route requires Python 3.11 or tomli")
-        return parse_codex_auth_config_fallback(text)
+        return parse_codex_auth_config_fallback(text, require_auth_only=strict)
     try:
         config = tomllib.loads(text)
     except ValueError:
@@ -4756,6 +4774,29 @@ def codex_source_home(repo: Path) -> Path | None:
         if resolved.is_dir() and external_env_path(repo, str(resolved))
         else None
     )
+
+
+def codex_operator_model(repo: Path) -> str | None:
+    source_home = codex_source_home(repo)
+    if source_home is None:
+        return None
+    config_path = source_home / "config.toml"
+    if not external_env_path(repo, str(config_path)):
+        raise SystemExit("Codex inference configuration refused: operator config must be outside the reviewed repository")
+    config = load_codex_auth_config(config_path, strict=True, allow_auth_only_fallback=True)
+    if "model" not in config:
+        return None
+    model = config["model"]
+    if not isinstance(model, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", model) is None:
+        raise SystemExit("Codex inference configuration refused: operator model must be a single identifier")
+    return model
+
+
+def codex_effective_model(repo: Path, model: str | None, thinking: str | None) -> str | None:
+    if model is None:
+        model = codex_operator_model(repo)
+    validate_thinking_level("codex", model, thinking)
+    return model
 
 
 def codex_auth_config_flags(
@@ -5436,6 +5477,7 @@ def codex_command(
     cmd = [resolve_command(args.codex_bin, source_repo), "--ask-for-approval", "never"]
     if args.web_search:
         cmd.append("--search")
+    model = codex_effective_model(source_repo, model, args.thinking)
     if model:
         cmd.extend(["--model", model])
     # User overrides go before the isolation flags so isolation stays authoritative on conflicts.
@@ -5500,6 +5542,7 @@ def stage_review_images(review_root: Path, images: Sequence[ImageEvidence]) -> l
 def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     if not args.tools:
         raise SystemExit("--no-tools is not supported by the Codex engine; use --engine claude --no-tools for a no-tools run")
+    model = codex_effective_model(repo, args.model, args.thinking)
     ensure_codex_isolation_supported(args, repo)
     temp_root = safe_temp_root(repo, engine="codex")
     schema_path = write_json_temp(PROVIDER_SCHEMA, temp_root)
@@ -5510,7 +5553,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         dir=temp_root,
     ) as output_file:
         output_path = Path(output_file.name)
-    models = [args.model]
+    models = [model]
     fallback_model = getattr(args, "fallback_model", None)
     if fallback_model and fallback_model != args.model:
         models.append(fallback_model)
@@ -7016,7 +7059,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         action="append",
-        help="Model override or engine=model. Repeatable. Defaults: codex=gpt-6.1-sol with an access-only gpt-6-sol retry, claude=claude-fable-5, amp=openai/gpt-5.6-sol.",
+        help="Model override or engine=model. Repeatable. Defaults: codex=external operator model or native CLI default, claude=claude-fable-5, amp=openai/gpt-5.6-sol.",
     )
     parser.add_argument("--thinking", action="append", help="Thinking/effort override or engine=level. Repeatable. Codex: none, minimal, low, medium, high, xhigh, max; gpt-6-sol and gpt-6-luna exclude minimal; gpt-6.1-sol and gpt-6-astra require low through max. Claude: low, medium, high, xhigh, max. Amp: none, low, medium, high, xhigh, max. Pi: off, minimal, low, medium, high, xhigh.")
     parser.add_argument(
@@ -7148,6 +7191,17 @@ def parse_keyed_options(values: list[str] | None, option: str) -> tuple[str | No
     return global_value, per_engine
 
 
+def validate_thinking_level(engine: str, model: str | None, thinking: str | None) -> None:
+    thinking_levels = THINKING_LEVELS_BY_ENGINE[engine]
+    thinking_target = engine
+    if engine == "codex" and model in {"gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"}:
+        thinking_levels = thinking_levels - ({"none", "minimal"} if model in {"gpt-6.1-sol", "gpt-6-astra"} else {"minimal"})
+        thinking_target = f"{engine} model {model}"
+    if thinking and thinking not in thinking_levels:
+        valid = ", ".join(sorted(thinking_levels)) or "none"
+        raise SystemExit(f"invalid thinking level for {thinking_target}: {thinking} (valid: {valid})")
+
+
 def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
     if args.engine == "kimi":
         raise SystemExit(KIMI_PRIVATE_INPUT_UNSUPPORTED)
@@ -7194,8 +7248,8 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
             or env_fallback_by_engine.get(engine)
             or env_global_fallback
         )
-    elif engine == "codex" and model == DEFAULT_MODEL_BY_ENGINE["codex"]:
-        fallback_model = DEFAULT_CODEX_ACCESS_FALLBACK_MODEL
+    elif engine == "codex" and model == "gpt-6.1-sol":
+        fallback_model = "gpt-6-sol"
     elif engine == "codex" and model == "gpt-6-sol":
         # Keep the shipped retry contract for explicitly selected GPT-6 Sol.
         fallback_model = "gpt-6-luna"
@@ -7204,14 +7258,7 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
         fallback_model = "gpt-5.6-terra"
     else:
         fallback_model = None
-    thinking_levels = THINKING_LEVELS_BY_ENGINE[engine]
-    thinking_target = engine
-    if engine == "codex" and model in {"gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"}:
-        thinking_levels = thinking_levels - ({"none", "minimal"} if model in {"gpt-6.1-sol", "gpt-6-astra"} else {"minimal"})
-        thinking_target = f"{engine} model {model}"
-    if thinking and thinking not in thinking_levels:
-        valid = ", ".join(sorted(thinking_levels)) or "none"
-        raise SystemExit(f"invalid thinking level for {thinking_target}: {thinking} (valid: {valid})")
+    validate_thinking_level(engine, model, thinking)
     clone = copy.copy(args)
     clone.model = model
     clone.thinking = thinking
@@ -7314,6 +7361,7 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
         try:
             codex_config_keys(reviewer)
             codex_speed_override(reviewer)
+            codex_effective_model(repo, reviewer.model, reviewer.thinking)
             load_codex_inference_route(repo, codex_config_overrides(reviewer))
         except SystemExit as exc:
             return False, str(exc.code)
@@ -7702,6 +7750,8 @@ def main_with_args(args: argparse.Namespace) -> int:
         return 2
     with PreparationProgress("target selection"):
         repo = repo_root()
+        if reviewers[0].engine == "codex":
+            codex_effective_model(repo, reviewers[0].model, reviewers[0].thinking)
         prepare_output_paths(args, repo)
         if getattr(args, "status_output", None):
             Path(args.status_output).unlink(missing_ok=True)

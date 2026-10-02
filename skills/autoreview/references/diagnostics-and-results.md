@@ -75,9 +75,12 @@ Codex runs collect usage with live display on or off. The final report, status
 sidecar, and terminal summary include `usage`: process attempts, reported,
 unknown and partial attempt counts, `complete`, and observed token totals.
 Each fresh attempt contributes its last valid cumulative snapshot once, including
-access retries and failed passes. The default GPT-6.1 Sol reviewer retries GPT-6
-Sol once only on an account-access failure; this retry does not chain to Luna.
-Network, rate-limit, capacity, and unsupported-effort errors do not select a fallback.
+access retries and failed passes. Inherited operator models and the unpinned native
+default have no model fallback. Explicit GPT-6.1 Sol, GPT-6 Sol, and GPT-5.6 Sol
+selections retry once to GPT-6 Sol, GPT-6 Luna, and GPT-5.6 Terra, respectively,
+only on an account-access failure. Retries do not chain; other explicit models
+have no fallback. Network, rate-limit, capacity, and unsupported-effort errors do
+not select a fallback.
 Cached input and reasoning output are subsets
 of input and output, not extra totals to add. These are observed tokens, not a
 billing estimate or a cache-hit promise. Missing telemetry, including Codex's

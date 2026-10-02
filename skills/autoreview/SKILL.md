@@ -154,25 +154,28 @@ it or Codex is unavailable for the review; report the concrete availability fail
 before switching. Do not switch because a review is slow, rate-limited, or returns
 findings, or to bypass a safety refusal or isolation failure.
 
-Codex defaults to `gpt-6.1-sol`, high reasoning, with a single `gpt-6-sol` retry
-only for an account-access failure. Explicit `gpt-6.1-sol` selections use the same
-retry. Explicit `gpt-6-sol` selections retain their access-only `gpt-6-luna` retry;
-other explicit models, including Luna and Astra, have no model fallback.
-Explicit `gpt-5.6-sol` selections retain their access-only `gpt-5.6-terra` retry.
-GPT-6.1 Sol rejects `none` and `minimal` effort before review preparation;
-GPT-6 Sol and Luna reject `minimal`. An effort-only override keeps the default model.
-Honor explicit user engine/model choices.
-The helper does not automatically fall back between engines.
+Select the Codex engine with `--engine codex`; the helper does not pin a default
+model version. With no model override, it uses the top-level `model` from the
+operator's external `CODEX_HOME/config.toml` (normally `~/.codex/config.toml`).
+Only that validated scalar is projected into the isolated invocation. If absent,
+Codex chooses its native default. Inherited/default models have no automatic
+model fallback. Reasoning defaults to `high`; an effort-only override leaves
+model selection unchanged. Known model/effort incompatibilities are rejected
+before review preparation and again before reviewer launch.
+
+Explicit `gpt-6.1-sol`, `gpt-6-sol`, and `gpt-5.6-sol` selections retain their
+single account-access retry to `gpt-6-sol`, `gpt-6-luna`, and `gpt-5.6-terra`,
+respectively. Other explicit models have no fallback. Honor explicit user
+engine/model choices. The helper never falls back between engines.
 
 Use `--engine`, `--model`, and `--thinking` to override the defaults.
 `--codex-speed fast` selects priority service when supported. Only Claude accepts
 `--fallback-model`. Per-engine environment overrides use `AUTOREVIEW_<ENGINE>_*`.
 
-If your account cannot access Sol or Luna, pin an available model. To require
-GPT-6 Astra without a model fallback, select it explicitly:
+To follow the operator's configured model:
 
 ```bash
-"$AUTOREVIEW" --mode local --model gpt-6-astra --thinking high
+"$AUTOREVIEW" --mode local --engine codex
 ```
 
 GPT-6.1 Sol and GPT-6 Astra support `low`, `medium`, `high`, `xhigh`, and `max`;
@@ -188,8 +191,18 @@ See the [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol)
 [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) model docs
 and [Codex reasoning modes](https://learn.chatgpt.com/docs/models#know-when-to-use-max-or-ultra).
 
-By default, Codex preserves only authentication settings from user configuration;
-provider, profile, context and catalogue settings remain ignored. To project a
+By default, Codex preserves authentication settings and the top-level model from
+external user configuration; provider, profile, context and catalogue settings
+remain ignored. Explicit model overrides take precedence. Model inheritance
+requires Python 3.11 or `tomli`. Without either parser, a missing config or a
+config containing only supported authentication settings keeps the native default
+unpinned. The fallback accepts bare `cli_auth_credentials_store`,
+`forced_login_method`, and `forced_chatgpt_workspace_id` declarations with its
+existing literal-value syntax, plus blank lines and comments. Any other declaration,
+table, or unsupported syntax requires a TOML parser or an explicit `--model`;
+a configured model is never silently replaced by the native default. Explicit
+model selections retain the existing authentication fallback with unrelated config.
+Invalid model values and repository-owned config paths are refused before reviewer launch. To project a
 named route, select it explicitly through the existing config override:
 
 ```bash
