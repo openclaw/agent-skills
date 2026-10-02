@@ -12,6 +12,7 @@ Public shared skills for agent workflows.
 - Helper scripts belong under `skills/<name>/scripts/`.
 - Validate after edits: `scripts/validate-skills`.
 - Do not edit generated/vendor copies in downstream repos; update here, then sync.
+- Autoreview consumers use one shared installation and a Markdown entrypoint. Do not restore vendored autoreview implementations or tests.
 
 ## Layout
 

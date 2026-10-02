@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Use one shared autoreview installation across repositories through thin Markdown entrypoints instead of vendored implementations and tests.
+- Preserve Crabline's Windows review launcher, Python 3.10 interpreter probing, complete malicious-fixture expectations, and harness cleanup failure reporting in the canonical skill. Thanks @vincentkoc.
+
 ## 0.4.0 - 2026-09-30
 
 **Highlights:** Review with GPT-6.1 Sol by default, with early effort validation and an access-only GPT-6 Sol retry.

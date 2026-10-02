@@ -27,6 +27,7 @@ MODULES = [
     "skills.autoreview.tests.test_engine_stage",
     "skills.autoreview.tests.test_terminal_report_authority",
     "skills.autoreview.tests.test_output_path_interpretation",
+    "skills.autoreview.tests.test_review_harness",
 ]
 
 

@@ -116,8 +116,25 @@ ln -sfn "$(pwd)/skills/crabbox" /path/to/shared-skills/crabbox
 Recommended one-liner for repo `AGENTS.md` files:
 
 ```text
-Shared agent workflows: install or symlink https://github.com/openclaw/agent-skills for `autoreview`, `crabbox`, and other common skills; do not vendor shared skills here unless this repo intentionally needs a zero-setup snapshot.
+Shared agent workflows: install or symlink https://github.com/openclaw/agent-skills for `autoreview`, `crabbox`, and other common skills. Autoreview uses one shared installation; repository entrypoints refer to it.
 ```
+
+## Shared Autoreview
+
+Install autoreview once with `python3 scripts/install-skills autoreview`. The
+default `~/.agents/skills/autoreview` symlink serves every repository. On Windows,
+use `python`; add `--mode copy` if symlinks are unavailable.
+
+Repositories keep only a `.agents/skills/autoreview/SKILL.md` entrypoint copied
+from [the repository template](skills/autoreview/references/repository-entrypoint.md).
+Agents read the full installed skill and run its helper from the repository being
+reviewed. Repo-specific review thresholds and contribution rules stay in that
+repository. Helpers, fixtures, and their tests stay here.
+
+Contribute shared improvements here first. After active reviews finish, update
+this checkout once to update every symlinked consumer. Copy-mode installations
+need `python3 scripts/install-skills --mode copy --force autoreview` after the
+source update. Review runs do not download or update code automatically.
 
 ## Zero-Setup Repos
 
@@ -132,9 +149,8 @@ That snapshot is a distribution artifact, not the source of truth:
 - keep downstream copies small in number
 - add provenance and drift checks when a repo vendors a snapshot
 
-`autoreview` is a good candidate for a zero-setup snapshot in flagship repos
-because review closeout is part of the contribution workflow. Large operational
-skills should be vendored only when the repo genuinely needs them available
+This option does not apply to `autoreview`, which uses the shared installation
+above. Vendor other operational skills only when the repo needs them available
 without setup.
 
 ## Repository Layout
