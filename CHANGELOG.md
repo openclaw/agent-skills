@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Skip inaccessible executable search candidates during Autoreview preflight while preserving explicit executable selection and repository-path rejection.
+
 ## 0.4.0 - 2026-09-30
 
 **Highlights:** Review with GPT-6.1 Sol by default, with early effort validation and an access-only GPT-6 Sol retry.
