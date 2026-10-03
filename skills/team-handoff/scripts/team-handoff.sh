@@ -136,7 +136,8 @@ done
 
 case "$cmd" in
   probe)
-    gateway_call "$via" health '{}' | python3 -c 'import sys,json; d=json.load(sys.stdin); ok = d.get("ok", True) and not d.get("error"); print("ok" if ok else json.dumps(d.get("error"))); sys.exit(0 if ok else 1)'
+    out="$(gateway_call "$via" health '{}')" || { printf '%s\n' "$out" >&2; exit 1; }
+    printf '%s' "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); ok = d.get("ok", True) and not d.get("error"); print("ok" if ok else json.dumps(d.get("error"))); sys.exit(0 if ok else 1)'
     ;;
   create)
     [ -n "$label" ] && [ -n "$message_file" ] || { usage; exit 2; }
@@ -171,7 +172,8 @@ print("runId:", d.get("runId"), "| status:", d.get("status"), "| identity:", ide
     ;;
   status)
     key="${positional[0]:-}"; [ -n "$key" ] || { usage; exit 2; }
-    gateway_call "$via" chat.history "$(printf '{"sessionKey":"%s","limit":3}' "$key")" | python3 -c '
+    out="$(gateway_call "$via" chat.history "$(printf '{"sessionKey":"%s","limit":3}' "$key")")" || { printf '%s\n' "$out" >&2; exit 1; }
+    printf '%s' "$out" | python3 -c '
 import sys, json
 d = json.load(sys.stdin)
 if not d.get("ok", True) or d.get("error"):
@@ -186,7 +188,8 @@ for m in d.get("messages", [])[-2:]:
     ;;
   archive)
     key="${positional[0]:-}"; sid="${positional[1]:-}"; [ -n "$key" ] && [ -n "$sid" ] || { usage; exit 2; }
-    gateway_call "$via" sessions.patch "$(printf '{"key":"%s","expectedSessionId":"%s","archived":true}' "$key" "$sid")" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("archived" if d.get("ok") else json.dumps(d.get("error")))'
+    out="$(gateway_call "$via" sessions.patch "$(printf '{"key":"%s","expectedSessionId":"%s","archived":true}' "$key" "$sid")")" || { printf '%s\n' "$out" >&2; exit 1; }
+    printf '%s' "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("archived" if d.get("ok") else json.dumps(d.get("error")))'
     ;;
   *) usage; exit 2 ;;
 esac
