@@ -24,6 +24,8 @@ repo. See [VISION.md](VISION.md) for catalog boundaries and admission principles
 - `readme-standard`: house README structure, badge row, tone, and verification
   gates for steipete/openclaw repos.
 - `session-viewer`: local searchable HTML viewer for agent session JSONL.
+- `team-handoff`: start a seeded worktree session on a shared OpenClaw Gateway as
+  yourself in one request.
 
 Repo-specific product skills should stay in the repo they describe. For example,
 an `acpx` usage skill belongs in `openclaw/acpx`; a general review helper belongs
