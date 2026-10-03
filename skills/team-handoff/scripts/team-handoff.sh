@@ -10,6 +10,8 @@ if [ -f "$CONFIG_FILE" ]; then
     case "$line" in ''|'#'*) continue ;; esac
     key="${line%%=*}"; value="${line#*=}"
     case "$key" in OPENCLAW_HANDOFF_*) ;; *) continue ;; esac
+    # Allow the documented `KEY=value   # comment` form: drop a whitespace-prefixed comment and padding.
+    value="$(printf '%s' "$value" | sed -E 's/[[:space:]]+#.*$//; s/[[:space:]]+$//; s/^[[:space:]]+//')"
     if [ -z "${!key+x}" ]; then
       export "$key=$value"
     fi
@@ -91,7 +93,8 @@ gateway_call() {
   case "$via" in
     profile)
       require_url
-      ensure_profile
+      # Callers evaluate gateway_call inside an assignment, where set -e does not apply.
+      ensure_profile || return $?
       command -v "$CLI" >/dev/null 2>&1 || [ -x "$CLI" ] || { echo "OpenClaw CLI not found: $CLI (set OPENCLAW_HANDOFF_CLI)" >&2; return 2; }
       OPENCLAW_STATE_DIR="$PROFILE_DIR" OPENCLAW_CONFIG_PATH="$PROFILE_DIR/openclaw.json" \
         "$CLI" gateway call "$method" --json --timeout 120000 --params "$params" 2>&1
