@@ -5,10 +5,15 @@ set -euo pipefail
 
 CONFIG_FILE="${OPENCLAW_HANDOFF_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/openclaw/team-handoff.env}"
 if [ -f "$CONFIG_FILE" ]; then
-  set -a
-  # shellcheck disable=SC1090
-  . "$CONFIG_FILE"
-  set +a
+  # The file supplies defaults only; variables already in the environment win.
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    key="${line%%=*}"; value="${line#*=}"
+    case "$key" in OPENCLAW_HANDOFF_*) ;; *) continue ;; esac
+    if [ -z "${!key+x}" ]; then
+      export "$key=$value"
+    fi
+  done < "$CONFIG_FILE"
 fi
 
 URL="${OPENCLAW_HANDOFF_URL:-}"
