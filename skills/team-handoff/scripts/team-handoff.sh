@@ -18,15 +18,20 @@ if [ -f "$CONFIG_FILE" ]; then
   done < "$CONFIG_FILE"
 fi
 
+expand_home() {
+  # Config values are exported without shell expansion; honor a leading ~ ourselves.
+  case "$1" in "~") printf '%s' "$HOME" ;; "~/"*) printf '%s%s' "$HOME" "${1#\~}" ;; *) printf '%s' "$1" ;; esac
+}
+
 URL="${OPENCLAW_HANDOFF_URL:-}"
 AGENT_DEFAULT="${OPENCLAW_HANDOFF_AGENT:-main}"
 PROJECT_DEFAULT="${OPENCLAW_HANDOFF_PROJECT:-}"
-PROFILE_DIR="${OPENCLAW_HANDOFF_PROFILE_DIR:-$HOME/.openclaw/profiles/team}"
-CLI="${OPENCLAW_HANDOFF_CLI:-openclaw}"
+PROFILE_DIR="$(expand_home "${OPENCLAW_HANDOFF_PROFILE_DIR:-$HOME/.openclaw/profiles/team}")"
+CLI="$(expand_home "${OPENCLAW_HANDOFF_CLI:-openclaw}")"
 SSH_HOST="${OPENCLAW_HANDOFF_SSH_HOST:-}"
 REMOTE_CLI="${OPENCLAW_HANDOFF_REMOTE_CLI:-openclaw}"
 REMOTE_USER="${OPENCLAW_HANDOFF_REMOTE_USER:-openclaw}"
-CLOUDFLARED="${OPENCLAW_HANDOFF_CLOUDFLARED:-}"
+CLOUDFLARED="$(expand_home "${OPENCLAW_HANDOFF_CLOUDFLARED:-}")"
 
 usage() {
   cat <<'EOF'
@@ -96,7 +101,9 @@ gateway_call() {
       # Callers evaluate gateway_call inside an assignment, where set -e does not apply.
       ensure_profile || return $?
       command -v "$CLI" >/dev/null 2>&1 || [ -x "$CLI" ] || { echo "OpenClaw CLI not found: $CLI (set OPENCLAW_HANDOFF_CLI)" >&2; return 2; }
-      OPENCLAW_STATE_DIR="$PROFILE_DIR" OPENCLAW_CONFIG_PATH="$PROFILE_DIR/openclaw.json" \
+      # Inherited Gateway overrides outrank gateway.remote.url; the validated profile must decide the target.
+      env -u OPENCLAW_GATEWAY_URL -u OPENCLAW_GATEWAY_TOKEN -u OPENCLAW_GATEWAY_PASSWORD \
+        OPENCLAW_STATE_DIR="$PROFILE_DIR" OPENCLAW_CONFIG_PATH="$PROFILE_DIR/openclaw.json" \
         "$CLI" gateway call "$method" --json --timeout 120000 --params "$params" 2>&1
       ;;
     ssh)
