@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add `team-handoff`: start a worktree session on a shared OpenClaw Gateway behind Cloudflare Access as the operator's own identity in one `sessions.create` request, with status/archive helpers and an opt-in SSH operator fallback.
+
 ## 0.4.0 - 2026-09-30
 
 **Highlights:** Review with GPT-6.1 Sol by default, with early effort validation and an access-only GPT-6 Sol retry.

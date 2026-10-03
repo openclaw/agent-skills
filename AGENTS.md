@@ -18,3 +18,4 @@ Public shared skills for agent workflows.
 - `skills/autoreview`: shared closeout/code-review helper.
 - `skills/beam`: redacted read-only coding-session publication.
 - `skills/crabbox`: shared Crabbox/Testbox remote validation workflow.
+- `skills/team-handoff`: one-request worktree session handoff to a shared Gateway.
