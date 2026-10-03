@@ -21,6 +21,11 @@
       "title": "Documentation",
       "description": "Skills for writing and reviewing project documentation.",
       "skills": ["readme-standard"]
+    },
+    {
+      "title": "Settlement",
+      "description": "Skills for agents paid in XNO (Nano): bind a payment to the order it pays for.",
+      "skills": ["nano-invoice"]
     }
   ]
 }
