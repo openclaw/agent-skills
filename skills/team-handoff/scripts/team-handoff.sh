@@ -44,7 +44,20 @@ ws_url() {
 }
 
 ensure_profile() {
-  [ -f "$PROFILE_DIR/openclaw.json" ] && return 0
+  if [ -f "$PROFILE_DIR/openclaw.json" ]; then
+    # A cached profile pins both the remote URL and the Access app; refuse to send to a stale target.
+    python3 - "$PROFILE_DIR/openclaw.json" "$URL" "$(ws_url)" <<'PY' || return 2
+import json, sys
+path, url, ws = sys.argv[1:4]
+config = json.load(open(path))
+remote = config.get("gateway", {}).get("remote", {}).get("url")
+args = config.get("secrets", {}).get("providers", {}).get("cloudflare-access", {}).get("args", [])
+app = next((a[len("-app="):] for a in args if isinstance(a, str) and a.startswith("-app=")), None)
+if remote != ws or app != url:
+    sys.exit(f"profile {path} targets {remote} / {app}, not {url}; move it aside or fix it before using this URL")
+PY
+    return 0
+  fi
   local bin
   bin="${CLOUDFLARED:-$(command -v cloudflared || true)}"
   [ -n "$bin" ] || { echo "cloudflared not found; install it or set OPENCLAW_HANDOFF_CLOUDFLARED" >&2; return 2; }
@@ -80,8 +93,8 @@ gateway_call() {
       ;;
     ssh)
       [ -n "$SSH_HOST" ] || { echo "OPENCLAW_HANDOFF_SSH_HOST is not set; the SSH fallback is opt-in" >&2; return 2; }
-      local remote_tmp="/tmp/team-handoff-$$-$RANDOM.json"
-      printf '%s' "$params" | ssh -o BatchMode=yes "$SSH_HOST" "cat > $remote_tmp && chmod a+r $remote_tmp && sudo -u $REMOTE_USER -H $REMOTE_CLI gateway call $method --json --timeout 120000 --params \"\$(cat $remote_tmp)\" 2>&1; rc=\$?; rm -f $remote_tmp; exit \$rc"
+      # The payload travels on stdin and stays in the remote shell's memory; no shared temp file.
+      printf '%s' "$params" | ssh -o BatchMode=yes "$SSH_HOST" "params=\$(cat); sudo -n -u $REMOTE_USER -H $REMOTE_CLI gateway call $method --json --timeout 120000 --params \"\$params\" 2>&1"
       ;;
     *) echo "unknown --via $via" >&2; return 2 ;;
   esac
@@ -141,7 +154,15 @@ PY
     if [ -z "$key" ]; then printf '%s\n' "$out" >&2; exit 1; fi
     if [ -n "$URL" ]; then printf 'url: %s\n' "$(pretty_url "$agent" "$label" "$key")"; fi
     printf 'key: %s\n' "$key"
-    printf '%s' "$out" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("runId:", d.get("runId"), "| status:", d.get("status"), "| identity:", "'"$([ "$via" = ssh ] && echo 'Gateway operator (ssh fallback)' || echo 'operator via Access')"'")'
+    # sessions.create can succeed while the initial turn is rejected (runStarted:false + runError).
+    printf '%s' "$out" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+identity = sys.argv[1]
+if d.get("runStarted") is False or d.get("runError"):
+    print("runStarted: false | runError:", json.dumps(d.get("runError")), "| the session exists but the handoff turn did not start", file=sys.stderr)
+    sys.exit(1)
+print("runId:", d.get("runId"), "| status:", d.get("status"), "| identity:", identity)' "$([ "$via" = ssh ] && echo 'Gateway operator (ssh fallback)' || echo 'operator via Access')"
     ;;
   status)
     key="${positional[0]:-}"; [ -n "$key" ] || { usage; exit 2; }
