@@ -181,7 +181,9 @@ Honor explicit user engine/model choices.
 The helper does not automatically fall back between engines.
 
 Use `--engine`, `--model`, and `--thinking` to override the defaults.
-`--codex-speed fast` selects priority service when supported. Only Claude accepts
+`--codex-speed fast` selects priority service when supported; `--codex-speed ultrafast`
+selects Ultrafast when the active model catalog lists it (Codex otherwise silently
+sends the standard tier). Only Claude accepts
 `--fallback-model`. Per-engine environment overrides use `AUTOREVIEW_<ENGINE>_*`.
 
 If your account cannot access Sol or Luna, pin an available model. To require

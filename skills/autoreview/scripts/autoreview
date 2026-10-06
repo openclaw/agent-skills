@@ -5337,13 +5337,16 @@ def codex_config_keys(args: argparse.Namespace) -> list[str]:
     return [override.partition("=")[0].strip() for override in codex_config_overrides(args)]
 
 
+CODEX_SPEEDS = ("fast", "ultrafast", "flex", "default")
+
+
 def codex_speed_override(args: argparse.Namespace) -> str | None:
     speed = getattr(args, "codex_speed", None) or os.environ.get("AUTOREVIEW_CODEX_SPEED", "").strip() or None
     if speed is None:
         return None
     speed = speed.strip().lower()
-    if speed not in {"fast", "flex", "default"}:
-        raise SystemExit(f"invalid Codex speed: {speed} (valid: fast, flex, default)")
+    if speed not in CODEX_SPEEDS:
+        raise SystemExit(f"invalid Codex speed: {speed} (valid: {', '.join(CODEX_SPEEDS)})")
     return f'service_tier="{speed}"'
 
 
@@ -7044,8 +7047,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--codex-speed",
-        choices=["fast", "flex", "default"],
-        help="Codex service tier: fast (priority processing), flex, or default. Env default: AUTOREVIEW_CODEX_SPEED. Silently standard when the model catalog does not list the tier.",
+        choices=CODEX_SPEEDS,
+        help="Codex service tier: fast (priority processing), ultrafast, flex, or default. Env default: AUTOREVIEW_CODEX_SPEED. Silently standard when the model catalog does not list the tier.",
     )
     parser.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
     parser.add_argument("--amp-bin", default=os.environ.get("AMP_BIN", "amp"))

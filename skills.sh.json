@@ -10,7 +10,7 @@
     {
       "title": "Handoff",
       "description": "Skills for sharing context across agents, PRs, and issues.",
-      "skills": ["handoff", "agent-transcript"]
+      "skills": ["handoff", "agent-transcript", "team-handoff"]
     },
     {
       "title": "Sessions",
