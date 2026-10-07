@@ -292,6 +292,8 @@ Git scope, and structured result validation. Keep those controls enabled.
 Before repository detection or target selection, Git must pass `--version`
 within 10 seconds. Failure exits `2` with an `incomplete` diagnostic and the
 resolved executable (or the unresolved selection); it never means `scoped-clean`.
+Executable discovery skips inaccessible search candidates; an inaccessible
+explicit executable override still fails preflight.
 Set `AUTOREVIEW_GIT` to a trusted external Git executable to override every
 helper-owned Git invocation. On macOS with a broken selected Xcode, use
 `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` for the invocation.

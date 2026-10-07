@@ -2199,18 +2199,19 @@ def first_executable_candidate(path: Path, *, reject_root: Path | None = None) -
     else:
         candidates = [path]
     for candidate in candidates:
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            try:
-                lexical_candidate = Path(os.path.abspath(candidate))
-                resolved_candidate = candidate.resolve(strict=True)
-            except OSError:
+        try:
+            if not candidate.is_file() or not os.access(candidate, os.X_OK):
                 continue
-            if reject_root is not None and (
-                is_within(lexical_candidate, reject_root)
-                or is_within(resolved_candidate, reject_root)
-            ):
-                continue
-            return str(lexical_candidate)
+            lexical_candidate = Path(os.path.abspath(candidate))
+            resolved_candidate = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if reject_root is not None and (
+            is_within(lexical_candidate, reject_root)
+            or is_within(resolved_candidate, reject_root)
+        ):
+            continue
+        return str(lexical_candidate)
     return None
 
 
