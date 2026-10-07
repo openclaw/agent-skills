@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Update development Node.js types to 26.6.4 and the native macOS sandbox-test Codex CLI to 0.160.1.
 - Skip inaccessible executable search candidates during Autoreview preflight while preserving explicit executable selection and repository-path rejection. Thanks @vincentkoc.
 - Use one shared autoreview installation across repositories through thin Markdown entrypoints instead of vendored implementations and tests.
 - Preserve Crabline's Windows review launcher, Python 3.10 interpreter probing, complete malicious-fixture expectations, and harness cleanup failure reporting in the canonical skill. Thanks @vincentkoc.

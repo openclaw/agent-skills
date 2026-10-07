@@ -67,7 +67,7 @@ jobs:
           python-version: '3.14'
       - name: Install sandbox CLI
         run: |
-          npm install --prefix "$RUNNER_TEMP/autoreview-codex" --ignore-scripts --no-audit --no-fund @openai/codex@0.159.3
+          npm install --prefix "$RUNNER_TEMP/autoreview-codex" --ignore-scripts --no-audit --no-fund @openai/codex@0.160.1
           echo "$RUNNER_TEMP/autoreview-codex/node_modules/.bin" >> "$GITHUB_PATH"
       - name: Exercise native sandbox and Git boundaries without provider access
         run: |
