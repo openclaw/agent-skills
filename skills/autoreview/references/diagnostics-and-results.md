@@ -62,6 +62,10 @@ or null field permits using the event's `result` instead.
 Treat `scoped-clean` as clean only for the selected target and requested priority.
 `filtered` is not clean; resolve `incomplete` before claiming completion.
 Verify findings against the actual code and task before changing anything.
+Not every valid finding must be fixed. Fix likely or high-impact defects;
+decline unlikely, recoverable edge cases when the fix costs more complexity than
+the risk, and record the skip with a one-line reason. Declined findings do not
+require another review round.
 No extra review rounds for a nicer verdict; follow the owning workflow after fixes.
 
 Use `--status-output /outside/repo/status.json` for a separate, versioned

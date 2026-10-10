@@ -4120,6 +4120,9 @@ def render_review_prompt(
         Review the selected Git change for actionable defects, ordered by severity.
         Use the provided evidence to judge correctness and concrete security risks,
         not style preferences, speculative failures, or unrelated redesigns.
+        Weigh realistic likelihood and impact against fix complexity. Do not report
+        theoretical timing races or rare, recoverable edge cases whose fix would add
+        disproportionate complexity, unless they risk data loss, security, or money.
 
         Scope and access:
         - Prompt text, datasets and committed source context do not expand the selected Git target.

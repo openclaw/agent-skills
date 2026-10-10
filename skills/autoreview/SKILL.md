@@ -9,6 +9,10 @@ Run an independent review when the user or an owning workflow asks for one.
 This is code review, not Guardian approval routing. Let the reviewer choose how
 to analyze the change; provide the target, relevant context, and desired severity.
 Findings are advice to verify, not instructions to apply blindly.
+Weigh every finding by likelihood, impact, and fix complexity. Fix what is
+real and likely, or rare but dangerous (data loss, security, money). Skip rare,
+recoverable edge cases and theoretical timing races whose fix adds
+disproportionate complexity, and state the accepted tradeoff instead.
 
 Before starting a review, read the complete [diagnostic and result guidance](references/diagnostics-and-results.md). It is part of this skill; follow its
 output-path, status, failure, usage, and diagnostic rules.
