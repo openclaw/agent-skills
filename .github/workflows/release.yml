@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version matching a dated CHANGELOG section
+        required: true
+        type: string
+      dry_run:
+        description: Validate and verify without publishing
+        default: true
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.repository }}-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    permissions:
+      actions: read
+      checks: read
+      contents: write
+      statuses: read
+    uses: openclaw/release-workflows/.github/workflows/release-source.yml@v1
+    with:
+      version: ${{ inputs.version || github.ref_name }}
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+      require-signed-tag: true
+      strict-checks: true
+      ci-check-events: '["push"]'
+      source-archives: true
+      test-command: |
+        python3 -m venv "$RUNNER_TEMP/release-venv"
+        "$RUNNER_TEMP/release-venv/bin/pip" install -r requirements-dev.txt
+        npx --yes --package=node@26.10.0 --call 'npm ci --ignore-scripts'
+        PATH="$RUNNER_TEMP/release-venv/bin:$PATH" npx --yes --package=node@26.10.0 --call 'python scripts/check-skills'
