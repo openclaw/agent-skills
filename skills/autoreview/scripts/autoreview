@@ -5040,13 +5040,15 @@ def codex_runtime_env(
     codex_bin: str,
     *,
     file_auth_linked: bool,
+    command_auth: bool = False,
 ) -> dict[str, str]:
     runtime_home = runtime_root / "home"
     runtime_config = runtime_home / ".config"
     runtime_data = runtime_home / ".local" / "share"
     runtime_state = runtime_home / ".local" / "state"
     runtime_cache = runtime_home / ".cache"
-    runtime_codex_home = runtime_root / "codex-home"
+    # A provider retry must not inherit the subscription attempt's auth.json.
+    runtime_codex_home = runtime_root / ("provider-home" if command_auth else "codex-home")
     for path in (
         runtime_home,
         runtime_config,
@@ -5059,7 +5061,7 @@ def codex_runtime_env(
     source_codex_home = codex_source_home(repo)
     active_codex_home = (
         runtime_codex_home
-        if file_auth_linked or source_codex_home is None
+        if command_auth or file_auth_linked or source_codex_home is None
         else source_codex_home
     )
     return safe_engine_env(
@@ -5649,7 +5651,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                 )
             auth_config = prepare_codex_inference_config(route, runtime_root)
             auth_config = stage_codex_auth_helper(repo, runtime_root, auth_config)
-            file_auth_linked = prepare_codex_runtime_auth(repo, runtime_codex_home)
+            file_auth_linked = not command_auth and prepare_codex_runtime_auth(repo, runtime_codex_home)
             attempts = list(enumerate(models))
             while attempts:
                 index, model = attempts.pop(0)
@@ -5662,7 +5664,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                     schema_path,
                     output_path,
                     model,
-                    force_file_auth=file_auth_linked,
+                    force_file_auth=file_auth_linked or command_auth,
                     auth_config=auth_config,
                     image_paths=image_paths,
                 )
@@ -5693,6 +5695,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                             runtime_root,
                             cmd[0],
                             file_auth_linked=file_auth_linked,
+                            command_auth=command_auth,
                         ),
                     )
                 except EngineInterrupted as exc:

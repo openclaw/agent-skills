@@ -68,6 +68,8 @@ Profile settings remain ignored. Force configured route before subscription atte
   or symlink provenance. Windows keeps native executable route.
 - Command-auth runs: suppress raw provider diagnostics; report fixed failure
   categories; retain compact progress, usage, assistant report streaming.
+- Command-auth runs use a separate empty file credential store, including on
+  subscription fallback; they never inherit or refresh subscription credentials.
 - Empty final report: fail without exposing captured stdout.
 
 - Catalogue + authentication working-directory paths: resolve relative to operator

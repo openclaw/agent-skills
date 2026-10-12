@@ -2444,9 +2444,14 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
     def run_codex_attempts(
         self, failures: list[str], *, explicit: bool = False,
         login_missing: bool = False, configured: bool = True,
+        credential_store: str = "file", inspect_attempt=None,
     ):
         if configured:
             self.configure_provider()
+            config_path = self.home / "config.toml"
+            config_path.write_text(
+                f'cli_auth_credentials_store = "{credential_store}"\n' + config_path.read_text(),
+            )
         with mock.patch.object(sys, "argv", ["autoreview", "--no-web-search"]):
             args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
         args.model = "review-model"
@@ -2457,6 +2462,8 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
 
         def run(command, _cwd, **kwargs):
             commands.append(command)
+            if inspect_attempt is not None:
+                inspect_attempt(command, kwargs["env"], len(commands))
             self.assertEqual(kwargs["input_text"], "same review input")
             stopper = kwargs["stop_on_output"]
             self.assertIsInstance(stopper, AUTOREVIEW.CodexAuthFailureStopper)
@@ -2518,6 +2525,37 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
         self.assertEqual(notice.count("codex auth:"), 1)
         self.assertIn("authentication", output)
         self.assertNotIn("PRIVATE_SENTINEL", notice + output)
+
+    def test_command_auth_uses_empty_file_store_without_subscription_credentials(self) -> None:
+        source_auth = self.home / "auth.json"
+        original = '{"tokens": {"refresh_token": "synthetic-expired-token"}}'
+        source_auth.write_text(original)
+        for explicit in (False, True):
+            for credential_store in ("file", "keyring"):
+                with self.subTest(explicit=explicit, credential_store=credential_store):
+                    homes = []
+
+                    def inspect(command, env, attempt):
+                        home = Path(env["CODEX_HOME"])
+                        homes.append(home)
+                        if explicit or attempt == 2:
+                            self.assertNotEqual(home, self.home)
+                            self.assertTrue(home.is_dir())
+                            self.assertFalse((home / "auth.json").exists())
+                            self.assertIn('cli_auth_credentials_store="file"', command)
+                            if not explicit:
+                                self.assertNotEqual(home, homes[0])
+                        elif credential_store == "file":
+                            self.assertTrue(os.path.samefile(home / "auth.json", source_auth))
+                        else:
+                            self.assertEqual(home, self.home)
+
+                    _, _, output = self.run_codex_attempts(
+                        [] if explicit else ["refresh_token_reused"], explicit=explicit,
+                        credential_store=credential_store, inspect_attempt=inspect,
+                    )
+                    self.assertEqual(output, "clean")
+                    self.assertEqual(source_auth.read_text(), original)
 
     def test_explicit_route_authentication_failure_has_no_fallback_notice(self) -> None:
         commands, notice, output = self.run_codex_attempts(["401 Unauthorized"], explicit=True)
