@@ -440,7 +440,7 @@ class StageTests(unittest.TestCase):
         def launch(*a,**kw):
             proc=REAL_POPEN(*a,**kw); PROCESSES.append(proc); return proc
         stubs={'ensure_codex_isolation_supported':lambda *a:None,'safe_temp_root':lambda *a,**kw:self.root,
-               'load_codex_inference_route':lambda *a:None,'prepare_codex_inference_config':lambda *a:[],
+               'load_codex_inference_route':lambda *a:([], None),'prepare_codex_inference_config':lambda *a:[],
                'stage_codex_auth_helper':lambda *a:[],'prepare_codex_runtime_auth':lambda *a:False,
                'codex_command':command,'codex_model_access_failure':lambda *a:True,
                'codex_runtime_env':lambda *a,**kw:{'HOME':str(self.home),'TMPDIR':str(self.home),'PATH':os.environ.get('PATH', os.defpath),'LANG':'C.UTF-8'}}
@@ -625,7 +625,7 @@ class StageTests(unittest.TestCase):
                 stubs = {
                     'ensure_codex_isolation_supported': lambda *a: None,
                     'safe_temp_root': lambda *a, **kw: self.root,
-                    'load_codex_inference_route': lambda *a: None,
+                    'load_codex_inference_route': lambda *a: ([], None),
                     'prepare_codex_inference_config': lambda *a: [],
                     'stage_codex_auth_helper': lambda *a: [],
                     'prepare_codex_runtime_auth': lambda *a: False,
