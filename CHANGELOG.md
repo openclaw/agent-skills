@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Make this repository's ClawSweeper reviews opt-in for maintainer PRs and issues, with a one-time reminder; clarify when agents should request hosted reviews in the shared Autoreview skill.
+
 - Isolate Autoreview's configured command-auth provider from subscription credentials so an expired subscription cannot break a working direct-provider retry.
 
 - Accept and project `supports_websockets` on Autoreview's named command-auth OpenAI route, so reviews use the Responses WebSocket transport instead of re-uploading the full prompt on every step.

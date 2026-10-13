@@ -9,6 +9,17 @@ Run an independent review when the user or owning workflow asks. This is code
 review, not Guardian approval routing. Supply target, context, and severity;
 let the reviewer choose the analysis. Verify findings before acting.
 
+## Hosted review requests
+
+ClawSweeper reviews are opt-in for maintainer-authored PRs and issues. Request
+`@clawsweeper review` only when the maintainer asks for it or the owning workflow
+specifically requires ClawSweeper, after the work and validation are complete.
+A generic independent-review requirement does not require a hosted bot review.
+Check for an existing queued or running review before requesting one. Do not
+automatically request reviews on PR creation, pushes, edits, or progress updates,
+and do not repeat a pending request. A later head needs a new request only when
+another review is required and that work is complete.
+
 ## Run
 
 Run the shared helper from the repository being reviewed:
