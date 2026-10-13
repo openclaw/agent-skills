@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add optional Autoreview preflight summaries for clean committed branch reviews, preserving native reports, status, and exit codes without another model call or GitHub write.
+
 - Make this repository's ClawSweeper reviews opt-in for maintainer PRs and issues, with a one-time reminder; clarify when agents should request hosted reviews in the shared Autoreview skill.
 
 - Isolate Autoreview's configured command-auth provider from subscription credentials so an expired subscription cannot break a working direct-provider retry.

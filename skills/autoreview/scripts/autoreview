@@ -185,6 +185,7 @@ class CapturedBundle(NamedTuple):
     spans: tuple[SourceSpan, ...] = ()
     commit: str | None = None
     images: tuple[ImageEvidence, ...] = ()
+    base: str | None = None
 
 
 class UntrackedSources(NamedTuple):
@@ -3467,7 +3468,8 @@ def branch_bundle(repo: Path, base_ref: str) -> CapturedBundle:
             ),
             branch_patch,
         ]
-    ), set(branch_paths) - tracked_sensitive_paths(branch_paths), commit=head_ref, images=images)
+    ), set(branch_paths) - tracked_sensitive_paths(branch_paths), commit=head_ref, images=images,
+        base=merge_base)
 
 
 def commit_diff_refs(repo: Path, commit_ref: str) -> tuple[str, ...]:
@@ -7216,6 +7218,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--json-output", help="Write validated structured review JSON.")
     parser.add_argument("--engine-stage-dir", help="Opt in to a closed local diagnostic for the first streamed Codex process; requires a fresh private local directory. Never a provider receipt or review verdict.")
     parser.add_argument("--status-output", help="Write a versioned status sidecar, including reviewer_unavailable; does not change report JSON or exit codes.")
+    parser.add_argument("--preflight-output", help="Write an advisory openclaw-preflight:v1 block for a clean committed branch; requires --preflight-repo. Never attaches to GitHub.")
+    parser.add_argument("--preflight-repo", help="Explicit target owner/repository for --preflight-output; never inferred from origin.")
     parser.add_argument(
         "--stream-engine-output",
         action="store_true",
@@ -7230,6 +7234,14 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit(f"invalid --engine/AUTOREVIEW_ENGINE: {args.engine}")
     if args.max_priority not in ("P0", "P1", "P2", "P3"):
         parser.error(f"invalid --max-priority/AUTOREVIEW_MAX_PRIORITY: {args.max_priority!r}")
+    if bool(args.preflight_output) != bool(args.preflight_repo):
+        parser.error("--preflight-output and --preflight-repo must be used together")
+    if args.preflight_output:
+        if args.mode not in ("auto", "branch") or args.dry_run:
+            parser.error("--preflight-output requires a real branch review; use --mode branch --base <ref>")
+        if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.preflight_repo)
+                or len(args.preflight_repo) > 256):
+            parser.error("--preflight-repo must be the target owner/repository")
     return args
 
 
@@ -7718,13 +7730,14 @@ def run_review_passes(
 def prepare_output_paths(args: argparse.Namespace, repo: Path) -> None:
     """Validate all destinations, then freeze their original cwd/tilde meaning."""
     repo_root_path = repo.resolve()
-    distinct_referents = bool(getattr(args, "status_output", None))
+    distinct_referents = bool(getattr(args, "status_output", None) or getattr(args, "preflight_output", None))
     outputs: list[tuple[str, Path]] = []
     destinations: dict[str, str] = {}
     for option, attribute in (
         ("--json-output", "json_output"),
         ("--output", "output"),
         ("--status-output", "status_output"),
+        ("--preflight-output", "preflight_output"),
         ("--engine-stage-dir", "engine_stage_dir"),
     ):
         value = getattr(args, attribute, None)
@@ -7767,6 +7780,15 @@ def prepare_output_paths(args: argparse.Namespace, repo: Path) -> None:
         # Retain lexical destinations so atomic writes replace final symlinks.
         if attribute != "engine_stage_dir":
             destinations[attribute] = str(path)
+    if getattr(args, "preflight_output", None) and getattr(args, "engine_stage_dir", None):
+        stage = Path(args.engine_stage_dir).expanduser().absolute().resolve()
+        preflight = Path(destinations["preflight_output"])
+        # The diagnostic owns every entry in its private directory, including partial writes.
+        stage_key = tuple(unicodedata.normalize("NFD", part).casefold() for part in stage.parts)
+        for candidate in (preflight.parent.resolve() / preflight.name, preflight.resolve()):
+            key = tuple(unicodedata.normalize("NFD", part).casefold() for part in candidate.parts)
+            if key[:len(stage_key)] == stage_key:
+                raise SystemExit("--preflight-output must stay outside --engine-stage-dir")
     for attribute, destination in destinations.items():
         setattr(args, attribute, destination)
 
@@ -7803,6 +7825,35 @@ def write_review_status(args: argparse.Namespace, status: str, exit_code: int,
     if usage := review_usage_summary(args):
         envelope["usage"] = usage
     atomic_write_text(Path(args.status_output), json.dumps(envelope, indent=2) + "\n")
+
+
+def preflight_block(args: argparse.Namespace, captured: CapturedBundle,
+                    report: dict[str, Any], version: str) -> str:
+    """Project only native outcome facts, never model prose or review authority."""
+    threshold = f"Threshold {args.max_priority}; "
+    if args.max_priority != "P3":
+        threshold += "lower priorities not assessed; "
+    summary = (
+        threshold + f"status {report['review_status']}; "
+        f"accepted {len(report['findings'])}; "
+        f"priority-filtered {len(report.get('priority_filtered_findings', []))}; "
+        f"scope/attribution-rejected {len(report.get('scope_rejected_findings', [])) + len(report.get('attribution_rejected_findings', []))}; "
+        f"missing-required {len(report.get('missing_required_findings', []))}. "
+        "Self-reported; see native report."
+    )
+    payload = {
+        "v": 1, "repo": args.preflight_repo, "base": captured.base, "head": captured.commit,
+        "tool": {"name": "autoreview", "version": version},
+        "completion": "partial" if report["review_status"] == "incomplete" else "complete",
+        "summary": summary,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    for character, escaped in (("<", "\\u003c"), (">", "\\u003e"), ("&", "\\u0026")):
+        encoded = encoded.replace(character, escaped)
+    block = f"<!-- openclaw-preflight:v1\n{encoded}\n-->"
+    if len(summary.encode("utf-8")) > 512 or len(block.encode("utf-8")) > 4096:
+        raise ValueError("preflight summary exceeds its byte limit")
+    return block
 
 
 def main() -> int:
@@ -7846,7 +7897,11 @@ def main_with_args(args: argparse.Namespace) -> int:
         prepare_output_paths(args, repo)
         if getattr(args, "status_output", None):
             Path(args.status_output).unlink(missing_ok=True)
+        if getattr(args, "preflight_output", None):
+            Path(args.preflight_output).unlink(missing_ok=True)
         target, target_ref = choose_target(repo, args.mode, args.base)
+        if getattr(args, "preflight_output", None) and (target != "branch" or is_dirty(repo)):
+            raise SystemExit("preflight export requires a clean committed branch; commit changes and use --mode branch --base <ref>")
         branch = current_branch(repo)
     print(f"autoreview target: {target}", flush=True)
     print(f"branch: {branch}", flush=True)
@@ -7877,8 +7932,17 @@ def main_with_args(args: argparse.Namespace) -> int:
         evidence = capture_evidence_inputs(args, repo)
     with PreparationProgress("initial source snapshot") as progress:
         review_source_snapshot = source_tree_snapshot(repo, progress)
+    if getattr(args, "preflight_output", None) and is_dirty(repo):
+        raise SystemExit("source became dirty before preflight capture; commit changes and rerun")
     with PreparationProgress("bundle/evidence preparation"):
         captured = build_bundle(repo, target, target_ref, args.commit)
+        if getattr(args, "preflight_output", None):
+            if (not captured.paths or captured.commit != review_source_snapshot[0]
+                    or not captured.base or not captured.commit
+                    or not re.fullmatch(r"[0-9a-f]{40}", captured.base)
+                    or not re.fullmatch(r"[0-9a-f]{40}", captured.commit)):
+                raise SystemExit("preflight export requires a nonempty SHA-1 branch range")
+            preflight_version = "source-" + hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
         require_image_engine(reviewer.engine, captured.images)
         if target == "commit":
             target_ref = args.commit
@@ -7973,6 +8037,15 @@ def main_with_args(args: argparse.Namespace) -> int:
     else:
         exit_code = 1 if has_findings or overall_incorrect else 0
     write_review_status(args, report["review_status"], exit_code)
+    if getattr(args, "preflight_output", None):
+        try:
+            # Export has its own late check: report writes must not restamp a changed source.
+            if source_tree_snapshot(repo) != review_source_snapshot or is_dirty(repo):
+                raise ValueError("source changed before preflight export; rerun on the clean branch")
+            verify_evidence(repo, evidence.files)
+            atomic_write_text(Path(args.preflight_output), preflight_block(args, captured, report, preflight_version))
+        except (OSError, ValueError, SystemExit) as exc:
+            print(f"preflight export failed: {display_escape(exc, 500)}; native review outcome preserved", file=sys.stderr)
     return exit_code
 
 

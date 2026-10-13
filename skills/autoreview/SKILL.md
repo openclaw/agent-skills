@@ -164,6 +164,15 @@ resolved parent entries/referents. Use distinct destinations and a fresh status 
 For path aliases, machine status, usage, or local stage observation, read
 [diagnostic details](references/diagnostics-and-results.md).
 
+For an optional shareable summary of a clean committed branch, add
+`--preflight-output /outside/repo/preflight.txt --preflight-repo owner/repository`
+to `--mode branch --base <ref>`. Name the intended PR target explicitly, including
+when reviewing a fork. The helper writes one bounded advisory comment without
+GitHub access or another review. Native reports, status, and exit codes stay unchanged.
+Local/commit targets, dirty trees, empty ranges, and dry runs cannot export this
+committed-range summary. Read [summary limits](references/diagnostics-and-results.md#preflight-summary)
+before sharing; it is self-reported, not trusted execution or review exemption.
+
 | Exit | Meaning |
 | --- | --- |
 | `0` | `scoped-clean`, or a correct verdict with only filtered lower-priority findings |
