@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Document pinned source installation and explicit upgrades/rollback; cover copy/symlink replacement, external state preservation, and installed Autoreview help without changing installer behavior.
+
 - Make this repository's ClawSweeper reviews opt-in for maintainer PRs and issues, with a one-time reminder; clarify when agents should request hosted reviews in the shared Autoreview skill.
 
 - Isolate Autoreview's configured command-auth provider from subscription credentials so an expired subscription cannot break a working direct-provider retry.
