@@ -56,6 +56,115 @@ DRAFT_REPORT = {
 }
 
 
+class AutoreviewVersionTests(unittest.TestCase):
+    def test_version_ignores_typed_review_environment_defaults(self) -> None:
+        expected = "autoreview source-sha256:" + hashlib.sha256(SCRIPT_PATH.read_bytes()).hexdigest() + "\n"
+        for name in ("AUTOREVIEW_MAX_REVIEW_PASSES", "AUTOREVIEW_ENGINE_TIMEOUT_SECONDS"):
+            for value in ("0", "invalid"):
+                with self.subTest(name=name, value=value):
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with mock.patch.object(sys, "argv", ["autoreview", "--version"]), \
+                            mock.patch.dict(os.environ, {name: value}), \
+                            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        with self.assertRaises(SystemExit) as caught:
+                            AUTOREVIEW.main_impl()
+                    self.assertEqual(caught.exception.code, 0, stderr.getvalue())
+                    self.assertEqual(stdout.getvalue(), expected)
+                    self.assertEqual(stderr.getvalue(), "")
+
+    def test_version_exits_before_review_preparation(self) -> None:
+        stdout = io.StringIO()
+        expected = hashlib.sha256(SCRIPT_PATH.read_bytes()).hexdigest()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(sys, "argv", ["autoreview", "--version"]))
+            stack.enter_context(mock.patch.dict(os.environ, {
+                "AUTOREVIEW_ENGINE": "invalid", "AUTOREVIEW_MAX_PRIORITY": "invalid",
+            }))
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            for name in ("main_with_args", "preflight_git", "reviewer_args", "EngineStage"):
+                stack.enter_context(mock.patch.object(
+                    AUTOREVIEW, name, side_effect=AssertionError(f"unexpected {name}"),
+                ))
+            with self.assertRaises(SystemExit) as caught:
+                AUTOREVIEW.main_impl()
+        self.assertEqual(caught.exception.code, 0)
+        self.assertEqual(stdout.getvalue(), f"autoreview source-sha256:{expected}\n")
+
+    def test_unreadable_version_source_fails_without_a_fingerprint(self) -> None:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["autoreview", "--version"]), \
+                mock.patch.object(Path, "read_bytes", side_effect=OSError("fixture unreadable")), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as caught:
+                AUTOREVIEW.main_impl()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("cannot read source for --version", stderr.getvalue())
+
+    def test_installed_version_identifies_executed_helper_without_side_effects(self) -> None:
+        repo = SCRIPT_PATH.resolve().parents[3]
+        with tempfile.TemporaryDirectory(prefix="autoreview-version.") as temporary:
+            root = Path(temporary)
+            cwd = root / "outside checkout with spaces 雪"
+            cwd.mkdir()
+            operator = root / "operator"
+            operator.mkdir()
+            outputs = [operator / name for name in ("human.txt", "report.json", "status.json")]
+            for path in [*outputs, operator / "config.toml", operator / "auth.json"]:
+                path.write_text("preserved fixture\n", encoding="utf-8")
+            installed = []
+            for mode in ("copy", "symlink"):
+                target = root / mode
+                result = subprocess.run([
+                    sys.executable, "-B", str(repo / "scripts/install-skills"),
+                    "--target", str(target), "--mode", mode, "autoreview",
+                ], cwd=cwd, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                installed.append(target / "autoreview/scripts/autoreview")
+
+            def snapshot(directory):
+                return {
+                    str(path.relative_to(directory)): (
+                        stat.S_IMODE(path.lstat().st_mode),
+                        ("link", os.readlink(path)) if path.is_symlink()
+                        else ("directory",) if path.is_dir() else ("file", path.read_bytes()),
+                    ) for path in directory.rglob("*")
+                }
+
+            before = snapshot(root), snapshot(SCRIPT_PATH.parent.parent)
+            env = {**os.environ, "HOME": str(operator), "USERPROFILE": str(operator),
+                   "PATH": str(root / "no executables"), "AUTOREVIEW_ENGINE": "invalid",
+                   "AUTOREVIEW_MAX_PRIORITY": "invalid", "AUTOREVIEW_MAX_REVIEW_PASSES": "invalid",
+                   "AUTOREVIEW_ENGINE_TIMEOUT_SECONDS": "0"}
+            for helper in (SCRIPT_PATH.resolve(), *installed):
+                with self.subTest(helper=helper):
+                    result = subprocess.run([
+                        sys.executable, "-I", "-B", str(helper), "--version",
+                        "--output", str(outputs[0]), "--json-output", str(outputs[1]),
+                        "--status-output", str(outputs[2]), "--engine-stage-dir", str(root / "stage"),
+                    ], cwd=cwd, env=env, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "autoreview source-sha256:"
+                                     + hashlib.sha256(helper.read_bytes()).hexdigest() + "\n")
+                    self.assertEqual(result.stderr, "")
+            self.assertEqual((snapshot(root), snapshot(SCRIPT_PATH.parent.parent)), before)
+
+            copied = installed[0]
+            copied.write_bytes(copied.read_bytes() + b"\n# Changed copied source fixture.\n")
+            result = subprocess.run([sys.executable, "-I", "-B", str(copied), "--version"],
+                                    cwd=cwd, env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "autoreview source-sha256:"
+                             + hashlib.sha256(copied.read_bytes()).hexdigest() + "\n")
+            self.assertNotEqual(copied.read_bytes(), SCRIPT_PATH.read_bytes())
+            unknown = subprocess.run([sys.executable, "-I", "-B", str(copied), "--unknown-flag"],
+                                     cwd=cwd, env={**env, "AUTOREVIEW_MAX_REVIEW_PASSES": "1",
+                                                   "AUTOREVIEW_ENGINE_TIMEOUT_SECONDS": "10"},
+                                     capture_output=True, text=True, timeout=10)
+            self.assertEqual(unknown.returncode, 2)
+            self.assertIn("unrecognized arguments", unknown.stderr)
+
+
 class AutoreviewCursorTests(unittest.TestCase):
     def test_parser_resource_errors_are_invalid_reports(self) -> None:
         args = argparse.Namespace(engine="codex", max_priority="P2")

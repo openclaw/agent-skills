@@ -7148,8 +7148,20 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+class SourceVersionAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        # Exit before argparse converts unrelated review environment defaults.
+        try:
+            digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        except OSError:
+            parser.exit(1, "autoreview: cannot read source for --version\n")
+        print(f"autoreview source-sha256:{digest}")
+        parser.exit()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Bundle-driven AI code review.")
+    parser.add_argument("--version", action=SourceVersionAction, nargs=0, help="Print this helper's source SHA-256 and exit; not a release version.")
     parser.add_argument("--mode", choices=["auto", "local", "uncommitted", "branch", "commit"], default="auto")
     parser.add_argument("--base", help="Branch base, or explicit commit to compare with the index in local mode.")
     parser.add_argument("--commit", default="HEAD")

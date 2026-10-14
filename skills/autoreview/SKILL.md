@@ -35,6 +35,11 @@ The default links to this source. Honor custom `--target` paths; here use
 See `--help` for flags/env overrides. Keep `codex exec`: native `codex review`
 cannot combine explicit Git targets and custom instructions.
 
+`python3 "$AUTOREVIEW" --version` prints `autoreview source-sha256:<64 hex digits>`
+for the executing helper's bytes, including copy-mode installations. It exits
+without Git, configuration, engine probes or report writes. This identifies the
+helper content, not a release, the complete skill or an attestation.
+
 Consumers keep the [shared-skill entrypoint](references/repository-entrypoint.md)
 and local review requirements. Update shared behavior here after active reviews finish.
 Copy-mode installs need
