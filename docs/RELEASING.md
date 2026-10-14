@@ -66,6 +66,9 @@ python3 /path/to/shared-skills/autoreview/scripts/autoreview \
 ```
 
 On Windows, use `python` or the installed `scripts/autoreview.ps1` launcher.
+Both PowerShell launchers search native Python applications without importing
+PowerShell modules for missing candidates. They try `py -3`, `python3`, then
+`python`, and require Python 3.10 or newer.
 Existing native flags, executable selection, and trust checks still apply.
 Help does not contact a model. Dry-run checks source preparation and local
 executable capabilities; it does not prove model access or sandbox execution.

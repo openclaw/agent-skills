@@ -131,6 +131,70 @@ class ReviewHarnessTests(unittest.TestCase):
                     self.assertIn(helper, launched)
                     self.assertIn("two words" if filename == "autoreview.ps1" else "--fixture benign", launched)
 
+    @unittest.skipUnless(os.name == "nt", "native PowerShell command discovery test")
+    def test_powershell_wrappers_do_not_autoload_modules_for_missing_python(self) -> None:
+        powershell = shutil.which("powershell") or shutil.which("pwsh")
+        self.assertIsNotNone(powershell, "native PowerShell is required")
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            modules = root / "modules"
+            marker = root / "imported.txt"
+            log = root / "launch.log"
+            for name in ("py", "python3"):
+                module = modules / name
+                module.mkdir(parents=True)
+                (module / f"{name}.psd1").write_text(
+                    f"@{{ RootModule = '{name}.psm1'; ModuleVersion = '1.0'; "
+                    f"FunctionsToExport = @('{name}') }}", encoding="utf-8",
+                )
+                (module / f"{name}.psm1").write_text(
+                    "[IO.File]::AppendAllText($env:IMPORT_MARKER, 'imported')\n"
+                    f"function {name} {{ }}\n", encoding="utf-8",
+                )
+            python = root / "python.cmd"
+            python.write_text(
+                "@echo off\r\n"
+                'if "%~1"=="-c" exit /b 0\r\n'
+                'echo %*>>"%WRAPPER_LOG%"\r\n'
+                "exit /b 23\r\n", encoding="utf-8",
+            )
+            env = {**os.environ, "PATH": str(root), "IMPORT_MARKER": str(marker),
+                   "WRAPPER_LOG": str(log),
+                   "PSMODULEPATH": os.pathsep.join((str(modules),
+                                                    str(Path(powershell).resolve().parent / "Modules"),
+                                                    os.environ.get("PSMODULEPATH", "")))}
+
+            def run(*args: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", *args],
+                    env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True, timeout=30,
+                )
+
+            # Establish that native discovery can import this trap, rather than
+            # passing merely because the fixture module is not discoverable.
+            control = run("-Command", "Get-Command py -CommandType Application -ErrorAction SilentlyContinue | Out-Null; exit 0")
+            self.assertEqual(control.returncode, 0, control.stderr)
+            self.assertTrue(marker.exists())
+            marker.unlink()
+
+            for filename, args, helper in (
+                ("autoreview.ps1", ["--help", "two words"], "autoreview"),
+                ("test-review-harness.ps1", ["-Fixture", "benign"], "test-review-harness.py"),
+            ):
+                with self.subTest(filename=filename):
+                    result = run("-File", str(SCRIPT.with_name(filename)), *args)
+                    self.assertEqual(result.returncode, 23, result.stderr)
+                    self.assertFalse(marker.exists(), "missing executable lookup imported a module")
+                    self.assertIn(helper, log.read_text(encoding="utf-8").splitlines()[-1])
+            python.unlink()
+            for filename in ("autoreview.ps1", "test-review-harness.ps1"):
+                with self.subTest(missing_python=filename):
+                    result = run("-File", str(SCRIPT.with_name(filename)))
+                    self.assertEqual(result.returncode, 127, result.stderr)
+                    self.assertIn("Python 3.10 or newer is required", result.stderr)
+                    self.assertFalse(marker.exists())
+
     @unittest.skipIf(os.name == "nt", "POSIX harness wrapper test")
     def test_posix_harness_skips_non_python3_fallbacks(self) -> None:
         harness = SCRIPT.with_name("test-review-harness")
