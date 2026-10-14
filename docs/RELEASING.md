@@ -120,6 +120,8 @@ proof dependencies. Tests decode a fixture PNG, parse fixture operator TOML, and
 check the actionable refusals when a required optional dependency is absent.
 Help and unsupported `--version` exit behavior run from a directory with spaces
 and Unicode; source, installation, and external state must remain unchanged.
+Windows profile and application-data directories are separate writable test
+paths; PowerShell may populate its own module cache there.
 
 These are no-model installation checks, not published-release certificates,
 live auth/scanner/sandbox tests, or coverage of every architecture. ZIP executable

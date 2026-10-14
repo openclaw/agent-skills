@@ -36,10 +36,9 @@ if ($PSBoundParameters.ContainsKey('Engine')) {
 
 foreach ($Candidate in $Candidates) {
     # Missing executable names must not trigger unrelated module discovery.
-    $Command = & {
-        $PSModuleAutoLoadingPreference = 'None'
-        Get-Command $Candidate.Name -CommandType Application -ErrorAction SilentlyContinue
-    } | Select-Object -First 1
+    $Command = $ExecutionContext.InvokeCommand.GetCommands(
+        $Candidate.Name, [System.Management.Automation.CommandTypes]::Application, $false
+    ) | Select-Object -First 1
     if ($null -eq $Command) {
         continue
     }

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import io
 import json
@@ -51,7 +50,8 @@ class InstalledAutoreviewTests(unittest.TestCase):
                 expected[path.decode()] = oid.decode()
 
         for filename in ("source.tar.gz", "source.zip"):
-            with self.subTest(archive=filename), tempfile.TemporaryDirectory() as tmp:
+            with (self.subTest(archive=filename), tempfile.TemporaryDirectory() as tmp,
+                  tempfile.TemporaryDirectory() as runtime_tmp):
                 scratch = Path(tmp).resolve()
                 source = scratch / "source"
                 archive_path = OPTIONS.archives / filename
@@ -95,6 +95,16 @@ class InstalledAutoreviewTests(unittest.TestCase):
                        if name.upper() in {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "LANG"}}
                 env.update(HOME=str(user), USERPROFILE=str(user), CODEX_HOME=str(user),
                            PYTHONDONTWRITEBYTECODE="1")
+                if os.name == "nt":
+                    # PowerShell owns writable profile/cache state separately from
+                    # the source, install, target, and operator-state proof trees.
+                    profile = Path(runtime_tmp).resolve()
+                    roaming = profile / "AppData/Roaming"
+                    local = profile / "AppData/Local"
+                    roaming.mkdir(parents=True)
+                    local.mkdir(parents=True)
+                    env.update(HOME=str(profile), USERPROFILE=str(profile),
+                               APPDATA=str(roaming), LOCALAPPDATA=str(local))
                 env.pop("PYTHONPATH", None)
 
                 def run(args: list[str], status: int = 0, stage: str = "install") -> subprocess.CompletedProcess[str]:
@@ -104,28 +114,6 @@ class InstalledAutoreviewTests(unittest.TestCase):
                                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                                 stderr=subprocess.PIPE, timeout=30)
                     except subprocess.TimeoutExpired as error:
-                        if os.name == "nt" and filename == "source.tar.gz" and stage == "installed help":
-                            # Diagnose the first failing archive without replacing the
-                            # direct -File acceptance check or changing its timeout.
-                            script = str(helper.with_suffix(".ps1")).replace("'", "''")
-                            trace = base64.b64encode(
-                                f"Set-PSDebug -Trace 1; & '{script}' --help".encode("utf-16-le")
-                            ).decode("ascii")
-                            try:
-                                traced = subprocess.run(
-                                    [powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
-                                     "Bypass", "-EncodedCommand", trace], cwd=cwd, env=env,
-                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, timeout=30,
-                                )
-                                trace_status = f"exit {traced.returncode}"
-                                trace_stdout, trace_stderr = traced.stdout, traced.stderr
-                            except subprocess.TimeoutExpired as diagnostic:
-                                trace_status = "timeout"
-                                trace_stdout, trace_stderr = diagnostic.stdout, diagnostic.stderr
-                            print(f"diagnostic-only PowerShell trace: {trace_status}; "
-                                  f"stdout={(trace_stdout or b'')[-12000:]!r}; "
-                                  f"stderr={(trace_stderr or b'')[-12000:]!r}", flush=True)
                         self.fail(f"{stage} timed out: stdout={error.stdout!r}; stderr={error.stderr!r}")
                     self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                     return result
