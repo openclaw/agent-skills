@@ -13,6 +13,62 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  installed-source:
+    name: installed source (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: '3.10'
+          - os: ubuntu-latest
+            python: '3.11'
+          - os: windows-latest
+            python: '3.14'
+    env:
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      SOURCE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+    steps:
+      # Archive identity must use the candidate head, not the PR merge commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Prepare exact candidate archives and isolated Python
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          archives="$RUNNER_TEMP/installed-source-archives"
+          mkdir "$archives"
+          curl --fail --silent --show-error --location \
+            "https://api.github.com/repos/$SOURCE_REPOSITORY/tarball/$SOURCE_SHA" \
+            --output "$archives/source.tar.gz"
+          curl --fail --silent --show-error --location \
+            "https://api.github.com/repos/$SOURCE_REPOSITORY/zipball/$SOURCE_SHA" \
+            --output "$archives/source.zip"
+          python -m venv "$RUNNER_TEMP/installed-source-python"
+          proof_python="$RUNNER_TEMP/installed-source-python/bin/python"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            proof_python="$RUNNER_TEMP/installed-source-python/Scripts/python.exe"
+          fi
+          echo "PROOF_PYTHON=$proof_python" >> "$GITHUB_ENV"
+          echo "PROOF_ARCHIVES=$archives" >> "$GITHUB_ENV"
+      - name: Qualify installed helper without optional dependencies
+        shell: bash
+        run: '"$PROOF_PYTHON" -B scripts/installed-autoreview.test.py --archives "$PROOF_ARCHIVES" --extras absent'
+      - name: Install pinned optional proof dependencies
+        shell: bash
+        run: '"$PROOF_PYTHON" -m pip install --only-binary=:all: Pillow==12.3.0 tomli==2.5.0'
+      - name: Qualify real installed image decoder and TOML parser
+        shell: bash
+        run: '"$PROOF_PYTHON" -B scripts/installed-autoreview.test.py --archives "$PROOF_ARCHIVES" --extras present'
+
   validate:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}

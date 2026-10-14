@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Qualify copied source archives on Python 3.10/3.11 and native Windows PowerShell, including real optional Pillow/tomli branches without model calls.
+
 - Document pinned source installation and explicit upgrades/rollback; cover copy/symlink replacement, external state preservation, and installed Autoreview help without changing installer behavior.
 
 - Make this repository's ClawSweeper reviews opt-in for maintainer PRs and issues, with a one-time reminder; clarify when agents should request hosted reviews in the shared Autoreview skill.

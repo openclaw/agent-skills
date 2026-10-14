@@ -107,5 +107,17 @@ assets shipped with v0.5.0 from the current workflow.
 Installer tests cover copy/symlink replacement, rollback, outside-state retention,
 and the real copied helper's help path from a directory with spaces and Unicode.
 Symlink tests skip when Windows lacks permission to create links. This does not
-qualify Python 3.10/3.11, native Windows provider execution, optional Pillow/tomli
-paths, or model access. Those require their own platform/runtime proof.
+qualify native Windows provider execution or model access.
+
+The separate installed-source CI jobs check exact candidate tar/ZIP bytes against
+Git, then copy-install Autoreview outside the checkout. Ubuntu jobs exercise
+Python 3.10/3.11; Windows exercises the real copied PowerShell launcher. Each job
+uses a fresh Python environment before and after installing pinned Pillow/tomli
+proof dependencies. Tests decode a fixture PNG, parse fixture operator TOML, and
+check the actionable refusals when a required optional dependency is absent.
+Help and unsupported `--version` exit behavior run from a directory with spaces
+and Unicode; source, installation, and external state must remain unchanged.
+
+These are no-model installation checks, not published-release certificates,
+live auth/scanner/sandbox tests, or coverage of every architecture. ZIP executable
+mode portability remains unqualified; Windows invokes the PowerShell launcher.
