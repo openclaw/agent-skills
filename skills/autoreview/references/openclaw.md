@@ -19,8 +19,8 @@ failure. The standalone helper's default remains Codex.
 Before selecting native, establish all of these from the current session:
 
 - The canonical helper package, Python 3.10+, Git and a POSIX filesystem are available.
-- OpenClaw Code Mode exposes `agents.run`, complete structured `read` pagination,
-  `write`, shell `exec`, and an existing process tool to observe and stop the helper.
+- OpenClaw Code Mode exposes `agents.run`, shell `exec` with structured `aggregated`
+  output and bounded `env` values, and `process` to observe and stop the helper.
 - The selected existing reviewer agent is admitted under the initiating identity.
   Its effective policy denies repository access, shell/file/network operations,
   publishing and further delegation, retaining only the collector result transport.
@@ -40,7 +40,9 @@ supported explicitly selected route, or report the limitation without a clean ve
 
 ## Start the helper
 
-Run from the reviewed repository using the existing background process tool. Use a
+Run from the reviewed repository using shell `exec` with `yieldMs` to obtain an
+ordinary request-owned process handle; do not use independent `background: true`.
+Choose the command's overall timeout to cover the planned review budget. Use a
 fresh path under a private task-owned directory outside the repository; do not create
 the `handoff` directory yourself. Report destinations must stay outside it.
 
@@ -62,8 +64,8 @@ an unowned job. `--dry-run` cannot qualify a native child and is refused.
 
 When the helper prints `native pass ready: N/T`, run the following complete cell in
 OpenClaw Code Mode, setting `directory`, `helper`, `passNumber` and `reviewerAgentId`.
-Read the current tool declarations first. `read` must return structured `kind` and
-`content`, not a display string. The cell reads every page, sends the full prepared
+Read the current tool declarations first. Shell `exec` must return structured
+`status`, `exitCode` and `aggregated`. The cell reads every page, sends the full prepared
 assignment, waits for the terminal structured value and writes it before the reply
 ends. It never emits a full prompt/report through model-visible output.
 
@@ -73,27 +75,50 @@ const helper = "/absolute/canonical/autoreview/scripts/autoreview";
 const passNumber = 1;
 const reviewerAgentId = "existing-restricted-reviewer";
 const byteLength = s => encodeURIComponent(s).replace(/%[0-9A-F]{2}|./g, "x").length;
-async function readComplete(path) {
-  let input = { path }, content = "";
-  const seen = new Set();
-  while (true) {
-    const page = await read(input);
-    if (!page || !["text", "truncated"].includes(page.kind) || typeof page.content !== "string")
-      throw new Error("Complete structured file transport unavailable");
-    content += page.content;
-    if (content.length > 4_000_000) throw new Error("Request exceeds native transport budget");
-    if (page.kind === "text") return content;
-    const next = page.continuation;
-    if (!next || !Number.isInteger(next.offset) || next.offset < 1)
-      throw new Error("Missing file continuation");
-    const key = JSON.stringify(next);
-    if (seen.has(key)) throw new Error("Repeated file continuation");
-    seen.add(key);
-    if (next.cursor === undefined) content += "\n";
-    input = { path, offset: next.offset, ...(next.cursor === undefined ? {} : { cursor: next.cursor }),
-      ...(next.limit === undefined ? {} : { limit: next.limit }) };
-  }
+const quote = s => "'" + s.replace(/'/g, "'\\''") + "'";
+async function python(code, args, env) {
+  const result = await exec({command: "python3 -c " + quote(code) + args.map(x => " " + quote(String(x))).join(""),
+    ...(env ? {env} : {}), awaitResults: true});
+  if (result.status !== "completed" || result.exitCode !== 0)
+    throw new Error("Native transport command failed; inspect the owned helper");
+  return JSON.parse(result.aggregated);
 }
+const readPage = `import os,sys,json,stat
+fd=os.open(sys.argv[1],os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+offset=int(sys.argv[2])
+with os.fdopen(fd,"rb") as f:
+ info=os.fstat(f.fileno()); total=info.st_size
+ assert stat.S_ISREG(info.st_mode) and info.st_uid==os.getuid() and info.st_nlink==1
+ assert 0<total<=4000000 and 0<=offset<total
+ f.seek(offset); data=f.read(8192)
+print(json.dumps({"offset":offset,"next":offset+len(data),"total":total,"content":data.decode("ascii")}))`;
+async function readComplete(path) {
+  let offset = 0, total, content = "";
+  do {
+    const page = await python(readPage, [path, offset]);
+    if (!page || page.offset !== offset || !Number.isSafeInteger(page.total) ||
+        page.total <= 0 || page.total > 4_000_000 || typeof page.content !== "string" ||
+        page.next !== offset + page.content.length || page.next !== Math.min(offset + 8192, page.total) ||
+        (total !== undefined && page.total !== total))
+      throw new Error("Invalid or incomplete request page");
+    total = page.total;
+    content += page.content;
+    offset = page.next;
+  } while (offset < total);
+  return content;
+}
+const appendChunk = `import os,sys,stat,json
+from pathlib import Path
+p=Path(sys.argv[1]); offset=int(sys.argv[2]); parent=p.parent.stat()
+assert parent.st_uid==os.getuid() and not stat.S_IMODE(parent.st_mode)&0o077
+data=os.environ["AUTOREVIEW_NATIVE_CHUNK"].encode("utf-8")
+assert 0<len(data)<=32768 and 0<=offset and offset+len(data)<=2000000
+fd=os.open(p,os.O_WRONLY|os.O_NOFOLLOW|os.O_NONBLOCK|(os.O_CREAT|os.O_EXCL if offset==0 else 0),0o600)
+with os.fdopen(fd,"ab") as f:
+ info=os.fstat(f.fileno())
+ assert stat.S_ISREG(info.st_mode) and info.st_uid==os.getuid() and info.st_nlink==1 and info.st_size==offset
+ f.write(data)
+print(json.dumps({"next":offset+len(data)}))`;
 const request = JSON.parse(await readComplete(`${directory}/${passNumber}.request.json`));
 if (request.protocol !== "autoreview-native-v1" || request.pass !== passNumber ||
     typeof request.prompt !== "string" || byteLength(request.prompt) !== request.prompt_bytes ||
@@ -118,10 +143,19 @@ if (byteLength(response) > request.max_result_bytes) {
   response = JSON.stringify({ run_id: request.run_id, pass: passNumber,
     prompt_sha256: request.prompt_sha256, status: "failed", report: null });
 }
-// Stage beside the exchange: write can create parents, so it must never write inside it.
+// Use existing private exec.env transport; report content never enters command argv.
 const spool = `${directory}.${request.run_id}.${passNumber}.response.json`;
-await write({ path: spool, content: response });
-const quote = s => "'" + s.replace(/'/g, "'\\''") + "'";
+let bytes = 0;
+for (let offset = 0; offset < response.length;) {
+  let end = Math.min(offset + 8192, response.length);
+  const last = response.charCodeAt(end - 1);
+  if (last >= 0xD800 && last <= 0xDBFF) end--; // Keep UTF-16 surrogate pairs intact.
+  const chunk = response.slice(offset, end);
+  const receipt = await python(appendChunk, [spool, bytes], {AUTOREVIEW_NATIVE_CHUNK: chunk});
+  bytes += byteLength(chunk);
+  if (receipt.next !== bytes) throw new Error("Incomplete response transfer");
+  offset = end;
+}
 const submitted = await exec({ command: `python3 ${quote(helper)} --native-submit ${quote(directory)} ${quote(spool)}`,
   awaitResults: true });
 if (submitted.status !== "completed" || submitted.exitCode !== 0)
@@ -138,6 +172,17 @@ speculatively, manufacture missing responses, recover an earlier successful chil
 message after terminal failure, or retry for a cleaner finding set.
 
 ## Lifecycle and limits
+
+Container-only scratch is deliberately accessed through the existing shell tool,
+not through host-backed file tools or a new bind mount. Sandboxed exec has closed
+stdin and disables PTY, so this consumer does not use stdin, terminal input or
+inherited descriptors. Request JSON is ASCII-encoded by the helper and read in
+8,192-byte JSON-framed pages with exact offsets and lengths. Never substitute a
+large `cat` or a truncated log for those pages. Responses use bounded, single-line
+environment chunks through OpenClaw's existing private container env-file transport;
+JSON serialization escapes newlines and NULs. This is invocation data, not saved
+configuration. A lower aggregate limit, denied environment override or failed
+chunk aborts the consumer; it never silently narrows a pass or a report.
 
 The helper owns `handoff` and removes it on normal exit or handled interruption.
 Its in-memory capture remains authoritative until all passes and the final source

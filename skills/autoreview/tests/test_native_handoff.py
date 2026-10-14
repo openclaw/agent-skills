@@ -103,7 +103,8 @@ class NativeHandoffTests(unittest.TestCase):
         self.assertFalse(self.handoff.exists(), "helper did not clean its exchange")
         return out + err
 
-    def consumer(self, request, report=CLEAN, *, failure=False, page_size=67, delay=0):
+    def consumer(self, request, report=CLEAN, *, failure=False, delay=0,
+                 output_limit=32768, drop_env=False, expected_launches=1):
         """Run the exact shipped cell, substituting only its documented inputs."""
         if not shutil.which("node"):
             self.fail("Node is required for the documented consumer contract test")
@@ -114,21 +115,21 @@ class NativeHandoffTests(unittest.TestCase):
         harness = r'''
 const fs = require("node:fs");
 const crypto = require("node:crypto");
-const supplied = JSON.parse(process.env.NATIVE_FIXTURE);
-let launches = 0;
-async function read(input) {
-  const data = fs.readFileSync(input.path, "utf8");
-  const offset = Number(input.cursor || 0), end = Math.min(offset + supplied.pageSize, data.length);
-  return {kind: end < data.length ? "truncated" : "text", content: data.slice(offset, end),
-    ...(end < data.length ? {continuation: {offset: 1, cursor: String(end)}} : {})};
-}
-async function write(input) {
-  fs.mkdirSync(require("node:path").dirname(input.path), {recursive: true});
-  fs.writeFileSync(input.path, input.content);
-}
+const supplied = JSON.parse(fs.readFileSync(process.env.NATIVE_FIXTURE_PATH, "utf8"));
+let launches = 0, envCalls = 0;
+// No file tools or stdin: model the standard container-only scratch boundary.
 async function exec(input) {
-  const result = require("node:child_process").spawnSync(input.command, {shell: true, encoding: "utf8"});
-  return {status: "completed", exitCode: result.status};
+  if (input.env) {
+    envCalls++;
+    const chunk = input.env.AUTOREVIEW_NATIVE_CHUNK;
+    if (typeof chunk !== "string" || Buffer.byteLength(chunk) > 32768 || /[\r\n\0]/.test(chunk))
+      throw Error("unsafe environment chunk");
+    if (chunk.length > 20 && input.command.includes(chunk)) throw Error("report entered argv");
+  }
+  const result = require("node:child_process").spawnSync(input.command, {shell: true, encoding: "utf8",
+    env: {...process.env, ...(supplied.dropEnv ? {} : input.env)}});
+  return {status: "completed", exitCode: result.status,
+    aggregated: result.stdout.slice(-supplied.outputLimit).trim()};
 }
 const agents = {async run(prompt, options) {
   launches++;
@@ -146,13 +147,16 @@ const agents = {async run(prompt, options) {
   return supplied.report;
 }};
 '''
-        harness += "(async () => {\n" + cell + "\n})().then(result => console.log(JSON.stringify({result, launches}))).catch(error => {console.log(JSON.stringify({error: error.message, launches})); process.exitCode = 1;});"
-        env = self.env | {"NATIVE_FIXTURE": json.dumps({"digest": request["prompt_sha256"],
-            "report": report, "failure": failure, "pageSize": page_size, "delay": delay,
+        harness += "(async () => {\n" + cell + "\n})().then(result => console.log(JSON.stringify({result, launches, envCalls}))).catch(error => {console.log(JSON.stringify({error: error.message, launches, envCalls})); process.exitCode = 1;});"
+        fixture = self.root / "consumer-fixture.json"
+        fixture.write_text(json.dumps({"digest": request["prompt_sha256"],
+            "report": report, "failure": failure, "delay": delay,
+            "outputLimit": output_limit, "dropEnv": drop_env,
             **({"model": request["model"]} if request["model"] is not None else {}),
-            **({"thinking": request["thinking"]} if request["thinking"] is not None else {})})}
-        result = subprocess.run(["node", "-e", harness], env=env, text=True, capture_output=True, timeout=6)
-        self.assertEqual(json.loads(result.stdout)["launches"], 1, result.stderr)
+            **({"thinking": request["thinking"]} if request["thinking"] is not None else {})}))
+        env = self.env | {"NATIVE_FIXTURE_PATH": str(fixture)}
+        result = subprocess.run(["node", "-e", harness], env=env, text=True, capture_output=True, timeout=15)
+        self.assertEqual(json.loads(result.stdout)["launches"], expected_launches, result.stderr)
         return result
 
     def test_documented_consumer_complete_and_explicit_model(self):
@@ -184,11 +188,34 @@ const agents = {async run(prompt, options) {
         for number in range(1, first["passes"] + 1):
             req = first if number == 1 else self.request(number)
             self.assertLessEqual(req["prompt_bytes"], 512_000)
-            self.assertEqual(self.consumer(req, page_size=31_000).returncode, 0)
+            self.assertEqual(self.consumer(req).returncode, 0)
         self.finish(0)
         report = json.loads(self.report.read_text())
         self.assertEqual(len(report["pass_reports"]), first["passes"])
         self.assertEqual(report["review_status"], "scoped-clean")
+
+    def test_response_larger_than_exec_output_budget_stays_complete(self):
+        report = copy.deepcopy(CLEAN)
+        report.update(overall_correctness="patch is incorrect", findings=[
+            FINDING | {"title": f"[P2] Complete finding {number}",
+                       "body": "é🙂\\\"\n" * 250} for number in range(150)])
+        self.start("--max-priority", "P2", timeout="15")
+        result = self.consumer(self.request(), report)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertGreater(json.loads(result.stdout)["envCalls"], 1)
+        self.finish(1)
+        validated = json.loads(self.report.read_text())
+        self.assertEqual(len(validated["findings"]), 150)
+        self.assertEqual(validated["findings"][-1]["body"], report["findings"][-1]["body"])
+
+    def test_truncated_stdout_and_denied_environment_are_not_clean(self):
+        for options in ({"output_limit": 100, "expected_launches": 0}, {"drop_env": True}):
+            with self.subTest(options=options):
+                self.start(timeout=".6")
+                self.assertEqual(self.consumer(self.request(), **options).returncode, 1)
+                self.finish(1)
+                self.assertFalse(self.report.exists())
+                self.assertFalse(json.loads(self.status.read_text())["report_produced"])
 
     def test_source_change_prevents_publication(self):
         self.start()
