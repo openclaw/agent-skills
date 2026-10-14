@@ -73,7 +73,7 @@ class OutputPathInterpretationTests(unittest.TestCase):
         # Native Git may refresh index stat data; staged entries must not change.
         return files, git(self.repo, "ls-files", "--stage", "-z")
 
-    def invoke(self, engine, *, overrides=None, with_status=True):
+    def invoke(self, engine, *, overrides=None, with_status=True, extra_args=()):
         # Literal argv values model quoted shell arguments and programmatic use.
         destinations = {flag: f"~/{name}" for flag, name in self.names.items()}
         destinations.update(overrides or {})
@@ -83,6 +83,7 @@ class OutputPathInterpretationTests(unittest.TestCase):
         for flag in ("--status-output", "--output", "--json-output"):
             if flag != "--status-output" or with_status:
                 argv.extend((flag, destinations[flag]))
+        argv.extend(extra_args)
         stdout, stderr = io.StringIO(), io.StringIO()
         main = self.helper["main_impl"]
         with mock.patch.dict(main.__globals__, {"run_engine": engine}), \
@@ -185,6 +186,99 @@ class OutputPathInterpretationTests(unittest.TestCase):
                 self.assertEqual(self.snapshot(), before)
                 self.assertEqual(status.read_bytes(), stale, "validation failure removed stale status")
                 self.assertEqual({path.name for path in self.home.iterdir()}, {"status.json"})
+
+    def test_dry_runs_preserve_existing_outputs_on_preflight_success_and_failure(self):
+        for available in (True, False):
+            with self.subTest(engine_available=available):
+                for name in self.names.values():
+                    (self.home / name).write_bytes(f"prior output: {name}\n".encode())
+                before = {path.name: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns)
+                          for path in self.home.iterdir()}
+                source = self.snapshot()
+                engine = mock.Mock(side_effect=AssertionError("dry run started a reviewer"))
+                resolution = mock.Mock(return_value=(available, None if available else "synthetic unavailable"))
+                with mock.patch.dict(self.helper["main_impl"].__globals__, {"resolve_engine_binary": resolution}):
+                    self.assertEqual(self.invoke(engine, extra_args=("--dry-run",)), 0 if available else 1)
+                resolution.assert_called_once()
+                engine.assert_not_called()
+                self.assertEqual({path.name: (path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns)
+                                  for path in self.home.iterdir()}, before)
+                self.assertEqual(self.snapshot(), source)
+
+    def test_dry_runs_do_not_create_output_files(self):
+        for available in (True, False):
+            with self.subTest(engine_available=available):
+                engine = mock.Mock(side_effect=AssertionError("dry run started a reviewer"))
+                resolution = mock.Mock(return_value=(available, None if available else "synthetic unavailable"))
+                with mock.patch.dict(self.helper["main_impl"].__globals__, {"resolve_engine_binary": resolution}):
+                    self.assertEqual(self.invoke(engine, extra_args=("--dry-run",)), 0 if available else 1)
+                engine.assert_not_called()
+                self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_only_real_reviews_clear_status_before_target_selection_failure(self):
+        status = self.home / "status.json"
+        prior = b"prior status must survive a dry run\n"
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                status.write_bytes(prior)
+                engine = mock.Mock(side_effect=AssertionError("invalid target reached reviewer"))
+                options = ("--base", "refs/heads/nonexistent-output-path-fixture")
+                if dry_run:
+                    options += ("--dry-run",)
+                with self.assertRaises(SystemExit):
+                    self.invoke(engine, extra_args=options)
+                engine.assert_not_called()
+                if dry_run:
+                    self.assertEqual(status.read_bytes(), prior)
+                else:
+                    self.assertFalse(status.exists(), "real review retained stale status")
+
+    def test_dry_runs_still_validate_all_output_paths(self):
+        status = self.home / "status.json"
+        prior = b"prior status before invalid dry run\n"
+        status.write_bytes(prior)
+        engine = mock.Mock(side_effect=AssertionError("invalid output reached reviewer"))
+        preflight = mock.Mock(side_effect=AssertionError("invalid output reached preflight"))
+        with mock.patch.dict(self.helper["main_impl"].__globals__, {"dry_run_preflight": preflight}):
+            with self.assertRaisesRegex(SystemExit, "--json-output must point outside"):
+                self.invoke(engine, overrides={"--json-output": "source.txt"}, extra_args=("--dry-run",))
+        preflight.assert_not_called()
+        engine.assert_not_called()
+        self.assertEqual(status.read_bytes(), prior)
+
+    def test_dry_runs_preserve_status_symlink_entries_and_referents(self):
+        status = self.home / "status.json"
+        for dangling in (False, True):
+            with self.subTest(dangling=dangling):
+                target = self.root / f"prior-status-{dangling}.json"
+                prior = b"prior status referent\n"
+                if not dangling:
+                    target.write_bytes(prior)
+                try:
+                    status.symlink_to(target)
+                except OSError as error:
+                    if os.name == "nt" and getattr(error, "winerror", None) == 1314:
+                        self.skipTest("Windows symlink privilege is unavailable")
+                    raise
+                try:
+                    original = status.lstat()
+                    original_target = os.readlink(status)
+                    engine = mock.Mock(side_effect=AssertionError("dry run started a reviewer"))
+                    with mock.patch.dict(self.helper["main_impl"].__globals__, {
+                        "resolve_engine_binary": mock.Mock(return_value=(True, None)),
+                    }):
+                        self.assertEqual(self.invoke(engine, extra_args=("--dry-run",)), 0)
+                    engine.assert_not_called()
+                    self.assertTrue(status.is_symlink())
+                    self.assertEqual(os.readlink(status), original_target)
+                    self.assertEqual(status.lstat().st_ino, original.st_ino)
+                    self.assertEqual(status.lstat().st_mtime_ns, original.st_mtime_ns)
+                    if not dangling:
+                        self.assertEqual(target.read_bytes(), prior)
+                    else:
+                        self.assertFalse(target.exists())
+                finally:
+                    status.unlink(missing_ok=True)
 
     def test_report_entry_aliases_are_refused_with_and_without_status(self):
         stale = b"unrequested status must remain unchanged\n"

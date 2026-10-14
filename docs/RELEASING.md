@@ -39,7 +39,8 @@ Keep the verified source archive and its extracted directory outside the project
 being reviewed. Record its tag, resolved commit, and archive checksum before
 installing. A tag names a release; a commit pins the source. `.release-version`
 alone does not identify a commit: unreleased changes can retain the last version.
-Autoreview has no `--version` flag; it exits 2 for that option.
+Autoreview's `--version` prints `autoreview source-sha256:` followed by the hash
+of the executing helper. This identifies helper bytes, not a release or full skill.
 
 Install only the desired skill from the retained source:
 
@@ -53,8 +54,9 @@ identifies that directory, whose root contains `.release-version`. Keep the
 directory available and unchanged while it is installed. Copy mode installs only
 `skills/autoreview`, including its helper, PowerShell launcher, and references;
 it omits the root `.release-version`. For copies, retain the source identity and
-compare installed files with that source instead of inferring a release from an
-installed version command. Neither mode verifies a release signature for you.
+compare installed files with that source. The helper's `--version` can confirm its
+content hash, but does not establish archive or release provenance. Neither mode
+verifies a release signature for you.
 
 Run the helper from the Git project being reviewed, not from the source archive:
 
@@ -118,8 +120,8 @@ Python 3.10/3.11; Windows exercises the real copied PowerShell launcher. Each jo
 uses a fresh Python environment before and after installing pinned Pillow/tomli
 proof dependencies. Tests decode a fixture PNG, parse fixture operator TOML, and
 check the actionable refusals when a required optional dependency is absent.
-Help and unsupported `--version` exit behavior run from a directory with spaces
-and Unicode; source, installation, and external state must remain unchanged.
+Help, exact helper-byte `--version` identity, and a genuine unknown-option refusal
+run from a directory with spaces and Unicode; source, installation, and external state must remain unchanged.
 Windows profile and application-data directories are separate writable test
 paths; PowerShell may populate its own module cache there.
 

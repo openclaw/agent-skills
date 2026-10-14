@@ -146,7 +146,12 @@ class InstalledAutoreviewTests(unittest.TestCase):
                 else:
                     launch = [sys.executable, "-B", str(helper)]
                 self.assertIn("usage:", run([*launch, "--help"], stage="installed help").stdout.lower())
-                self.assertIn("unrecognized arguments", run([*launch, "--version"], 2, stage="installed unsupported version").stderr)
+                version = run([*launch, "--version"], stage="installed helper identity")
+                digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+                self.assertEqual(version.stdout, f"autoreview source-sha256:{digest}\n")
+                self.assertEqual(version.stderr, "")
+                self.assertIn("unrecognized arguments: --unknown-option",
+                              run([*launch, "--unknown-option"], 2, stage="installed unknown option").stderr)
                 self.assertEqual(tree(scratch), before)
 
                 # Import the copied helper in a fresh interpreter: exercise real optional

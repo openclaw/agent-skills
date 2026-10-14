@@ -56,6 +56,115 @@ DRAFT_REPORT = {
 }
 
 
+class AutoreviewVersionTests(unittest.TestCase):
+    def test_version_ignores_typed_review_environment_defaults(self) -> None:
+        expected = "autoreview source-sha256:" + hashlib.sha256(SCRIPT_PATH.read_bytes()).hexdigest() + "\n"
+        for name in ("AUTOREVIEW_MAX_REVIEW_PASSES", "AUTOREVIEW_ENGINE_TIMEOUT_SECONDS"):
+            for value in ("0", "invalid"):
+                with self.subTest(name=name, value=value):
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with mock.patch.object(sys, "argv", ["autoreview", "--version"]), \
+                            mock.patch.dict(os.environ, {name: value}), \
+                            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        with self.assertRaises(SystemExit) as caught:
+                            AUTOREVIEW.main_impl()
+                    self.assertEqual(caught.exception.code, 0, stderr.getvalue())
+                    self.assertEqual(stdout.getvalue(), expected)
+                    self.assertEqual(stderr.getvalue(), "")
+
+    def test_version_exits_before_review_preparation(self) -> None:
+        stdout = io.StringIO()
+        expected = hashlib.sha256(SCRIPT_PATH.read_bytes()).hexdigest()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(sys, "argv", ["autoreview", "--version"]))
+            stack.enter_context(mock.patch.dict(os.environ, {
+                "AUTOREVIEW_ENGINE": "invalid", "AUTOREVIEW_MAX_PRIORITY": "invalid",
+            }))
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            for name in ("main_with_args", "preflight_git", "reviewer_args", "EngineStage"):
+                stack.enter_context(mock.patch.object(
+                    AUTOREVIEW, name, side_effect=AssertionError(f"unexpected {name}"),
+                ))
+            with self.assertRaises(SystemExit) as caught:
+                AUTOREVIEW.main_impl()
+        self.assertEqual(caught.exception.code, 0)
+        self.assertEqual(stdout.getvalue(), f"autoreview source-sha256:{expected}\n")
+
+    def test_unreadable_version_source_fails_without_a_fingerprint(self) -> None:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["autoreview", "--version"]), \
+                mock.patch.object(Path, "read_bytes", side_effect=OSError("fixture unreadable")), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as caught:
+                AUTOREVIEW.main_impl()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("cannot read source for --version", stderr.getvalue())
+
+    def test_installed_version_identifies_executed_helper_without_side_effects(self) -> None:
+        repo = SCRIPT_PATH.resolve().parents[3]
+        with tempfile.TemporaryDirectory(prefix="autoreview-version.") as temporary:
+            root = Path(temporary)
+            cwd = root / "outside checkout with spaces 雪"
+            cwd.mkdir()
+            operator = root / "operator"
+            operator.mkdir()
+            outputs = [operator / name for name in ("human.txt", "report.json", "status.json")]
+            for path in [*outputs, operator / "config.toml", operator / "auth.json"]:
+                path.write_text("preserved fixture\n", encoding="utf-8")
+            installed = []
+            for mode in ("copy", "symlink"):
+                target = root / mode
+                result = subprocess.run([
+                    sys.executable, "-B", str(repo / "scripts/install-skills"),
+                    "--target", str(target), "--mode", mode, "autoreview",
+                ], cwd=cwd, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                installed.append(target / "autoreview/scripts/autoreview")
+
+            def snapshot(directory):
+                return {
+                    str(path.relative_to(directory)): (
+                        stat.S_IMODE(path.lstat().st_mode),
+                        ("link", os.readlink(path)) if path.is_symlink()
+                        else ("directory",) if path.is_dir() else ("file", path.read_bytes()),
+                    ) for path in directory.rglob("*")
+                }
+
+            before = snapshot(root), snapshot(SCRIPT_PATH.parent.parent)
+            env = {**os.environ, "HOME": str(operator), "USERPROFILE": str(operator),
+                   "PATH": str(root / "no executables"), "AUTOREVIEW_ENGINE": "invalid",
+                   "AUTOREVIEW_MAX_PRIORITY": "invalid", "AUTOREVIEW_MAX_REVIEW_PASSES": "invalid",
+                   "AUTOREVIEW_ENGINE_TIMEOUT_SECONDS": "0"}
+            for helper in (SCRIPT_PATH.resolve(), *installed):
+                with self.subTest(helper=helper):
+                    result = subprocess.run([
+                        sys.executable, "-I", "-B", str(helper), "--version",
+                        "--output", str(outputs[0]), "--json-output", str(outputs[1]),
+                        "--status-output", str(outputs[2]), "--engine-stage-dir", str(root / "stage"),
+                    ], cwd=cwd, env=env, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "autoreview source-sha256:"
+                                     + hashlib.sha256(helper.read_bytes()).hexdigest() + "\n")
+                    self.assertEqual(result.stderr, "")
+            self.assertEqual((snapshot(root), snapshot(SCRIPT_PATH.parent.parent)), before)
+
+            copied = installed[0]
+            copied.write_bytes(copied.read_bytes() + b"\n# Changed copied source fixture.\n")
+            result = subprocess.run([sys.executable, "-I", "-B", str(copied), "--version"],
+                                    cwd=cwd, env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "autoreview source-sha256:"
+                             + hashlib.sha256(copied.read_bytes()).hexdigest() + "\n")
+            self.assertNotEqual(copied.read_bytes(), SCRIPT_PATH.read_bytes())
+            unknown = subprocess.run([sys.executable, "-I", "-B", str(copied), "--unknown-flag"],
+                                     cwd=cwd, env={**env, "AUTOREVIEW_MAX_REVIEW_PASSES": "1",
+                                                   "AUTOREVIEW_ENGINE_TIMEOUT_SECONDS": "10"},
+                                     capture_output=True, text=True, timeout=10)
+            self.assertEqual(unknown.returncode, 2)
+            self.assertIn("unrecognized arguments", unknown.stderr)
+
+
 class AutoreviewCursorTests(unittest.TestCase):
     def test_parser_resource_errors_are_invalid_reports(self) -> None:
         args = argparse.Namespace(engine="codex", max_priority="P2")
@@ -2562,6 +2671,299 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
         self.assertEqual(len(commands), 1)
         self.assertEqual(notice, "")
         self.assertIn("authentication", output)
+
+
+class AutoreviewPreflightTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="autoreview-preflight.")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        environment = {key: os.environ[key] for key in (
+            "PATH", "PATHEXT", "SYSTEMROOT", "SystemRoot", "COMSPEC", "WINDIR",
+            "TEMP", "TMP", "TMPDIR", "DEVELOPER_DIR",
+        ) if key in os.environ}
+        environment.update({"HOME": str(self.root), "USERPROFILE": str(self.root)})
+        patch = mock.patch.dict(os.environ, environment, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.git("init", "-q")
+        self.git("config", "user.email", "test@example.invalid")
+        self.git("config", "user.name", "Test")
+        self.git("config", "core.autocrlf", "false")
+        self.git("config", "commit.gpgsign", "false")
+        (self.repo / "source.txt").write_text("before\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "base")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.git("branch", "base")
+        (self.repo / "source.txt").write_text("after\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "candidate")
+        self.head = self.git("rev-parse", "HEAD").strip()
+        previous = Path.cwd()
+        os.chdir(self.repo)
+        self.addCleanup(os.chdir, previous)
+        self.block = self.root / "preflight.txt"
+        self.report = self.root / "report.json"
+        self.status = self.root / "status.json"
+
+    def git(self, *args):
+        return fixture_git(self.repo, *args, check=True, stdout=subprocess.PIPE, text=True).stdout
+
+    def invoke(self, provider=None, *, extra=(), export=True, effect=None):
+        argv = [str(SCRIPT_PATH), "--mode", "branch", "--base", "base", "--engine", "codex",
+                "--json-output", str(self.report), "--status-output", str(self.status)]
+        if export:
+            argv += ["--preflight-output", str(self.block), "--preflight-repo", "upstream/example"]
+        argv += list(extra)
+        reply = {**FINAL_REPORT, "review_completion": "complete"} if provider is None else provider
+        engine = mock.Mock(side_effect=effect, return_value=json.dumps(reply))
+        self.stdout, self.stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(AUTOREVIEW, "run_engine", engine), \
+                contextlib.redirect_stdout(self.stdout), contextlib.redirect_stderr(self.stderr):
+            result = AUTOREVIEW.main_impl()
+        self.engine = engine
+        return result
+
+    def payload(self):
+        text = self.block.read_text()
+        self.assertTrue(text.startswith("<!-- openclaw-preflight:v1\n"))
+        self.assertTrue(text.endswith("\n-->"))
+        self.assertLessEqual(len(text.encode()), 4096)
+        payload = json.loads(text.split("\n", 1)[1].rsplit("\n", 1)[0])
+        self.assertLessEqual(len(payload["summary"].encode()), 512)
+        return payload
+
+    def test_export_preserves_native_outputs_and_explicit_target(self):
+        self.assertEqual(self.invoke(export=False), 0)
+        native_report, native_status = self.report.read_bytes(), self.status.read_bytes()
+        self.assertEqual(self.invoke(), 0)
+        self.assertEqual(self.report.read_bytes(), native_report)
+        self.assertEqual(self.status.read_bytes(), native_status)
+        payload = self.payload()
+        self.assertEqual(set(payload), {"v", "repo", "base", "head", "tool", "completion", "summary"})
+        self.assertEqual((payload["repo"], payload["base"], payload["head"]),
+                         ("upstream/example", self.base, self.head))
+        self.assertEqual(payload["tool"], {"name": "autoreview", "version":
+                         "source-" + hashlib.sha256(SCRIPT_PATH.read_bytes()).hexdigest()[:12]})
+        self.assertEqual(payload["completion"], "complete")
+        self.assertIn("Threshold P0; lower priorities not assessed; status scoped-clean", payload["summary"])
+        self.engine.assert_called_once()
+
+    def test_native_incomplete_incorrect_and_filtered_are_not_clean(self):
+        finding = {"title": "Synthetic finding", "body": "Synthetic detail.", "priority": "P1",
+                   "confidence": 0.9, "category": "bug",
+                   "code_location": {"file_path": "source.txt", "line": 1}}
+        for provider, status, completion, code in (
+            ({**FINAL_REPORT, "review_completion": "incomplete"}, "incomplete", "partial", 2),
+            ({**FINAL_REPORT, "overall_correctness": "patch is incorrect", "review_completion": "complete"},
+             "incorrect", "complete", 1),
+            ({**FINAL_REPORT, "findings": [finding], "review_completion": "complete"},
+             "filtered", "complete", 0),
+            ({**FINAL_REPORT, "findings": [{**finding, "priority": "P0"}], "review_completion": "complete"},
+             "findings", "complete", 1),
+        ):
+            with self.subTest(status=status):
+                self.assertEqual(self.invoke(provider), code)
+                payload = self.payload()
+                self.assertEqual(payload["completion"], completion)
+                self.assertIn("status " + status, payload["summary"])
+                self.assertNotIn("Synthetic detail", self.block.read_text())
+                if status == "filtered":
+                    self.assertIn("priority-filtered 1", payload["summary"])
+
+    def test_unsupported_and_unpaired_options_fail_before_work(self):
+        for args in (
+            ["--preflight-output", str(self.block)], ["--preflight-repo", "owner/repo"],
+            ["--mode", "local"], ["--mode", "commit"], ["--dry-run"],
+            ["--preflight-repo", "https://github.com/owner/repo"],
+            ["--preflight-repo", "o/" + "x" * 255],
+        ):
+            prefix = [] if len(args) == 2 and args[0] in ("--preflight-output", "--preflight-repo") and args[1] in (str(self.block), "owner/repo") else [
+                "--preflight-output", str(self.block), "--preflight-repo", "owner/repo"]
+            with self.subTest(args=args), mock.patch.object(sys, "argv", [str(SCRIPT_PATH), *prefix, *args]), \
+                    mock.patch.object(AUTOREVIEW, "preflight_git") as git_probe, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    AUTOREVIEW.main_impl()
+                git_probe.assert_not_called()
+
+    def test_dirty_and_empty_ranges_fail_without_review(self):
+        for change in ("tracked", "untracked", "empty"):
+            with self.subTest(change=change):
+                if change == "tracked":
+                    (self.repo / "source.txt").write_text("dirty\n")
+                elif change == "untracked":
+                    (self.repo / "new.txt").write_text("untracked\n")
+                else:
+                    self.git("update-ref", "refs/heads/base", self.head)
+                with mock.patch.object(AUTOREVIEW, "run_review_passes") as engine:
+                    with self.assertRaises(SystemExit):
+                        self.invoke()
+                    engine.assert_not_called()
+                (self.repo / "source.txt").write_text("after\n")
+                (self.repo / "new.txt").unlink(missing_ok=True)
+                self.assertFalse(self.block.exists())
+
+    def test_pre_snapshot_dirty_race_and_forged_head_fail_without_review(self):
+        original = AUTOREVIEW.source_tree_snapshot
+        def dirty_snapshot(*args, **kwargs):
+            (self.repo / "source.txt").write_text("racing edit\n")
+            return original(*args, **kwargs)
+        with mock.patch.object(AUTOREVIEW, "source_tree_snapshot", side_effect=dirty_snapshot), \
+                mock.patch.object(AUTOREVIEW, "run_review_passes") as engine:
+            with self.assertRaises(SystemExit):
+                self.invoke()
+            engine.assert_not_called()
+        (self.repo / "source.txt").write_text("after\n")
+        captured = AUTOREVIEW.branch_bundle(self.repo, self.base)._replace(commit="1" * 40)
+        with mock.patch.object(AUTOREVIEW, "build_bundle", return_value=captured), \
+                mock.patch.object(AUTOREVIEW, "run_review_passes") as engine:
+            with self.assertRaises(SystemExit):
+                self.invoke()
+            engine.assert_not_called()
+
+    def test_captured_merge_base_does_not_follow_a_moving_ref(self):
+        def reply(*_args):
+            self.git("update-ref", "refs/heads/base", self.head)
+            return json.dumps({**FINAL_REPORT, "review_completion": "complete"})
+        self.assertEqual(self.invoke(effect=reply), 0)
+        self.assertEqual(self.payload()["base"], self.base)
+
+    def test_source_mutation_and_invalid_result_do_not_leave_stale_block(self):
+        self.block.write_text("old block")
+        def reply(*_args):
+            (self.repo / "source.txt").write_text("changed during review\n")
+            return json.dumps({**FINAL_REPORT, "review_completion": "complete"})
+        self.assertEqual(self.invoke(effect=reply), 1)
+        self.assertFalse(self.block.exists())
+        (self.repo / "source.txt").write_text("after\n")
+        self.block.write_text("old block")
+        with self.assertRaises(AUTOREVIEW.ReviewerUnavailable):
+            self.invoke(effect=lambda *_: "invalid report")
+        self.assertFalse(self.block.exists())
+        self.assertEqual(json.loads(self.status.read_text())["status"], "reviewer_unavailable")
+
+    def test_export_failure_preserves_native_outcome(self):
+        original = AUTOREVIEW.atomic_write_text
+        def write(path, text):
+            if path == self.block:
+                raise OSError("synthetic output error")
+            return original(path, text)
+        self.block.write_text("stale block")
+        with mock.patch.object(AUTOREVIEW, "atomic_write_text", side_effect=write):
+            self.assertEqual(self.invoke(), 0)
+        self.assertFalse(self.block.exists())
+        self.assertIn("preflight export failed", self.stderr.getvalue())
+        self.assertEqual(json.loads(self.status.read_text())["exit_code"], 0)
+        self.assertEqual(json.loads(self.report.read_text())["review_status"], "scoped-clean")
+
+    def test_late_export_mutation_keeps_already_published_native_status(self):
+        original = AUTOREVIEW.write_review_status
+        def write(*args, **kwargs):
+            original(*args, **kwargs)
+            (self.repo / "source.txt").write_text("changed after native publication\n")
+        with mock.patch.object(AUTOREVIEW, "write_review_status", side_effect=write):
+            self.assertEqual(self.invoke(), 0)
+        self.assertFalse(self.block.exists())
+        self.assertIn("preflight export failed", self.stderr.getvalue())
+        self.assertEqual(json.loads(self.status.read_text())["status"], "scoped-clean")
+
+    def test_non_codex_engine_and_expect_findings_keep_native_meaning(self):
+        self.assertEqual(self.invoke(extra=("--engine", "pi", "--expect-findings")), 1)
+        self.assertEqual(json.loads(self.status.read_text())["engine"], "pi")
+        self.assertEqual(self.payload()["completion"], "complete")
+        self.assertIn("status scoped-clean", self.payload()["summary"])
+
+    def test_auto_branch_and_full_priority_range_are_supported(self):
+        self.git("checkout", "-qb", "feature")
+        self.assertEqual(self.invoke(extra=("--mode", "auto", "--max-priority", "P3")), 0)
+        self.assertIn("Threshold P3; status scoped-clean", self.payload()["summary"])
+        self.assertNotIn("lower priorities", self.payload()["summary"])
+
+    def test_later_failed_pass_never_exports_an_earlier_report(self):
+        self.block.write_text("stale block")
+        failed = AUTOREVIEW.ReviewerUnavailable("synthetic later pass failed")
+        prompts = AUTOREVIEW.prepare_review_prompts
+        def two_passes(*args, **kwargs):
+            first = prompts(*args, **kwargs)[0]
+            return [first, first]
+        replies = iter([json.dumps({**FINAL_REPORT, "review_completion": "complete"}), failed])
+        def reply(*_args):
+            result = next(replies)
+            if isinstance(result, Exception) or isinstance(result, SystemExit):
+                raise result
+            return result
+        with mock.patch.object(AUTOREVIEW, "prepare_review_prompts", side_effect=two_passes):
+            with self.assertRaises(AUTOREVIEW.ReviewerUnavailable):
+                self.invoke(effect=reply)
+        self.assertFalse(self.block.exists())
+        self.assertFalse(self.report.exists())
+        self.assertEqual(json.loads(self.status.read_text())["status"], "reviewer_unavailable")
+
+    def test_all_sensitive_omitted_changes_are_not_exportable(self):
+        self.git("update-ref", "refs/heads/base", self.head)
+        (self.repo / ".env").write_text("SYNTHETIC=value\n")
+        self.git("add", ".env")
+        self.git("commit", "-qm", "sensitive path fixture")
+        with mock.patch.object(AUTOREVIEW, "run_review_passes") as engine:
+            with self.assertRaises(SystemExit):
+                self.invoke()
+            engine.assert_not_called()
+
+    def test_output_alias_and_repository_destination_fail_before_review(self):
+        for path in (self.repo / "preflight.txt", self.report, self.status):
+            with self.subTest(path=path), mock.patch.object(AUTOREVIEW, "run_review_passes") as engine:
+                with self.assertRaises(SystemExit):
+                    self.invoke(extra=("--preflight-output", str(path)))
+                engine.assert_not_called()
+
+    def test_engine_stage_namespace_is_preserved_before_review(self):
+        stage = self.root / "stage"
+        stage.mkdir()
+        for name in ("engine-stage.json", ".engine-stage.partial", "other.txt"):
+            path = stage / name
+            path.write_text("diagnostic sentinel")
+            with self.subTest(name=name), mock.patch.object(AUTOREVIEW, "run_review_passes") as engine:
+                with self.assertRaisesRegex(SystemExit, "outside --engine-stage-dir"):
+                    self.invoke(extra=("--preflight-output", str(path), "--engine-stage-dir", str(stage)))
+                engine.assert_not_called()
+                self.assertEqual(path.read_text(), "diagnostic sentinel")
+
+    @unittest.skipIf(os.name == "nt", "symlink privilege is not available in standard Windows CI")
+    def test_engine_stage_resolved_aliases_are_preserved(self):
+        stage = self.root / "stage"
+        stage.mkdir()
+        diagnostic = stage / "engine-stage.json"
+        diagnostic.write_text("diagnostic sentinel")
+        directory_alias = self.root / "stage-alias"
+        directory_alias.symlink_to(stage, target_is_directory=True)
+        file_alias = self.root / "output-alias"
+        file_alias.symlink_to(diagnostic)
+        for path, stage_path in ((directory_alias / diagnostic.name, stage),
+                                 (file_alias, stage), (diagnostic, directory_alias)):
+            with self.subTest(path=path), mock.patch.object(AUTOREVIEW, "run_review_passes") as engine:
+                with self.assertRaisesRegex(SystemExit, "outside --engine-stage-dir"):
+                    self.invoke(extra=("--preflight-output", str(path), "--engine-stage-dir", str(stage_path)))
+                engine.assert_not_called()
+                self.assertEqual(diagnostic.read_text(), "diagnostic sentinel")
+        self.assertTrue(file_alias.is_symlink())
+
+    def test_engine_stage_case_and_unicode_aliases_are_refused_portably(self):
+        # Match the conservative spelling rules even on case-sensitive filesystems.
+        for name, alias in (("stage-case", "STAGE-CASE"), ("\u00e9tape", "e\u0301tape")):
+            stage = self.root / name
+            stage.mkdir()
+            diagnostic = stage / "engine-stage.json"
+            diagnostic.write_text("diagnostic sentinel")
+            with self.subTest(alias=alias), mock.patch.object(AUTOREVIEW, "run_review_passes") as engine:
+                with self.assertRaisesRegex(SystemExit, "outside --engine-stage-dir"):
+                    self.invoke(extra=("--preflight-output", str(self.root / alias / diagnostic.name),
+                                       "--engine-stage-dir", str(stage)))
+                engine.assert_not_called()
+                self.assertEqual(diagnostic.read_text(), "diagnostic sentinel")
 
 
 if __name__ == "__main__":
