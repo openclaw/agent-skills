@@ -7856,7 +7856,7 @@ def main_with_args(args: argparse.Namespace) -> int:
     with PreparationProgress("target selection"):
         repo = repo_root()
         prepare_output_paths(args, repo)
-        if getattr(args, "status_output", None):
+        if not args.dry_run and getattr(args, "status_output", None):
             Path(args.status_output).unlink(missing_ok=True)
         target, target_ref = choose_target(repo, args.mode, args.base)
         branch = current_branch(repo)
