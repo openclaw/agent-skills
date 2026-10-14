@@ -12,7 +12,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$Harness = Join-Path $PSScriptRoot 'test-review-harness.py'
+$Harness = [IO.Path]::Combine($PSScriptRoot, 'test-review-harness.py')
 $ForwardedArgs = @()
 $Candidates = @(
     @{ Name = 'py'; Arguments = @('-3') },
@@ -36,9 +36,13 @@ if ($PSBoundParameters.ContainsKey('Engine')) {
 
 foreach ($Candidate in $Candidates) {
     # Missing executable names must not trigger unrelated module discovery.
-    $Command = $ExecutionContext.InvokeCommand.GetCommands(
+    $Command = $null
+    foreach ($Application in $ExecutionContext.InvokeCommand.GetCommands(
         $Candidate.Name, [System.Management.Automation.CommandTypes]::Application, $false
-    ) | Select-Object -First 1
+    )) {
+        $Command = $Application
+        break
+    }
     if ($null -eq $Command) {
         continue
     }
