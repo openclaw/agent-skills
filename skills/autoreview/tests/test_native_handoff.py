@@ -100,12 +100,13 @@ class NativeHandoffTests(unittest.TestCase):
         self.assertFalse(self.handoff.exists(), "helper did not clean its exchange")
         return out + err
 
-    def consumer(self, request, report=CLEAN, *, failure=False, page_size=67):
-        """Run the exact shipped cell, substituting only its three documented inputs."""
+    def consumer(self, request, report=CLEAN, *, failure=False, page_size=67, delay=0):
+        """Run the exact shipped cell, substituting only its documented inputs."""
         if not shutil.which("node"):
             self.fail("Node is required for the documented consumer contract test")
         cell = re.search(r"```javascript\n(.*?)\n```", REFERENCE.read_text(), re.S).group(1)
         cell = cell.replace('"/absolute/private/task/handoff"', json.dumps(str(self.handoff)))
+        cell = cell.replace('"/absolute/canonical/autoreview/scripts/autoreview"', json.dumps(str(SCRIPT)))
         cell = cell.replace("const passNumber = 1;", f'const passNumber = {request["pass"]};')
         harness = r'''
 const fs = require("node:fs");
@@ -118,9 +119,17 @@ async function read(input) {
   return {kind: end < data.length ? "truncated" : "text", content: data.slice(offset, end),
     ...(end < data.length ? {continuation: {offset: 1, cursor: String(end)}} : {})};
 }
-async function write(input) { fs.writeFileSync(input.path, input.content); }
+async function write(input) {
+  fs.mkdirSync(require("node:path").dirname(input.path), {recursive: true});
+  fs.writeFileSync(input.path, input.content);
+}
+async function exec(input) {
+  const result = require("node:child_process").spawnSync(input.command, {shell: true, encoding: "utf8"});
+  return {status: "completed", exitCode: result.status};
+}
 const agents = {async run(prompt, options) {
   launches++;
+  if (supplied.delay) await new Promise(resolve => setTimeout(resolve, supplied.delay));
   const start = "<autoreview-pass>\n", end = "\n</autoreview-pass>";
   if (!prompt.startsWith(start) || !prompt.endsWith(end)) throw Error("missing wrapper");
   const exact = prompt.slice(start.length, -end.length);
@@ -136,7 +145,7 @@ const agents = {async run(prompt, options) {
 '''
         harness += "(async () => {\n" + cell + "\n})().then(result => console.log(JSON.stringify({result, launches}))).catch(error => {console.log(JSON.stringify({error: error.message, launches})); process.exitCode = 1;});"
         env = self.env | {"NATIVE_FIXTURE": json.dumps({"digest": request["prompt_sha256"],
-            "report": report, "failure": failure, "pageSize": page_size,
+            "report": report, "failure": failure, "pageSize": page_size, "delay": delay,
             **({"model": request["model"]} if request["model"] is not None else {}),
             **({"thinking": request["thinking"]} if request["thinking"] is not None else {})})}
         result = subprocess.run(["node", "-e", harness], env=env, text=True, capture_output=True, timeout=6)
@@ -227,6 +236,64 @@ const agents = {async run(prompt, options) {
         self.assertEqual(self.consumer(self.request(), failure=True).returncode, 1)
         self.finish(1)
         self.assertFalse(self.report.exists())
+
+    def test_late_collector_cannot_recreate_retired_exchange(self):
+        self.start(timeout=".3")
+        result = self.consumer(self.request(), delay=800)
+        self.assertEqual(result.returncode, 1)
+        self.finish(1)
+        self.assertTrue(json.loads(self.status.read_text())["timed_out"])
+        self.assertFalse(self.report.exists())
+        self.assertEqual(list(self.root.glob("*.response.json")), [])
+
+    def test_output_descendant_aliases_are_rejected_before_review(self):
+        import argparse
+        import runpy
+        helper = runpy.run_path(str(SCRIPT))
+        for exchange, output in (("handoff", "HANDOFF"), ("r\u00e9view", "re\u0301view")):
+            with self.subTest(exchange=exchange):
+                args = argparse.Namespace(native_handoff=str(self.root / exchange),
+                    json_output=str(self.root / output / "report.json"))
+                with self.assertRaisesRegex(SystemExit, "outside --native-handoff"):
+                    helper["prepare_output_paths"](args, self.repo)
+                self.assertFalse((self.root / exchange).exists())
+
+    def test_retirement_waits_for_an_active_submission(self):
+        self.start(timeout=".6")
+        request = self.request()
+        spool = self.root / f"handoff.{request['run_id']}.1.response.json"
+        spool.write_text(json.dumps({"run_id": request["run_id"], "pass": 1,
+            "prompt_sha256": request["prompt_sha256"], "status": "done", "report": CLEAN}))
+        marker = self.root / "submission-entered"
+        code = '''import os, runpy, sys, time
+from pathlib import Path
+module = runpy.run_path(sys.argv[1])
+original = os.replace
+def delayed(source, destination, **options):
+    Path(sys.argv[4]).touch()
+    time.sleep(.8)
+    return original(source, destination, **options)
+os.replace = delayed
+module["submit_native_response"](Path(sys.argv[2]), Path(sys.argv[3]))
+'''
+        sender = subprocess.Popen([sys.executable, "-c", code, str(SCRIPT),
+            str(self.handoff), str(spool), str(marker)], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 3
+            while not marker.exists() and sender.poll() is None and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(marker.exists(), "submission did not reach the locked write")
+            out, err = sender.communicate(timeout=5)
+            self.assertEqual(sender.returncode, 0, out + err)
+            self.finish(1)
+            self.assertTrue(json.loads(self.status.read_text())["timed_out"])
+            self.assertFalse(spool.exists())
+            self.assertFalse(self.report.exists())
+        finally:
+            if sender.poll() is None:
+                sender.terminate()
+                sender.communicate(timeout=5)
 
     def test_response_commit_and_file_custody(self):
         for case in ("byte mismatch", "symlink"):

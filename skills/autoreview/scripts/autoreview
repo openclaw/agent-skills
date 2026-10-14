@@ -7162,6 +7162,16 @@ class SourceVersionAction(argparse.Action):
         parser.exit()
 
 
+class NativeSubmitAction(argparse.Action):
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace,
+                 values: list[str], option_string: str | None = None) -> None:
+        try:
+            submit_native_response(Path(values[0]), Path(values[1]))
+        except (OSError, ValueError, RecursionError) as exc:
+            parser.exit(1, f"native response not submitted: {exc}\n")
+        parser.exit()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Bundle-driven AI code review.")
     parser.add_argument("--version", action=SourceVersionAction, nargs=0, help="Print this helper's source SHA-256 and exit; not a release version.")
@@ -7170,6 +7180,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--commit", default="HEAD")
     parser.add_argument("--engine", choices=ENGINES, default=os.environ.get("AUTOREVIEW_ENGINE", "codex"))
     parser.add_argument("--native-handoff", help="Fresh private directory outside the repo for the OpenClaw collector consumer. Requires --engine openclaw and --engine-timeout-seconds; see references/openclaw.md.")
+    parser.add_argument("--native-submit", action=NativeSubmitAction, nargs=2, metavar=("HANDOFF", "RESPONSE"), help="Commit a complete native response to an existing live exchange, remove its spool, and exit. No Git or reviewer startup.")
     parser.add_argument(
         "--model",
         action="append",
@@ -7823,9 +7834,14 @@ def prepare_output_paths(args: argparse.Namespace, repo: Path) -> None:
         setattr(args, attribute, destination)
     if getattr(args, "native_handoff", None):
         handoff = Path(args.native_handoff).resolve()
+        handoff_key = tuple(unicodedata.normalize("NFD", part).casefold() for part in handoff.parts)
         for attribute, destination in destinations.items():
-            if attribute != "native_handoff" and Path(destination).resolve().is_relative_to(handoff):
-                raise SystemExit("review outputs must stay outside --native-handoff (removed on exit)")
+            if attribute != "native_handoff":
+                path = Path(destination)
+                for candidate in (path.parent.resolve() / path.name, path.resolve()):
+                    key = tuple(unicodedata.normalize("NFD", part).casefold() for part in candidate.parts)
+                    if key[:len(handoff_key)] == handoff_key:
+                        raise SystemExit("review outputs must stay outside --native-handoff (removed on exit)")
 
 
 def atomic_write_text(path: Path, content: str) -> None:
@@ -7871,24 +7887,34 @@ class NativeHandoff:
         except OSError as exc:
             raise SystemExit(f"cannot create fresh native handoff directory: {exc}") from None
         self.identity = self.root.stat()
+        self.lock_fd = None
         try:
             if stat.S_IMODE(self.identity.st_mode) & 0o077:
                 raise SystemExit("native handoff requires a private directory")
+            self.lock_fd = os.open(self.root / ".lock", os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
         except BaseException:
             self.close()
             raise
 
     def close(self) -> None:
         # Never clean up a replacement directory or follow a replaced symlink.
+        import fcntl
         try:
+            if self.lock_fd is not None:
+                fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
             current = self.root.lstat()
+            if (current.st_dev, current.st_ino) == (self.identity.st_dev, self.identity.st_ino):
+                shutil.rmtree(self.root)
         except FileNotFoundError:
-            return
-        if (current.st_dev, current.st_ino) == (self.identity.st_dev, self.identity.st_ino):
-            shutil.rmtree(self.root)
+            pass
+        finally:
+            if self.lock_fd is not None:
+                os.close(self.lock_fd)
+                self.lock_fd = None
 
-    def read_file(self, path: Path, limit: int) -> bytes:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    @staticmethod
+    def read_file(path: Path | str, limit: int, *, dir_fd: int | None = None) -> bytes:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
         with os.fdopen(descriptor, "rb") as handle:
             info = os.fstat(handle.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid():
@@ -7940,6 +7966,78 @@ class NativeHandoff:
             return json.dumps(result["report"])
         except (OSError, ValueError, RecursionError) as exc:
             raise ReviewerUnavailable(f"invalid native result: {exc}", reason="invalid_report") from None
+
+
+def submit_native_response(root: Path, source: Path) -> None:
+    """Commit through an existing directory fd; a late collector cannot recreate it.
+
+    The parent writes its spool beside the exchange, under the same private
+    task directory. Submission removes only that named, identity-checked spool,
+    even when the exchange has already retired. It never publishes a verdict.
+    """
+    if os.name != "posix":
+        raise ValueError("native submission requires POSIX directory custody")
+    import fcntl
+    root, source = root.absolute(), source.absolute()
+    parent = root.parent.stat()
+    if (parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077
+            or source.parent.resolve() != root.parent.resolve()
+            or not re.fullmatch(re.escape(root.name) + r"\.[a-f0-9]{32}\.[1-9][0-9]*\.response\.json", source.name)):
+        raise ValueError("response spool must use the exchange's owned private parent and request identity")
+    source_identity = source.lstat()
+    try:
+        raw = NativeHandoff.read_file(source, NativeHandoff.MAX_RESULT_BYTES)
+        response = json.loads(raw)
+        if (not isinstance(response, dict) or type(response.get("pass")) is not int
+                or response["pass"] < 1 or not isinstance(response.get("run_id"), str)
+                or source.name != f"{root.name}.{response['run_id']}.{response['pass']}.response.json"):
+            raise ValueError("response spool does not match its request identity")
+        descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        lock = None
+        try:
+            lock = os.open(".lock", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            info = os.fstat(descriptor)
+            if (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077
+                    or os.fstat(lock).st_nlink != 1):
+                raise ValueError("native exchange is not private and owned")
+            number = response["pass"]
+            request = json.loads(NativeHandoff.read_file(
+                f"{number}.request.json", 4_000_000, dir_fd=descriptor))
+            if any(response.get(key) != request.get(key) for key in ("run_id", "pass", "prompt_sha256")):
+                raise ValueError("native response does not match the live prepared pass")
+            # A failed partial submission is never retried or replaced.
+            claim = os.open(f"{number}.submitted", os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o600, dir_fd=descriptor)
+            os.close(claim)
+            for name, data in (
+                (f"{number}.result.json", raw),
+                (f"{number}.ready", json.dumps({"run_id": response["run_id"],
+                    "pass": number, "bytes": len(raw)}).encode("utf-8")),
+            ):
+                temporary = ".submit-" + secrets.token_hex(16)
+                try:
+                    file_descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                              0o600, dir_fd=descriptor)
+                    with os.fdopen(file_descriptor, "wb") as handle:
+                        handle.write(data)
+                    os.replace(temporary, name, src_dir_fd=descriptor, dst_dir_fd=descriptor)
+                finally:
+                    try:
+                        os.unlink(temporary, dir_fd=descriptor)
+                    except FileNotFoundError:
+                        pass
+        finally:
+            if lock is not None:
+                os.close(lock)
+            os.close(descriptor)
+    finally:
+        try:
+            current = source.lstat()
+            if (current.st_dev, current.st_ino) == (source_identity.st_dev, source_identity.st_ino):
+                source.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def write_review_status(args: argparse.Namespace, status: str, exit_code: int,

@@ -20,7 +20,7 @@ Before selecting native, establish all of these from the current session:
 
 - The canonical helper package, Python 3.10+, Git and a POSIX filesystem are available.
 - OpenClaw Code Mode exposes `agents.run`, complete structured `read` pagination,
-  `write`, and an existing process tool to launch, observe and stop the helper.
+  `write`, shell `exec`, and an existing process tool to observe and stop the helper.
 - The selected existing reviewer agent is admitted under the initiating identity.
   Its effective policy denies repository access, shell/file/network operations,
   publishing and further delegation, retaining only the collector result transport.
@@ -61,7 +61,7 @@ an unowned job. `--dry-run` cannot qualify a native child and is refused.
 ## Deliver one prepared pass
 
 When the helper prints `native pass ready: N/T`, run the following complete cell in
-OpenClaw Code Mode, changing only `directory`, `passNumber` and `reviewerAgentId`.
+OpenClaw Code Mode, setting `directory`, `helper`, `passNumber` and `reviewerAgentId`.
 Read the current tool declarations first. `read` must return structured `kind` and
 `content`, not a display string. The cell reads every page, sends the full prepared
 assignment, waits for the terminal structured value and writes it before the reply
@@ -69,6 +69,7 @@ ends. It never emits a full prompt/report through model-visible output.
 
 ```javascript
 const directory = "/absolute/private/task/handoff";
+const helper = "/absolute/canonical/autoreview/scripts/autoreview";
 const passNumber = 1;
 const reviewerAgentId = "existing-restricted-reviewer";
 const byteLength = s => encodeURIComponent(s).replace(/%[0-9A-F]{2}|./g, "x").length;
@@ -117,11 +118,14 @@ if (byteLength(response) > request.max_result_bytes) {
   response = JSON.stringify({ run_id: request.run_id, pass: passNumber,
     prompt_sha256: request.prompt_sha256, status: "failed", report: null });
 }
-await write({ path: `${directory}/${passNumber}.result.json`, content: response });
-// Commit only after the full response write finishes. The helper checks this byte count.
-await write({ path: `${directory}/${passNumber}.ready`, content: JSON.stringify({
-  run_id: request.run_id, pass: passNumber, bytes: byteLength(response)
-}) });
+// Stage beside the exchange: write can create parents, so it must never write inside it.
+const spool = `${directory}.${request.run_id}.${passNumber}.response.json`;
+await write({ path: spool, content: response });
+const quote = s => "'" + s.replace(/'/g, "'\\''") + "'";
+const submitted = await exec({ command: `python3 ${quote(helper)} --native-submit ${quote(directory)} ${quote(spool)}`,
+  awaitResults: true });
+if (submitted.status !== "completed" || submitted.exitCode !== 0)
+  throw new Error("Native response was not committed; inspect the helper and settle the owned child");
 if (failure) throw failure;
 return { pass: passNumber, delivered: true, passes: request.passes };
 ```
@@ -138,7 +142,13 @@ message after terminal failure, or retry for a cleaner finding set.
 The helper owns `handoff` and removes it on normal exit or handled interruption.
 Its in-memory capture remains authoritative until all passes and the final source
 check finish. Requests are atomic, sequential and identified by a fresh run id,
-pass number and prompt SHA-256. Responses are limited to 2,000,000 UTF-8 bytes;
+pass number and prompt SHA-256. `--native-submit HANDOFF RESPONSE` opens the existing
+exchange and commits through its directory descriptor, under the same short file
+lock used by cleanup. It never creates an exchange. A collector that finishes after
+timeout cannot recreate a retired handoff; submission refuses it and removes its
+identity-checked spool. Each pass can be submitted only once. This command transports
+the result; the waiting original invocation still owns all review validation.
+Responses are limited to 2,000,000 UTF-8 bytes;
 oversized, malformed, mismatched, missing and uncommitted responses are never clean.
 The request/result handshake binds transport to a prepared pass; it is not a signed
 reviewer or permission attestation. The qualified parent is trusted to deliver the
@@ -150,5 +160,8 @@ child through their existing process/collector facilities, then verify both sett
 Stopping the helper alone does not cancel an OpenClaw child. A timeout yields
 `reviewer_unavailable`, no validated report, and no automatic route change. After an
 uncatchable kill, remove only the known task-owned handoff after settling its readers.
+If the parent stops between staging and submission, also remove its named response
+spool after the child and all owned writers settle. The private task parent remains
+the parent's cleanup responsibility; do not replace it with a shared temporary root.
 Preserve final reports separately; never use chat summaries or reply-scoped
 `results.save` references as durable result storage.
