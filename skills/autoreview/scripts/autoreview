@@ -7150,8 +7150,20 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+class SourceVersionAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        # Exit before argparse converts unrelated review environment defaults.
+        try:
+            digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        except OSError:
+            parser.exit(1, "autoreview: cannot read source for --version\n")
+        print(f"autoreview source-sha256:{digest}")
+        parser.exit()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Bundle-driven AI code review.")
+    parser.add_argument("--version", action=SourceVersionAction, nargs=0, help="Print this helper's source SHA-256 and exit; not a release version.")
     parser.add_argument("--mode", choices=["auto", "local", "uncommitted", "branch", "commit"], default="auto")
     parser.add_argument("--base", help="Branch base, or explicit commit to compare with the index in local mode.")
     parser.add_argument("--commit", default="HEAD")
@@ -7895,7 +7907,7 @@ def main_with_args(args: argparse.Namespace) -> int:
     with PreparationProgress("target selection"):
         repo = repo_root()
         prepare_output_paths(args, repo)
-        if getattr(args, "status_output", None):
+        if not args.dry_run and getattr(args, "status_output", None):
             Path(args.status_output).unlink(missing_ok=True)
         if getattr(args, "preflight_output", None):
             Path(args.preflight_output).unlink(missing_ok=True)

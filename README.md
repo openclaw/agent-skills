@@ -138,6 +138,12 @@ this checkout once to update every symlinked consumer. Copy-mode installations
 need `python3 scripts/install-skills --mode copy --force autoreview` after the
 source update. Review runs do not download or update code automatically.
 
+To compare installed helper content, run
+`python3 ~/.agents/skills/autoreview/scripts/autoreview --version` (use your
+custom install path when applicable). The output is `autoreview source-sha256:`
+followed by the helper's SHA-256. It does not identify a release or the full skill
+and does not read configuration, invoke Git or a reviewer, or write reports.
+
 ## Zero-Setup Repos
 
 Some important repos should work for contributors who only cloned that repo and
