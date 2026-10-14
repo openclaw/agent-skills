@@ -78,9 +78,11 @@ Read for output-path edge cases, machine status, usage accounting, local stage o
 
 - Status contains no logs, prompts, findings, model identifiers.
 - Bounded display-safe stderr diagnostics + command-auth suppression stay enabled.
-- Use fresh status path: after argument/path validation, remove old status before
-  target selection.
-- Dry runs, preflight/pre-launch isolation refusals, source mutations, interruptions,
+- Use a fresh status path for real reviews: after argument/path validation, remove
+  old status before target selection.
+- Dry runs validate output paths but do not create, replace, or remove output files.
+  Any existing status belongs to a prior invocation, not the dry run.
+- Preflight/pre-launch isolation refusals, source mutations, interruptions,
   output failures: no new status. Absence never means clean verdict.
 
 ## Usage
