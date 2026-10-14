@@ -96,9 +96,14 @@ class InstalledAutoreviewTests(unittest.TestCase):
                            PYTHONDONTWRITEBYTECODE="1")
                 env.pop("PYTHONPATH", None)
 
-                def run(args: list[str], status: int = 0) -> subprocess.CompletedProcess[str]:
-                    result = subprocess.run(args, cwd=cwd, env=env, text=True,
-                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+                def run(args: list[str], status: int = 0, stage: str = "install") -> subprocess.CompletedProcess[str]:
+                    print(f"installed-source {filename}: {stage}", flush=True)
+                    try:
+                        result = subprocess.run(args, cwd=cwd, env=env, text=True,
+                                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                                stderr=subprocess.PIPE, timeout=30)
+                    except subprocess.TimeoutExpired as error:
+                        self.fail(f"{stage} timed out: stdout={error.stdout!r}; stderr={error.stderr!r}")
                     self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                     return result
 
@@ -116,18 +121,21 @@ class InstalledAutoreviewTests(unittest.TestCase):
                     # The real launcher must choose the isolated proof interpreter,
                     # not a host py.exe that silently escapes the dependency matrix.
                     env["PATH"] = str(Path(sys.executable).parent)
-                    selected = run([powershell, "-NoProfile", "-Command",
-                                    "$other = Get-Command py,python3 -CommandType Application -ErrorAction SilentlyContinue; "
-                                    "if ($other) { throw 'Unexpected Python launcher' }; "
-                                    "& (Get-Command python -CommandType Application).Source -c 'import sys; print(sys.executable)'"
-                                    ]).stdout.strip()
+                    for candidate in ("py", "python3"):
+                        self.assertIsNone(shutil.which(candidate, path=env["PATH"]))
+                    selected = run([powershell, "-NoProfile", "-NonInteractive", "-Command",
+                                    "[Console]::Error.WriteLine('python-discovery'); "
+                                    "$python = (Get-Command python -CommandType Application).Source; "
+                                    "[Console]::Error.WriteLine('python-invocation'); "
+                                    "& $python -c 'import sys; print(sys.executable)'"
+                                    ], stage="PowerShell interpreter witness").stdout.strip()
                     self.assertEqual(Path(selected).resolve(), Path(sys.executable).resolve())
-                    launch = [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                    launch = [powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
                               str(helper.with_suffix(".ps1"))]
                 else:
                     launch = [sys.executable, "-B", str(helper)]
-                self.assertIn("usage:", run([*launch, "--help"]).stdout.lower())
-                self.assertIn("unrecognized arguments", run([*launch, "--version"], 2).stderr)
+                self.assertIn("usage:", run([*launch, "--help"], stage="installed help").stdout.lower())
+                self.assertIn("unrecognized arguments", run([*launch, "--version"], 2, stage="installed unsupported version").stderr)
                 self.assertEqual(tree(scratch), before)
 
                 # Import the copied helper in a fresh interpreter: exercise real optional
@@ -164,7 +172,7 @@ print(json.dumps({"parser": parser, "image": image}))
 '''
                 config = scratch / "operator-fixture.toml"
                 result = run([sys.executable, "-I", "-B", "-c", probe,
-                              str(helper), str(config), OPTIONS.extras])
+                              str(helper), str(config), OPTIONS.extras], stage="installed optional dependencies")
                 config.unlink()
                 self.assertEqual(tree(scratch), before)
                 print(json.dumps({"archive": filename, "sha256": hashlib.sha256(archive_bytes).hexdigest(),
