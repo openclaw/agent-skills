@@ -260,22 +260,25 @@ class OutputPathInterpretationTests(unittest.TestCase):
                     if os.name == "nt" and getattr(error, "winerror", None) == 1314:
                         self.skipTest("Windows symlink privilege is unavailable")
                     raise
-                original = status.lstat()
-                engine = mock.Mock(side_effect=AssertionError("dry run started a reviewer"))
-                with mock.patch.dict(self.helper["main_impl"].__globals__, {
-                    "resolve_engine_binary": mock.Mock(return_value=(True, None)),
-                }):
-                    self.assertEqual(self.invoke(engine, extra_args=("--dry-run",)), 0)
-                engine.assert_not_called()
-                self.assertTrue(status.is_symlink())
-                self.assertEqual(os.readlink(status), str(target))
-                self.assertEqual(status.lstat().st_ino, original.st_ino)
-                self.assertEqual(status.lstat().st_mtime_ns, original.st_mtime_ns)
-                if not dangling:
-                    self.assertEqual(target.read_bytes(), prior)
-                else:
-                    self.assertFalse(target.exists())
-                status.unlink()
+                try:
+                    original = status.lstat()
+                    original_target = os.readlink(status)
+                    engine = mock.Mock(side_effect=AssertionError("dry run started a reviewer"))
+                    with mock.patch.dict(self.helper["main_impl"].__globals__, {
+                        "resolve_engine_binary": mock.Mock(return_value=(True, None)),
+                    }):
+                        self.assertEqual(self.invoke(engine, extra_args=("--dry-run",)), 0)
+                    engine.assert_not_called()
+                    self.assertTrue(status.is_symlink())
+                    self.assertEqual(os.readlink(status), original_target)
+                    self.assertEqual(status.lstat().st_ino, original.st_ino)
+                    self.assertEqual(status.lstat().st_mtime_ns, original.st_mtime_ns)
+                    if not dangling:
+                        self.assertEqual(target.read_bytes(), prior)
+                    else:
+                        self.assertFalse(target.exists())
+                finally:
+                    status.unlink(missing_ok=True)
 
     def test_report_entry_aliases_are_refused_with_and_without_status(self):
         stale = b"unrequested status must remain unchanged\n"
