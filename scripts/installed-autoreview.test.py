@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import io
 import json
@@ -103,6 +104,28 @@ class InstalledAutoreviewTests(unittest.TestCase):
                                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                                 stderr=subprocess.PIPE, timeout=30)
                     except subprocess.TimeoutExpired as error:
+                        if os.name == "nt" and filename == "source.tar.gz" and stage == "installed help":
+                            # Diagnose the first failing archive without replacing the
+                            # direct -File acceptance check or changing its timeout.
+                            script = str(helper.with_suffix(".ps1")).replace("'", "''")
+                            trace = base64.b64encode(
+                                f"Set-PSDebug -Trace 1; & '{script}' --help".encode("utf-16-le")
+                            ).decode("ascii")
+                            try:
+                                traced = subprocess.run(
+                                    [powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
+                                     "Bypass", "-EncodedCommand", trace], cwd=cwd, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, timeout=30,
+                                )
+                                trace_status = f"exit {traced.returncode}"
+                                trace_stdout, trace_stderr = traced.stdout, traced.stderr
+                            except subprocess.TimeoutExpired as diagnostic:
+                                trace_status = "timeout"
+                                trace_stdout, trace_stderr = diagnostic.stdout, diagnostic.stderr
+                            print(f"diagnostic-only PowerShell trace: {trace_status}; "
+                                  f"stdout={(trace_stdout or b'')[-12000:]!r}; "
+                                  f"stderr={(trace_stderr or b'')[-12000:]!r}", flush=True)
                         self.fail(f"{stage} timed out: stdout={error.stdout!r}; stderr={error.stderr!r}")
                     self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                     return result
