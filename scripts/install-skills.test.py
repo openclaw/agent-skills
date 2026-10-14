@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -264,14 +265,21 @@ class InstallSkillsTest(unittest.TestCase):
             self.assertTrue((installed / "scripts/autoreview.ps1").is_file())
             cwd = root / "separate project 雪"
             cwd.mkdir()
-            for option, code in (("--help", 0), ("--version", 2)):
+            for option, code in (("--help", 0), ("--version", 0), ("--unknown-option", 2)):
                 with self.subTest(option=option):
                     result = subprocess.run(
                         [sys.executable, str(installed / "scripts/autoreview"), option],
                         cwd=cwd, capture_output=True, text=True, check=False,
                     )
                     self.assertEqual(result.returncode, code, result.stderr)
-                    self.assertIn("usage:", result.stdout + result.stderr)
+                    if option == "--version":
+                        digest = hashlib.sha256((installed / "scripts/autoreview").read_bytes()).hexdigest()
+                        self.assertEqual(result.stdout, f"autoreview source-sha256:{digest}\n")
+                        self.assertEqual(result.stderr, "")
+                    else:
+                        self.assertIn("usage:", result.stdout + result.stderr)
+                        if option == "--unknown-option":
+                            self.assertIn("unrecognized arguments: --unknown-option", result.stderr)
             self.assertEqual(list(cwd.iterdir()), [])
             self.assertEqual(self.file_bytes(installed), source_bytes)
             self.assertEqual(self.file_bytes(source), source_bytes)

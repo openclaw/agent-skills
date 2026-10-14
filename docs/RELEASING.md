@@ -39,7 +39,8 @@ Keep the verified source archive and its extracted directory outside the project
 being reviewed. Record its tag, resolved commit, and archive checksum before
 installing. A tag names a release; a commit pins the source. `.release-version`
 alone does not identify a commit: unreleased changes can retain the last version.
-Autoreview has no `--version` flag; it exits 2 for that option.
+Autoreview's `--version` prints `autoreview source-sha256:` followed by the hash
+of the executing helper. This identifies helper bytes, not a release or full skill.
 
 Install only the desired skill from the retained source:
 
@@ -53,8 +54,9 @@ identifies that directory, whose root contains `.release-version`. Keep the
 directory available and unchanged while it is installed. Copy mode installs only
 `skills/autoreview`, including its helper, PowerShell launcher, and references;
 it omits the root `.release-version`. For copies, retain the source identity and
-compare installed files with that source instead of inferring a release from an
-installed version command. Neither mode verifies a release signature for you.
+compare installed files with that source. The helper's `--version` can confirm its
+content hash, but does not establish archive or release provenance. Neither mode
+verifies a release signature for you.
 
 Run the helper from the Git project being reviewed, not from the source archive:
 

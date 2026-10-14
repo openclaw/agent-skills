@@ -78,10 +78,36 @@ Read for output-path edge cases, machine status, usage accounting, local stage o
 
 - Status contains no logs, prompts, findings, model identifiers.
 - Bounded display-safe stderr diagnostics + command-auth suppression stay enabled.
-- Use fresh status path: after argument/path validation, remove old status before
-  target selection.
-- Dry runs, preflight/pre-launch isolation refusals, source mutations, interruptions,
+- Use a fresh status path for real reviews: after argument/path validation, remove
+  old status before target selection.
+- Dry runs validate output paths but do not create, replace, or remove output files.
+  Any existing status belongs to a prior invocation, not the dry run.
+- Preflight/pre-launch isolation refusals, source mutations, interruptions,
   output failures: no new status. Absence never means clean verdict.
+
+## Preflight summary
+
+`--preflight-output PATH --preflight-repo owner/repository` writes one raw
+`openclaw-preflight:v1` comment, at most 4096 UTF-8 bytes. The explicit repository
+is a caller claim about the target, never inferred from a fork's remote.
+Only a clean, nonempty branch range is supported, including `auto` when it
+selects a branch. Base and head identify the actual captured merge-base and
+commit; local/index/working-tree mixtures are not relabelled as commits.
+
+The deterministic summary includes the selected priority, native status, and
+known accepted/filtered/incomplete counts. Priorities below the selected threshold are not assessed.
+Validated `incomplete` maps to `partial`; other validated outcomes map to
+`complete`, including findings and incorrect verdicts. Neither means clean.
+The descriptive `source-<12 hex>` version fingerprints the helper file; it is
+not a released package version or trusted execution evidence.
+
+The output follows the same external-path/atomic-write rules as native reports,
+with distinct destinations outside the engine-stage directory. A prior block is removed before review. No safe
+validated outcome, source drift, or unavailable reviewer means no new block.
+An export failure after native publication warns on stderr and leaves the native
+report, status, and exit unchanged. Check that the new file exists before sharing.
+The helper does not attach, upload, fetch a report, or bypass hosted review.
+Summary JSON carries no model prose, source text, report hash, roles, or usage.
 
 ## Usage
 
