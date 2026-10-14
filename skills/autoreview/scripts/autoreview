@@ -7899,18 +7899,19 @@ class NativeHandoff:
     def close(self) -> None:
         # Never clean up a replacement directory or follow a replaced symlink.
         import fcntl
-        try:
-            if self.lock_fd is not None:
-                fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
-            current = self.root.lstat()
-            if (current.st_dev, current.st_ino) == (self.identity.st_dev, self.identity.st_ino):
-                shutil.rmtree(self.root)
-        except FileNotFoundError:
-            pass
-        finally:
-            if self.lock_fd is not None:
-                os.close(self.lock_fd)
-                self.lock_fd = None
+        with deferred_owned_process_signals():
+            try:
+                if self.lock_fd is not None:
+                    fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
+                current = self.root.lstat()
+                if (current.st_dev, current.st_ino) == (self.identity.st_dev, self.identity.st_ino):
+                    shutil.rmtree(self.root)
+            except FileNotFoundError:
+                pass
+            finally:
+                if self.lock_fd is not None:
+                    os.close(self.lock_fd)
+                    self.lock_fd = None
 
     @staticmethod
     def read_file(path: Path | str, limit: int, *, dir_fd: int | None = None) -> bytes:

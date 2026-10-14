@@ -49,11 +49,13 @@ class NativeHandoffTests(unittest.TestCase):
         self.report = self.root / "report.json"
         self.status = self.root / "status.json"
         self.process = None
+        self.processes = []
 
     def tearDown(self):
-        if self.process is not None and self.process.poll() is None:
-            self.process.terminate()
-            self.process.communicate(timeout=5)
+        for process in self.processes:
+            if process.poll() is None:
+                process.terminate()
+            process.communicate(timeout=5)
         self.temp.cleanup()
 
     def git(self, *args):
@@ -66,6 +68,7 @@ class NativeHandoffTests(unittest.TestCase):
             "--engine-timeout-seconds", timeout, "--json-output", str(self.report),
             "--status-output", str(self.status), *options],
             cwd=self.repo, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.processes.append(self.process)
         return self.process
 
     def request(self, number=1):
@@ -258,7 +261,7 @@ const agents = {async run(prompt, options) {
                     helper["prepare_output_paths"](args, self.repo)
                 self.assertFalse((self.root / exchange).exists())
 
-    def test_retirement_waits_for_an_active_submission(self):
+    def assert_retirement_waits_for_submission(self, interrupt):
         self.start(timeout=".6")
         request = self.request()
         spool = self.root / f"handoff.{request['run_id']}.1.response.json"
@@ -284,9 +287,15 @@ module["submit_native_response"](Path(sys.argv[2]), Path(sys.argv[3]))
             while not marker.exists() and sender.poll() is None and time.monotonic() < deadline:
                 time.sleep(.01)
             self.assertTrue(marker.exists(), "submission did not reach the locked write")
+            if interrupt:
+                deadline = time.monotonic() + 3
+                while not self.status.exists() and self.process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertTrue(self.status.exists(), "helper did not reach timeout cleanup")
+                self.process.send_signal(signal.SIGTERM)
             out, err = sender.communicate(timeout=5)
             self.assertEqual(sender.returncode, 0, out + err)
-            self.finish(1)
+            self.finish(143 if interrupt else 1)
             self.assertTrue(json.loads(self.status.read_text())["timed_out"])
             self.assertFalse(spool.exists())
             self.assertFalse(self.report.exists())
@@ -313,6 +322,12 @@ module["submit_native_response"](Path(sys.argv[2]), Path(sys.argv[3]))
                 self.finish(1)
                 self.assertFalse(self.report.exists())
                 self.assertEqual(json.loads(self.status.read_text())["reason"], "invalid_report")
+
+    def test_retirement_waits_for_an_active_submission(self):
+        self.assert_retirement_waits_for_submission(False)
+
+    def test_signal_during_retirement_still_joins_submission(self):
+        self.assert_retirement_waits_for_submission(True)
 
     def test_signal_cleans_helper_without_publishing(self):
         self.start()
