@@ -35,7 +35,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, NamedTuple
 
 
-ENGINES = ("codex", "claude", "amp", "pi", "kimi")
+ENGINES = ("codex", "claude", "amp", "pi", "kimi", "openclaw")
 KIMI_PRIVATE_INPUT_UNSUPPORTED = (
     "kimi review is unavailable: its supported CLI prompt mode has no private input channel; "
     "refusing to place review content in process arguments"
@@ -421,6 +421,7 @@ DEFAULT_THINKING_BY_ENGINE = {
     "codex": "medium",
 }
 THINKING_LEVELS_BY_ENGINE = {
+    "openclaw": {"off", "minimal", "low", "medium", "high", "xhigh", "max"},
     "amp": set(AMP_THINKING_VALUES),
     "codex": {"none", "minimal", "low", "medium", "high", "xhigh", "max"},
     "claude": {"low", "medium", "high", "xhigh", "max"},
@@ -7168,6 +7169,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base", help="Branch base, or explicit commit to compare with the index in local mode.")
     parser.add_argument("--commit", default="HEAD")
     parser.add_argument("--engine", choices=ENGINES, default=os.environ.get("AUTOREVIEW_ENGINE", "codex"))
+    parser.add_argument("--native-handoff", help="Fresh private directory outside the repo for the OpenClaw collector consumer. Requires --engine openclaw and --engine-timeout-seconds; see references/openclaw.md.")
     parser.add_argument(
         "--model",
         action="append",
@@ -7189,7 +7191,7 @@ def parse_args() -> argparse.Namespace:
         "--engine-timeout-seconds",
         type=positive_float,
         default=os.environ.get("AUTOREVIEW_ENGINE_TIMEOUT_SECONDS"),
-        help="Optional wall-clock limit for each reviewer process. Disabled by default. Env: AUTOREVIEW_ENGINE_TIMEOUT_SECONDS.",
+        help="Wall-clock limit per CLI attempt or native pass. Disabled by default for CLIs; required for native handoff. Env: AUTOREVIEW_ENGINE_TIMEOUT_SECONDS.",
     )
     parser.add_argument("--codex-bin", default=os.environ.get("CODEX_BIN", "codex"))
     parser.add_argument(
@@ -7246,6 +7248,17 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit(f"invalid --engine/AUTOREVIEW_ENGINE: {args.engine}")
     if args.max_priority not in ("P0", "P1", "P2", "P3"):
         parser.error(f"invalid --max-priority/AUTOREVIEW_MAX_PRIORITY: {args.max_priority!r}")
+    if args.engine == "openclaw":
+        if os.name != "posix":
+            parser.error("native handoff currently requires a POSIX host with private directory permissions")
+        if not args.native_handoff or args.engine_timeout_seconds is None:
+            parser.error("--engine openclaw requires --native-handoff and --engine-timeout-seconds")
+        if args.dry_run:
+            parser.error("native handoff has no CLI startup probe; qualify the collector before running")
+        if args.codex_config or args.codex_speed or args.engine_stage_dir or args.stream_engine_output:
+            parser.error("CLI configuration/diagnostics cannot be applied to an OpenClaw child")
+    elif args.native_handoff:
+        parser.error("--native-handoff requires --engine openclaw; it never switches an explicit engine")
     if bool(args.preflight_output) != bool(args.preflight_repo):
         parser.error("--preflight-output and --preflight-repo must be used together")
     if args.preflight_output:
@@ -7258,6 +7271,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_engine(args: argparse.Namespace, repo: Path, prompt: str) -> str:
+    if args.engine == "openclaw":
+        return args._native_handoff.run(prompt)
     if args.engine == "codex":
         return run_codex(args, repo, prompt)
     if args.engine == "claude":
@@ -7381,7 +7396,9 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
     clone.model = model
     clone.thinking = thinking
     clone.fallback_model = fallback_model
-    clone.tools = False if engine in {"amp", "pi"} else args.tools
+    clone.tools = False if engine in {"amp", "pi", "openclaw"} else args.tools
+    if engine == "openclaw":
+        clone.web_search = False
     return [clone]
 
 
@@ -7751,6 +7768,7 @@ def prepare_output_paths(args: argparse.Namespace, repo: Path) -> None:
         ("--status-output", "status_output"),
         ("--preflight-output", "preflight_output"),
         ("--engine-stage-dir", "engine_stage_dir"),
+        ("--native-handoff", "native_handoff"),
     ):
         value = getattr(args, attribute, None)
         if not value:
@@ -7803,6 +7821,11 @@ def prepare_output_paths(args: argparse.Namespace, repo: Path) -> None:
                 raise SystemExit("--preflight-output must stay outside --engine-stage-dir")
     for attribute, destination in destinations.items():
         setattr(args, attribute, destination)
+    if getattr(args, "native_handoff", None):
+        handoff = Path(args.native_handoff).resolve()
+        for attribute, destination in destinations.items():
+            if attribute != "native_handoff" and Path(destination).resolve().is_relative_to(handoff):
+                raise SystemExit("review outputs must stay outside --native-handoff (removed on exit)")
 
 
 def atomic_write_text(path: Path, content: str) -> None:
@@ -7818,6 +7841,105 @@ def atomic_write_text(path: Path, content: str) -> None:
         os.replace(temporary_path, path)
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+class NativeHandoff:
+    """One live invocation's transport; review state/validation stay in the caller.
+
+    The parent consumes a request, writes its full response, then commits it with
+    a small .ready file. Requests become visible only as their pass starts, so a
+    rejected response cannot launch the next pass. This is not a restart API.
+    """
+
+    MAX_RESULT_BYTES = 2_000_000
+
+    def __init__(self, args: argparse.Namespace, reviewer: argparse.Namespace,
+                 prompts: list[str] | list[ReviewPass]) -> None:
+        self.root = Path(args.native_handoff)
+        self.run_id = secrets.token_hex(16)
+        self.pass_count = len(prompts)
+        self.pass_number = 0
+        self.timeout = args.engine_timeout_seconds
+        self.model = reviewer.model
+        self.thinking = reviewer.thinking
+        parent = self.root.parent.stat()
+        if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
+            raise SystemExit("native handoff requires an owned private parent directory")
+        # mkdir's exclusive creation refuses existing paths, including symlinks.
+        try:
+            self.root.mkdir(mode=0o700)
+        except OSError as exc:
+            raise SystemExit(f"cannot create fresh native handoff directory: {exc}") from None
+        self.identity = self.root.stat()
+        try:
+            if stat.S_IMODE(self.identity.st_mode) & 0o077:
+                raise SystemExit("native handoff requires a private directory")
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        # Never clean up a replacement directory or follow a replaced symlink.
+        try:
+            current = self.root.lstat()
+        except FileNotFoundError:
+            return
+        if (current.st_dev, current.st_ino) == (self.identity.st_dev, self.identity.st_ino):
+            shutil.rmtree(self.root)
+
+    def read_file(self, path: Path, limit: int) -> bytes:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid():
+                raise ValueError("native result must be an owned regular file")
+            data = handle.read(limit + 1)
+            if len(data) > limit:
+                raise ValueError("native result exceeds the transport limit; no partial report accepted")
+            return data
+
+    def run(self, prompt: str) -> str:
+        self.pass_number += 1
+        number = self.pass_number
+        digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        request = {
+            "protocol": "autoreview-native-v1", "run_id": self.run_id,
+            "pass": number, "passes": self.pass_count,
+            "prompt": prompt, "prompt_bytes": utf8_size(prompt), "prompt_sha256": digest,
+            "output_schema": PROVIDER_SCHEMA, "model": self.model, "thinking": self.thinking,
+            "max_result_bytes": self.MAX_RESULT_BYTES,
+        }
+        atomic_write_text(self.root / f"{number}.request.json", json.dumps(request))
+        print(f"native pass ready: {number}/{self.pass_count}", flush=True)
+        deadline = time.monotonic() + self.timeout
+        ready_path = self.root / f"{number}.ready"
+        try:
+            while not ready_path.exists():
+                if time.monotonic() >= deadline:
+                    failure = ReviewerUnavailable("native collector result timed out", reason="timeout")
+                    failure.timed_out = True
+                    raise failure
+                time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+            ready = json.loads(self.read_file(ready_path, 1024))
+            raw = self.read_file(self.root / f"{number}.result.json", self.MAX_RESULT_BYTES)
+            if (not isinstance(ready, dict) or set(ready) != {"run_id", "pass", "bytes"}
+                    or ready["run_id"] != self.run_id or type(ready["pass"]) is not int
+                    or ready["pass"] != number or type(ready["bytes"]) is not int
+                    or ready["bytes"] != len(raw)):
+                raise ValueError("native result commit does not match the complete response")
+            result = json.loads(raw)
+            if (not isinstance(result, dict)
+                    or set(result) != {"run_id", "pass", "prompt_sha256", "status", "report"}
+                    or result["run_id"] != self.run_id or type(result["pass"]) is not int
+                    or result["pass"] != number or result["prompt_sha256"] != digest):
+                raise ValueError("native result does not match the prepared pass")
+            if result["status"] != "done":
+                raise ReviewerUnavailable("native collector failed; no route retry", reason="execution_failed")
+            if not isinstance(result["report"], dict):
+                raise ValueError("native collector did not return a structured report")
+            return json.dumps(result["report"])
+        except (OSError, ValueError, RecursionError) as exc:
+            raise ReviewerUnavailable(f"invalid native result: {exc}", reason="invalid_report") from None
 
 
 def write_review_status(args: argparse.Namespace, status: str, exit_code: int,
@@ -7892,6 +8014,8 @@ def main_impl() -> int:
     try:
         return main_with_args(args)
     finally:
+        if handoff := getattr(args, "_native_handoff", None):
+            handoff.close()
         if stage is not None:
             try:
                 persist_engine_stage(args.engine_stage_dir, stage)
@@ -7933,7 +8057,7 @@ def main_with_args(args: argparse.Namespace) -> int:
         if speed:
             print(f"codex_speed: {speed}", flush=True)
     print(f"tools: {'on' if reviewer.tools else 'off'}", flush=True)
-    print(f"web_search: {'on' if args.web_search else 'off'}", flush=True)
+    print(f"web_search: {'on' if reviewer.web_search else 'off'}", flush=True)
     display_ref = args.commit if target == "commit" else target_ref
     if display_ref:
         print(f"ref: {display_ref}", flush=True)
@@ -7977,6 +8101,10 @@ def main_with_args(args: argparse.Namespace) -> int:
                 "rerun autoreview against the updated tree"
             )
     try:
+        if reviewer.engine == "openclaw":
+            with deferred_owned_process_signals():
+                args._native_handoff = NativeHandoff(args, reviewer, prompts)
+                reviewer._native_handoff = args._native_handoff
         pass_results = run_review_passes(
             args,
             reviewers,

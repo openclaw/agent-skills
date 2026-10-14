@@ -26,7 +26,7 @@ Run the shared helper from the repository being reviewed:
 
 ```bash
 AUTOREVIEW="$HOME/.agents/skills/autoreview/scripts/autoreview"
-python3 "$AUTOREVIEW" --mode local --engine codex
+python3 "$AUTOREVIEW" --mode local
 ```
 
 Install from the canonical checkout: `python3 scripts/install-skills autoreview`.
@@ -90,8 +90,17 @@ verified parent-relative patch; otherwise attribution stays unknown.
 
 ## Engines
 
-Start with `--engine codex`, including second opinions; honor explicit engine/model
-choices. Use Claude only when requested or Codex is unavailable; report the concrete
+The helper defaults to Codex. Before starting a review, honor explicit engine/model
+choices, including environment configuration. In an OpenClaw session with no explicit
+reviewer route, keep a usable configured CLI. If the CLI is absent or known to have
+no configured authentication, select the existing restricted native collector only
+when the [OpenClaw handoff requirements](references/openclaw.md) are satisfied.
+This is skill-level availability selection before any review starts; the helper
+does not discover parent tools or switch routes. Missing context, isolation errors,
+or a launched review's findings, refusal, timeout or execution failure never justify
+switching. If neither route is eligible, report unavailable.
+
+Use Claude only when requested or Codex is unavailable; report the concrete
 failure first. Slowness, rate limits, findings, safety refusals, and isolation failures
 do not justify switching. No automatic cross-engine fallback.
 
