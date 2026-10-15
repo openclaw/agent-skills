@@ -26,8 +26,11 @@ parent transports are unsupported. Report unavailable if requirements are unmet.
 
 ## Start
 
-Run from the reviewed repository with `exec` and `yieldMs`; retain its process handle.
-Do not use `background: true`. Set the overall timeout to cover all planned passes.
+Run from the reviewed repository with `exec`, `yieldMs: 1000` and
+`awaitResults: false`; retain its process handle. `awaitResults: true` disables
+yielding and blocks the parent from starting the reviewer the helper waits for.
+Do not use `background: true`; the helper must stay owned by the request.
+Set the overall timeout to cover all planned passes.
 Use a private task directory outside the repository. Let the helper create `handoff`;
 keep reports outside that directory.
 
@@ -48,7 +51,8 @@ native reviewers. The per-pass timeout includes transport. Native `--dry-run` is
 At `native pass ready: N/T`, run this cell once for that pass. Set its first four
 variables and check the current tool declarations. Deliver the complete prompt and
 actual terminal structured result; chat previews and saved-result references are
-not substitutes.
+not substitutes. The short bridge commands below use `awaitResults: true` to
+collect their results; the initial waiting helper must yield as described above.
 
 ```javascript
 const directory = "/absolute/private/task/handoff";
