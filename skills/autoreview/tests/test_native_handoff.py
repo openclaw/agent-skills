@@ -249,37 +249,59 @@ class NativeHandoffTests(ReviewFixture):
                 self.assertFalse((self.root / exchange).exists())
 
     def assert_retirement_waits_for_submission(self, interrupt):
-        self.start(timeout=".6")
-        request = self.request()
-        spool = self.root / f"handoff.{request['run_id']}.1.response.json"
-        spool.write_text(json.dumps({"run_id": request["run_id"], "pass": 1,
-            "prompt_sha256": request["prompt_sha256"], "status": "done", "output": self.completion(request, CLEAN)}))
+        ready = self.root / "submitter-ready"
+        job = self.root / "submission.json"
         marker = self.root / "submission-entered"
-        code = '''import os, runpy, sys, time
+        release = self.root / "submission-release"
+        code = '''import json, os, runpy, sys, time
 from pathlib import Path
 module = runpy.run_path(sys.argv[1])
 original = os.replace
 def delayed(source, destination, **options):
     Path(sys.argv[4]).touch()
-    time.sleep(.8)
+    deadline = time.monotonic() + 10
+    while not Path(sys.argv[5]).exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("submission was not released")
+        time.sleep(.01)
     return original(source, destination, **options)
 os.replace = delayed
-module["submit_native_response"](Path(sys.argv[2]), Path(sys.argv[3]))
+Path(sys.argv[3]).touch()
+while not Path(sys.argv[2]).exists():
+    time.sleep(.01)
+job = json.loads(Path(sys.argv[2]).read_text())
+module["submit_native_response"](Path(job["root"]), Path(job["source"]))
 '''
         sender = subprocess.Popen([sys.executable, "-c", code, str(SCRIPT),
-            str(self.handoff), str(spool), str(marker)], env=self.env,
+            str(job), str(ready), str(marker), str(release)], env=self.env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
+            # Import before the helper's short deadline starts, then hold its
+            # active writer until timeout cleanup is actually waiting on it.
+            deadline = time.monotonic() + 6
+            while not ready.exists() and sender.poll() is None and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(ready.exists(), "submission process did not initialize")
+            self.start(timeout=".6")
+            request = self.request()
+            spool = self.root / f"handoff.{request['run_id']}.1.response.json"
+            spool.write_text(json.dumps({"run_id": request["run_id"], "pass": 1,
+                "prompt_sha256": request["prompt_sha256"], "status": "done", "output": self.completion(request, CLEAN)}))
+            pending_job = job.with_suffix(".tmp")
+            pending_job.write_text(json.dumps({"root": str(self.handoff), "source": str(spool)}))
+            pending_job.replace(job)
             deadline = time.monotonic() + 3
             while not marker.exists() and sender.poll() is None and time.monotonic() < deadline:
                 time.sleep(.01)
             self.assertTrue(marker.exists(), "submission did not reach the locked write")
+            deadline = time.monotonic() + 3
+            while not self.status.exists() and self.process.poll() is None and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(self.status.exists(), "helper did not reach timeout cleanup")
+            self.assertIsNone(self.process.poll(), "helper exited before its active writer")
             if interrupt:
-                deadline = time.monotonic() + 3
-                while not self.status.exists() and self.process.poll() is None and time.monotonic() < deadline:
-                    time.sleep(.01)
-                self.assertTrue(self.status.exists(), "helper did not reach timeout cleanup")
                 self.process.send_signal(signal.SIGTERM)
+            release.touch()
             out, err = sender.communicate(timeout=5)
             self.assertEqual(sender.returncode, 0, out + err)
             self.finish(143 if interrupt else 1)
@@ -289,7 +311,7 @@ module["submit_native_response"](Path(sys.argv[2]), Path(sys.argv[3]))
         finally:
             if sender.poll() is None:
                 sender.terminate()
-                sender.communicate(timeout=5)
+            sender.communicate(timeout=5)
 
     def test_response_commit_and_file_custody(self):
         for case in ("byte mismatch", "symlink"):
