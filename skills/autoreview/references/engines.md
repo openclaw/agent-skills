@@ -2,6 +2,13 @@
 
 Read for model/effort overrides, provider projection, optional engines.
 
+These options configure helper engines, not Copilot model access. When Codex CLI
+is unavailable, the skill permits a separate
+[Copilot subagent review](../SKILL.md#copilot-subagent-review), preferably with an
+accessible Codex model or otherwise a comparable model. Select it before launch;
+it is not `--engine copilot`, does not inherit Codex CLI flags/defaults, and
+produces no helper-validated machine status or helper isolation guarantees.
+
 - Defaults + engine-selection policy: [SKILL.md](../SKILL.md#engines).
 - Explicit `gpt-6.1-sol`: same access-only `gpt-6-sol` retry.
   Explicit `gpt-6-sol`: access-only `gpt-6-luna` retry.
@@ -92,5 +99,6 @@ Profile settings remain ignored. Force configured route before subscription atte
   argument; helper has no supported private prompt input channel.
 - Previous Kimi execution path intentionally retired; never expose bundle in
   process arguments. Existing `--kimi-bin` arguments accepted for same clear refusal.
-- Never silently select another engine. Custom agent file ≠ equivalent replacement:
-  changes input into templated system prompt.
+- Never silently select another engine. Custom agent file ≠ equivalent helper
+  replacement: changes input into templated system prompt. The documented Copilot
+  subagent route is a separate assessment with explicitly reported limitations.
