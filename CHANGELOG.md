@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Run OpenClaw reviews through restricted agent execution, preserving canonical capture and validation with a bounded sandbox handoff; clarify yielding and process ownership. Thanks @shakkernerd. (#323, #325, #326)
+- Document independent Copilot subagent reviews when the Codex CLI is unavailable, keeping model access separate from local CLI availability. Thanks @shanselman. (#324)
+
 - Prevent both PowerShell review launchers from importing unrelated modules while searching for Python. Qualify copied source archives on Python 3.10/3.11 and native Windows PowerShell, including real optional Pillow/tomli branches without model calls.
 
 - Document pinned source installation and explicit upgrades/rollback; cover copy/symlink replacement, external state preservation, and installed Autoreview help without changing installer behavior.
