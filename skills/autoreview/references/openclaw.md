@@ -26,9 +26,11 @@ parent transports are unsupported. Report unavailable if requirements are unmet.
 
 ## Start
 
-Run from the reviewed repository with `exec`, `yieldMs: 1000` and
-`awaitResults: false`; retain its process handle. `awaitResults: true` disables
-yielding and blocks the parent from starting the reviewer the helper waits for.
+Set `awaitResults: false` on the outer Code Mode cell that launches the helper.
+Inside that cell, run from the reviewed repository with `exec`, `yieldMs: 1000`
+and `awaitResults: false`; retain its process handle. Setting `awaitResults: true`
+on either the outer cell or the shell call disables yielding and blocks the
+parent from starting the reviewer the helper waits for.
 Do not use `background: true`; the helper must stay owned by the request.
 Set the overall timeout to cover all planned passes.
 Use a private task directory outside the repository. Let the helper create `handoff`;
