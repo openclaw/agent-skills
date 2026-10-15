@@ -1,173 +1,134 @@
-# OpenClaw native review
+# OpenClaw review execution
 
-Use an existing restricted reviewer for text reviews in OpenClaw Code Mode.
-The canonical helper prepares each pass and validates the final result.
+The OpenClaw engine runs a restricted `openclaw agent exec` reviewer. The canonical
+helper owns Git capture, frozen input checks, pass planning and complete report
+validation. There are no reviewer profiles or child-agent collectors.
 
-## Requirements
+## Choose the execution route
 
-Follow the [engine-selection rules](../SKILL.md#engines). Before starting, confirm:
+Honor the [engine-selection rules](../SKILL.md#engines), including explicit engine,
+model and effort choices. Select the route before launch; never switch routes after
+a failed review. Text review requires Python 3.10+, Git and POSIX private-directory
+permissions. Image review remains Codex-only.
 
-- Python 3.10+, Git, a POSIX filesystem and the canonical helper are available.
-- Code Mode exposes `agents.run`, `exec` with structured `status`, `exitCode` and
-  `aggregated` output plus bounded `env`, and `process` to monitor and stop the helper.
-- The reviewer is admitted under the initiating identity and uses isolated context.
-  Its enforced policy allows only result delivery: no repository, shell, file,
-  network, publishing or delegation access. Do not change permissions, credentials
-  or agent configuration to qualify it.
-- The intended model/effort is available. CLI settings require an explicitly selected
-  or approved native equivalent; never silently replace them with child defaults.
-- The full request and result fit the bridge, collector and model limits.
-  Supply required unchanged context through the helper; children cannot inherit
-  a private parent worktree.
+On an authenticated host, run the canonical helper directly:
 
-Unknown authentication does not qualify as absent authentication. Do not launch a
-review to probe it. Images, Windows, native Codex dynamic-tool output and other
-parent transports are unsupported. Report unavailable if requirements are unmet.
+```sh
+python3 "$AUTOREVIEW" --mode branch --base "$BASE" \
+  --engine openclaw --model "$MODEL" --thinking "$THINKING" \
+  --openclaw-config "$MODEL_CONFIG" \
+  --engine-timeout-seconds 900 --max-priority P2
+```
 
-## Start
+Use the model and effort the caller selected. Direct execution requires an explicit `provider/model`. The trusted `openclaw` executable
+must support `agent exec --message-file --config --cwd --model --thinking --json`.
+`--openclaw-bin` or `OPENCLAW_BIN` can select an external trusted executable.
+`--dry-run` checks preparation and CLI support without contacting a provider.
 
-Set `awaitResults: false` on the outer Code Mode cell that launches the helper.
-Inside that cell, run from the reviewed repository with `exec`, `yieldMs: 1000`
-and `awaitResults: false`; retain its process handle. Setting `awaitResults: true`
-on either the outer cell or the shell call disables yielding and blocks the
-parent from starting the reviewer the helper waits for.
-Do not use `background: true`; the helper must stay owned by the request.
-Set the overall timeout to cover all planned passes.
-Use a private task directory outside the repository. Let the helper create `handoff`;
-keep reports outside that directory.
+The helper sends the full prompt on stdin and runs in a private empty workspace.
+It generates a configuration denying all tools, disabling Code Mode, skills,
+workspace context injection and model fallback, and pins the OpenClaw runtime.
+Temporary state and processes are owned by this invocation and removed on exit or
+handled interruption. The process timeout is a total per-pass deadline, including
+startup and transport. Forced termination may require task-owned scratch cleanup.
+
+Direct execution requires `--openclaw-config /absolute/external/models.json`
+(or `AUTOREVIEW_OPENCLAW_CONFIG`) with an explicit catalog entry for the selected
+provider/model, including its API, endpoint and model metadata. Only that provider
+and model are projected; other catalogs are excluded. Provider credentials come
+from the supported provider environment variables or that selected configuration.
+`AUTOREVIEW_PROVIDER_ENV_ALLOW` may name additional credential variables
+for a custom provider. Ambient OpenClaw state, Gateway tokens, project configuration,
+plugins and shell environment import are not inherited. The configuration must be
+an operator-owned JSON file outside the reviewed repository; an existing operator
+config with the selected catalog is sufficient, without a separate reviewer
+profile. Other configuration fields cannot change
+reviewer permissions. Environment secret references must name forwarded variables;
+file/command secret resolvers and ambient login profiles are not projected. No
+configuration or credentials are copied into the reviewed repository.
+
+Inside an OpenClaw sandbox, use the bound `autoreview` tool with the selected
+`model`, `thinking`, target and `maxPriority`. It runs canonical capture and
+validation in the current sandbox and only the restricted reviewer on the host.
+Do not launch the host CLI from guest shell, create a reviewer profile, copy host
+credentials, or substitute an unrestricted agent. If this tool or the qualified
+canonical helper is unavailable, report unavailable. An explicit different engine
+continues to use that engine's eligible route.
+
+## Bound execution contract
+
+This section is for the trusted OpenClaw integration. Ordinary sandbox callers use
+`autoreview`; they do not manually orchestrate a reviewer. The integration owns
+current caller authority, selected-model admission, executable/configuration
+provenance, process cancellation and complete bounded transport. Request identifiers
+bind response ownership; they do not grant authority or attest reviewer isolation.
+
+Start the installed canonical helper inside the current invocation's sandbox:
 
 ```sh
 python3 "$AUTOREVIEW" --mode branch --base "$BASE" \
   --engine openclaw --native-handoff "$PRIVATE/handoff" \
-  --engine-timeout-seconds 900 --max-priority P2 \
-  --json-output "$PRIVATE/report.json" --status-output "$PRIVATE/status.json"
+  --engine-timeout-seconds 900 --model "$MODEL" --thinking "$THINKING" \
+  --max-priority P2 --json-output "$PRIVATE/report.json" \
+  --status-output "$PRIVATE/status.json"
 ```
 
-Choose target, severity and timeout from the request; the values above are examples.
-Use `--model <native-model-id>` and `--thinking <level>` for explicit choices;
-otherwise the reviewer configuration applies. CLI tuning flags do not configure
-native reviewers. The per-pass timeout includes transport. Native `--dry-run` is refused.
+The integration derives `$PRIVATE` from its sandbox capability and creates its
+private parent outside the repository. The helper creates `handoff` exclusively;
+reports stay outside it. Keep the waiting process owned and yielding. Qualify the
+installed helper with its source identity (`--version`) before execution. A helper
+with the old structured-child protocol is not compatible.
 
-## Submit each pass
+At `native pass ready: N/T`, read the complete `N.request.json` (at most 4,000,000
+bytes). Its fields are:
 
-At `native pass ready: N/T`, run this cell once for that pass. Set its first four
-variables and check the current tool declarations. Deliver the complete prompt and
-actual terminal structured result; chat previews and saved-result references are
-not substitutes. The short bridge commands below use `awaitResults: true` to
-collect their results; the initial waiting helper must yield as described above.
+| Field | Meaning |
+| --- | --- |
+| `protocol` | `autoreview-exec-v1` |
+| `run_id`, `pass`, `passes` | Invocation identity and sequential pass/count |
+| `prompt`, `prompt_bytes`, `prompt_sha256` | Complete UTF-8 prompt, length and digest |
+| `model`, `thinking` | Explicit selection, or null when the trusted caller supplies it |
+| `max_result_bytes` | 2,000,000 UTF-8 bytes for the complete encoded response |
 
-```javascript
-const directory = "/absolute/private/task/handoff";
-const helper = "/absolute/canonical/autoreview/scripts/autoreview";
-const passNumber = 1;
-const reviewerAgentId = "existing-restricted-reviewer";
-const byteLength = s => encodeURIComponent(s).replace(/%[0-9A-F]{2}|./g, "x").length;
-const quote = s => "'" + s.replace(/'/g, "'\\''") + "'";
-async function python(code, args, env) {
-  const result = await exec({command: "python3 -c " + quote(code) + args.map(x => " " + quote(String(x))).join(""),
-    ...(env ? {env} : {}), awaitResults: true});
-  if (result.status !== "completed" || result.exitCode !== 0)
-    throw new Error("Native transport command failed; inspect the owned helper");
-  return JSON.parse(result.aggregated);
+The prompt already contains the canonical report schema. Send its bytes intact
+through private stdin to fixed restricted `openclaw agent exec --json`; the host
+owns its empty cwd, configuration, credentials, deadline and process lifetime.
+Never accept host executable/configuration/path authority from the request.
+
+After the process exits, create one response with exactly these fields:
+
+```json
+{
+  "run_id": "request run_id",
+  "pass": 1,
+  "prompt_sha256": "request prompt_sha256",
+  "status": "done",
+  "output": "complete raw agent-exec JSON stdout"
 }
-const readPage = `import os,sys,json,stat
-fd=os.open(sys.argv[1],os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
-offset=int(sys.argv[2])
-with os.fdopen(fd,"rb") as f:
- info=os.fstat(f.fileno()); total=info.st_size
- assert stat.S_ISREG(info.st_mode) and info.st_uid==os.getuid() and info.st_nlink==1
- assert 0<total<=4000000 and 0<=offset<total
- f.seek(offset); data=f.read(8192)
-print(json.dumps({"offset":offset,"next":offset+len(data),"total":total,"content":data.decode("ascii")}))`;
-async function readComplete(path) {
-  let offset = 0, total, content = "";
-  do {
-    const page = await python(readPage, [path, offset]);
-    if (!page || page.offset !== offset || !Number.isSafeInteger(page.total) ||
-        page.total <= 0 || page.total > 4_000_000 || typeof page.content !== "string" ||
-        page.next !== offset + page.content.length || page.next !== Math.min(offset + 8192, page.total) ||
-        (total !== undefined && page.total !== total))
-      throw new Error("Invalid or incomplete request page");
-    total = page.total;
-    content += page.content;
-    offset = page.next;
-  } while (offset < total);
-  return content;
-}
-const appendChunk = `import os,sys,stat,json
-from pathlib import Path
-p=Path(sys.argv[1]); offset=int(sys.argv[2]); parent=p.parent.stat()
-assert parent.st_uid==os.getuid() and not stat.S_IMODE(parent.st_mode)&0o077
-data=os.environ["AUTOREVIEW_NATIVE_CHUNK"].encode("utf-8")
-assert 0<len(data)<=32768 and 0<=offset and offset+len(data)<=2000000
-fd=os.open(p,os.O_WRONLY|os.O_NOFOLLOW|os.O_NONBLOCK|(os.O_CREAT|os.O_EXCL if offset==0 else 0),0o600)
-with os.fdopen(fd,"ab") as f:
- info=os.fstat(f.fileno())
- assert stat.S_ISREG(info.st_mode) and info.st_uid==os.getuid() and info.st_nlink==1 and info.st_size==offset
- f.write(data)
-print(json.dumps({"next":offset+len(data)}))`;
-const request = JSON.parse(await readComplete(`${directory}/${passNumber}.request.json`));
-if (request.protocol !== "autoreview-native-v1" || request.pass !== passNumber ||
-    typeof request.prompt !== "string" || byteLength(request.prompt) !== request.prompt_bytes ||
-    !/^[a-f0-9]{32}$/.test(request.run_id) || !/^[a-f0-9]{64}$/.test(request.prompt_sha256))
-  throw new Error("Invalid or incomplete prepared pass");
-let report = null, status = "failed", failure;
-try {
-  // The wrapper keeps the prepared bytes intact even when the collector trims its task.
-  report = await agents.run("<autoreview-pass>\n" + request.prompt + "\n</autoreview-pass>", {
-    agentId: reviewerAgentId, label: `autoreview-${passNumber}`, schema: request.output_schema,
-    ...(request.model === null ? {} : { model: request.model }),
-    ...(request.thinking === null ? {} : { thinking: request.thinking })
-  });
-  if (!report || typeof report !== "object" || Array.isArray(report))
-    throw new Error("Collector returned no structured report");
-  status = "done";
-} catch (error) { failure = error; }
-let response = JSON.stringify({ run_id: request.run_id, pass: passNumber,
-  prompt_sha256: request.prompt_sha256, status, report });
-if (byteLength(response) > request.max_result_bytes) {
-  failure = new Error("Complete report exceeds native transport budget");
-  response = JSON.stringify({ run_id: request.run_id, pass: passNumber,
-    prompt_sha256: request.prompt_sha256, status: "failed", report: null });
-}
-// Use existing private exec.env transport; report content never enters command argv.
-const spool = `${directory}.${request.run_id}.${passNumber}.response.json`;
-let bytes = 0;
-for (let offset = 0; offset < response.length;) {
-  let end = Math.min(offset + 8192, response.length);
-  const last = response.charCodeAt(end - 1);
-  if (last >= 0xD800 && last <= 0xDBFF) end--; // Keep UTF-16 surrogate pairs intact.
-  const chunk = response.slice(offset, end);
-  const receipt = await python(appendChunk, [spool, bytes], {AUTOREVIEW_NATIVE_CHUNK: chunk});
-  bytes += byteLength(chunk);
-  if (receipt.next !== bytes) throw new Error("Incomplete response transfer");
-  offset = end;
-}
-const submitted = await exec({ command: `python3 ${quote(helper)} --native-submit ${quote(directory)} ${quote(spool)}`,
-  awaitResults: true });
-if (submitted.status !== "completed" || submitted.exitCode !== 0)
-  throw new Error("Native response was not committed; inspect the helper and settle the owned child");
-if (failure) throw failure;
-return { pass: passNumber, delivered: true, passes: request.passes };
 ```
 
-Wait on the helper's process handle for the next pass or exit. Only its final status
-and report determine the verdict. Do not launch passes early, resubmit them, reuse
-an older child response after failure, or rerun to obtain fewer findings.
+Use `done` only for exit 0. Nonzero exit, cancellation, timeout or incomplete output
+uses `failed` with `output: null`; never salvage an earlier answer. The host does
+not parse the report. The helper requires one successful terminal envelope, a
+nonempty `final`, and the explicitly selected model when supplied, then applies
+its existing report parser and completion/scope validation. CLI success alone is
+not a clean review. Oversized output fails without truncating or dropping findings.
 
-## Limits and cleanup
+Write the bounded response to the sibling spool named
+`handoff.RUN_ID.N.response.json`, then commit it with the same installed helper:
 
-- Keep the cell's paging and environment-chunk transport. File tools, stdin, PTY,
-  inherited descriptors and large log output are not supported substitutes.
-- Responses must fit 2,000,000 UTF-8 bytes. Never truncate a report or drop inputs.
-  Failed, malformed, mismatched or incomplete submissions cannot produce a clean result.
-- The parent must deliver the full prompt and actual reviewer output. The pass
-  identifiers do not attest reviewer identity or permissions.
-- The helper removes `handoff` on normal exit or handled interruption. Late submissions
-  cannot recreate it. Existing handoff directories cannot be resumed.
-- On parent failure, stop both the helper and accepted child, then verify settlement.
-  Stopping the helper alone does not stop the child. Timeout returns
-  `reviewer_unavailable` without a validated report or route change.
-- After an unhandled kill or interrupted submission, settle all readers/writers before
-  removing the known handoff, named response spool and private task directory.
-  Keep final reports separately; chat summaries and `results.save` are not durable storage.
+```sh
+python3 "$AUTOREVIEW" --native-submit "$PRIVATE/handoff" "$RESPONSE_SPOOL"
+```
+
+Submission exclusively claims the pass, atomically publishes the complete result
+and ready marker, and removes the named spool. It does not perform Git work or
+publish a verdict. It cannot recreate a retired exchange. Wait for the next request
+or helper exit; never start passes early, resubmit, or resume an old exchange.
+
+Only the helper's final report/status determines the outcome. Preserve its distinction
+between findings, incomplete assessment, unavailable reviewer and scoped clean.
+Source changes prevent publication. On parent failure, stop and join both owned
+processes before cleanup. The helper removes its exchange on normal exit and handled
+interruption; after an unhandled kill, settle readers/writers before removing only
+the known private directory and named spool. No failed pass triggers route fallback.

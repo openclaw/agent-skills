@@ -1,4 +1,4 @@
-"""Exercise the real helper and the documented Code Mode consumer without a provider."""
+"""Exercise real helper capture, raw completion submission and lifecycle boundaries."""
 from __future__ import annotations
 
 import copy
@@ -6,8 +6,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -16,7 +14,6 @@ import time
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "autoreview"
-REFERENCE = SCRIPT.parents[1] / "references" / "openclaw.md"
 CLEAN = {"findings": [], "overall_correctness": "patch is correct",
          "overall_explanation": "Complete review of the supplied pass.",
          "overall_confidence": 0.9, "review_completion": "complete"}
@@ -26,8 +23,7 @@ FINDING = {"title": "[P2] Restore free shipping at the threshold",
            "code_location": {"file_path": "shipping.py", "line": 1}, "source_attribution": None}
 
 
-@unittest.skipUnless(os.name == "posix", "native handoff uses POSIX custody")
-class NativeHandoffTests(unittest.TestCase):
+class ReviewFixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="autoreview-native-")
         self.root = Path(self.temp.name)
@@ -61,6 +57,9 @@ class NativeHandoffTests(unittest.TestCase):
     def git(self, *args):
         return subprocess.check_output(["git", *args], cwd=self.repo, env=self.env, text=True)
 
+
+@unittest.skipUnless(os.name == "posix", "native handoff uses POSIX custody")
+class NativeHandoffTests(ReviewFixture):
     def start(self, *options, timeout="8"):
         self.process = subprocess.Popen([
             sys.executable, str(SCRIPT), "--mode", "branch", "--base", self.base,
@@ -80,6 +79,8 @@ class NativeHandoffTests(unittest.TestCase):
             out, err = self.process.communicate(timeout=3)
             self.fail(f"no request {number}, exit {self.process.returncode}: {out}\n{err}")
         result = json.loads(path.read_text())
+        self.assertEqual(result["protocol"], "autoreview-exec-v1")
+        self.assertNotIn("output_schema", result)
         self.assertEqual(result["prompt_bytes"], len(result["prompt"].encode()))
         self.assertEqual(result["prompt_sha256"], hashlib.sha256(result["prompt"].encode()).hexdigest())
         self.assertEqual(self.handoff.stat().st_mode & 0o777, 0o700)
@@ -88,7 +89,7 @@ class NativeHandoffTests(unittest.TestCase):
     def deliver(self, request, report=None, *, modify=None, raw=None, commit=True):
         response = {"run_id": request["run_id"], "pass": request["pass"],
                     "prompt_sha256": request["prompt_sha256"], "status": "done",
-                    "report": copy.deepcopy(CLEAN if report is None else report)}
+                    "output": self.completion(request, CLEAN if report is None else report)}
         if modify:
             modify(response)
         data = json.dumps(response).encode() if raw is None else raw
@@ -103,63 +104,29 @@ class NativeHandoffTests(unittest.TestCase):
         self.assertFalse(self.handoff.exists(), "helper did not clean its exchange")
         return out + err
 
-    def consumer(self, request, report=CLEAN, *, failure=False, delay=0,
-                 output_limit=32768, drop_env=False, expected_launches=1):
-        """Run the exact shipped cell, substituting only its documented inputs."""
-        if not shutil.which("node"):
-            self.fail("Node is required for the documented consumer contract test")
-        cell = re.search(r"```javascript\n(.*?)\n```", REFERENCE.read_text(), re.S).group(1)
-        cell = cell.replace('"/absolute/private/task/handoff"', json.dumps(str(self.handoff)))
-        cell = cell.replace('"/absolute/canonical/autoreview/scripts/autoreview"', json.dumps(str(SCRIPT)))
-        cell = cell.replace("const passNumber = 1;", f'const passNumber = {request["pass"]};')
-        harness = r'''
-const fs = require("node:fs");
-const crypto = require("node:crypto");
-const supplied = JSON.parse(fs.readFileSync(process.env.NATIVE_FIXTURE_PATH, "utf8"));
-let launches = 0, envCalls = 0;
-// No file tools or stdin: model the standard container-only scratch boundary.
-async function exec(input) {
-  if (input.env) {
-    envCalls++;
-    const chunk = input.env.AUTOREVIEW_NATIVE_CHUNK;
-    if (typeof chunk !== "string" || Buffer.byteLength(chunk) > 32768 || /[\r\n\0]/.test(chunk))
-      throw Error("unsafe environment chunk");
-    if (chunk.length > 20 && input.command.includes(chunk)) throw Error("report entered argv");
-  }
-  const result = require("node:child_process").spawnSync(input.command, {shell: true, encoding: "utf8",
-    env: {...process.env, ...(supplied.dropEnv ? {} : input.env)}});
-  return {status: "completed", exitCode: result.status,
-    aggregated: result.stdout.slice(-supplied.outputLimit).trim()};
-}
-const agents = {async run(prompt, options) {
-  launches++;
-  if (supplied.delay) await new Promise(resolve => setTimeout(resolve, supplied.delay));
-  const start = "<autoreview-pass>\n", end = "\n</autoreview-pass>";
-  if (!prompt.startsWith(start) || !prompt.endsWith(end)) throw Error("missing wrapper");
-  const exact = prompt.slice(start.length, -end.length);
-  if (crypto.createHash("sha256").update(exact).digest("hex") !== supplied.digest)
-    throw Error("prompt bytes changed");
-  if (options.agentId !== "existing-restricted-reviewer" || !options.schema.required.includes("review_completion"))
-    throw Error("collector contract changed");
-  if (options.model !== supplied.model || options.thinking !== supplied.thinking)
-    throw Error("explicit model/effort lost");
-  if (supplied.failure) throw Error("terminal collector failure");
-  return supplied.report;
-}};
-'''
-        harness += "(async () => {\n" + cell + "\n})().then(result => console.log(JSON.stringify({result, launches, envCalls}))).catch(error => {console.log(JSON.stringify({error: error.message, launches, envCalls})); process.exitCode = 1;});"
-        fixture = self.root / "consumer-fixture.json"
-        fixture.write_text(json.dumps({"digest": request["prompt_sha256"],
-            "report": report, "failure": failure, "delay": delay,
-            "outputLimit": output_limit, "dropEnv": drop_env,
-            **({"model": request["model"]} if request["model"] is not None else {}),
-            **({"thinking": request["thinking"]} if request["thinking"] is not None else {})}))
-        env = self.env | {"NATIVE_FIXTURE_PATH": str(fixture)}
-        result = subprocess.run(["node", "-e", harness], env=env, text=True, capture_output=True, timeout=15)
-        self.assertEqual(json.loads(result.stdout)["launches"], expected_launches, result.stderr)
-        return result
+    @staticmethod
+    def completion(request, report):
+        model = request["model"] or "fixture/reviewer"
+        provider, _, model_id = model.partition("/")
+        return json.dumps({"ok": True, "status": "ok", "final": json.dumps(report),
+                           "model": model_id or model, "provider": provider})
 
-    def test_documented_consumer_complete_and_explicit_model(self):
+    def consumer(self, request, report=CLEAN, *, failure=False, delay=0):
+        # Simulate only the remote execution boundary; invoke the real submit
+        # command and preserve its complete bytes and one-shot commit custody.
+        if delay:
+            time.sleep(delay / 1000)
+        response = {"run_id": request["run_id"], "pass": request["pass"],
+                    "prompt_sha256": request["prompt_sha256"],
+                    "status": "failed" if failure else "done",
+                    "output": None if failure else self.completion(request, report)}
+        spool = self.root / f"handoff.{request['run_id']}.{request['pass']}.response.json"
+        spool.write_text(json.dumps(response))
+        return subprocess.run([sys.executable, str(SCRIPT), "--native-submit",
+                               str(self.handoff), str(spool)],
+                              cwd=self.repo, env=self.env, text=True, capture_output=True, timeout=15)
+
+    def test_complete_raw_output_and_explicit_model(self):
         self.start("--model", "openai/gpt-6-astra", "--thinking", "high")
         request = self.request()
         self.assertEqual(request["model"], "openai/gpt-6-astra")
@@ -202,20 +169,10 @@ const agents = {async run(prompt, options) {
         self.start("--max-priority", "P2", timeout="15")
         result = self.consumer(self.request(), report)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertGreater(json.loads(result.stdout)["envCalls"], 1)
         self.finish(1)
         validated = json.loads(self.report.read_text())
         self.assertEqual(len(validated["findings"]), 150)
         self.assertEqual(validated["findings"][-1]["body"], report["findings"][-1]["body"])
-
-    def test_truncated_stdout_and_denied_environment_are_not_clean(self):
-        for options in ({"output_limit": 100, "expected_launches": 0}, {"drop_env": True}):
-            with self.subTest(options=options):
-                self.start(timeout=".6")
-                self.assertEqual(self.consumer(self.request(), **options).returncode, 1)
-                self.finish(1)
-                self.assertFalse(self.report.exists())
-                self.assertFalse(json.loads(self.status.read_text())["report_produced"])
 
     def test_source_change_prevents_publication(self):
         self.start()
@@ -237,6 +194,9 @@ const agents = {async run(prompt, options) {
             ("incomplete", {"report": CLEAN | {"review_completion": "incomplete"}}, 2),
             ("failed after report", {"modify": lambda x: x.update(status="failed")}, 1),
             ("over limit", {"raw": b" " * 2_000_001}, 1),
+            ("truncated stdout", {"modify": lambda x: x.update(output='{"ok":true')}, 1),
+            ("failed envelope", {"modify": lambda x: x.update(output=json.dumps({"ok": False, "status": "error", "final": json.dumps(CLEAN)}))}, 1),
+            ("earlier valid payload", {"modify": lambda x: x.update(output=json.dumps({"ok": True, "status": "ok", "final": "", "payloads": [{"text": json.dumps(CLEAN)}]}))}, 1),
         ]
         for name, kwargs, code in cases:
             with self.subTest(name=name):
@@ -263,7 +223,7 @@ const agents = {async run(prompt, options) {
 
     def test_consumer_terminal_failure_is_not_retried(self):
         self.start()
-        self.assertEqual(self.consumer(self.request(), failure=True).returncode, 1)
+        self.assertEqual(self.consumer(self.request(), failure=True).returncode, 0)
         self.finish(1)
         self.assertFalse(self.report.exists())
 
@@ -293,7 +253,7 @@ const agents = {async run(prompt, options) {
         request = self.request()
         spool = self.root / f"handoff.{request['run_id']}.1.response.json"
         spool.write_text(json.dumps({"run_id": request["run_id"], "pass": 1,
-            "prompt_sha256": request["prompt_sha256"], "status": "done", "report": CLEAN}))
+            "prompt_sha256": request["prompt_sha256"], "status": "done", "output": self.completion(request, CLEAN)}))
         marker = self.root / "submission-entered"
         code = '''import os, runpy, sys, time
 from pathlib import Path
@@ -355,6 +315,25 @@ module["submit_native_response"](Path(sys.argv[2]), Path(sys.argv[3]))
 
     def test_signal_during_retirement_still_joins_submission(self):
         self.assert_retirement_waits_for_submission(True)
+
+    def test_concurrent_exchange_cannot_consume_another_reviews_completion(self):
+        self.start()
+        first_process, first_handoff = self.process, self.handoff
+        first_request = self.request()
+        self.handoff = self.root / "second-handoff"
+        second_report = self.root / "second-report.json"
+        second_status = self.root / "second-status.json"
+        self.start("--json-output", str(second_report), "--status-output", str(second_status))
+        second_request = self.request()
+        self.assertNotEqual(first_request["run_id"], second_request["run_id"])
+        self.deliver(first_request)
+        self.finish(1)
+        self.assertFalse(second_report.exists())
+        self.assertTrue(first_handoff.exists())
+        self.process, self.handoff = first_process, first_handoff
+        self.deliver(first_request)
+        self.finish(0)
+        self.assertEqual(json.loads(self.report.read_text())["review_status"], "scoped-clean")
 
     def test_signal_cleans_helper_without_publishing(self):
         self.start()

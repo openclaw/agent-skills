@@ -20,6 +20,7 @@ MODULES = [
     "skills/autoreview/scripts/autoreview_test.py",
     "skills.autoreview.tests.test_autoreview_hardening",
     "skills.autoreview.tests.test_native_handoff",
+    "skills.autoreview.tests.test_openclaw_exec",
     "skills.autoreview.tests.test_codex_sandbox",
     "skills.autoreview.tests.test_codex_inference_route",
     "skills.autoreview.tests.test_git_line_endings",

@@ -102,3 +102,13 @@ Profile settings remain ignored. Force configured route before subscription atte
 - Never silently select another engine. Custom agent file ≠ equivalent helper
   replacement: changes input into templated system prompt. The documented Copilot
   subagent route is a separate assessment with explicitly reported limitations.
+
+## OpenClaw
+
+`--engine openclaw` uses restricted `openclaw agent exec`, directly on a trusted
+host or through the bound sandbox `autoreview` tool. Select `--model provider/model`
+and `--thinking` explicitly for direct execution, and supply an external
+`--openclaw-config` containing the selected provider/model catalog. The helper owns the empty
+workspace, no-tools configuration, private prompt input, timeout and cleanup.
+There is no child reviewer profile, model fallback or output-schema CLI dependency.
+See [execution and integration requirements](openclaw.md) before launch.

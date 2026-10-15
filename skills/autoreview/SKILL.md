@@ -96,9 +96,10 @@ verified parent-relative patch; otherwise attribution stays unknown.
   Honor explicit engine/model choices and environment settings.
 - When Codex CLI is unavailable, Copilot users may select an independent
   [subagent review](#copilot-subagent-review) before launch.
-- In OpenClaw, use the [native collector](references/openclaw.md) only when no route
-  was specified, the CLI is missing or has no configured authentication, and the
-  handoff requirements are met.
+- For the OpenClaw engine, use [restricted agent execution](references/openclaw.md):
+  direct CLI on an authenticated host, or the bound `autoreview` tool inside an
+  OpenClaw sandbox. With no explicit route and no eligible default CLI, use the
+  bound tool when available. Preserve explicit model and effort choices.
 - Use Claude only when requested or Codex is unavailable; explain why.
 
 Never switch review hosts after launch or to bypass missing context, isolation failures,
@@ -133,7 +134,7 @@ If Codex CLI is unavailable, use a separate Copilot reviewer subagent with an
 accessible Codex model, or a comparable code-review-capable model if none is
 available. Honor explicit model choices; do not silently substitute them. This
 is an independent assessment through Copilot, not a new helper engine or the
-OpenClaw native collector. Do not install Codex CLI merely to satisfy the default.
+OpenClaw execution integration. Do not install Codex CLI merely to satisfy the default.
 
 - Before launch, state why this route is used and the selected host/model.
   Use separate reviewer context, not the implementing agent's self-review;
