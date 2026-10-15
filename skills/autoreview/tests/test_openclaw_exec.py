@@ -26,7 +26,7 @@ class OpenClawExecTests(native.ReviewFixture):
                          "apiKey": "${OPENAI_API_KEY}", "models": [{"id": "reviewer", "name": "Review"}]}
         self.config.write_text(json.dumps({"models": {"providers": {"fixture": self.provider}}}))
         self.binary.write_text("#!" + sys.executable + "\n" + r'''
-import json, os, pathlib, signal, sys, time
+import json, os, pathlib, signal, subprocess, sys, time
 args = sys.argv[1:]
 if args == ["agent", "exec", "--help"]:
     print("--message-file --config --cwd --model --thinking --json")
@@ -35,6 +35,11 @@ assert args[:2] == ["agent", "exec"]
 assert args[args.index("--message-file") + 1] == "-"
 prompt = sys.stdin.read()
 config = json.loads(pathlib.Path(args[args.index("--config") + 1]).read_text())
+for provider in config["models"]["providers"].values():
+    service = provider.get("localService")
+    if service:
+        subprocess.run([service["command"], *service.get("args", [])],
+                       cwd=service.get("cwd"), env=service.get("env"), check=True)
 assert "review_completion" in prompt
 assert prompt not in " ".join(args)
 record = {"args": args, "config": config, "cwd": os.getcwd(), "pid": os.getpid(),
@@ -85,12 +90,21 @@ if case == "exit-failure":
 
     def test_direct_cli_keeps_prompt_private_and_owns_restrictions(self):
         config = self.root / "operator.json"
-        config.write_text(json.dumps({"models": {"providers": {"fixture": self.provider, "unused": {"models": [{"id": "other"}]}}}, "tools": {"allow": ["*"]},
+        sentinel = self.root / "must-not-start-service"
+        unsafe_provider = self.provider | {
+            "localService": {"command": sys.executable,
+                             "args": ["-c", "from pathlib import Path; Path(" + repr(str(sentinel)) + ").touch()"],
+                             "cwd": str(self.repo)},
+            "agentRuntime": {"id": "external-runtime"},
+            "models": [self.provider["models"][0] | {"agentRuntime": {"id": "external-runtime"}}],
+        }
+        config.write_text(json.dumps({"models": {"providers": {"fixture": unsafe_provider, "unused": {"models": [{"id": "other"}]}}}, "tools": {"allow": ["*"]},
                                      "agents": {"entries": {"unsafe": {"skills": ["all"]}}},
                                      "plugins": {"allow": ["unsafe"]}, "env": {"UNSAFE": "value"}}))
         self.start_direct("--openclaw-config", str(config))
         records, _ = self.finish_direct(0)
         self.assertEqual(len(records), 1)
+        self.assertFalse(sentinel.exists(), "provider command escaped restricted configuration")
         record = records[0]
         self.assertEqual(record["config"]["tools"], {"deny": ["*"], "codeMode": {"enabled": False}})
         self.assertEqual(record["config"]["agents"]["entries"], {"main": {"skills": [], "contextInjection": "never"}})

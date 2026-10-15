@@ -7315,9 +7315,18 @@ def openclaw_review_config(args: argparse.Namespace, repo: Path) -> dict[str, An
         matches = [model for model in catalog if isinstance(model, dict) and model.get("id") == model_id] if isinstance(catalog, list) else []
         if len(matches) != 1:
             raise ValueError("selected model must occur once")
-        config: dict[str, Any] = {"models": {"providers": {
-            provider: {**selected, "models": matches},
-        }}}
+        # Provider catalogs also carry localService commands and harness policy.
+        # Only inference fields cross into this fixed, process-owned runtime.
+        provider_fields = ("baseUrl", "apiKey", "auth", "api", "maxTokens", "timeoutSeconds",
+                           "region", "injectNumCtxForOpenAICompat", "params", "headers",
+                           "authHeader", "request")
+        model_fields = ("id", "name", "api", "baseUrl", "reasoning", "input", "cost",
+                        "contextWindow", "contextTokens", "maxTokens", "thinkingLevelMap",
+                        "params", "headers", "compat", "mediaInput", "responseModelEquivalent",
+                        "metadataSource")
+        projection = {key: selected[key] for key in provider_fields if key in selected}
+        projection["models"] = [{key: matches[0][key] for key in model_fields if key in matches[0]}]
+        config: dict[str, Any] = {"models": {"providers": {provider: projection}}}
     except (OSError, ValueError, RecursionError):
         raise SystemExit("--openclaw-config must contain the selected models.providers catalog entry as JSON (at most 2000000 bytes)") from None
     config.update({

@@ -42,8 +42,9 @@ for a custom provider. Ambient OpenClaw state, Gateway tokens, project configura
 plugins and shell environment import are not inherited. The configuration must be
 an operator-owned JSON file outside the reviewed repository; an existing operator
 config with the selected catalog is sufficient, without a separate reviewer
-profile. Other configuration fields cannot change
-reviewer permissions. Environment secret references must name forwarded variables;
+profile. Only known inference fields are copied; provider local-service commands
+and provider/model runtime selectors are excluded. A local endpoint must already
+be running. Other configuration fields cannot change reviewer permissions. Environment secret references must name forwarded variables;
 file/command secret resolvers and ambient login profiles are not projected. No
 configuration or credentials are copied into the reviewed repository.
 
