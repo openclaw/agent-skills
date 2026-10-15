@@ -90,19 +90,14 @@ verified parent-relative patch; otherwise attribution stays unknown.
 
 ## Engines
 
-The helper defaults to Codex. Before starting a review, honor explicit engine/model
-choices, including environment configuration. In an OpenClaw session with no explicit
-reviewer route, keep a usable configured CLI. If the CLI is absent or known to have
-no configured authentication, select the existing restricted native collector only
-when the [OpenClaw handoff requirements](references/openclaw.md) are satisfied.
-This is skill-level availability selection before any review starts; the helper
-does not discover parent tools or switch routes. Missing context, isolation errors,
-or a launched review's findings, refusal, timeout or execution failure never justify
-switching. If neither route is eligible, report unavailable.
+- Use Codex by default. Honor explicit engine/model choices and environment settings.
+- In OpenClaw, use the [native collector](references/openclaw.md) only when no route
+  was specified, the CLI is missing or has no configured authentication, and the
+  handoff requirements are met.
+- Use Claude only when requested or Codex is unavailable; explain why.
 
-Use Claude only when requested or Codex is unavailable; report the concrete
-failure first. Slowness, rate limits, findings, safety refusals, and isolation failures
-do not justify switching. No automatic cross-engine fallback.
+Never switch after launch or to bypass missing context, isolation failures,
+slowness or rate limits. If no route is eligible, report unavailable.
 
 Codex defaults to **GPT-6.1 Sol (`gpt-6.1-sol`), medium reasoning, Ultrafast**.
 It retries GPT-6 Sol once only for account-access failure, without chaining to Luna.

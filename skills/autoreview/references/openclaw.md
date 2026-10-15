@@ -1,50 +1,35 @@
 # OpenClaw native review
 
-Use this consumer only in an eligible OpenClaw Code Mode session. The same helper
-captures, partitions and validates the review; an existing isolated collector
-replaces the external CLI execution. No direct model API or credentials are added.
+Use an existing restricted reviewer for text reviews in OpenClaw Code Mode.
+The canonical helper prepares each pass and validates the final result.
 
-## Select before execution
+## Requirements
 
-Honor explicit engine/provider choices and `AUTOREVIEW_ENGINE`. Preserve explicit
-model and reasoning choices; never substitute a configured child default for them.
-A model or provider setting intended for a CLI is not automatically an OpenClaw model
-id. Use the selected CLI unless the caller has selected or approved its native
-counterpart. Keep a working configured CLI as the ordinary default. With no explicit
-route, a missing CLI or known absent authentication permits native selection before
-execution. Unknown authentication is not evidence of absence. Do not run a review
-merely to test authentication. Never switch after launch or work around an isolation
-failure. The standalone helper's default remains Codex.
+Follow the [engine-selection rules](../SKILL.md#engines). Before starting, confirm:
 
-Before selecting native, establish all of these from the current session:
+- Python 3.10+, Git, a POSIX filesystem and the canonical helper are available.
+- Code Mode exposes `agents.run`, `exec` with structured `status`, `exitCode` and
+  `aggregated` output plus bounded `env`, and `process` to monitor and stop the helper.
+- The reviewer is admitted under the initiating identity and uses isolated context.
+  Its enforced policy allows only result delivery: no repository, shell, file,
+  network, publishing or delegation access. Do not change permissions, credentials
+  or agent configuration to qualify it.
+- The intended model/effort is available. CLI settings require an explicitly selected
+  or approved native equivalent; never silently replace them with child defaults.
+- The full request and result fit the bridge, collector and model limits.
+  Supply required unchanged context through the helper; children cannot inherit
+  a private parent worktree.
 
-- The canonical helper package, Python 3.10+, Git and a POSIX filesystem are available.
-- OpenClaw Code Mode exposes `agents.run`, shell `exec` with structured `aggregated`
-  output and bounded `env` values, and `process` to observe and stop the helper.
-- The selected existing reviewer agent is admitted under the initiating identity.
-  Its effective policy denies repository access, shell/file/network operations,
-  publishing and further delegation, retaining only the collector result transport.
-  An instruction to be read-only is not enforcement. There is no per-spawn read-only
-  flag. Do not add permissions, credentials or agent configuration to make a run pass.
-- The child uses isolated context and the intended model/effort. `agents.run` starts
-  a non-thread collector with isolated context. It cannot inherit a private parent
-  worktree; supply required unchanged context using the helper's existing options.
-- The complete request and result fit the active Code Mode bridge, collector and
-  model context budgets. A tool preview or chat/history rendering is not a full value.
+Unknown authentication does not qualify as absent authentication. Do not launch a
+review to probe it. Images, Windows, native Codex dynamic-tool output and other
+parent transports are unsupported. Report unavailable if requirements are unmet.
 
-Native currently supports text reviews in this Code Mode path. Image-bearing changes
-are refused by the helper. Native Codex dynamic-tool output, other harness transports,
-Windows handoff custody and image attachments are not qualified by this consumer.
-Do not drop inputs or reduce finding counts to fit a transport. Use an already
-supported explicitly selected route, or report the limitation without a clean verdict.
+## Start
 
-## Start the helper
-
-Run from the reviewed repository using shell `exec` with `yieldMs` to obtain an
-ordinary request-owned process handle; do not use independent `background: true`.
-Choose the command's overall timeout to cover the planned review budget. Use a
-fresh path under a private task-owned directory outside the repository; do not create
-the `handoff` directory yourself. Report destinations must stay outside it.
+Run from the reviewed repository with `exec` and `yieldMs`; retain its process handle.
+Do not use `background: true`. Set the overall timeout to cover all planned passes.
+Use a private task directory outside the repository. Let the helper create `handoff`;
+keep reports outside that directory.
 
 ```sh
 python3 "$AUTOREVIEW" --mode branch --base "$BASE" \
@@ -53,21 +38,17 @@ python3 "$AUTOREVIEW" --mode branch --base "$BASE" \
   --json-output "$PRIVATE/report.json" --status-output "$PRIVATE/status.json"
 ```
 
-Choose target and severity from the request; P2 above is an example, not a new default.
-Pass `--model <OpenClaw model id>` and `--thinking <level>` for explicit native choices.
-Omitted values use the qualified reviewer agent's configuration. CLI tuning options
-cannot configure a native child. The per-pass timeout includes transport and collection;
-select it before launch, observe the helper's existing process handle, and do not detach
-an unowned job. `--dry-run` cannot qualify a native child and is refused.
+Choose target, severity and timeout from the request; the values above are examples.
+Use `--model <native-model-id>` and `--thinking <level>` for explicit choices;
+otherwise the reviewer configuration applies. CLI tuning flags do not configure
+native reviewers. The per-pass timeout includes transport. Native `--dry-run` is refused.
 
-## Deliver one prepared pass
+## Submit each pass
 
-When the helper prints `native pass ready: N/T`, run the following complete cell in
-OpenClaw Code Mode, setting `directory`, `helper`, `passNumber` and `reviewerAgentId`.
-Read the current tool declarations first. Shell `exec` must return structured
-`status`, `exitCode` and `aggregated`. The cell reads every page, sends the full prepared
-assignment, waits for the terminal structured value and writes it before the reply
-ends. It never emits a full prompt/report through model-visible output.
+At `native pass ready: N/T`, run this cell once for that pass. Set its first four
+variables and check the current tool declarations. Deliver the complete prompt and
+actual terminal structured result; chat previews and saved-result references are
+not substitutes.
 
 ```javascript
 const directory = "/absolute/private/task/handoff";
@@ -164,49 +145,23 @@ if (failure) throw failure;
 return { pass: passNumber, delivered: true, passes: request.passes };
 ```
 
-Use the helper's process handle to wait for the next prepared pass or terminal exit.
-Repeat the cell for each newly announced pass exactly once. A successful delivery is
-not a review verdict. The helper may reject the schema, scope, attribution or source,
-and only its final status/report determines the outcome. Do not launch later passes
-speculatively, manufacture missing responses, recover an earlier successful child
-message after terminal failure, or retry for a cleaner finding set.
+Wait on the helper's process handle for the next pass or exit. Only its final status
+and report determine the verdict. Do not launch passes early, resubmit them, reuse
+an older child response after failure, or rerun to obtain fewer findings.
 
-## Lifecycle and limits
+## Limits and cleanup
 
-Container-only scratch is deliberately accessed through the existing shell tool,
-not through host-backed file tools or a new bind mount. Sandboxed exec has closed
-stdin and disables PTY, so this consumer does not use stdin, terminal input or
-inherited descriptors. Request JSON is ASCII-encoded by the helper and read in
-8,192-byte JSON-framed pages with exact offsets and lengths. Never substitute a
-large `cat` or a truncated log for those pages. Responses use bounded, single-line
-environment chunks through OpenClaw's existing private container env-file transport;
-JSON serialization escapes newlines and NULs. This is invocation data, not saved
-configuration. A lower aggregate limit, denied environment override or failed
-chunk aborts the consumer; it never silently narrows a pass or a report.
-
-The helper owns `handoff` and removes it on normal exit or handled interruption.
-Its in-memory capture remains authoritative until all passes and the final source
-check finish. Requests are atomic, sequential and identified by a fresh run id,
-pass number and prompt SHA-256. `--native-submit HANDOFF RESPONSE` opens the existing
-exchange and commits through its directory descriptor, under the same short file
-lock used by cleanup. It never creates an exchange. A collector that finishes after
-timeout cannot recreate a retired handoff; submission refuses it and removes its
-identity-checked spool. Each pass can be submitted only once. This command transports
-the result; the waiting original invocation still owns all review validation.
-Responses are limited to 2,000,000 UTF-8 bytes;
-oversized, malformed, mismatched, missing and uncommitted responses are never clean.
-The request/result handshake binds transport to a prepared pass; it is not a signed
-reviewer or permission attestation. The qualified parent is trusted to deliver the
-complete prompt and the collector's actual terminal result.
-
-An existing directory is refused, so a stale interrupted run cannot be resumed or
-mistaken for a new review. On parent failure, stop the owned helper and any accepted
-child through their existing process/collector facilities, then verify both settled.
-Stopping the helper alone does not cancel an OpenClaw child. A timeout yields
-`reviewer_unavailable`, no validated report, and no automatic route change. After an
-uncatchable kill, remove only the known task-owned handoff after settling its readers.
-If the parent stops between staging and submission, also remove its named response
-spool after the child and all owned writers settle. The private task parent remains
-the parent's cleanup responsibility; do not replace it with a shared temporary root.
-Preserve final reports separately; never use chat summaries or reply-scoped
-`results.save` references as durable result storage.
+- Keep the cell's paging and environment-chunk transport. File tools, stdin, PTY,
+  inherited descriptors and large log output are not supported substitutes.
+- Responses must fit 2,000,000 UTF-8 bytes. Never truncate a report or drop inputs.
+  Failed, malformed, mismatched or incomplete submissions cannot produce a clean result.
+- The parent must deliver the full prompt and actual reviewer output. The pass
+  identifiers do not attest reviewer identity or permissions.
+- The helper removes `handoff` on normal exit or handled interruption. Late submissions
+  cannot recreate it. Existing handoff directories cannot be resumed.
+- On parent failure, stop both the helper and accepted child, then verify settlement.
+  Stopping the helper alone does not stop the child. Timeout returns
+  `reviewer_unavailable` without a validated report or route change.
+- After an unhandled kill or interrupted submission, settle all readers/writers before
+  removing the known handoff, named response spool and private task directory.
+  Keep final reports separately; chat summaries and `results.save` are not durable storage.
