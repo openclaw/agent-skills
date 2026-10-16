@@ -21,40 +21,64 @@ class OpenClawExecTests(native.ReviewFixture):
         super().setUp()
         self.binary = self.root / "openclaw"
         self.capture = self.root / "invocations.jsonl"
-        self.config = self.root / "models.json"
-        self.provider = {"baseUrl": "https://example.invalid/v1", "api": "openai-completions",
-                         "apiKey": "${OPENAI_API_KEY}", "models": [{"id": "reviewer", "name": "Review"}]}
-        self.config.write_text(json.dumps({"models": {"providers": {"fixture": self.provider}}}))
+        self.config = self.root / "operator.json"
+        self.home = self.root / "home"
+        self.home.mkdir()
+        (self.home / "auth.json").write_text('{"fixture":"stored-login"}')
+        self.config.write_text(json.dumps({"agents": {
+            "defaults": {"systemAgent": {"agentId": "review"},
+                         "model": {"primary": "fixture/default", "fallbacks": ["fixture/backup"]}},
+            "entries": {"review": {"skills": ["ambient"], "contextInjection": "always", "nativeRuntimeConsent": ["codex"]},
+                        "string-model": {"model": "fixture/string"},
+                        "object-model": {"model": {"primary": "fixture/object", "fallbacks": ["fixture/backup"]}}}},
+            "models": {"providers": {"fixture": {"apiKey": "${CUSTOM_PROVIDER_KEY}", "models": [{"id": "default"}]}}},
+            "gateway": {"auth": {"token": "${OPENCLAW_GATEWAY_TOKEN}"}}}))
         self.binary.write_text("#!" + sys.executable + "\n" + r'''
-import json, os, pathlib, signal, subprocess, sys, time
+import json, os, pathlib, signal, sys
 args = sys.argv[1:]
 if args == ["agent", "exec", "--help"]:
-    print("--message-file --config --cwd --model --thinking --json")
+    print("--message-file --config --config-override --cwd --model --thinking --json")
+    raise SystemExit()
+config_path = pathlib.Path(args[args.index("--config") + 1] if "--config" in args else os.environ["OPENCLAW_CONFIG_PATH"])
+try:
+    base = json.loads(config_path.read_text())
+    if "${CUSTOM_PROVIDER_KEY}" in json.dumps(base) and os.environ.get("CUSTOM_PROVIDER_KEY") != "fixture-custom-key":
+        raise ValueError("missing native environment interpolation input")
+except (OSError, ValueError):
+    print(json.dumps({"ok": False, "error": {"type": "cli_error", "message": "invalid configuration"}}))
+    raise SystemExit(1)
+if args == ["config", "get", "agents", "--json"]:
+    if "agents" not in base:
+        print(json.dumps({"ok": False, "error": {"type": "cli_error", "message": "Config path is valid but unset: agents. The runtime default applies until you set an authored value."}}))
+        raise SystemExit(1)
+    print(json.dumps(base["agents"]))
     raise SystemExit()
 assert args[:2] == ["agent", "exec"]
 assert args[args.index("--message-file") + 1] == "-"
 prompt = sys.stdin.read()
-config = json.loads(pathlib.Path(args[args.index("--config") + 1]).read_text())
-for provider in config["models"]["providers"].values():
-    service = provider.get("localService")
-    if service:
-        subprocess.run([service["command"], *service.get("args", [])],
-                       cwd=service.get("cwd"), env=service.get("env"), check=True)
+override = json.loads(args[args.index("--config-override") + 1])
 assert "review_completion" in prompt
 assert prompt not in " ".join(args)
-record = {"args": args, "config": config, "cwd": os.getcwd(), "pid": os.getpid(),
-          "prompt": prompt, "home": os.environ["HOME"],
+default = base.get("agents", {}).get("defaults", {}).get("model", "fixture/default")
+model = args[args.index("--model") + 1] if "--model" in args else default
+if isinstance(model, dict): model = model["primary"]
+record = {"args": args, "override": override, "config_path": str(config_path),
+          "cwd": os.getcwd(), "pid": os.getpid(), "prompt": prompt,
+          "home": os.environ["HOME"], "stored_auth": (pathlib.Path(os.environ["HOME"]) / "auth.json").exists(),
           "provider_key_present": os.environ.get("OPENAI_API_KEY") == "fixture-key",
-          "ambient_present": any(x in os.environ for x in ["NODE_OPTIONS", "OPENCLAW_CONFIG_PATH", "OPENCLAW_GATEWAY_TOKEN"])}
+          "custom_key_present": os.environ.get("CUSTOM_PROVIDER_KEY") == "fixture-custom-key",
+          "gateway_key_present": os.environ.get("OPENCLAW_GATEWAY_TOKEN") == "fixture-gateway-key",
+          "repo_auth_present": "CODEX_HOME" in os.environ,
+          "unsafe_env_present": any(x in os.environ for x in ["NODE_OPTIONS", "NODE_PATH", "BUN_OPTIONS", "BASH_ENV"])}
 with open(os.environ["AUTOREVIEW_FAKE_CAPTURE"], "a") as f:
     f.write(json.dumps(record) + "\n")
 case = os.environ.get("AUTOREVIEW_FAKE_CASE", "clean")
-if case == "wait":
-    signal.pause()
+if case == "wait": signal.pause()
 report = {"findings": [], "overall_correctness": "patch is correct", "overall_explanation": "Complete review of supplied scope.", "overall_confidence": 0.9, "review_completion": "complete"}
 if case == "incomplete": report["review_completion"] = "incomplete"
 if case == "invalid": report = {"review_completion": "complete"}
-envelope = {"ok": True, "status": "ok", "final": json.dumps(report), "provider": "fixture", "model": "reviewer"}
+provider, model_id = model.split("/", 1)
+envelope = {"ok": True, "status": "ok", "final": json.dumps(report), "provider": provider, "model": model_id}
 if case == "wrong-model": envelope["model"] = "substitute"
 if case == "empty": envelope["final"] = ""
 if case == "failed-envelope": envelope["ok"], envelope["status"] = False, "error"
@@ -66,16 +90,19 @@ if case == "exit-failure":
 ''')
         self.binary.chmod(0o700)
         self.env.update(AUTOREVIEW_FAKE_CAPTURE=str(self.capture), OPENAI_API_KEY="fixture-key",
-                        OPENCLAW_CONFIG_PATH=str(self.root / "ambient.json"),
-                        OPENCLAW_GATEWAY_TOKEN="must-not-forward", NODE_OPTIONS="--trace-warnings")
+                        HOME=str(self.home), OPENCLAW_CONFIG_PATH=str(self.config),
+                        CUSTOM_PROVIDER_KEY="fixture-custom-key", OPENCLAW_GATEWAY_TOKEN="fixture-gateway-key",
+                        NODE_OPTIONS="--trace-warnings", NODE_PATH=str(self.repo),
+                        BUN_OPTIONS="--preload=hostile.js", BASH_ENV=str(self.repo / "hostile.sh"),
+                        CODEX_HOME=str(self.repo / "hostile-auth"))
 
     def start_direct(self, *options, case="clean", timeout="8"):
         self.env["AUTOREVIEW_FAKE_CASE"] = case
         self.process = subprocess.Popen([
             sys.executable, str(native.SCRIPT), "--mode", "branch", "--base", self.base,
-            "--engine", "openclaw", "--openclaw-bin", str(self.binary), "--openclaw-config", str(self.config),
-            "--model", "fixture/reviewer", "--thinking", "high", "--engine-timeout-seconds", timeout,
-            "--json-output", str(self.report), "--status-output", str(self.status), *options],
+            "--engine", "openclaw", "--openclaw-bin", str(self.binary),
+            "--engine-timeout-seconds", timeout, "--json-output", str(self.report),
+            "--status-output", str(self.status), *options],
             cwd=self.repo, env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.processes.append(self.process)
         return self.process
@@ -88,34 +115,42 @@ if case == "exit-failure":
             self.assertFalse(Path(record["cwd"]).parent.exists(), "private runtime leaked")
         return records, stdout + stderr
 
-    def test_direct_cli_keeps_prompt_private_and_owns_restrictions(self):
-        config = self.root / "operator.json"
-        sentinel = self.root / "must-not-start-service"
-        unsafe_provider = self.provider | {
-            "localService": {"command": sys.executable,
-                             "args": ["-c", "from pathlib import Path; Path(" + repr(str(sentinel)) + ").touch()"],
-                             "cwd": str(self.repo)},
-            "agentRuntime": {"id": "external-runtime"},
-            "models": [self.provider["models"][0] | {"agentRuntime": {"id": "external-runtime"}}],
-        }
-        config.write_text(json.dumps({"models": {"providers": {"fixture": unsafe_provider, "unused": {"models": [{"id": "other"}]}}}, "tools": {"allow": ["*"]},
-                                     "agents": {"entries": {"unsafe": {"skills": ["all"]}}},
-                                     "plugins": {"allow": ["unsafe"]}, "env": {"UNSAFE": "value"}}))
-        self.start_direct("--openclaw-config", str(config))
-        records, _ = self.finish_direct(0)
+    def test_direct_inherits_native_selection_and_auth_with_sparse_restrictions(self):
+        original = self.config.read_bytes()
+        self.start_direct()
+        records, output = self.finish_direct(0)
         self.assertEqual(len(records), 1)
-        self.assertFalse(sentinel.exists(), "provider command escaped restricted configuration")
         record = records[0]
-        self.assertEqual(record["config"]["tools"], {"deny": ["*"], "codeMode": {"enabled": False}})
-        self.assertEqual(record["config"]["agents"]["entries"], {"main": {"skills": [], "contextInjection": "never"}})
-        self.assertEqual(record["config"]["agents"]["defaults"]["model"], {"primary": "fixture/reviewer", "fallbacks": []})
-        self.assertEqual(record["config"]["agents"]["defaults"]["models"]["fixture/reviewer"], {"agentRuntime": {"id": "openclaw"}})
-        self.assertEqual(record["config"]["plugins"], {"allow": []})
-        self.assertEqual(record["config"]["models"], {"providers": {"fixture": self.provider}})
-        self.assertFalse(record["ambient_present"])
+        self.assertEqual(record["override"], {
+            "tools": {"deny": ["*"], "toolSearch": False, "codeMode": {"enabled": False}},
+            "agents": {"defaults": {"skills": [], "contextInjection": "never", "model": {"fallbacks": []}},
+                       "entries": {"review": {"skills": [], "contextInjection": "never", "nativeRuntimeConsent": []},
+                                   "string-model": {"skills": [], "contextInjection": "never", "nativeRuntimeConsent": []},
+                                   "object-model": {"skills": [], "contextInjection": "never", "model": {"fallbacks": []}, "nativeRuntimeConsent": []}}}})
+        for option in ("--model", "--thinking", "--config", "--state-dir", "--isolated"):
+            self.assertNotIn(option, record["args"])
+        self.assertEqual(record["home"], str(self.home))
+        self.assertTrue(record["stored_auth"])
         self.assertTrue(record["provider_key_present"])
-        self.assertEqual(record["args"][record["args"].index("--thinking") + 1], "high")
+        self.assertTrue(record["custom_key_present"])
+        self.assertTrue(record["gateway_key_present"])
+        self.assertFalse(record["repo_auth_present"])
+        self.assertFalse(record["unsafe_env_present"])
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertIn("effective model: fixture/default", output)
         self.assertEqual(json.loads(self.status.read_text())["status"], "scoped-clean")
+
+    def test_explicit_options_override_canonical_environment_and_select_native_config(self):
+        selected = self.root / "selected.json"
+        selected.write_text('{"agents":{"defaults":{"model":"fixture/selected"}}}')
+        self.env.update(AUTOREVIEW_OPENCLAW_MODEL="fixture/configured", AUTOREVIEW_OPENCLAW_THINKING="low")
+        self.start_direct("--openclaw-config", str(selected), "--model", "fixture/explicit", "--thinking", "high")
+        records, output = self.finish_direct(0)
+        record = records[0]
+        self.assertEqual(record["config_path"], str(selected))
+        self.assertEqual(record["override"]["agents"]["defaults"], {"skills": [], "contextInjection": "never"})
+        self.assertEqual(record["args"][record["args"].index("--thinking") + 1], "high")
+        self.assertIn("effective model: fixture/explicit", output)
 
     def test_terminal_failures_never_retry_or_salvage_a_report(self):
         for case in ("malformed", "empty", "wrong-model", "invalid", "failed-envelope", "oversized", "exit-failure", "incomplete"):
@@ -123,7 +158,7 @@ if case == "exit-failure":
                 self.capture.unlink(missing_ok=True)
                 self.report.unlink(missing_ok=True)
                 self.status.unlink(missing_ok=True)
-                self.start_direct(case=case)
+                self.start_direct("--model", "fixture/reviewer", case=case)
                 records, output = self.finish_direct(2 if case == "incomplete" else 1)
                 self.assertEqual(len(records), 1)
                 self.assertNotIn("sensitive fixture diagnostic", output)
@@ -149,27 +184,27 @@ if case == "exit-failure":
                     os.kill(records[0]["pid"], 0)
                 self.assertFalse(self.report.exists())
 
-    def test_missing_catalog_and_repository_config_fail_before_cli_launch(self):
-        config = self.repo / "models.json"
-        config.write_text('{"models":{}}')
-        missing = self.root / "missing-model.json"
-        missing.write_text('{"models":{"providers":{}}}')
-        for candidate, message in ((str(config), "outside the reviewed repository"),
-                                   ("", "requires --openclaw-config"),
-                                   (str(missing), "selected models.providers catalog entry")):
+    def test_repository_config_and_native_config_failure_prevent_execution(self):
+        for candidate, message in ((self.repo / "config.json", "outside the reviewed repository"),
+                                   (self.root / "missing.json", "configuration could not be read")):
             with self.subTest(config=candidate):
-                self.start_direct("--openclaw-config", candidate)
+                self.start_direct("--openclaw-config", str(candidate))
                 records, output = self.finish_direct(1)
                 self.assertEqual(records, [])
                 self.assertIn(message, output)
+
+    def test_only_native_valid_unset_agents_uses_configless_defaults(self):
+        self.config.write_text("{}")
+        self.start_direct()
+        records, _ = self.finish_direct(0)
+        self.assertEqual(records[0]["override"]["agents"], {"defaults": {"skills": [], "contextInjection": "never", "model": {"fallbacks": []}}})
 
     def test_direct_config_environment_does_not_change_other_routes(self):
         parse = runpy.run_path(str(native.SCRIPT))["parse_args"]
         with mock.patch.dict(os.environ, {"AUTOREVIEW_OPENCLAW_CONFIG": str(self.config)}):
             for arguments, expected in ((["--engine", "codex"], None),
                                         (["--engine", "openclaw"], str(self.config)),
-                                        (["--engine", "openclaw", "--native-handoff", str(self.handoff),
-                                          "--engine-timeout-seconds", "10"], None)):
+                                        (["--engine", "openclaw", "--native-handoff", str(self.handoff)], None)):
                 with mock.patch.object(sys, "argv", [str(native.SCRIPT), *arguments]):
                     self.assertEqual(parse().openclaw_config, expected)
 
@@ -178,6 +213,11 @@ if case == "exit-failure":
         records, _ = self.finish_direct(0)
         self.assertEqual(records, [])
         self.assertFalse(self.report.exists())
+        self.binary.write_text(self.binary.read_text().replace("--config --config-override --cwd", "--config --cwd"))
+        self.start_direct("--dry-run")
+        records, output = self.finish_direct(1)
+        self.assertEqual(records, [])
+        self.assertIn("--config-override", output)
 
 
 if __name__ == "__main__":

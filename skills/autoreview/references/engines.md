@@ -106,9 +106,12 @@ Profile settings remain ignored. Force configured route before subscription atte
 ## OpenClaw
 
 `--engine openclaw` uses restricted `openclaw agent exec`, directly on a trusted
-host or through the bound sandbox `autoreview` tool. Select `--model provider/model`
-and `--thinking` explicitly for direct execution, and supply an external
-`--openclaw-config` containing the selected provider/model catalog. The helper owns the empty
-workspace, no-tools configuration, private prompt input, timeout and cleanup.
+host or through the bound sandbox `autoreview` tool. Omitted model and effort use
+normal OpenClaw selection; explicit helper options and environment settings retain
+their normal precedence. Direct execution inherits native configuration and
+authentication; optional `--openclaw-config` selects an external operator config.
+The helper owns review restrictions, the empty workspace, private prompt input,
+optional timeout and cleanup. Bound integrations apply current caller permissions
+before execution and return the admitted model for terminal validation.
 There is no child reviewer profile, model fallback or output-schema CLI dependency.
 See [execution and integration requirements](openclaw.md) before launch.

@@ -99,7 +99,10 @@ verified parent-relative patch; otherwise attribution stays unknown.
 - For the OpenClaw engine, use [restricted agent execution](references/openclaw.md):
   direct CLI on an authenticated host, or the bound `autoreview` tool inside an
   OpenClaw sandbox. With no explicit route and no eligible default CLI, use the
-  bound tool when available. Preserve explicit model and effort choices.
+  bound tool when available. Supply the target and explicitly requested overrides;
+  the helper owns review defaults, and native OpenClaw supplies configuration and
+  authentication. The bound integration admits the model under current caller
+  permissions before execution and reports the effective choice.
 - Use Claude only when requested or Codex is unavailable; explain why.
 
 Never switch review hosts after launch or to bypass missing context, isolation failures,

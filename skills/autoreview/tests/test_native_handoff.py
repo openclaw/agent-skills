@@ -64,7 +64,7 @@ class NativeHandoffTests(ReviewFixture):
         self.process = subprocess.Popen([
             sys.executable, str(SCRIPT), "--mode", "branch", "--base", self.base,
             "--engine", "openclaw", "--native-handoff", str(self.handoff),
-            "--engine-timeout-seconds", timeout, "--json-output", str(self.report),
+            *(["--engine-timeout-seconds", timeout] if timeout else []), "--json-output", str(self.report),
             "--status-output", str(self.status), *options],
             cwd=self.repo, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.processes.append(self.process)
@@ -133,6 +133,36 @@ class NativeHandoffTests(ReviewFixture):
         self.assertEqual(self.consumer(request).returncode, 0)
         self.finish(0)
         self.assertEqual(json.loads(self.report.read_text())["review_status"], "scoped-clean")
+
+    def test_request_carries_canonical_options_without_host_configuration(self):
+        self.env.update(AUTOREVIEW_OPENCLAW_MODEL="fixture/configured",
+                        AUTOREVIEW_OPENCLAW_THINKING="low")
+        self.start("--thinking", "high", timeout=None)
+        request = self.request()
+        self.assertEqual(request["model"], "fixture/configured")
+        self.assertEqual(request["thinking"], "high")
+        self.assertIsNone(request["engine_timeout_seconds"])
+        self.assertIs(request["admitted_model"], True)
+        self.assertNotIn("config_override", request)
+        self.assertNotIn("agent_override", request)
+        self.assertEqual(self.consumer(request).returncode, 0)
+        self.finish(0)
+
+    def test_admitted_model_is_validated_and_reported_without_a_default_timeout(self):
+        for actual in ("fixture/permitted", "fixture/unselected"):
+            with self.subTest(actual=actual):
+                self.report.unlink(missing_ok=True)
+                self.start("--model", "fixture/configured", timeout=None)
+                request = self.request()
+                self.deliver(request, modify=lambda response: response.update(
+                    model="fixture/permitted",
+                    output=self.completion(request | {"model": actual}, CLEAN)))
+                output = self.finish(0 if actual == "fixture/permitted" else 1)
+                if actual == "fixture/permitted":
+                    self.assertIn("effective model: fixture/permitted", output)
+                    self.assertEqual(json.loads(self.report.read_text())["review_status"], "scoped-clean")
+                else:
+                    self.assertFalse(self.report.exists())
 
     def test_real_finding_and_priority_filter_preserved(self):
         for threshold, code, status in (("P2", 1, "findings"), ("P0", 1, "filtered")):
