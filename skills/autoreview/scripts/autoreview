@@ -7353,7 +7353,7 @@ def openclaw_review_config(args: argparse.Namespace, repo: Path) -> dict[str, An
         raise SystemExit("OpenClaw configuration could not be read; run openclaw config get agents --json with the selected config") from None
 
 
-def openclaw_final_output(output: Any, model: str | None) -> str:
+def openclaw_final_output(output: Any, model: str | None, effective_models: list[str]) -> str:
     try:
         if not isinstance(output, str) or utf8_size(output) > 2_000_000:
             raise ValueError("missing or oversized completion")
@@ -7372,8 +7372,10 @@ def openclaw_final_output(output: Any, model: str | None) -> str:
                 raise ValueError("completion model differs from selected model")
         if all(isinstance(envelope.get(key), str) and envelope[key].strip()
                for key in ("provider", "model")):
-            print("effective model: " + display_escape(
-                f"{envelope['provider']}/{envelope['model']}", 500), flush=True)
+            actual = f"{envelope['provider']}/{envelope['model']}"
+            if actual not in effective_models:
+                effective_models.append(actual)
+            print("effective model: " + display_escape(actual, 500), flush=True)
         return final
     except (ValueError, RecursionError):
         # Provider output can contain credentials or prompt content. Only fixed
@@ -7454,7 +7456,7 @@ def run_openclaw(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                                     max_runtime_seconds=args.engine_timeout_seconds)
     if result.returncode:
         raise ReviewerUnavailable(f"OpenClaw review execution failed ({result.returncode}); no route retry", result=result)
-    return openclaw_final_output(result.stdout, args.model)
+    return openclaw_final_output(result.stdout, args.model, args.openclaw_models)
 
 
 def run_engine(args: argparse.Namespace, repo: Path, prompt: str) -> str:
@@ -8056,6 +8058,7 @@ class NativeHandoff:
         self.timeout = args.engine_timeout_seconds
         self.model = reviewer.model
         self.thinking = reviewer.thinking
+        self.effective_models = reviewer.openclaw_models
         parent = self.root.parent.stat()
         if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
             raise SystemExit("native handoff requires an owned private parent directory")
@@ -8146,7 +8149,7 @@ class NativeHandoff:
             if "model" in result and (not isinstance(model, str) or "/" not in model
                                       or not all(part.strip() for part in model.split("/", 1))):
                 raise ValueError("native result has no admitted model")
-            return openclaw_final_output(result["output"], model)
+            return openclaw_final_output(result["output"], model, self.effective_models)
         except (OSError, ValueError, RecursionError) as exc:
             raise ReviewerUnavailable(f"invalid native result: {exc}", reason="invalid_report") from None
 
@@ -8239,6 +8242,8 @@ def write_review_status(args: argparse.Namespace, status: str, exit_code: int,
     }
     if usage := review_usage_summary(args):
         envelope["usage"] = usage
+    if args.engine == "openclaw" and (models := getattr(args, "openclaw_models", None)):
+        envelope["effective_models"] = models
     atomic_write_text(Path(args.status_output), json.dumps(envelope, indent=2) + "\n")
 
 
@@ -8323,6 +8328,8 @@ def main_with_args(args: argparse.Namespace) -> int:
     print(f"autoreview target: {target}", flush=True)
     print(f"branch: {branch}", flush=True)
     reviewer = reviewers[0]
+    if reviewer.engine == "openclaw":
+        args.openclaw_models = reviewer.openclaw_models = []
     print(f"engine: {reviewer.engine}", flush=True)
     if reviewer.model:
         print(f"model: {reviewer.model}", flush=True)

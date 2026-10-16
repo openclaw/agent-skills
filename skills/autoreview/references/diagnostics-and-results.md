@@ -76,7 +76,10 @@ Read for output-path edge cases, machine status, usage accounting, local stage o
   `report_produced: true`, even with findings. Never publish private completion field.
 - Missing/invalid completion: invalid report, not unfinished.
 
-- Status contains no logs, prompts, findings, model identifiers.
+- Status contains no logs, prompts or findings. OpenClaw status may include
+  `effective_models`, the unique provider/model identities observed in validated
+  terminal responses; rejected or missing identities are not recorded. Other
+  engines' status fields are unchanged.
 - Bounded display-safe stderr diagnostics + command-auth suppression stay enabled.
 - Use a fresh status path for real reviews: after argument/path validation, remove
   old status before target selection.

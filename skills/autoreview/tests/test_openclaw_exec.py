@@ -139,6 +139,7 @@ if case == "exit-failure":
         self.assertEqual(self.config.read_bytes(), original)
         self.assertIn("effective model: fixture/default", output)
         self.assertEqual(json.loads(self.status.read_text())["status"], "scoped-clean")
+        self.assertEqual(json.loads(self.status.read_text())["effective_models"], ["fixture/default"])
 
     def test_explicit_options_override_canonical_environment_and_select_native_config(self):
         selected = self.root / "selected.json"
@@ -165,6 +166,8 @@ if case == "exit-failure":
                 status = json.loads(self.status.read_text())
                 self.assertEqual(status["status"], "incomplete" if case == "incomplete" else "reviewer_unavailable")
                 self.assertEqual(status["report_produced"], case == "incomplete")
+                if case == "wrong-model":
+                    self.assertNotIn("effective_models", status)
 
     def test_timeout_and_cancellation_settle_child_and_remove_runtime(self):
         for cancel in (False, True):

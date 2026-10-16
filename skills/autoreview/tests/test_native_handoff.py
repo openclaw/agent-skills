@@ -161,8 +161,10 @@ class NativeHandoffTests(ReviewFixture):
                 if actual == "fixture/permitted":
                     self.assertIn("effective model: fixture/permitted", output)
                     self.assertEqual(json.loads(self.report.read_text())["review_status"], "scoped-clean")
+                    self.assertEqual(json.loads(self.status.read_text())["effective_models"], ["fixture/permitted"])
                 else:
                     self.assertFalse(self.report.exists())
+                    self.assertNotIn("effective_models", json.loads(self.status.read_text()))
 
     def test_real_finding_and_priority_filter_preserved(self):
         for threshold, code, status in (("P2", 1, "findings"), ("P0", 1, "filtered")):
@@ -190,6 +192,7 @@ class NativeHandoffTests(ReviewFixture):
         report = json.loads(self.report.read_text())
         self.assertEqual(len(report["pass_reports"]), first["passes"])
         self.assertEqual(report["review_status"], "scoped-clean")
+        self.assertEqual(json.loads(self.status.read_text())["effective_models"], ["fixture/reviewer"])
 
     def test_response_larger_than_exec_output_budget_stays_complete(self):
         report = copy.deepcopy(CLEAN)

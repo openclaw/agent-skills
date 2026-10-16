@@ -156,6 +156,10 @@ or helper exit; never start passes early, resubmit, or resume an old exchange.
 
 Only the helper's final report/status determines the outcome. Preserve its distinction
 between findings, incomplete assessment, unavailable reviewer and scoped clean.
+The status receipt's optional `effective_models` lists validated terminal model
+identities across passes, including an admitted selection that differs from the
+configured preference. Return this metadata to the caller rather than parsing
+model output or relying on progress logs.
 Source changes prevent publication. On parent failure, stop and join both owned
 processes before cleanup. The helper removes its exchange on normal exit and handled
 interruption; after an unhandled kill, settle readers/writers before removing only
