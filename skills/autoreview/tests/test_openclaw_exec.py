@@ -28,9 +28,11 @@ class OpenClawExecTests(native.ReviewFixture):
         self.config.write_text(json.dumps({"agents": {
             "defaults": {"systemAgent": {"agentId": "review"},
                          "model": {"primary": "fixture/default", "fallbacks": ["fixture/backup"]}},
-            "entries": {"review": {"skills": ["ambient"], "contextInjection": "always", "nativeRuntimeConsent": ["codex"]},
+            "entries": {"review": {"skills": ["ambient"], "contextInjection": "always", "nativeRuntimeConsent": ["codex"],
+                                   "tools": {"alsoAllow": ["autoreview"], "byProvider": {"fixture": {"allow": ["read"]}}, "sandbox": {"tools": {"alsoAllow": ["read"]}}}},
                         "string-model": {"model": "fixture/string"},
                         "object-model": {"model": {"primary": "fixture/object", "fallbacks": ["fixture/backup"]}}}},
+            "tools": {"allow": ["read"], "byProvider": {"fixture": {"alsoAllow": ["read"]}}, "sandbox": {"tools": {"allow": ["read"]}}},
             "models": {"providers": {"fixture": {"apiKey": "${CUSTOM_PROVIDER_KEY}", "models": [{"id": "default"}]}}},
             "gateway": {"auth": {"token": "${OPENCLAW_GATEWAY_TOKEN}"}}}))
         self.binary.write_text("#!" + sys.executable + "\n" + r'''
@@ -47,11 +49,12 @@ try:
 except (OSError, ValueError):
     print(json.dumps({"ok": False, "error": {"type": "cli_error", "message": "invalid configuration"}}))
     raise SystemExit(1)
-if args == ["config", "get", "agents", "--json"]:
-    if "agents" not in base:
-        print(json.dumps({"ok": False, "error": {"type": "cli_error", "message": "Config path is valid but unset: agents. The runtime default applies until you set an authored value."}}))
+if len(args) == 4 and args[:2] == ["config", "get"] and args[-1] == "--json":
+    section = args[2]
+    if section not in base:
+        print(json.dumps({"ok": False, "error": {"type": "cli_error", "message": f"Config path is valid but unset: {section}. The runtime default applies until you set an authored value."}}))
         raise SystemExit(1)
-    print(json.dumps(base["agents"]))
+    print(json.dumps(base[section]))
     raise SystemExit()
 assert args[:2] == ["agent", "exec"]
 assert args[args.index("--message-file") + 1] == "-"
@@ -121,12 +124,14 @@ if case == "exit-failure":
         records, output = self.finish_direct(0)
         self.assertEqual(len(records), 1)
         record = records[0]
+        empty_grants = {"allow": [], "alsoAllow": [], "sandbox": {"tools": {"allow": [], "alsoAllow": []}}}
+        provider_grants = empty_grants | {"byProvider": {"fixture": {"allow": [], "alsoAllow": []}}}
         self.assertEqual(record["override"], {
-            "tools": {"deny": ["*"], "toolSearch": False, "codeMode": {"enabled": False}},
+            "tools": provider_grants | {"deny": ["*"], "toolSearch": False, "codeMode": {"enabled": False}},
             "agents": {"defaults": {"skills": [], "contextInjection": "never", "model": {"fallbacks": []}},
-                       "entries": {"review": {"skills": [], "contextInjection": "never", "nativeRuntimeConsent": []},
-                                   "string-model": {"skills": [], "contextInjection": "never", "nativeRuntimeConsent": []},
-                                   "object-model": {"skills": [], "contextInjection": "never", "model": {"fallbacks": []}, "nativeRuntimeConsent": []}}}})
+                       "entries": {"review": {"skills": [], "contextInjection": "never", "nativeRuntimeConsent": [], "tools": provider_grants},
+                                   "string-model": {"skills": [], "contextInjection": "never", "nativeRuntimeConsent": [], "tools": empty_grants},
+                                   "object-model": {"skills": [], "contextInjection": "never", "model": {"fallbacks": []}, "nativeRuntimeConsent": [], "tools": empty_grants}}}})
         for option in ("--model", "--thinking", "--config", "--state-dir", "--isolated"):
             self.assertNotIn(option, record["args"])
         self.assertEqual(record["home"], str(self.home))

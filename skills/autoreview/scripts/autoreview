@@ -7295,7 +7295,8 @@ def parse_args() -> argparse.Namespace:
 OPENCLAW_REVIEW_AGENT_OVERRIDE = {"nativeRuntimeConsent": []}
 
 
-def openclaw_review_overrides(agents: dict[str, Any] | None = None) -> dict[str, Any]:
+def openclaw_review_overrides(agents: dict[str, Any] | None = None,
+                             tools: dict[str, Any] | None = None) -> dict[str, Any]:
     # Apply review policy without selecting an owner or reconstructing inference
     # configuration. A string primary already disables native model fallbacks.
     agents = agents or {}
@@ -7306,12 +7307,23 @@ def openclaw_review_overrides(agents: dict[str, Any] | None = None) -> dict[str,
             result["model"] = {"fallbacks": []}
         return result
 
+    def tool_restrictions(policy: dict[str, Any]) -> dict[str, Any]:
+        # Deny-all owns enforcement; empty grants remove the native guard's
+        # expectation that an inherited explicit allowlist must yield a tool.
+        result: dict[str, Any] = {"allow": [], "alsoAllow": [],
+                                  "sandbox": {"tools": {"allow": [], "alsoAllow": []}}}
+        if providers := policy.get("byProvider"):
+            result["byProvider"] = {key: {"allow": [], "alsoAllow": []} for key in providers}
+        return result
+
     override: dict[str, Any] = {"defaults": restrictions(agents.get("defaults", {}), defaults=True)}
     if entries := agents.get("entries"):
         override["entries"] = {
-            key: restrictions(value) | OPENCLAW_REVIEW_AGENT_OVERRIDE for key, value in entries.items()
+            key: restrictions(value) | OPENCLAW_REVIEW_AGENT_OVERRIDE
+                 | {"tools": tool_restrictions(value.get("tools", {}))}
+            for key, value in entries.items()
         }
-    return {"agents": override, "tools": {
+    return {"agents": override, "tools": tool_restrictions(tools or {}) | {
         "deny": ["*"], "toolSearch": False, "codeMode": {"enabled": False},
     }}
 
@@ -7332,25 +7344,28 @@ def openclaw_review_config(args: argparse.Namespace, repo: Path) -> dict[str, An
         env = openclaw_runtime_env(repo, binary, root)
         if source := openclaw_config_file(args, repo):
             env["OPENCLAW_CONFIG_PATH"] = source
-        result = run_with_heartbeat([binary, "config", "get", "agents", "--json"], root,
-                                    label="openclaw configuration", env=env,
-                                    max_runtime_seconds=args.engine_timeout_seconds)
-    try:
-        agents = json.loads(result.stdout)
-        if not isinstance(agents, dict):
-            raise ValueError("invalid agents configuration")
-        if result.returncode:
-            error = agents.get("error")
-            if (agents.get("ok") is False and isinstance(error, dict)
-                    and error.get("type") == "cli_error"
-                    and isinstance(error.get("message"), str)
-                    and error["message"].startswith("Config path is valid but unset: agents.")):
-                agents = {}
-            else:
-                raise ValueError("native configuration read failed")
-        return openclaw_review_overrides(agents)
-    except (ValueError, TypeError, AttributeError, RecursionError):
-        raise SystemExit("OpenClaw configuration could not be read; run openclaw config get agents --json with the selected config") from None
+        sections: dict[str, dict[str, Any]] = {}
+        for section in ("agents", "tools"):
+            result = run_with_heartbeat([binary, "config", "get", section, "--json"], root,
+                                        label="openclaw configuration", env=env,
+                                        max_runtime_seconds=args.engine_timeout_seconds)
+            try:
+                value = json.loads(result.stdout)
+                if not isinstance(value, dict):
+                    raise ValueError("invalid configuration section")
+                if result.returncode:
+                    error = value.get("error")
+                    if (value.get("ok") is False and isinstance(error, dict)
+                            and error.get("type") == "cli_error"
+                            and isinstance(error.get("message"), str)
+                            and error["message"].startswith(f"Config path is valid but unset: {section}.")):
+                        value = {}
+                    else:
+                        raise ValueError("native configuration read failed")
+                sections[section] = value
+            except (ValueError, TypeError, AttributeError, RecursionError):
+                raise SystemExit(f"OpenClaw configuration could not be read; run openclaw config get {section} --json with the selected config") from None
+        return openclaw_review_overrides(sections["agents"], sections["tools"])
 
 
 def openclaw_final_output(output: Any, model: str | None, effective_models: list[str]) -> str:

@@ -22,7 +22,7 @@ Supply only the target and explicitly requested overrides. Canonical options and
 review model or effort override, native OpenClaw selects them from its normal
 configuration. `--model provider/model` and `--thinking` remain available.
 The trusted executable must support `agent exec --message-file --config-override
---cwd --model --thinking --json` and `config get agents --json`.
+--cwd --model --thinking --json` and `config get <section> --json`.
 `--openclaw-bin` or `OPENCLAW_BIN` can select an external trusted executable.
 `--dry-run` checks preparation and CLI support without contacting a provider.
 
@@ -38,8 +38,10 @@ inherited Git overrides and package-manager startup variables are excluded;
 PATH and known configuration, authentication and certificate paths keep their
 existing repository-local rejection. Environment values are never diagnostics.
 
-The helper reads `agents` once through the native configuration command and creates
-a sparse run-only override: deny tools and tool discovery, disable Code Mode, suppress skills and
+The helper reads the `agents` and `tools` sections once through the native
+configuration command and creates a sparse run-only override: deny tools and tool
+discovery, clear inherited tool grants in global, agent, provider and sandbox
+policies so intentional no-tools runs pass native validation, disable Code Mode, suppress skills and
 workspace context for defaults and existing agents, and clear configured object
 model fallbacks, including an empty chain when no primary is configured. String
 model selections stay intact. All other configuration,
