@@ -7962,6 +7962,24 @@ def run_review_passes(
     return chunk_reports
 
 
+def require_output_ready(path: Path, option: str) -> None:
+    try:
+        if path.is_dir() and not path.is_symlink():
+            raise OSError("output destination is a directory")
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent, prefix=".autoreview-output-probe.", delete=False,
+        ) as handle:
+            probe = Path(handle.name)
+        try:
+            atomic_write_text(probe, "autoreview output preflight\n")
+        finally:
+            probe.unlink(missing_ok=True)
+    except OSError:
+        raise SystemExit(
+            f"{option} output destination is not writable: {display_escape(path, 500)}"
+        ) from None
+
+
 def prepare_output_paths(args: argparse.Namespace, repo: Path) -> None:
     """Validate all destinations, then freeze their original cwd/tilde meaning."""
     repo_root_path = repo.resolve()
@@ -8037,6 +8055,15 @@ def prepare_output_paths(args: argparse.Namespace, repo: Path) -> None:
                     key = tuple(unicodedata.normalize("NFD", part).casefold() for part in candidate.parts)
                     if key[:len(handoff_key)] == handoff_key:
                         raise SystemExit("review outputs must stay outside --native-handoff (removed on exit)")
+
+    for option, attribute in (
+        ("--json-output", "json_output"),
+        ("--output", "output"),
+        ("--status-output", "status_output"),
+        ("--preflight-output", "preflight_output"),
+    ):
+        if destination := destinations.get(attribute):
+            require_output_ready(Path(destination), option)
 
 
 def atomic_write_text(path: Path, content: str) -> None:
