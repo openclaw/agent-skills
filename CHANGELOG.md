@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Review submodule gitlink additions, bumps and removals as exact pin metadata with selected `.gitmodules` URLs, preserving isolated Git/authentication and explicit upstream-code scope.
+
 - Run OpenClaw reviews through restricted agent execution, preserving canonical capture and validation with a bounded sandbox handoff; clarify yielding and process ownership. Thanks @shakkernerd. (#323, #325, #326)
 - Document independent Copilot subagent reviews when the Codex CLI is unavailable, keeping model access separate from local CLI availability. Thanks @shanselman. (#324)
 

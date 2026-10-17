@@ -21,6 +21,7 @@ TEST_MODULES = {
         "skills.autoreview.tests.test_codex_inference_route",
         "skills.autoreview.tests.test_git_line_endings",
         "skills.autoreview.tests.test_git_boundary",
+        "skills.autoreview.tests.test_gitlinks",
         "skills.autoreview.tests.test_git_filter_collection",
         "skills.autoreview.tests.test_engine_stage",
         "skills.autoreview.tests.test_terminal_report_authority",

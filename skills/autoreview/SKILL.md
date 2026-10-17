@@ -56,6 +56,10 @@ Choose the target explicitly when ambiguous:
 | Committed branch/PR | `--mode branch --base <ref>` | Merge-base → HEAD; excludes dirty work |
 | One commit | `--mode commit --commit <ref>` | Raw parent → commit; root compares against empty tree |
 
+Gitlink bumps include full old/new IDs and selected `.gitmodules` URLs as pin
+metadata; upstream contents are not automatically fetched or reviewed. See
+[submodule pin scope](references/git-and-context.md#submodule-pins).
+
 `auto` selects local when dirty, otherwise branch using the PR base or `origin/main`.
 Clean main has no implicit target. `uncommitted` aliases local. The helper never fetches.
 For a complete PR candidate including dirty rewrites, pin the merge base:
