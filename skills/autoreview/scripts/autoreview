@@ -1281,16 +1281,18 @@ def _signal_owned_process_group(proc: subprocess.Popen) -> bool:
         if taskkill is None:
             return True
         try:
-            result = subprocess.run(
+            subprocess.run(
                 [taskkill, "/PID", str(proc.pid), "/T", "/F"],
                 capture_output=True,
                 text=True,
                 timeout=_OWNED_PROCESS_GRACE_SECONDS,
                 check=False,
             )
-            return bool(result.returncode)
         except (OSError, subprocess.TimeoutExpired):
-            return True
+            pass
+        # taskkill success does not collect this Popen's exit status. Always
+        # wait on its process handle, then enforce if termination is pending.
+        return True
     try:
         os.killpg(proc.pid, signal.SIGTERM)
         return True
