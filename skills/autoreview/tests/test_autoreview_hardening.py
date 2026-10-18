@@ -5429,6 +5429,56 @@ class AutoreviewHardeningTests(unittest.TestCase):
         self.assertNotEqual(argv[0], "taskkill")
         proc.kill.assert_not_called()
 
+    def test_successful_windows_taskkill_still_waits_for_owned_processes(self) -> None:
+        for batched in (False, True):
+            for force_required in (False, True):
+                with self.subTest(batched=batched, force_required=force_required):
+                    events = []
+                    processes = []
+                    for pid in ((1234, 5678) if batched else (1234,)):
+                        proc = mock.Mock(pid=pid, returncode=None)
+                        proc.poll.side_effect = lambda proc=proc: proc.returncode
+
+                        def wait(*, timeout, proc=proc):
+                            events.append(("wait", proc.pid))
+                            self.assertGreater(timeout, 0)
+                            if force_required and not proc.kill.called:
+                                raise subprocess.TimeoutExpired("reviewer", timeout)
+                            proc.returncode = 1
+                            return proc.returncode
+
+                        proc.wait.side_effect = wait
+                        processes.append(proc)
+
+                    def taskkill(argv, **kwargs):
+                        events.append(("signal", int(argv[2])))
+                        # Success can precede the owned handle becoming signaled.
+                        self.assertTrue(all(proc.returncode is None for proc in processes))
+                        return subprocess.CompletedProcess(argv, 0)
+
+                    with mock.patch.object(os, "name", "nt"), mock.patch.dict(
+                        self.helper["terminate_process_group"].__globals__,
+                        {"_resolve_windows_taskkill": lambda: r"C:\Windows\System32\taskkill.exe"},
+                    ), mock.patch("subprocess.run", side_effect=taskkill):
+                        if batched:
+                            for proc in processes:
+                                self.helper["register_owned_process"](proc)
+                            try:
+                                self.helper["terminate_owned_processes"]()
+                            finally:
+                                for proc in processes:
+                                    self.helper["unregister_owned_process"](proc)
+                        else:
+                            self.helper["terminate_process_group"](processes[0])
+
+                    self.assertEqual(events[:len(processes)], [
+                        ("signal", proc.pid) for proc in processes
+                    ])
+                    for proc in processes:
+                        self.assertIsNotNone(proc.returncode)
+                        self.assertEqual(proc.wait.call_count, 2 if force_required else 1)
+                        self.assertEqual(proc.kill.call_count, int(force_required))
+
     def test_terminate_process_group_skips_taskkill_when_unresolved(self) -> None:
         proc = mock.Mock(pid=1234)
         proc.poll.return_value = None
