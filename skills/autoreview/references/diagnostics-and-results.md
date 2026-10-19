@@ -41,6 +41,11 @@ Read for output-path edge cases, machine status, usage accounting, local stage o
 - Conservatively refuse case-only/Unicode-normalization aliases on every platform.
 - Tilde/relative paths expand once, anchored to invocation directory.
 - Atomic writes replace final symlink; never modify its target.
+- After path and alias checks, probe report parents for file creation, writing,
+  and atomic replacement before target selection or reviewer startup. Existing
+  reports remain untouched; missing parents are not created. This checks current
+  storage readiness, not capacity or permissions for a later report write.
+  Existing read-only Windows report entries are refused before the probe.
 
 - Event streams: non-null `structured_output` must contain report object;
   only absent/null permits `result`. Last terminal event authoritative.

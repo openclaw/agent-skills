@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Check report output readiness before starting Autoreview, preserving existing reports and refusing unusable destinations early. Thanks @JeanFrancoisGagne.
 - Run native macOS sandbox and Git-boundary CI checks on the `xcode-27` Apple Silicon image.
 
 ## 0.6.0 - 2026-10-18
