@@ -213,7 +213,7 @@ python scripts/check-skills
 The check command runs frontmatter validation, syntax checks, all Python and
 Node tests, and `npm run typecheck` for the session viewer. The Node packages
 are development-only; installed skills do not need `npm install`. The separate
-macOS CI job installs a pinned Codex CLI to exercise native sandbox access
+macOS CI job uses the `xcode-27` Apple Silicon runner and installs a pinned Codex CLI to exercise native sandbox access
 controls without a reviewer account or provider request.
 
 For a quick frontmatter-only check, run `scripts/validate-skills`. It checks

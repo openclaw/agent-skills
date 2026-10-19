@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Run native macOS sandbox and Git-boundary CI checks on the `xcode-27` Apple Silicon image.
+
 ## 0.6.0 - 2026-10-18
 
 - Allow release tags signed by @vincentkoc's registered SSH signing key alongside the existing release signer.
