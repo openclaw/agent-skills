@@ -2904,6 +2904,123 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     with self.assertRaisesRegex(SystemExit, "sensitive|unsafe"):
                         self.helper["validate_evidence_file"](repo, rel, "--dataset")
 
+    def test_explicit_empty_local_runs_reviewer_and_validates_outcomes(self) -> None:
+        report = {
+            "findings": [], "overall_correctness": "patch is correct",
+            "overall_explanation": "Synthetic empty-scope review.",
+            "overall_confidence": 0.9, "review_completion": "complete",
+        }
+        cases = (
+            ("local", "complete", 0, "scoped-clean"),
+            ("branch", "complete", 0, "scoped-clean"),
+            ("local", "incomplete", 2, "incomplete"),
+            ("local", "incorrect", 1, "incorrect"),
+            ("local", "invalid", None, "reviewer_unavailable"),
+            ("local", "failed", None, "reviewer_unavailable"),
+            ("local", "drift", 1, None),
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            source = repo / "source.txt"
+            source.write_text("base\n", encoding="utf-8")
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "base")
+            base = git(repo, "rev-parse", "HEAD").strip()
+            source.write_text("head\n", encoding="utf-8")
+            git(repo, "commit", "-qam", "head")
+            head = git(repo, "rev-parse", "HEAD").strip()
+            git(repo, "restore", "--source", base, "--staged", "--worktree", ".")
+            self.assertNotEqual(head, base)
+            self.assertTrue(git(repo, "status", "--porcelain"))
+            self.assertEqual(git(repo, "diff", "--cached", base), "")
+            self.assertEqual(git(repo, "diff"), "")
+            for mode, outcome, exit_code, status in cases:
+                with self.subTest(mode=mode, outcome=outcome):
+                    outputs = root / f"{mode}-{outcome}"
+                    outputs.mkdir()
+                    sends = []
+
+                    def engine(_args, _repo, prompt):
+                        sends.append(prompt)
+                        if outcome == "failed":
+                            raise self.helper["ReviewerUnavailable"]("synthetic engine failure")
+                        if outcome == "invalid":
+                            return json.dumps({"findings": []})
+                        if outcome == "drift":
+                            source.write_text("changed during review\n", encoding="utf-8")
+                        response = dict(report)
+                        if outcome == "incomplete":
+                            response["review_completion"] = "incomplete"
+                        if outcome == "incorrect":
+                            response["overall_correctness"] = "patch is incorrect"
+                        return json.dumps(response)
+
+                    argv = [str(SCRIPT), "--engine", "codex", "--mode", mode,
+                            "--base", base if mode == "local" else head,
+                            "--json-output", str(outputs / "report.json"),
+                            "--status-output", str(outputs / "status.json")]
+                    with self.without_reviewer_defaults(), mock.patch.dict(self.helper["main_impl"].__globals__, {
+                        "repo_root": lambda: repo, "run_engine": engine,
+                    }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        if exit_code is None:
+                            with self.assertRaises(self.helper["ReviewerUnavailable"]):
+                                self.helper["main_impl"]()
+                        else:
+                            self.assertEqual(self.helper["main_impl"](), exit_code)
+                    self.assertEqual(len(sends), 1)
+                    if mode == "local":
+                        self.assertIn(f"base: {base}", sends[0])
+                        self.assertIn("Zero selected changes", sends[0])
+                        self.assertIn("Git status is relative to HEAD", sends[0])
+                        self.assertNotIn("diff --git", sends[0])
+                    if status:
+                        result = json.loads((outputs / "status.json").read_text())
+                        self.assertEqual(result["status"], status)
+                        self.assertEqual(result["report_produced"], exit_code is not None)
+                    else:
+                        self.assertFalse((outputs / "status.json").exists())
+                    if exit_code is None or outcome == "drift":
+                        self.assertFalse((outputs / "report.json").exists())
+                    else:
+                        result = json.loads((outputs / "report.json").read_text())
+                        self.assertEqual(result["review_status"], status)
+                        self.assertEqual(result["findings"], [])
+                        self.assertEqual(result["overall_explanation"], report["overall_explanation"])
+                    self.assertEqual(git(repo, "rev-parse", "HEAD").strip(), head)
+                    self.assertEqual(git(repo, "diff", "--cached", base), "")
+
+    def test_empty_scope_excludes_omissions_and_undone_staged_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            source = repo / "source.txt"
+            source.write_text("base\n", encoding="utf-8")
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "base")
+            base = git(repo, "rev-parse", "HEAD").strip()
+            with self.assertRaisesRegex(SystemExit, "no local changes to review"):
+                self.helper["local_bundle"](repo)
+            sensitive = repo / ".env"
+            sensitive.write_text("SYNTHETIC_OMISSION\n", encoding="utf-8")
+            for staged in (False, True):
+                if staged:
+                    git(repo, "add", ".env")
+                captured = self.helper["local_bundle"](repo, base)
+                self.assertEqual(captured.paths, set())
+                self.assertIn("# Review Input Omissions", captured.text)
+                self.assertNotIn("Zero selected changes", captured.text)
+                self.assertNotIn("SYNTHETIC_OMISSION", captured.text)
+            git(repo, "rm", "-f", ".env")
+            source.write_text("staged defect\n", encoding="utf-8")
+            git(repo, "add", "source.txt")
+            source.write_text("base\n", encoding="utf-8")
+            captured = self.helper["local_bundle"](repo, base)
+            self.assertEqual(captured.paths, {"source.txt"})
+            self.assertIn("+staged defect", captured.text)
+            self.assertIn("-staged defect", captured.text)
+            self.assertNotIn("Zero selected changes", captured.text)
+            self.assertEqual(len(captured.mixed), 1)
+
     def test_complete_candidate_scope_and_local_results_remain_honest(self) -> None:
         source = "Sources/Configuration/CredentialFile.swift"
         untracked = "Runtime/Configuration/CredentialFile.swift"

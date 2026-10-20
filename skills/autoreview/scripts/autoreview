@@ -3256,12 +3256,14 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
     omitted_tracked = len(
         tracked_sensitive_paths(staged_paths) | tracked_sensitive_paths(unstaged_paths)
     )
-    if (
+    empty_scope = (
         not staged_patch.strip()
         and not unstaged_patch.strip()
         and not untracked
+        and not omitted_tracked
         and not omitted_untracked
-    ):
+    )
+    if empty_scope and base_ref is None:
         raise SystemExit("no local changes to review")
     staged_blocked_paths = tracked_sensitive_paths(staged_paths)
     unstaged_blocked_paths = tracked_sensitive_paths(unstaged_paths)
@@ -3331,6 +3333,13 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
             if rel in mixed_paths:
                 owned_parts[len(parts) - 1] = ([(rel, parts[-1])], "working_tree")
     parts.extend(part for part in (staged_links, unstaged_links) if part)
+    if empty_scope:
+        parts.append(
+            "# Selected Local Scope\n"
+            f"base: {base_ref}\n"
+            "Zero selected changes: base, index and working tree agree; no untracked inputs.\n"
+            "Git status is relative to HEAD and does not define this base-relative scope."
+        )
     spans = []
     offset = 0
     transitions = {"index": {}, "working_tree": {}}

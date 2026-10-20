@@ -70,6 +70,12 @@ merge_base=$(git merge-base HEAD "origin/$pr_base")
 python3 "$AUTOREVIEW" --mode local --base "$merge_base"
 ```
 
+An explicit local base with zero selected changes still runs the reviewer, like
+an empty branch scope. A complete validated report may be `scoped-clean` for that
+empty delta; it does not certify the whole repository. Capture failures, omitted
+inputs and incomplete or failed reviews retain their existing handling. Local
+mode without a base still refuses an empty candidate.
+
 Staged and unstaged states are reviewed; index defects remain actionable despite
 working-tree fixes (`INDEX-only`). Same-repo nested linked checkouts are excluded;
 ordinary adjacent files remain in scope. For filters, line endings, locations,
