@@ -134,7 +134,7 @@ if case == "exit-failure":
                                    "object-model": {"skills": [], "contextInjection": "never", "model": {"fallbacks": []}, "nativeRuntimeConsent": [], "tools": empty_grants}}}})
         for option in ("--model", "--thinking", "--config", "--state-dir", "--isolated"):
             self.assertNotIn(option, record["args"])
-        self.assertEqual(record["home"], str(self.home))
+        self.assertEqual(record["home"], str(self.home.resolve()))
         self.assertTrue(record["stored_auth"])
         self.assertTrue(record["provider_key_present"])
         self.assertTrue(record["custom_key_present"])
