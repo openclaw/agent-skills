@@ -38,5 +38,5 @@ jobs:
       test-command: |
         python3 -m venv "$RUNNER_TEMP/release-venv"
         "$RUNNER_TEMP/release-venv/bin/pip" install -r requirements-dev.txt
-        npx --yes --package=node@26.10.0 --call 'npm ci --ignore-scripts'
-        PATH="$RUNNER_TEMP/release-venv/bin:$PATH" npx --yes --package=node@26.10.0 --call 'python scripts/check-skills'
+        npx --yes --package=node@26.12.1 --call 'npm ci --ignore-scripts'
+        PATH="$RUNNER_TEMP/release-venv/bin:$PATH" npx --yes --package=node@26.12.1 --call 'python scripts/check-skills'
