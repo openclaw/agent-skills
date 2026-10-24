@@ -2854,31 +2854,31 @@ class AutoreviewHardeningTests(unittest.TestCase):
             if mixed:
                 names.append("mixed.txt")
             for name in names:
-                (repo / name).write_text("base\n", encoding="utf-8")
-            (repo / ".gitignore").write_text("evidence/\n", encoding="utf-8")
+                (repo / name).write_bytes(b"base\n")
+            (repo / ".gitignore").write_bytes(b"evidence/\n")
             git(repo, "add", ".")
             git(repo, "commit", "-qm", "old head")
             old_head = git(repo, "rev-parse", "HEAD").strip()
             upstream = repo / "upstream"
             upstream.mkdir()
             for number in range(1800):
-                (upstream / f"{number:04d}-{'baseline-' * 18}.txt").write_text("upstream\n", encoding="utf-8")
+                (upstream / f"{number:04d}-{'baseline-' * 18}.txt").write_bytes(b"upstream\n")
             git(repo, "add", ".")
             git(repo, "commit", "-qm", "advanced base")
             base = git(repo, "rev-parse", "HEAD").strip()
             git(repo, "branch", "review-base")
             git(repo, "reset", "--soft", old_head)
-            (repo / "staged.txt").write_text("staged candidate\n", encoding="utf-8")
-            (repo / "added.txt").write_text("added candidate\n", encoding="utf-8")
+            (repo / "staged.txt").write_bytes(b"staged candidate\n")
+            (repo / "added.txt").write_bytes(b"added candidate\n")
             git(repo, "add", "staged.txt", "added.txt")
             git(repo, "rm", "-q", "deleted-index.txt")
-            (repo / "unstaged.txt").write_text("unstaged candidate\n", encoding="utf-8")
+            (repo / "unstaged.txt").write_bytes(b"unstaged candidate\n")
             (repo / "deleted-working.txt").unlink()
-            (repo / "notes.txt").write_text("untracked candidate\n", encoding="utf-8")
+            (repo / "notes.txt").write_bytes(b"untracked candidate\n")
             if mixed:
-                (repo / "mixed.txt").write_text("INDEX-only defect\n", encoding="utf-8")
+                (repo / "mixed.txt").write_bytes(b"INDEX-only defect\n")
                 git(repo, "add", "mixed.txt")
-                (repo / "mixed.txt").write_text("base\n", encoding="utf-8")
+                (repo / "mixed.txt").write_bytes(b"base\n")
             yield root, repo, base, old_head
 
     def test_local_status_preserves_diff_codes_and_quotes_paths(self) -> None:
@@ -2972,7 +2972,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
                             self.assertEqual(main(), exit_code)
                         self.assertGreater(len(sends), 1)
                         for number in range(43):
-                            self.assertTrue(any(f"# Dataset: evidence/context-{number}.txt" in p for p in sends))
+                            header = f"# Dataset: {Path(f'evidence/context-{number}.txt')}"
+                            self.assertTrue(any(header in p for p in sends))
                         result = json.loads((root / "report.json").read_text())
                         self.assertEqual(result["review_status"], status)
                         self.assertEqual(result["findings"], [])
