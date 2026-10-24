@@ -3043,12 +3043,19 @@ def collect_untracked_file_snapshots(
     return included, omitted
 
 
-def local_status(repo: Path, untracked: list[str], *, redact: bool = False) -> str:
+def local_status(staged_raw: str, unstaged_raw: str, untracked: list[str], *, redact: bool = False) -> str:
     if redact:
         return REVIEW_SECURITY_OMISSION
-    status = git(repo, "status", "--short", "--untracked-files=no").rstrip()
-    lines = [status] if status else []
-    lines.extend(f"?? {rel}" for rel in untracked)
+    # Reuse the exact no-renames diff queues, not a fresh HEAD-relative status.
+    # The selected base may be ahead of HEAD while its tree is already staged.
+    changes: dict[str, list[str]] = {}
+    for column, raw in enumerate((staged_raw, unstaged_raw)):
+        records = raw.split("\0")
+        for metadata, path in zip(records[::2], records[1::2]):
+            changes.setdefault(path, [" ", " "])[column] = metadata.split()[-1]
+    lines = ["Columns: base -> index, index -> working_tree; ?? untracked. Paths are JSON strings."]
+    lines.extend(f"{''.join(changes[path])} {json.dumps(path)}" for path in sorted(changes))
+    lines.extend(f"?? {json.dumps(rel)}" for rel in untracked)
     return "\n".join(lines)
 
 
@@ -3288,7 +3295,8 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
     parts = [
         "# Git Status",
         local_status(
-            repo,
+            staged_raw,
+            unstaged_raw,
             untracked,
             redact=bool(omitted_tracked or omitted_untracked),
         ),
@@ -3337,8 +3345,7 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
         parts.append(
             "# Selected Local Scope\n"
             f"base: {base_ref}\n"
-            "Zero selected changes: base, index and working tree agree; no untracked inputs.\n"
-            "Git status is relative to HEAD and does not define this base-relative scope."
+            "Zero selected changes: base, index and working tree agree; no untracked inputs."
         )
     spans = []
     offset = 0

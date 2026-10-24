@@ -6,6 +6,10 @@
   scope; presence/edits do not make parent dirty. Ordinary adjacent files stay included.
 - Revalidate worktree boundaries without changing Git ignore rules.
 
+- Local status columns come from the captured base → index and index → working-tree
+  diff queues, not a separate HEAD-relative status. Paths are JSON strings; renames
+  appear as add/delete transitions, matching the no-renames patches.
+
 - Git display settings cannot suppress context markers or add patch colors;
   repository configuration unchanged. Source paths/text retain literal whitespace.
 - Empty present source: line 1, column 1, empty excerpt. Empty physical lines:

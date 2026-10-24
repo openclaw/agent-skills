@@ -2844,6 +2844,142 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "refusing binary changes"):
                 self.helper["local_bundle"](repo)
 
+    @contextlib.contextmanager
+    def advanced_local_base(self, *, mixed=False):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            git(repo, "config", "core.autocrlf", "false")
+            names = ["staged.txt", "unstaged.txt", "deleted-index.txt", "deleted-working.txt"]
+            if mixed:
+                names.append("mixed.txt")
+            for name in names:
+                (repo / name).write_text("base\n", encoding="utf-8")
+            (repo / ".gitignore").write_text("evidence/\n", encoding="utf-8")
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "old head")
+            old_head = git(repo, "rev-parse", "HEAD").strip()
+            upstream = repo / "upstream"
+            upstream.mkdir()
+            for number in range(1800):
+                (upstream / f"{number:04d}-{'baseline-' * 18}.txt").write_text("upstream\n", encoding="utf-8")
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "advanced base")
+            base = git(repo, "rev-parse", "HEAD").strip()
+            git(repo, "branch", "review-base")
+            git(repo, "reset", "--soft", old_head)
+            (repo / "staged.txt").write_text("staged candidate\n", encoding="utf-8")
+            (repo / "added.txt").write_text("added candidate\n", encoding="utf-8")
+            git(repo, "add", "staged.txt", "added.txt")
+            git(repo, "rm", "-q", "deleted-index.txt")
+            (repo / "unstaged.txt").write_text("unstaged candidate\n", encoding="utf-8")
+            (repo / "deleted-working.txt").unlink()
+            (repo / "notes.txt").write_text("untracked candidate\n", encoding="utf-8")
+            if mixed:
+                (repo / "mixed.txt").write_text("INDEX-only defect\n", encoding="utf-8")
+                git(repo, "add", "mixed.txt")
+                (repo / "mixed.txt").write_text("base\n", encoding="utf-8")
+            yield root, repo, base, old_head
+
+    def test_local_status_preserves_diff_codes_and_quotes_paths(self) -> None:
+        # Raw no-renames transitions, including deletion/re-addition and type changes.
+        staged = ":100644 000000 aaaa 0000 D\0old name.txt\0:100644 120000 aaaa bbbb T\0link.txt\0"
+        unstaged = ":120000 120000 bbbb 0000 M\0link.txt\0"
+        untracked = ["old name.txt", 'line\n\t"雪.txt']
+        status = self.helper["local_status"](staged, unstaged, untracked)
+        self.assertEqual(status.splitlines()[1:], [
+            'TM "link.txt"', 'D  "old name.txt"', '?? "old name.txt"',
+            "?? " + json.dumps(untracked[1]),
+        ])
+        self.assertEqual(self.helper["local_status"](staged, unstaged, untracked, redact=True),
+                         self.helper["REVIEW_SECURITY_OMISSION"])
+
+    def test_local_status_matches_captured_base_index_and_working_transitions(self) -> None:
+        with self.advanced_local_base(mixed=True) as (_root, repo, base, old_head):
+            head_status = git(repo, "status", "--short", "--untracked-files=no")
+            self.assertGreater(len(head_status.encode()), 300_000)
+            before = self.helper["source_tree_snapshot"](repo)
+            captured = self.helper["local_bundle"](repo, "review-base")
+            status = captured.text.split("# Git Status\n\n", 1)[1].split("\n\n# Staged Diff", 1)[0]
+            self.assertNotIn("upstream/", status)
+            self.assertIn("base -> index", status)
+            self.assertIn("index -> working_tree", status)
+            for line in ('A  "added.txt"', 'D  "deleted-index.txt"', ' D "deleted-working.txt"',
+                         'MM "mixed.txt"', 'M  "staged.txt"', ' M "unstaged.txt"', '?? "notes.txt"'):
+                self.assertIn(line, status.splitlines())
+            self.assertEqual(captured.paths, {
+                "added.txt", "deleted-index.txt", "deleted-working.txt", "mixed.txt",
+                "staged.txt", "unstaged.txt", "notes.txt",
+            })
+            for args in (("--cached", base), ()):
+                patch = self.helper["git"](repo, "diff", *self.helper["SAFE_DIFF_FLAGS"], *args)
+                self.assertIn(patch.rstrip(), captured.text)
+            self.assertIn('path: "notes.txt"', captured.text)
+            record, = captured.mixed
+            self.assertEqual(record.path, "mixed.txt")
+            self.assertEqual(record.base.content, "base\n")
+            self.assertEqual(record.index.content, "INDEX-only defect\n")
+            self.assertEqual(record.working_tree.content, "base\n")
+            self.assertIn("+INDEX-only defect", captured.text)
+            self.assertIn("-INDEX-only defect", captured.text)
+            self.assertEqual(self.helper["source_tree_snapshot"](repo), before)
+            self.assertEqual(git(repo, "rev-parse", "HEAD").strip(), old_head)
+
+    def test_advanced_local_base_user_path_avoids_upstream_only_partitions(self) -> None:
+        with self.advanced_local_base() as (root, repo, base, old_head):
+            evidence = repo / "evidence"
+            evidence.mkdir()
+            datasets = []
+            for number in range(43):
+                rel = f"evidence/context-{number}.txt"
+                (repo / rel).write_text(f"context {number}\n" + "evidence\n" * 2100, encoding="utf-8")
+                datasets.extend(("--dataset", rel))
+            captured = self.helper["local_bundle"](repo, base)
+            self.assertEqual(captured.mixed, ())
+            before = self.helper["source_tree_snapshot"](repo)
+            sends = []
+
+            def engine(_args, _repo, prompt):
+                sends.append(prompt)
+                self.assertNotIn("upstream/", prompt)
+                self.assertIn(captured.text, prompt)
+                self.assertLessEqual(len(prompt.encode()), self.helper["MAX_REVIEW_PROMPT_BYTES"])
+                return json.dumps({
+                    "findings": [], "overall_correctness": "patch is correct",
+                    "overall_explanation": "Synthetic candidate assessment.", "overall_confidence": 0.9,
+                    "review_completion": completion,
+                })
+
+            main = self.helper["main_impl"]
+            argv = [str(SCRIPT), "--engine", "codex", "--mode", "local", "--base", "review-base",
+                    *datasets, "--json-output", str(root / "report.json"),
+                    "--status-output", str(root / "status.json")]
+            with self.without_reviewer_defaults(), mock.patch.dict(main.__globals__, {
+                "repo_root": lambda: repo, "run_engine": engine,
+                "resolve_engine_binary": lambda _reviewer, _repo: (True, None),
+            }):
+                output = io.StringIO()
+                with mock.patch.object(sys, "argv", [*argv, "--dry-run"]), contextlib.redirect_stdout(output):
+                    self.assertEqual(main(), 0)
+                self.assertIn("prompt: OK", output.getvalue())
+                self.assertEqual(sends, [])
+                self.assertFalse((root / "status.json").exists())
+                self.assertFalse((root / "report.json").exists())
+                for completion, exit_code, status in (("complete", 0, "scoped-clean"), ("incomplete", 2, "incomplete")):
+                    with self.subTest(completion=completion):
+                        sends.clear()
+                        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+                            self.assertEqual(main(), exit_code)
+                        self.assertGreater(len(sends), 1)
+                        for number in range(43):
+                            self.assertTrue(any(f"# Dataset: evidence/context-{number}.txt" in p for p in sends))
+                        result = json.loads((root / "report.json").read_text())
+                        self.assertEqual(result["review_status"], status)
+                        self.assertEqual(result["findings"], [])
+                        self.assertEqual(json.loads((root / "status.json").read_text())["status"], status)
+            self.assertEqual(self.helper["source_tree_snapshot"](repo), before)
+            self.assertEqual(git(repo, "rev-parse", "HEAD").strip(), old_head)
+
     def test_local_base_pins_named_ref_and_rejects_invalid_refs(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
@@ -2972,7 +3108,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     if mode == "local":
                         self.assertIn(f"base: {base}", sends[0])
                         self.assertIn("Zero selected changes", sends[0])
-                        self.assertIn("Git status is relative to HEAD", sends[0])
+                        self.assertIn("Columns: base -> index, index -> working_tree", sends[0])
                         self.assertNotIn("diff --git", sends[0])
                     if status:
                         result = json.loads((outputs / "status.json").read_text())
