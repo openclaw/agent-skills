@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Pin the Linux installed-source helper check to Python 3.11.18 for its patched certificate trust, while retaining the existing compatibility matrix. Thanks @joshavant. (#341)
+
 - Check report output readiness before starting Autoreview, preserving existing reports and refusing unusable destinations early. Thanks @JeanFrancoisGagne.
 - Run native macOS sandbox and Git-boundary CI checks on the `xcode-27` Apple Silicon image.
 
