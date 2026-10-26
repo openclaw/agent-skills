@@ -24,7 +24,7 @@ jobs:
           - os: ubuntu-latest
             python: '3.10'
           - os: ubuntu-latest
-            python: '3.11'
+            python: '3.11.18'
           - os: windows-latest
             python: '3.14'
     env:
