@@ -63,9 +63,13 @@ Profile settings remain ignored. Force configured route before subscription atte
 - Projection requires Python 3.11 or `tomli`; default auth-only operation keeps
   existing fallback parser.
 
-- Selected route must use `https://api.openai.com/v1` + command authentication
-  with absolute external executable. Fixed arguments belong in executable's wrapper;
-  omitted/empty `auth.args` accepted.
+- Selected route must use an absolute `https` base URL with a host and no userinfo,
+  query, or fragment (including empty `?`/`#`). OpenAI-compatible Responses gateways
+  are supported; `http` is refused, including loopback. The configured URL is
+  projected unchanged. Command authentication requires an absolute external
+  executable. Fixed arguments belong in its wrapper; omitted/empty `auth.args` accepted.
+- Choose the endpoint in the named provider, not through `OPENAI_BASE_URL`: passing
+  that environment variable through does not guarantee the Codex client uses it.
 - Omitted `wire_api`/`requires_openai_auth`: keep Codex `responses`/`false` defaults,
   respectively. Optional auth timing/context settings: native defaults/semantics.
 

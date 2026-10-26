@@ -2505,7 +2505,7 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
                 self.assertIsNone(AUTOREVIEW.load_codex_auth_fallback_route(
                     self.repo, [], self.failure, command_auth=False,
                 ))
-        self.configure_provider(base_url="https://example.invalid/v1")
+        self.configure_provider(base_url="http://example.invalid/v1")
         self.assertIsNone(AUTOREVIEW.load_codex_auth_fallback_route(
             self.repo, [], self.failure, command_auth=False,
         ))

@@ -5014,14 +5014,32 @@ def load_codex_inference_route(
         "name", "base_url", "wire_api", "requires_openai_auth", "supports_websockets", "auth",
     }:
         refuse("unsupported provider fields")
+    base_url = provider.get("base_url")
+    try:
+        # Validate before urlsplit can discard whitespace/control characters.
+        # The operator owns the endpoint; preserve its exact spelling below.
+        if (not isinstance(base_url, str) or not base_url
+                or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in base_url)
+                or any(char in base_url for char in "\\?#")
+                or re.search(r"%(?![0-9a-fA-F]{2})", base_url)):
+            raise ValueError
+        parsed = urllib.parse.urlsplit(base_url)
+        hostname = urllib.parse.unquote(parsed.hostname or "")
+        if (parsed.scheme != "https" or not hostname
+                or parsed.username is not None or parsed.password is not None
+                or parsed.port == 0 or parsed.netloc.endswith(":")
+                or any(char.isspace() or ord(char) < 32 or ord(char) == 127
+                       or char in "/\\@?#" for char in hostname)):
+            raise ValueError
+    except ValueError:
+        refuse("provider base_url must be an absolute https URL with a host and no userinfo, query, or fragment")
     if (
-        provider.get("base_url") != "https://api.openai.com/v1"
-        or provider.get("wire_api", "responses") != "responses"
+        provider.get("wire_api", "responses") != "responses"
         or provider.get("requires_openai_auth", False) is not False
         or not isinstance(provider.get("supports_websockets", False), bool)
         or not isinstance(provider.get("name", ""), str)
     ):
-        refuse("only command-auth OpenAI Responses routes are supported")
+        refuse("only command-auth Responses routes are supported")
     auth = provider.get("auth")
     if not isinstance(auth, dict) or set(auth) - {
         "command", "args", "cwd", "timeout_ms", "refresh_interval_ms",
