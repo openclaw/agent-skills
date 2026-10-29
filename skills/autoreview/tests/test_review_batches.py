@@ -42,6 +42,7 @@ class ReviewBatchTests(unittest.TestCase):
             self.git(repo, "config", "user.name", "Autoreview Test")
             self.git(repo, "config", "user.email", "autoreview@example.invalid")
             self.git(repo, "config", "core.autocrlf", "false")
+            self.git(repo, "config", "core.filemode", "false")
             (repo / ".gitignore").write_text(".review/\n")
             for name in ("first.py", "second.py", "retired.py"):
                 (repo / name).write_text("value = 1\n")
@@ -51,7 +52,7 @@ class ReviewBatchTests(unittest.TestCase):
             self.git(repo, "commit", "-qm", "baseline")
             (repo / "first.py").write_text("value = 2  # fox 🦊\n")
             (repo / "second.py").write_text("value = 3\n")
-            (repo / "second.py").chmod(0o755)
+            self.git(repo, "update-index", "--chmod=+x", "second.py")
             (repo / "retired.py").unlink()
             self.git(repo, "commit", "-qam", "selected change")
             (repo / ".review").mkdir()
