@@ -43,15 +43,15 @@ class ReviewBatchTests(unittest.TestCase):
             self.git(repo, "config", "user.email", "autoreview@example.invalid")
             self.git(repo, "config", "core.autocrlf", "false")
             self.git(repo, "config", "core.filemode", "false")
-            (repo / ".gitignore").write_text(".review/\n")
+            (repo / ".gitignore").write_bytes(b".review/\n")
             for name in ("first.py", "second.py", "retired.py"):
-                (repo / name).write_text("value = 1\n")
+                (repo / name).write_bytes(b"value = 1\n")
             (repo / "contract.py").write_bytes(b"# whole contract\r\n" * 2_000)
-            (repo / "global.md").write_text("GLOBAL WHOLE OWNER\n")
+            (repo / "global.md").write_bytes(b"GLOBAL WHOLE OWNER\n")
             self.git(repo, "add", ".")
             self.git(repo, "commit", "-qm", "baseline")
-            (repo / "first.py").write_text("value = 2  # fox 🦊\n")
-            (repo / "second.py").write_text("value = 3\n")
+            (repo / "first.py").write_bytes("value = 2  # fox 🦊\n".encode("utf-8"))
+            (repo / "second.py").write_bytes(b"value = 3\n")
             self.git(repo, "update-index", "--chmod=+x", "second.py")
             (repo / "retired.py").unlink()
             self.git(repo, "commit", "-qam", "selected change")
@@ -74,7 +74,7 @@ class ReviewBatchTests(unittest.TestCase):
         }
 
     def write_manifest(self, repo, manifest):
-        (repo / ".review/batches.json").write_text(json.dumps(manifest))
+        (repo / ".review/batches.json").write_bytes(json.dumps(manifest).encode("utf-8"))
 
     def invoke(self, repo, *options, engine=None):
         argv = [str(SCRIPT), "--mode", "branch", "--base", "HEAD^", "--engine", "codex",
@@ -114,7 +114,7 @@ class ReviewBatchTests(unittest.TestCase):
             status, sends, output = self.invoke(repo)
             self.assertEqual(status, 0, output)
             self.assertEqual(len(sends), 2)
-            report = json.loads((repo.parent / "result.json").read_text())
+            report = json.loads((repo.parent / "result.json").read_bytes())
             allocation = report["review_allocation"]
             self.assertEqual(report["review_status"], "scoped-clean")
             self.assertEqual([row["label"] for row in report["pass_reports"]], ["first-owner", "integration"])
@@ -168,12 +168,15 @@ class ReviewBatchTests(unittest.TestCase):
             with self.subTest(kind=kind), self.fixture() as repo:
                 manifest = self.manifest(repo)
                 if kind == "sensitive":
-                    (repo / ".env").write_text("FAKE_TEST_VALUE=placeholder\n")
+                    (repo / ".env").write_bytes(b"FAKE_TEST_VALUE=placeholder\n")
                     self.git(repo, "add", "-f", ".env")
                     expected = "cannot certify a range with omitted sensitive inputs"
                 elif kind == "symlink":
-                    (repo / "link.py").symlink_to("first.py")
-                    self.git(repo, "add", "link.py")
+                    # Git's link mode needs no host symlink privilege on Windows.
+                    self.git(repo, "config", "core.symlinks", "false")
+                    (repo / "link.py").write_bytes(b"first.py")
+                    blob = self.git(repo, "hash-object", "-w", "link.py")
+                    self.git(repo, "update-index", "--add", "--cacheinfo", "120000," + blob + ",link.py")
                     expected = "does not support binary, symlink or gitlink changes"
                 elif kind == "gitlink":
                     self.git(repo, "update-index", "--add", "--cacheinfo",
@@ -201,7 +204,7 @@ class ReviewBatchTests(unittest.TestCase):
             bodies = {name: (f"# {name} contract\n" * 3_000)
                       for name in ("owner.py", "integration.py")}
             for name, body in bodies.items():
-                (repo / name).write_text(body)
+                (repo / name).write_bytes(body.encode("utf-8"))
                 self.git(repo, "add", name)
             self.git(repo, "commit", "--amend", "--no-edit", "-q")
             manifest = self.manifest(repo)
@@ -225,7 +228,7 @@ class ReviewBatchTests(unittest.TestCase):
                     else:
                         self.assertNotIn(body, prompt)
                         self.assertGreater(len((prompt + body).encode()), 190_000)
-            allocation = json.loads((repo.parent / "result.json").read_text())["review_allocation"]
+            allocation = json.loads((repo.parent / "result.json").read_bytes())["review_allocation"]
             self.assertEqual({row["path"] for row in allocation["contexts"]}, bodies.keys())
             self.assertEqual([row["contexts"] for row in allocation["batches"]],
                              [[name] for name in bodies])
@@ -273,7 +276,7 @@ class ReviewBatchTests(unittest.TestCase):
                 if outcome != "filtered":
                     self.assertNotEqual(status, 0)
                 if outcome not in {"invalid"}:
-                    report = json.loads((repo.parent / "result.json").read_text())
+                    report = json.loads((repo.parent / "result.json").read_bytes())
                     expected = {"incomplete": "incomplete", "filtered": "filtered", "outside": "incomplete",
                                 "integration-finding": "findings"}[outcome]
                     self.assertEqual(report["review_status"], expected)
@@ -286,9 +289,9 @@ class ReviewBatchTests(unittest.TestCase):
                 def engine(index, report):
                     if index == 1:
                         if mutation == "manifest":
-                            (repo / ".review/batches.json").write_text("{}")
+                            (repo / ".review/batches.json").write_bytes(b"{}")
                         elif mutation == "source":
-                            (repo / "contract.py").write_text("changed\n")
+                            (repo / "contract.py").write_bytes(b"changed\n")
                         else:
                             data = (repo / ".review/batches.json").read_bytes()
                             (repo / ".review").rename(repo / ".review-old")
@@ -318,7 +321,7 @@ class ReviewBatchTests(unittest.TestCase):
                 )
                 self.assertEqual(len(sends), 2)
                 self.assertEqual(status, 0 if complete else 2, output)
-                payload = json.loads(preflight.read_text().split("\n")[1])
+                payload = json.loads(preflight.read_bytes().split(b"\n")[1])
                 self.assertEqual(payload["completion"], "complete" if complete else "partial")
                 self.assertIn("status scoped-clean" if complete else "status incomplete", payload["summary"])
 
