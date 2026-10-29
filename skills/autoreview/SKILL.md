@@ -213,7 +213,13 @@ Each pass must finish its own assessment; a failed pass never yields partial cle
 
 Advancing heartbeats mean progress; use `--stream-engine-output`, not extra runs.
 `--dry-run` checks preparation/startup without a reviewer. Both print planned
-passes and prompt bytes. `--max-review-passes N` (or
+passes and prompt bytes. `--max-prompt-bytes N` sets the positive UTF-8 byte
+budget per prompt (default: `512000`). Use an explicit larger budget when the
+selected review route can accept the complete required context; the helper
+never raises it automatically or changes model context/token limits. Dry-run
+and live review use the same budget, keep intact context whole, and refuse any
+oversized final prompt before starting a reviewer.
+`--max-review-passes N` (or
 `AUTOREVIEW_MAX_REVIEW_PASSES`) rejects an over-budget plan before startup;
 there is no default ceiling. `--engine-timeout-seconds` limits each process attempt.
 These controls are not token hard caps and do not bound reasoning or tool use.

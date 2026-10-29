@@ -116,6 +116,10 @@ authentication, sandbox and mutation checks remain enabled.
 - Terminal fallbacks preserve feasible complete-evidence plan when batch framing cannot fit.
 - Intact instructions, source-context files, required mixed source context must fit
   per-pass prompt budget. Failed pass never produces partial clean verdict.
+- `--max-prompt-bytes N` selects that UTF-8 byte budget for dry-run and live review
+  (default `512000`). The plan reports its limit and largest rendered prompt.
+  A larger explicit budget admits more complete context only when it fits;
+  it does not change engine/model context limits or guarantee token capacity.
 - Otherwise compare bounded evidence allocations; keep existing plan unless total
   prompt bytes improve without more passes, or equal bytes need fewer passes.
 - Every change reviewed against every evidence batch.

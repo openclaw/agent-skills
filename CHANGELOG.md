@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add an explicit Autoreview `--max-prompt-bytes` planning budget for complete required context, keeping the 512,000-byte default, intact inputs, pass limits, and reviewer isolation unchanged.
+
 - Pin the Linux installed-source helper check to Python 3.11.18 for its patched certificate trust, while retaining the existing compatibility matrix. Thanks @joshavant. (#341)
 
 - Check report output readiness before starting Autoreview, preserving existing reports and refusing unusable destinations early. Thanks @JeanFrancoisGagne.

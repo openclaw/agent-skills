@@ -7319,6 +7319,12 @@ def parse_args() -> argparse.Namespace:
         help="Claude fallback model chain or claude=a,b. Repeatable.",
     )
     parser.add_argument(
+        "--max-prompt-bytes",
+        type=positive_int,
+        default=MAX_REVIEW_PROMPT_BYTES,
+        help="UTF-8 byte limit per planned prompt (default: 512000). Intact context must fit. Does not change model context or token limits.",
+    )
+    parser.add_argument(
         "--max-review-passes",
         type=positive_int,
         default=os.environ.get("AUTOREVIEW_MAX_REVIEW_PASSES"),
@@ -7864,7 +7870,16 @@ def check_review_pass_budget(limit: int | None, pass_count: int) -> None:
 
 
 def check_review_plan(args: argparse.Namespace, prompts: list[str] | list[ReviewPass]) -> None:
-    print(f"review plan: {len(prompts)} passes; {review_plan_bytes(prompts)} total prompt bytes", flush=True)
+    limit = getattr(args, "max_prompt_bytes", MAX_REVIEW_PROMPT_BYTES)
+    largest = max((utf8_size(item.prompt if isinstance(item, ReviewPass) else item)
+                   for item in prompts), default=0)
+    print(f"review plan: {len(prompts)} passes; {review_plan_bytes(prompts)} total prompt bytes; "
+          f"largest {largest} bytes; limit {limit} bytes per pass", flush=True)
+    if largest > limit:
+        raise SystemExit(
+            f"planned prompt has {largest} bytes; --max-prompt-bytes allows {limit}; "
+            "no reviewer was started."
+        )
     check_review_pass_budget(getattr(args, "max_review_passes", None), len(prompts))
 
 
@@ -7913,7 +7928,7 @@ def dry_run_preflight(
                 threshold_extra_prompt = apply_finding_threshold_prompt(args, evidence.prompt)
                 prompts = prepare_review_prompts(
                     repo, target, target_ref, captured, threshold_extra_prompt,
-                    evidence.datasets, MAX_REVIEW_PROMPT_BYTES,
+                    evidence.datasets, args.max_prompt_bytes,
                     getattr(args, "max_review_passes", None),
                 )
                 check_review_plan(args, prompts)
@@ -8506,6 +8521,7 @@ def main_with_args(args: argparse.Namespace) -> int:
     if reviewer.engine == "openclaw":
         args.openclaw_models = reviewer.openclaw_models = []
     print(f"engine: {reviewer.engine}", flush=True)
+    print(f"prompt budget: {args.max_prompt_bytes} bytes per pass", flush=True)
     if reviewer.model:
         print(f"model: {reviewer.model}", flush=True)
     if getattr(reviewer, "fallback_model", None):
@@ -8549,7 +8565,7 @@ def main_with_args(args: argparse.Namespace) -> int:
         extra_prompt = apply_finding_threshold_prompt(args, evidence.prompt)
         prompts = prepare_review_prompts(
             repo, target, target_ref, captured, extra_prompt, evidence.datasets,
-            MAX_REVIEW_PROMPT_BYTES,
+            args.max_prompt_bytes,
             getattr(args, "max_review_passes", None),
         )
     print(f"bundle: {utf8_size(captured.text)} bytes; review passes: {len(prompts)}", flush=True)

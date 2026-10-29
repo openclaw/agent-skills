@@ -8040,6 +8040,7 @@ os.execv(target, [str(target), *sys.argv[1:]])
                 prompt=[],
                 prompt_file=[],
                 dataset=[],
+                max_prompt_bytes=self.helper["MAX_REVIEW_PROMPT_BYTES"],
                 max_priority="P0",
             )
             stdout = io.StringIO()

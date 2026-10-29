@@ -32,6 +32,7 @@ MODULES = [
     "skills.autoreview.tests.test_output_path_interpretation",
     "skills.autoreview.tests.test_output_readiness",
     "skills.autoreview.tests.test_review_harness",
+    "skills.autoreview.tests.test_prompt_budget",
 ]
 
 
