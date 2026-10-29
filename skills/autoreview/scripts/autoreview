@@ -187,6 +187,11 @@ class CapturedBundle(NamedTuple):
     commit: str | None = None
     images: tuple[ImageEvidence, ...] = ()
     base: str | None = None
+    branch_paths: tuple[str, ...] = ()
+    branch_raw: str = ""
+    branch_patch: str = ""
+    branch_header: str = ""
+    omitted_paths: tuple[str, ...] = ()
 
 
 class UntrackedSources(NamedTuple):
@@ -225,6 +230,9 @@ class ReviewPass(NamedTuple):
     chunk: ReviewChunk
     datasets: tuple[ReviewDataset, ...] = ()
     evidence_batch: int = 1
+    assignment: str | None = None
+    paths: frozenset[str] | None = None
+    allocation: dict[str, Any] | None = None
 
 
 class ReviewResult(NamedTuple):
@@ -3155,12 +3163,12 @@ def removed_source_lines(patch: str) -> tuple[tuple[int, str], ...]:
     return tuple(removed)
 
 
-def local_patch_ownership(patch: str, paths: list[str]) -> list[tuple[str, str]]:
+def local_patch_ownership(patch: str, paths: list[str], label: str = "mixed local") -> list[tuple[str, str]]:
     # Git supplies the path order. Never infer identity from source-controlled
     # path headings; require a one-to-one mapping before attaching ownership.
     units = review_bundle_units(patch)
     if len(units) != len(paths) or any(not unit.startswith("diff --git ") for unit in units):
-        raise SystemExit("cannot establish mixed local patch ownership")
+        raise SystemExit(f"cannot establish {label} patch ownership")
     return list(zip(paths, units))
 
 
@@ -3550,18 +3558,19 @@ def branch_bundle(repo: Path, base_ref: str) -> CapturedBundle:
     branch_patch = git(
         repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--patch", "--end-of-options", merge_base, head_ref,
     )
-    omitted_tracked = bool(tracked_sensitive_paths(branch_paths))
+    omitted_paths = tracked_sensitive_paths(branch_paths)
+    original_patch = branch_patch
     branch_patch = validate_review_patch(
         branch_paths,
         branch_patch,
     )
-    return CapturedBundle("\n\n".join(
+    header = "\n\n".join(
         [
             "# Branch Diff",
             f"base: {base_label}",
             (
                 REVIEW_SECURITY_OMISSION
-                if omitted_tracked
+                if omitted_paths
                 else git(
                     repo,
                     "diff-tree",
@@ -3571,10 +3580,14 @@ def branch_bundle(repo: Path, base_ref: str) -> CapturedBundle:
                     merge_base, head_ref,
                 )
             ),
-            branch_patch,
-        ] + ([links] if links else [])
-    ), set(branch_paths) - tracked_sensitive_paths(branch_paths), commit=head_ref, images=images,
-        base=merge_base)
+        ]
+    ) + "\n\n"
+    text = header + branch_patch + ("\n\n" + links if links else "")
+    return CapturedBundle(
+        text, set(branch_paths) - omitted_paths, commit=head_ref, images=images,
+        base=merge_base, branch_paths=tuple(branch_paths), branch_raw=branch_raw,
+        branch_patch=original_patch, branch_header=header, omitted_paths=tuple(sorted(omitted_paths)),
+    )
 
 
 def commit_diff_refs(repo: Path, commit_ref: str) -> tuple[str, ...]:
@@ -4726,6 +4739,178 @@ def prepare_review_prompts(
         extra_prompt += "\n\n" + image_manifest(bundle.images)
     return build_review_prompts(
         repo, target, target_ref, bundle, extra_prompt, datasets, max_prompt_bytes, max_review_passes,
+    )
+
+
+def batch_object(value: Any, keys: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise SystemExit(f"invalid review-batches {label} fields")
+    return value
+
+
+def batch_strings(value: Any, label: str, *, nonempty: bool = True) -> list[str]:
+    if (not isinstance(value, list) or (nonempty and not value)
+            or any(not isinstance(item, str) or not item.strip() for item in value)
+            or len(set(value)) != len(value)):
+        raise SystemExit(f"review-batches {label} requires unique nonempty strings")
+    return value
+
+
+def batch_path(value: Any) -> str:
+    if (not isinstance(value, str) or not value or Path(value).is_absolute()
+            or any(part in {"", ".", ".."} for part in value.split("/"))
+            or Path(value).as_posix() != value or "\\" in value
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)):
+        raise SystemExit("review-batches requires canonical repo-relative paths")
+    return value
+
+
+def branch_batch_units(captured: CapturedBundle) -> list[dict[str, Any]]:
+    # Original obligations precede the legacy sensitive-input projection. A
+    # filtered paths union can never certify coverage of the original range.
+    if captured.omitted_paths:
+        raise SystemExit("review-batches cannot certify a range with omitted sensitive inputs")
+    if not captured.branch_paths or captured.images or not captured.base or not captured.commit:
+        raise SystemExit("review-batches v1 requires a nonempty text-only branch range")
+    pairs = local_patch_ownership(captured.branch_patch, list(captured.branch_paths), "branch batch")
+    raw = captured.branch_raw.split("\0")
+    if (raw[-1] != "" or len(raw) != 2 * len(pairs) + 1
+            or captured.branch_header + "".join(patch for _, patch in pairs) != captured.text):
+        raise SystemExit("review-batches cannot reconstruct the original branch bundle")
+    units = []
+    offset = utf8_size(captured.branch_header)
+    for index, (path, patch) in enumerate(pairs):
+        metadata = re.fullmatch(r":([0-7]{6}) ([0-7]{6}) ([0-9a-f]+) ([0-9a-f]+) ([AMD])", raw[index * 2])
+        if (not metadata or raw[index * 2 + 1] != path
+                or any(mode not in {"000000", "100644", "100755"} for mode in metadata.group(1, 2))
+                or re.search(r"^(?:Binary files |GIT binary patch$)", patch, re.MULTILINE)):
+            raise SystemExit("review-batches v1 does not support binary, symlink or gitlink changes")
+        batch_path(path)
+        units.append({
+            "path": path, "byte_offset": offset, "bytes": utf8_size(patch),
+            "sha256": hashlib.sha256(patch.encode("utf-8")).hexdigest(),
+            "before": {"mode": metadata[1], "blob": metadata[3]},
+            "after": {"mode": metadata[2], "blob": metadata[4]},
+            "status": metadata[5], "patch": patch,
+        })
+        offset += utf8_size(patch)
+    return units
+
+
+def prepare_batch_review(
+    args: argparse.Namespace, repo: Path, target: str, target_ref: str | None,
+    captured: CapturedBundle, evidence: EvidenceInputs,
+) -> tuple[EvidenceInputs, list[ReviewPass]]:
+    if target != "branch" or evidence.datasets:
+        raise SystemExit("--review-batches requires branch mode without --dataset or --source-context; use manifest contexts")
+    units = branch_batch_units(captured)
+    record = capture_evidence_file(repo, args.review_batches, "--review-batches")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise SystemExit("duplicate review-batches JSON key")
+            result[key] = value
+        return result
+
+    try:
+        manifest = json.loads(record.content, object_pairs_hook=unique_object)
+    except (ValueError, RecursionError) as exc:
+        raise SystemExit("invalid review-batches JSON") from exc
+    batch_object(manifest, {"version", "base", "head", "bundle_sha256", "contexts", "batches"}, "manifest")
+    bundle_digest = hashlib.sha256(captured.text.encode("utf-8")).hexdigest()
+    if (type(manifest["version"]) is not int or manifest["version"] != 1
+            or manifest["base"] != captured.base or manifest["head"] != captured.commit
+            or manifest["bundle_sha256"] != bundle_digest):
+        raise SystemExit("review-batches version or frozen range/bundle identity mismatch")
+    if not isinstance(manifest["contexts"], list) or not isinstance(manifest["batches"], list) or not manifest["batches"]:
+        raise SystemExit("review-batches contexts and nonempty batches must be arrays")
+    sources: dict[str, ReviewDataset] = {}
+    files = [*evidence.files, record]
+    contexts = []
+    for item in manifest["contexts"]:
+        batch_object(item, {"path", "blob", "mode"}, "context")
+        path = batch_path(item["path"])
+        if path in sources:
+            raise SystemExit("duplicate review-batches context path")
+        source = capture_source_context(repo, path, captured.commit)
+        _, oid, mode = source.source.identity.split(":")
+        if item["blob"] != oid or item["mode"] != mode:
+            raise SystemExit("review-batches context blob/mode mismatch")
+        assert source.source.content is not None
+        files.append(source)
+        sources[path] = ReviewDataset(path, source.source.content, provenance=(captured.commit, oid, mode))
+        contexts.append({**item, "bytes": utf8_size(source.source.content),
+                         "sha256": hashlib.sha256(source.source.content.encode("utf-8")).hexdigest()})
+    names: set[str] = set()
+    changed_coverage: set[str] = set()
+    context_coverage: set[str] = set()
+    unit_paths = {unit["path"] for unit in units}
+    plans = []
+    metadata = {
+        "version": 1, "base": captured.base, "head": captured.commit,
+        "bundle_sha256": bundle_digest, "bundle_bytes": utf8_size(captured.text),
+        "header_bytes": utf8_size(captured.branch_header),
+        "manifest_sha256": hashlib.sha256(record.content.encode("utf-8")).hexdigest(),
+        "omitted_paths": [], "units": [{key: value for key, value in unit.items() if key != "patch"} for unit in units],
+        "contexts": contexts,
+    }
+    for batch in manifest["batches"]:
+        batch_object(batch, {"name", "kind", "changes", "contexts", "obligations"}, "assignment")
+        name = batch["name"]
+        if not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}", name) or name in names:
+            raise SystemExit("review-batches assignment names must be unique identifiers")
+        if not isinstance(batch["kind"], str) or batch["kind"] not in {"owner", "integration"}:
+            raise SystemExit("review-batches assignment kind must be owner or integration")
+        changes = batch_strings(batch["changes"], "changes")
+        selected_contexts = batch_strings(batch["contexts"], "contexts", nonempty=False)
+        obligations = batch_strings(batch["obligations"], "obligations")
+        if not set(changes) <= unit_paths or not set(selected_contexts) <= sources.keys():
+            raise SystemExit("review-batches assignment references an unknown change or context")
+        names.add(name)
+        changed_coverage.update(changes)
+        context_coverage.update(selected_contexts)
+        # Canonical capture order, never manifest order or reparsed diff headings,
+        # owns the bytes. Overlap is explicit integration evidence, not omission.
+        selected_units = [unit for unit in units if unit["path"] in changes]
+        chunk = ReviewChunk(captured.branch_header + "".join(unit["patch"] for unit in selected_units))
+        assignment = {
+            "name": name, "kind": batch["kind"], "changes": [unit["path"] for unit in selected_units],
+            "contexts": selected_contexts, "obligations": obligations,
+        }
+        instructions = (
+            "# Explicit review assignment\n" + json.dumps(assignment, ensure_ascii=True) + "\n"
+            "Review every assigned change and obligation, including the stated cross-owner contracts. "
+            "The header describes the frozen full range; only the assigned change units are finding targets here. "
+            "Do not rely on another assignment to supply a missing caller, callee or integration contract. "
+            "Missing necessary evidence requires review_completion=incomplete. Other assignments cannot waive that result."
+        )
+        datasets = tuple(sources[path] for path in selected_contexts)
+        prompt = render_review_prompt(
+            current_branch(repo), target, target_ref, chunk,
+            apply_finding_threshold_prompt(args, evidence.prompt) + "\n\n" + instructions,
+            render_datasets(list(datasets)),
+        )
+        plans.append(ReviewPass(prompt, chunk, datasets, len(plans) + 1, name,
+                                frozenset(changes), {**metadata, "assignment": assignment}))
+    if changed_coverage != unit_paths or context_coverage != sources.keys():
+        raise SystemExit("review-batches omitted original change units or declared context inputs")
+    if len(plans) > 1 and not any(batch["kind"] == "integration" for batch in manifest["batches"]):
+        raise SystemExit("review-batches requires an explicit cross-owner integration assignment")
+    return EvidenceInputs(evidence.prompt, [], files), plans
+
+
+def prepare_selected_review(
+    args: argparse.Namespace, repo: Path, target: str, target_ref: str | None,
+    captured: CapturedBundle, evidence: EvidenceInputs,
+) -> tuple[EvidenceInputs, list[str] | list[ReviewPass]]:
+    evidence = capture_source_context_inputs(args, repo, captured, evidence)
+    if getattr(args, "review_batches", None):
+        return prepare_batch_review(args, repo, target, target_ref, captured, evidence)
+    return evidence, prepare_review_prompts(
+        repo, target, target_ref, captured, apply_finding_threshold_prompt(args, evidence.prompt),
+        evidence.datasets, args.max_prompt_bytes, getattr(args, "max_review_passes", None),
     )
 
 
@@ -7367,6 +7552,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", action="append", help="Extra evidence file to include in the review bundle.")
     parser.add_argument("--source-context", action="append", help="Repo-relative source path from the reviewed commit; branch/commit modes only, context without finding authority.")
     parser.add_argument("--source-context-file", action="append", help="Repo-relative source from the reviewed commit, kept intact in every pass; branch/commit modes only, context without finding authority.")
+    parser.add_argument("--review-batches", help="Repo-relative v1 allocation manifest for one frozen branch range. Whole change units and declared source contracts; no dataset/source-context partitioning. See references/git-and-context.md.")
     parser.add_argument(
         "--max-priority",
         choices=["P0", "P1", "P2", "P3"],
@@ -7915,6 +8101,11 @@ def dry_run_preflight(
         if target == "commit":
             target_ref = args.commit
         print("bundle: constructible", flush=True)
+        if target == "branch":
+            print("bundle identity: " + json.dumps({
+                "base": captured.base, "head": captured.commit,
+                "bundle_sha256": hashlib.sha256(captured.text.encode("utf-8")).hexdigest(),
+            }, sort_keys=True), flush=True)
     except (SystemExit, Exception) as exc:
         ok = bundle_ok = False
         print(f"bundle: FAILED ({exc})", flush=True)
@@ -7924,13 +8115,7 @@ def dry_run_preflight(
     if bundle_ok and inputs_ok:
         try:
             with PreparationProgress("bundle/evidence preparation"):
-                evidence = capture_source_context_inputs(args, repo, captured, evidence)
-                threshold_extra_prompt = apply_finding_threshold_prompt(args, evidence.prompt)
-                prompts = prepare_review_prompts(
-                    repo, target, target_ref, captured, threshold_extra_prompt,
-                    evidence.datasets, args.max_prompt_bytes,
-                    getattr(args, "max_review_passes", None),
-                )
+                evidence, prompts = prepare_selected_review(args, repo, target, target_ref, captured, evidence)
                 check_review_plan(args, prompts)
             with PreparationProgress("evidence verification"):
                 verify_evidence(repo, evidence.files)
@@ -7968,6 +8153,8 @@ def run_reviewer(
 ) -> ReviewResult:
     mixed = changed_paths.mixed if isinstance(changed_paths, CapturedBundle) else ()
     paths = changed_paths.paths if isinstance(changed_paths, CapturedBundle) else changed_paths
+    if isinstance(prompt, ReviewPass) and prompt.paths is not None:
+        paths = set(prompt.paths)
     available = {record.identity for record in prompt.chunk.sources} if isinstance(prompt, ReviewPass) else set()
     if mixed and not isinstance(prompt, ReviewPass):
         raise SystemExit("mixed review requires owner-built pass metadata")
@@ -7996,6 +8183,9 @@ def run_reviewer(
         raise ReviewerUnavailable(str(exc), reason="invalid_report") from None
     filter_findings_by_priority(report, args.max_priority)
     report["provider_report"] = provider_report
+    if isinstance(prompt, ReviewPass) and prompt.allocation is not None:
+        report["assignment"] = prompt.allocation["assignment"]
+        report["review_completion"] = completion
     if mixed:
         report["available_source_records"] = sorted(available)
     require_findings(report, required)
@@ -8095,7 +8285,8 @@ def run_review_passes(
             [],
             evidence,
         )
-        chunk_reports.append((f"chunk {index}/{len(prompts)}", chunk_report))
+        label = prompt.assignment if isinstance(prompt, ReviewPass) and prompt.assignment else f"chunk {index}/{len(prompts)}"
+        chunk_reports.append((label, chunk_report))
     return chunk_reports
 
 
@@ -8576,13 +8767,7 @@ def main_with_args(args: argparse.Namespace) -> int:
         require_image_engine(reviewer.engine, captured.images)
         if target == "commit":
             target_ref = args.commit
-        evidence = capture_source_context_inputs(args, repo, captured, evidence)
-        extra_prompt = apply_finding_threshold_prompt(args, evidence.prompt)
-        prompts = prepare_review_prompts(
-            repo, target, target_ref, captured, extra_prompt, evidence.datasets,
-            args.max_prompt_bytes,
-            getattr(args, "max_review_passes", None),
-        )
+        evidence, prompts = prepare_selected_review(args, repo, target, target_ref, captured, evidence)
     print(f"bundle: {utf8_size(captured.text)} bytes; review passes: {len(prompts)}", flush=True)
     check_review_plan(args, prompts)
     with PreparationProgress("pre-review verification") as progress:
@@ -8629,6 +8814,14 @@ def main_with_args(args: argparse.Namespace) -> int:
     report["review_status"] = review_status(
         report, complete=all(result.complete for _, result in pass_results),
     )
+    if prompts and isinstance(prompts[0], ReviewPass) and prompts[0].allocation is not None:
+        report["review_allocation"] = {
+            **{key: value for key, value in prompts[0].allocation.items() if key != "assignment"},
+            "batches": [{**prompt.allocation["assignment"], "prompt_bytes": utf8_size(prompt.prompt),
+                         "prompt_sha256": hashlib.sha256(prompt.prompt.encode("utf-8")).hexdigest(),
+                         "review_completion": "complete" if result.complete else "incomplete"}
+                        for prompt, (_, result) in zip(prompts, pass_results)],
+        }
     label = "autoreview"
     if len(chunk_reports) > 1:
         label += " chunked"
