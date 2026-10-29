@@ -8237,6 +8237,7 @@ class NativeHandoff:
     rejected response cannot launch the next pass. This is not a restart API.
     """
 
+    MAX_REQUEST_BYTES = 4_000_000
     MAX_RESULT_BYTES = 2_000_000
 
     def __init__(self, args: argparse.Namespace, reviewer: argparse.Namespace,
@@ -8249,6 +8250,10 @@ class NativeHandoff:
         self.model = reviewer.model
         self.thinking = reviewer.thinking
         self.effective_models = reviewer.openclaw_models
+        # Escaped JSON and envelope bytes must fit the consumer before any
+        # earlier pass can launch, even when a larger prompt budget is explicit.
+        for number, prompt in enumerate(prompts, 1):
+            self.encode_request(number, prompt.prompt if isinstance(prompt, ReviewPass) else prompt)
         parent = self.root.parent.stat()
         if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
             raise SystemExit("native handoff requires an owned private parent directory")
@@ -8296,9 +8301,7 @@ class NativeHandoff:
                 raise ValueError("native result exceeds the transport limit; no partial report accepted")
             return data
 
-    def run(self, prompt: str) -> str:
-        self.pass_number += 1
-        number = self.pass_number
+    def encode_request(self, number: int, prompt: str) -> tuple[str, str]:
         digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         request = {
             "protocol": "autoreview-exec-v1", "run_id": self.run_id,
@@ -8309,7 +8312,19 @@ class NativeHandoff:
             "engine_timeout_seconds": self.timeout,
             "max_result_bytes": self.MAX_RESULT_BYTES,
         }
-        atomic_write_text(self.root / f"{number}.request.json", json.dumps(request))
+        encoded = json.dumps(request)
+        if utf8_size(encoded) > self.MAX_REQUEST_BYTES:
+            raise SystemExit(
+                f"native handoff request {number}/{self.pass_count} exceeds {self.MAX_REQUEST_BYTES} bytes; "
+                "reduce --max-prompt-bytes; no request was published."
+            )
+        return encoded, digest
+
+    def run(self, prompt: str) -> str:
+        self.pass_number += 1
+        number = self.pass_number
+        encoded, digest = self.encode_request(number, prompt)
+        atomic_write_text(self.root / f"{number}.request.json", encoded)
         print(f"native pass ready: {number}/{self.pass_count}", flush=True)
         deadline = time.monotonic() + self.timeout if self.timeout is not None else None
         ready_path = self.root / f"{number}.ready"
@@ -8379,7 +8394,7 @@ def submit_native_response(root: Path, source: Path) -> None:
                 raise ValueError("native exchange is not private and owned")
             number = response["pass"]
             request = json.loads(NativeHandoff.read_file(
-                f"{number}.request.json", 4_000_000, dir_fd=descriptor))
+                f"{number}.request.json", NativeHandoff.MAX_REQUEST_BYTES, dir_fd=descriptor))
             if any(response.get(key) != request.get(key) for key in ("run_id", "pass", "prompt_sha256")):
                 raise ValueError("native response does not match the live prepared pass")
             # A failed partial submission is never retried or replaced.

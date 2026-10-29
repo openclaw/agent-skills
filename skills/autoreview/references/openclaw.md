@@ -103,8 +103,11 @@ run. Bind the first request's invocation and plan, and check subsequent requests
 consistently. An omitted helper timeout adds no wrapper deadline; caller
 cancellation and native process lifetime still apply.
 
-At `native pass ready: N/T`, read the complete `N.request.json` (at most 4,000,000
-bytes). Its fields are:
+Before creating the exchange, the helper checks every encoded request against the
+4,000,000-byte transport limit, including JSON escaping and envelope overhead.
+An explicit prompt budget does not raise this transport limit; reduce the prompt
+budget if a request is too large. At `native pass ready: N/T`, read the complete
+`N.request.json` (at most 4,000,000 bytes). Its fields are:
 
 | Field | Meaning |
 | --- | --- |
