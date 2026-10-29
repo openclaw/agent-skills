@@ -7813,9 +7813,13 @@ os.execv(target, [str(target), *sys.argv[1:]])
                 json.loads(line)
                 for line in invocations.read_text(encoding="utf-8").splitlines()
             ]
-            self.assertEqual(len(run_invocations), 2)
+            self.assertEqual(len(run_invocations), 3)
             self.assertEqual(run_invocations[0]["argv"], ["--version"])
-            self.assertIn("exec", run_invocations[1]["argv"])
+            self.assertIn("debug", run_invocations[1]["argv"])
+            self.assertIn("models", run_invocations[1]["argv"])
+            self.assertIn("exec", run_invocations[2]["argv"])
+            self.assertEqual(source_auth.read_bytes(), auth_before)
+            self.assertEqual(source_auth.stat().st_nlink, links_before)
 
             def normalized_runtime_env(invocation: dict[str, object]) -> dict[str, str]:
                 selected = invocation["env"]
@@ -7844,6 +7848,10 @@ os.execv(target, [str(target), *sys.argv[1:]])
             self.assertEqual(
                 normalized_runtime_env(run_invocations[0]),
                 normalized_runtime_env(run_invocations[1]),
+            )
+            self.assertEqual(
+                normalized_runtime_env(run_invocations[1]),
+                normalized_runtime_env(run_invocations[2]),
             )
 
     @unittest.skipIf(os.name == "nt", "the fake executable is POSIX-only")

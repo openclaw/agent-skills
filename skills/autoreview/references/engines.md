@@ -19,8 +19,11 @@ produces no helper-validated machine status or helper isolation guarantees.
 - Honor explicit user engine/model choices. No automatic fallback between engines.
 
 - Override defaults: `--engine`, `--model`, `--thinking`.
-- Codex tier: Ultrafast when active model catalog lists it; otherwise Codex silently
-  sends standard tier. Raw `--codex-config service_tier=...` keeps its value.
+- Default Codex tier: prefer Ultrafast; request Fast when the model catalog returned
+  by Codex advertises Fast but not Ultrafast. Unavailable, malformed, or ambiguous
+  catalogs leave the default unchanged. Explicit CLI, environment, and raw config
+  speed settings are preserved. Custom command-auth routes are not probed.
+  Catalog support is not evidence of account entitlement or actual service tier.
 - `--codex-speed fast`: priority service. `--codex-speed default`: standard tier.
 - Only Claude accepts `--fallback-model`.
 - Per-engine environment overrides: `AUTOREVIEW_<ENGINE>_*`.

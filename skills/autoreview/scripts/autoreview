@@ -5495,11 +5495,60 @@ def codex_speed_override(args: argparse.Namespace) -> str | None:
         # A raw --codex-config service_tier keeps working; otherwise default to Ultrafast.
         if "service_tier" in codex_config_keys(args):
             return None
-        speed = DEFAULT_CODEX_SPEED
+        speed = getattr(args, "_automatic_codex_speed", None) or DEFAULT_CODEX_SPEED
     speed = speed.strip().lower()
     if speed not in CODEX_SPEEDS:
         raise SystemExit(f"invalid Codex speed: {speed} (valid: {', '.join(CODEX_SPEEDS)})")
     return f'service_tier="{speed}"'
+
+
+def codex_default_speed_from_catalog(
+    args: argparse.Namespace, repo: Path, review_root: Path, runtime_root: Path,
+    auth_config: list[str], *, file_auth_linked: bool, command_auth: bool, model: str | None,
+) -> str | None:
+    """Prefer Fast only when Codex advertises it but not Ultrafast for this model.
+
+    The catalog is a capability signal, not an account entitlement or a receipt.
+    An unavailable probe or explicit speed leaves the existing selection intact.
+    """
+    if (not model or command_auth or getattr(args, "codex_speed", None)
+            or os.environ.get("AUTOREVIEW_CODEX_SPEED", "").strip()
+            or "service_tier" in codex_config_keys(args)):
+        return None
+    binary = resolve_command(args.codex_bin, repo)
+    cmd = [binary, "--ask-for-approval", "never"]
+    for override in codex_config_overrides(args):
+        if override.partition("=")[0].strip() != "model_provider":
+            cmd.extend(["-c", override])
+    cmd.extend(codex_config_isolation_flags(review_root, runtime_root))
+    cmd.extend(auth_config)
+    if file_auth_linked:
+        cmd.extend(["-c", 'cli_auth_credentials_store="file"'])
+    cmd.extend(["debug", "models"])
+    try:
+        result = subprocess.run(
+            cmd, cwd=review_root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, encoding=SUBPROCESS_TEXT_ENCODING,
+            errors=SUBPROCESS_TEXT_ERRORS, timeout=10, check=False,
+            env=codex_runtime_env(repo, runtime_root, binary,
+                                  file_auth_linked=file_auth_linked, command_auth=False),
+        )
+        if result.returncode != 0 or len(result.stdout) > 10_000_000:
+            return None
+        data = json.loads(result.stdout)
+        models = data.get("models") if isinstance(data, dict) else None
+        if not isinstance(models, list):
+            return None
+        matches = [entry for entry in models if isinstance(entry, dict) and entry.get("slug") == model]
+        if len(matches) != 1:
+            return None
+        speeds = matches[0].get("additional_speed_tiers")
+        if (isinstance(speeds, list) and all(isinstance(item, str) for item in speeds)
+                and "fast" in speeds and "ultrafast" not in speeds):
+            return "fast"
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return None
 
 
 def codex_error_messages(result: subprocess.CompletedProcess[str]) -> list[str]:
@@ -5785,8 +5834,17 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             while attempts:
                 index, model = attempts.pop(0)
                 output_path.write_text("")
+                attempt_args = copy.copy(args)
+                speed = codex_default_speed_from_catalog(
+                    args, repo, review_root, runtime_root, auth_config,
+                    file_auth_linked=file_auth_linked, command_auth=command_auth, model=model,
+                )
+                if speed:
+                    attempt_args._automatic_codex_speed = speed
+                    print(f"codex speed: requesting {speed}; Ultrafast is not advertised for {model}",
+                          file=sys.stderr, flush=True)
                 cmd = codex_command(
-                    args,
+                    attempt_args,
                     repo,
                     review_root,
                     runtime_root,
@@ -7347,7 +7405,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--codex-speed",
         choices=CODEX_SPEEDS,
-        help="Codex service tier: fast (priority processing), ultrafast, flex, or default. Env default: AUTOREVIEW_CODEX_SPEED. Silently standard when the model catalog does not list the tier.",
+        help="Codex service tier: fast (priority processing), ultrafast, flex, or default. Env default: AUTOREVIEW_CODEX_SPEED. The default may select fast when the Codex catalog advertises fast but not ultrafast.",
     )
     parser.add_argument("--claude-bin", default=os.environ.get("CLAUDE_BIN", "claude"))
     parser.add_argument("--amp-bin", default=os.environ.get("AMP_BIN", "amp"))

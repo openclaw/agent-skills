@@ -1826,6 +1826,66 @@ class AutoreviewExecutableDiscoveryTests(unittest.TestCase):
                     self.assertFalse(AUTOREVIEW.preflight_git())
 
 
+class AutoreviewCatalogSpeedTests(unittest.TestCase):
+    def test_default_speed_uses_only_unambiguous_advertised_fast(self):
+        args = argparse.Namespace(codex_speed=None, codex_config=[], codex_bin="codex")
+        repo = Path("/tmp/test-repo")
+        root = Path("/tmp/test-runtime")
+        def catalog(tiers):
+            return json.dumps({"models": [{"slug": "example-model", "additional_speed_tiers": tiers}]})
+        for output, code, expected in (
+            (catalog(["fast"]), 0, "fast"),
+            (catalog(["fast", "ultrafast"]), 0, None),
+            (catalog([]), 0, None),
+            (catalog(["ultrafast"]), 0, None),
+            (catalog(["fast", 42]), 0, None),
+            ('{}', 0, None),
+            ('not json', 0, None),
+            (catalog(["fast"]), 1, None),
+        ):
+            with self.subTest(output=output, code=code), \
+                 mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex"), \
+                 mock.patch.object(AUTOREVIEW, "codex_runtime_env", return_value={}), \
+                 mock.patch.object(AUTOREVIEW.subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, "")):
+                got = AUTOREVIEW.codex_default_speed_from_catalog(
+                    args, repo, repo, root, [], file_auth_linked=False, command_auth=False, model="example-model")
+                self.assertEqual(got, expected)
+
+    def test_probe_failure_does_not_change_default(self):
+        args = argparse.Namespace(codex_speed=None, codex_config=[], codex_bin="codex")
+        root = Path("/tmp/test-runtime")
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex"), \
+             mock.patch.object(AUTOREVIEW, "codex_runtime_env", return_value={}), \
+             mock.patch.object(AUTOREVIEW.subprocess, "run", side_effect=subprocess.TimeoutExpired("codex", 10)):
+            self.assertIsNone(AUTOREVIEW.codex_default_speed_from_catalog(
+                args, root, root, root, [], file_auth_linked=False, command_auth=False, model="model"))
+            self.assertEqual(AUTOREVIEW.codex_speed_override(args), 'service_tier="ultrafast"')
+
+    def test_selection_applies_to_command_without_changing_explicit_settings(self):
+        args = argparse.Namespace(codex_speed=None, codex_config=[], _automatic_codex_speed="fast")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(AUTOREVIEW.codex_speed_override(args), 'service_tier="fast"')
+            args.codex_speed = "ultrafast"
+            self.assertEqual(AUTOREVIEW.codex_speed_override(args), 'service_tier="ultrafast"')
+
+    def test_explicit_speed_and_provider_do_not_probe(self):
+        repo = Path("/tmp/test-repo")
+        for cli, env, config, command_auth in (
+            ("ultrafast", {}, [], False), ("fast", {}, [], False),
+            (None, {"AUTOREVIEW_CODEX_SPEED": "ultrafast"}, [], False),
+            (None, {}, ['service_tier="default"'], False), (None, {}, [], True),
+        ):
+            args = argparse.Namespace(codex_speed=cli, codex_config=config, codex_bin="codex")
+            with self.subTest(cli=cli, env=env, config=config, command_auth=command_auth), \
+                 mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(AUTOREVIEW.subprocess, "run") as runner:
+                self.assertIsNone(AUTOREVIEW.codex_default_speed_from_catalog(
+                    args, repo, repo, repo, [], file_auth_linked=False, command_auth=command_auth, model="example-model"))
+                runner.assert_not_called()
+
+
 class AutoreviewCompatibilityTests(unittest.TestCase):
     def test_default_reviewer_uses_sol_61_medium_ultrafast_with_sol_6_access_retry(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(sys, "argv", ["autoreview"]):
