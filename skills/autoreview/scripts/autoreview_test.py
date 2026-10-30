@@ -1868,10 +1868,14 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             if engine == "codex":
                 continue
             with self.subTest(engine=engine), mock.patch.dict(os.environ, {}, clear=True), \
-                    mock.patch.object(sys, "argv", ["autoreview", "--engine", engine, "--codex-no-fallback"]), \
+                    mock.patch.object(sys, "argv", ["autoreview", "--codex-no-fallback"]), \
                     mock.patch.object(AUTOREVIEW, "preflight_git", side_effect=AssertionError("unexpected preparation")):
+                # Other engines can have earlier platform admission refusals.
+                # Exercise this policy owner without replacing those guards.
+                args = AUTOREVIEW.parse_args()
+                args.engine = engine
                 with self.assertRaisesRegex(SystemExit, "--codex-no-fallback is only supported for codex"):
-                    AUTOREVIEW.main_impl()
+                    AUTOREVIEW.main_with_args(args)
 
     def test_codex_speed_default_yields_to_explicit_and_raw_service_tier(self) -> None:
         cases = (
