@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Add `autoreview --no-codex-model-fallback` to keep reviews on the selected Codex model and report access failures without trying another model.
+- Add `autoreview --codex-no-fallback` to keep reviews on the selected Codex model and authentication route, refusing model or configured-provider substitution while preserving native recovery within that route.
 - Add an explicit Autoreview `--max-prompt-bytes` planning budget for complete required context, keeping the 512,000-byte default, intact inputs, pass limits, and reviewer isolation unchanged. Native handoffs check all encoded requests against their existing transport limit before publishing any pass.
 
 - Pin the Linux installed-source helper check to Python 3.11.18 for its patched certificate trust, while retaining the existing compatibility matrix. Thanks @joshavant. (#341)

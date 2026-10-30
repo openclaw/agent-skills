@@ -3731,9 +3731,17 @@ class AutoreviewHardeningTests(unittest.TestCase):
                                 "--model", primary, "--no-web-search", "--codex-bin", str(executable),
                                 "--status-output", str(sidecar), "--json-output", str(report)]
                         if disabled:
-                            argv.append("--no-codex-model-fallback")
+                            argv.append("--codex-no-fallback")
+                        planned = subprocess.run(argv + ["--dry-run"], cwd=repo, env=env, text=True, capture_output=True, timeout=30)
+                        self.assertEqual(planned.returncode, 0, planned.stdout + planned.stderr)
+                        policy = "codex_fallback: disabled (model and authentication route)"
+                        self.assertEqual(policy in planned.stdout, disabled)
+                        self.assertEqual(f"fallback_model: {fallback}" in planned.stdout, not disabled)
+                        self.assertFalse(report.exists())
                         result = subprocess.run(argv, cwd=repo, env=env, text=True, capture_output=True, timeout=30)
                         self.assertEqual(result.returncode, 1 if disabled else 0, result.stdout + result.stderr)
+                        self.assertEqual(policy in result.stdout, disabled)
+                        self.assertEqual(f"fallback_model: {fallback}" in result.stdout, not disabled)
                         attempts = [json.loads(line)["argv"] for line in invocations.read_text().splitlines()]
                         models = [args[args.index("--model") + 1] for args in attempts if "exec" in args]
                         self.assertEqual(models, [primary] if disabled else [primary, fallback])

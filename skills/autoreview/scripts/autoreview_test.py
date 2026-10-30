@@ -1836,7 +1836,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         self.assertEqual(reviewer.fallback_model, "gpt-6-sol")
         self.assertEqual(AUTOREVIEW.codex_speed_override(reviewer), 'service_tier="ultrafast"')
 
-    def test_no_codex_model_fallback_preserves_primary_selection(self) -> None:
+    def test_codex_no_fallback_preserves_primary_selection(self) -> None:
         for model, fallback in (("gpt-6.1-sol", "gpt-6-sol"), ("gpt-6-sol", "gpt-6-luna"), ("gpt-5.6-sol", "gpt-5.6-terra")):
             selections = (
                 (["--model", model], {}),
@@ -1848,7 +1848,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                     with self.subTest(model=model, model_args=model_args, disabled=disabled), \
                             mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
                                 sys, "argv", ["autoreview", *model_args, "--thinking", "high", "--codex-speed", "fast",
-                                              *(["--no-codex-model-fallback"] if disabled else [])],
+                                              *(["--codex-no-fallback"] if disabled else [])],
                             ):
                         reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
                     self.assertEqual(reviewer.model, model)
@@ -1856,21 +1856,21 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                     self.assertEqual(AUTOREVIEW.codex_speed_override(reviewer), 'service_tier="fast"')
                     self.assertEqual(reviewer.fallback_model, None if disabled else fallback)
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
-            sys, "argv", ["autoreview", "--no-codex-model-fallback"],
+            sys, "argv", ["autoreview", "--codex-no-fallback"],
         ):
             args = AUTOREVIEW.parse_args()
             self.assertIsNone(AUTOREVIEW.reviewer_args(args)[0].fallback_model)
-            del args.no_codex_model_fallback
+            del args.codex_no_fallback
             self.assertEqual(AUTOREVIEW.reviewer_args(args)[0].fallback_model, "gpt-6-sol")
 
-    def test_no_codex_model_fallback_rejects_other_engines_before_preparation(self) -> None:
+    def test_codex_no_fallback_rejects_other_engines_before_preparation(self) -> None:
         for engine in AUTOREVIEW.ENGINES:
             if engine == "codex":
                 continue
             with self.subTest(engine=engine), mock.patch.dict(os.environ, {}, clear=True), \
-                    mock.patch.object(sys, "argv", ["autoreview", "--engine", engine, "--no-codex-model-fallback"]), \
+                    mock.patch.object(sys, "argv", ["autoreview", "--engine", engine, "--codex-no-fallback"]), \
                     mock.patch.object(AUTOREVIEW, "preflight_git", side_effect=AssertionError("unexpected preparation")):
-                with self.assertRaisesRegex(SystemExit, "--no-codex-model-fallback is only supported for codex"):
+                with self.assertRaisesRegex(SystemExit, "--codex-no-fallback is only supported for codex"):
                     AUTOREVIEW.main_impl()
 
     def test_codex_speed_default_yields_to_explicit_and_raw_service_tier(self) -> None:
@@ -2591,6 +2591,7 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
         self, failures: list[str], *, explicit: bool = False,
         login_missing: bool = False, configured: bool = True,
         credential_store: str = "file", inspect_attempt=None,
+        no_fallback: bool = False, fallback_model: str | None = None,
     ):
         if configured:
             self.configure_provider()
@@ -2598,19 +2599,29 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
             config_path.write_text(
                 f'cli_auth_credentials_store = "{credential_store}"\n' + config_path.read_text(),
             )
-        with mock.patch.object(sys, "argv", ["autoreview", "--no-web-search"]):
+        with mock.patch.object(sys, "argv", [
+            "autoreview", "--no-web-search", "--engine-timeout-seconds", "900",
+            *(["--codex-no-fallback"] if no_fallback else []),
+        ]):
             args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
         args.model = "review-model"
-        args.fallback_model = None
+        args.fallback_model = fallback_model
         args.codex_config = ['model_provider="review_api"'] if explicit else []
         commands = []
         stoppers = []
+        temporary_paths = []
 
         def run(command, _cwd, **kwargs):
             commands.append(command)
+            temporary_paths.extend((
+                _cwd, Path(kwargs["env"]["HOME"]).parent,
+                Path(command[command.index("--output-schema") + 1]),
+                Path(command[command.index("--output-last-message") + 1]),
+            ))
             if inspect_attempt is not None:
                 inspect_attempt(command, kwargs["env"], len(commands))
             self.assertEqual(kwargs["input_text"], "same review input")
+            self.assertEqual(kwargs["max_runtime_seconds"], 900)
             stopper = kwargs["stop_on_output"]
             self.assertIsInstance(stopper, AUTOREVIEW.CodexAuthFailureStopper)
             self.assertNotIn(stopper, stoppers)
@@ -2624,14 +2635,70 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
         with mock.patch.object(AUTOREVIEW, "resolve_command", return_value=sys.executable), \
                 mock.patch.object(AUTOREVIEW, "ensure_codex_isolation_supported"), \
                 mock.patch.object(AUTOREVIEW, "codex_subscription_login_missing", return_value=login_missing) as probe, \
+                mock.patch.object(AUTOREVIEW, "load_codex_auth_fallback_route", wraps=AUTOREVIEW.load_codex_auth_fallback_route) as discover, \
                 mock.patch.object(AUTOREVIEW, "run_with_heartbeat", side_effect=run), \
                 contextlib.redirect_stderr(stderr):
             try:
                 output = AUTOREVIEW.run_codex(args, self.repo, "same review input")
             except AUTOREVIEW.ReviewerUnavailable as exc:
                 output = str(exc)
-            self.assertEqual(probe.call_count, int(configured and not explicit))
+            self.assertEqual(probe.call_count, int(configured and not explicit and not no_fallback))
+            if no_fallback:
+                discover.assert_not_called()
+        self.assertTrue(temporary_paths)
+        self.assertFalse(any(path.exists() for path in temporary_paths))
         return commands, stderr.getvalue(), output
+
+    def test_no_fallback_missing_login_keeps_initial_subscription_route(self) -> None:
+        commands, notice, output = self.run_codex_attempts(
+            [], login_missing=True, no_fallback=True,
+        )
+        self.assertEqual(output, "clean")
+        self.assertEqual(len(commands), 1)
+        self.assertNotIn('model_provider="review_api"', commands[0])
+        self.assertEqual(notice, "")
+
+    def test_no_fallback_authentication_failure_never_reroutes(self) -> None:
+        for failure in ("401 Unauthorized", "token_expired"):
+            with self.subTest(failure=failure):
+                commands, notice, output = self.run_codex_attempts(
+                    [failure + " PRIVATE_SENTINEL"], no_fallback=True,
+                )
+                self.assertEqual(len(commands), 1)
+                self.assertNotIn('model_provider="review_api"', commands[0])
+                self.assertEqual(notice, "")
+                self.assertIn("authentication", output)
+                self.assertNotIn("PRIVATE_SENTINEL", notice + output)
+
+    def test_no_fallback_enforced_for_direct_namespace_model(self) -> None:
+        commands, notice, output = self.run_codex_attempts(
+            ["The model review-model does not exist or you do not have access to it."],
+            no_fallback=True, fallback_model="alternate-model",
+        )
+        self.assertEqual([command[command.index("--model") + 1] for command in commands], ["review-model"])
+        self.assertIn("codex engine failed", output)
+        self.assertEqual(notice, "")
+
+    def test_no_fallback_preserves_explicit_initial_provider_and_auth_store(self) -> None:
+        source_auth = self.home / "auth.json"
+        original = '{"tokens": {"refresh_token": "synthetic-token"}}'
+        source_auth.write_text(original)
+
+        def inspect(command, env, _attempt):
+            home = Path(env["CODEX_HOME"])
+            self.assertNotEqual(home, self.home)
+            self.assertTrue(home.is_dir())
+            self.assertFalse((home / "auth.json").exists())
+            self.assertIn('cli_auth_credentials_store="file"', command)
+
+        commands, notice, output = self.run_codex_attempts(
+            [], explicit=True, no_fallback=True, inspect_attempt=inspect,
+        )
+        self.assertEqual(output, "clean")
+        self.assertEqual(len(commands), 1)
+        self.assertIn('model_provider="review_api"', commands[0])
+        self.assertEqual(notice, "")
+        self.assertEqual(source_auth.read_text(), original)
 
     def test_missing_login_starts_on_configured_route_without_subscription_attempt(self) -> None:
         commands, notice, output = self.run_codex_attempts([], login_missing=True)
