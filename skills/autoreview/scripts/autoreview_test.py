@@ -2368,6 +2368,17 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             AUTOREVIEW.extract_json(json.dumps(payload))
 
 class AutoreviewAuthFallbackTests(unittest.TestCase):
+    # Native Codex 360319d8 login/src/auth/manager.rs:217–221, independent of markers.
+    NATIVE_REFRESH_FAILURES = (
+        "Your access token could not be refreshed because your refresh token has expired. "
+        "Please log out and sign in again.",
+        "Your access token could not be refreshed because your refresh token was already used. "
+        "Please log out and sign in again.",
+        "Your access token could not be refreshed because your refresh token was revoked. "
+        "Please log out and sign in again.",
+        "Your access token could not be refreshed. Please log out and sign in again.",
+    )
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="autoreview-auth-fallback.")
         self.addCleanup(self.temp.cleanup)
@@ -2433,6 +2444,60 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
             self.assertFalse(AUTOREVIEW.codex_authentication_failure(
                 subprocess.CompletedProcess([], 1, "", line),
             ))
+
+    def test_native_terminal_refresh_messages_and_event_shapes(self) -> None:
+        for message in self.NATIVE_REFRESH_FAILURES:
+            for event in (
+                {"type": "error", "message": message},
+                {"type": "turn.failed", "error": {"message": message}},
+            ):
+                with self.subTest(message=message, event=event):
+                    line = json.dumps(event)
+                    result = subprocess.CompletedProcess(
+                        [], 1, line, "Failed to refresh token status=400 Bad Request\n",
+                    )
+                    self.assertTrue(AUTOREVIEW.codex_authentication_failure(result))
+                    self.assertTrue(AUTOREVIEW.CodexAuthFailureStopper()("stdout", line))
+                    self.assertEqual(AUTOREVIEW.codex_failure_category(result), "authentication")
+                    self.assertFalse(AUTOREVIEW.codex_authentication_failure(
+                        AUTOREVIEW.TimedOutEngineProcess([], 124, line, result.stderr),
+                    ))
+
+    def test_native_refresh_messages_do_not_classify_review_content_or_near_matches(self) -> None:
+        for message in self.NATIVE_REFRESH_FAILURES:
+            for line in (
+                message,
+                json.dumps({"type": "item.completed", "item": {
+                    "type": "agent_message", "text": message,
+                }}),
+                json.dumps({"type": "item.completed", "item": {
+                    "type": "command_execution", "aggregated_output": message,
+                }}),
+            ):
+                with self.subTest(line=line):
+                    self.assertFalse(AUTOREVIEW.CodexAuthFailureStopper()("stdout", line))
+                    self.assertFalse(AUTOREVIEW.codex_authentication_failure(
+                        subprocess.CompletedProcess([], 1, line, ""),
+                    ))
+        for message in (
+            "Your access token could not be refreshed because you have since logged out or "
+            "signed in to another account. Please sign in again.",
+            "Your access token could not be refreshed; retrying the request.",
+            "Failed to refresh token: 400 Bad Request",
+            "Refreshing token",
+        ):
+            for stream, line in (
+                ("stdout", json.dumps({"type": "error", "message": message})),
+                ("stderr", message),
+            ):
+                with self.subTest(message=message, stream=stream):
+                    self.assertFalse(AUTOREVIEW.CodexAuthFailureStopper()(stream, line))
+                    self.assertFalse(AUTOREVIEW.codex_authentication_failure(
+                        subprocess.CompletedProcess(
+                            [], 1, line if stream == "stdout" else "",
+                            line if stream == "stderr" else "",
+                        ),
+                    ))
 
     def test_definite_authentication_failures_stop_immediately(self) -> None:
         for marker in AUTOREVIEW.CODEX_AUTH_TERMINAL_MARKERS:
@@ -2596,6 +2661,7 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
         login_missing: bool = False, configured: bool = True,
         credential_store: str = "file", inspect_attempt=None,
         no_fallback: bool = False, fallback_model: str | None = None,
+        failure_stdout: bool = False,
     ):
         if configured:
             self.configure_provider()
@@ -2631,7 +2697,11 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
             self.assertNotIn(stopper, stoppers)
             stoppers.append(stopper)
             if len(commands) <= len(failures):
-                return subprocess.CompletedProcess(command, 1, "", failures[len(commands) - 1])
+                failure = failures[len(commands) - 1]
+                return subprocess.CompletedProcess(
+                    command, 1, failure if failure_stdout else "",
+                    "" if failure_stdout else failure,
+                )
             Path(command[command.index("--output-last-message") + 1]).write_text("clean")
             return subprocess.CompletedProcess(command, 0, "", "")
 
@@ -2673,6 +2743,32 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
                 self.assertEqual(notice, "")
                 self.assertIn("authentication", output)
                 self.assertNotIn("PRIVATE_SENTINEL", notice + output)
+
+    def test_native_terminal_refresh_default_and_strict_routes(self) -> None:
+        for message in self.NATIVE_REFRESH_FAILURES:
+            for event in (
+                {"type": "error", "message": message + " PRIVATE_SENTINEL"},
+                {"type": "turn.failed", "error": {"message": message + " PRIVATE_SENTINEL"}},
+            ):
+                for strict in (False, True):
+                    with self.subTest(message=message, event=event, strict=strict):
+                        commands, notice, output = self.run_codex_attempts(
+                            [json.dumps(event)], failure_stdout=True, no_fallback=strict,
+                        )
+                        self.assertEqual(len(commands), 1 if strict else 2)
+                        self.assertNotIn('model_provider="review_api"', commands[0])
+                        self.assertEqual(
+                            [command[command.index("--model") + 1] for command in commands],
+                            ["review-model"] * len(commands),
+                        )
+                        if strict:
+                            self.assertEqual(notice, "")
+                            self.assertIn("authentication", output)
+                        else:
+                            self.assertIn('model_provider="review_api"', commands[1])
+                            self.assertEqual(notice.count("codex auth:"), 1)
+                            self.assertEqual(output, "clean")
+                        self.assertNotIn("PRIVATE_SENTINEL", notice + output)
 
     def test_no_fallback_enforced_for_direct_namespace_model(self) -> None:
         commands, notice, output = self.run_codex_attempts(

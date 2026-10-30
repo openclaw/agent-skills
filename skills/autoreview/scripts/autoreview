@@ -5746,6 +5746,15 @@ CODEX_AUTH_RECOVERY_MARKERS = (
 CODEX_AUTH_TERMINAL_MARKERS = (
     "refresh_token_reused", "refresh token has already been used", "token_expired",
     "missing bearer", "invalid api key",
+    # Codex emits these permanent token failures without their original error code.
+    # Full messages exclude transient refresh logs and guarded account changes.
+    "your access token could not be refreshed because your refresh token has expired. "
+    "please log out and sign in again.",
+    "your access token could not be refreshed because your refresh token was already used. "
+    "please log out and sign in again.",
+    "your access token could not be refreshed because your refresh token was revoked. "
+    "please log out and sign in again.",
+    "your access token could not be refreshed. please log out and sign in again.",
 )
 CODEX_AUTH_FAILURE_MARKERS = CODEX_AUTH_RECOVERY_MARKERS + CODEX_AUTH_TERMINAL_MARKERS
 
