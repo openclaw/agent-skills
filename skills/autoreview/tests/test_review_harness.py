@@ -158,11 +158,10 @@ class ReviewHarnessTests(unittest.TestCase):
                 'echo %*>>"%WRAPPER_LOG%"\r\n'
                 "exit /b 23\r\n", encoding="utf-8",
             )
+            # Confine native autoload discovery to the synthetic trap. Including
+            # PSHOME or inherited module paths also admits runner-wide modules.
             env = {**os.environ, "PATH": str(root), "IMPORT_MARKER": str(marker),
-                   "WRAPPER_LOG": str(log),
-                   "PSMODULEPATH": os.pathsep.join((str(modules),
-                                                    str(Path(powershell).resolve().parent / "Modules"),
-                                                    os.environ.get("PSMODULEPATH", "")))}
+                   "WRAPPER_LOG": str(log), "PSMODULEPATH": str(modules)}
 
             def run(*args: str) -> subprocess.CompletedProcess[str]:
                 return subprocess.run(
