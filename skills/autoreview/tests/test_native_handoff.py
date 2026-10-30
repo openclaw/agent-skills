@@ -1,17 +1,20 @@
 """Exercise real helper capture, raw completion submission and lifecycle boundaries."""
 from __future__ import annotations
 
+import argparse
 import copy
 import hashlib
 import json
 import os
 from pathlib import Path
+import runpy
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "autoreview"
 CLEAN = {"findings": [], "overall_correctness": "patch is correct",
@@ -147,6 +150,64 @@ class NativeHandoffTests(ReviewFixture):
         self.assertNotIn("agent_override", request)
         self.assertEqual(self.consumer(request).returncode, 0)
         self.finish(0)
+
+    def test_explicit_budget_preserves_native_request_limit(self):
+        context = self.repo / "context.txt"
+        for count, accepted in ((275_000, True), (350_000, False)):
+            with self.subTest(accepted=accepted):
+                self.report.unlink(missing_ok=True)
+                content = "😀" * count
+                context.write_text(content, encoding="utf-8")
+                self.start("--prompt-file", "context.txt", "--max-prompt-bytes", "1500000")
+                if accepted:
+                    request = self.request()
+                    self.assertIn(content, request["prompt"])
+                    self.assertGreater(request["prompt_bytes"], 1_000_000)
+                    self.assertLessEqual((self.handoff / "1.request.json").stat().st_size, 4_000_000)
+                    result = self.consumer(request)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.finish(0)
+                else:
+                    output = self.finish(1)
+                    self.assertIn("native handoff request 1/1 exceeds 4000000 bytes", output)
+                    self.assertNotIn("native pass ready", output)
+                    self.assertFalse(self.report.exists())
+
+    def test_later_oversized_request_refuses_before_exchange_creation(self):
+        helper = runpy.run_path(str(SCRIPT))
+        args = argparse.Namespace(native_handoff=str(self.handoff), engine_timeout_seconds=8)
+        reviewer = argparse.Namespace(model="fixture/reviewer", thinking="high", openclaw_models=[])
+        oversized = "😀" * 350_000
+        for prompt in (oversized, helper["ReviewPass"](oversized, helper["ReviewChunk"](""))):
+            with self.subTest(prompt=type(prompt).__name__):
+                handoff = None
+                try:
+                    with self.assertRaisesRegex(SystemExit, "native handoff request 2/2 exceeds 4000000 bytes"):
+                        handoff = helper["NativeHandoff"](args, reviewer, ["first pass", prompt])
+                finally:
+                    if handoff is not None:
+                        handoff.close()
+                self.assertFalse(self.handoff.exists())
+
+    def test_encoded_request_boundary_includes_envelope_and_escaping(self):
+        helper = runpy.run_path(str(SCRIPT))
+        args = argparse.Namespace(native_handoff=str(self.handoff), engine_timeout_seconds=8)
+        reviewer = argparse.Namespace(model="fixture/reviewer", thinking="high", openclaw_models=[])
+        handoff = helper["NativeHandoff"](args, reviewer, ["small"])
+        try:
+            prompt = '😀\\"\n'
+            encoded, digest = handoff.encode_request(1, prompt)
+            size = len(encoded.encode("utf-8"))
+            self.assertGreater(size, len(prompt.encode("utf-8")))
+            self.assertEqual(json.loads(encoded)["prompt"], prompt)
+            self.assertEqual(digest, hashlib.sha256(prompt.encode()).hexdigest())
+            with mock.patch.object(type(handoff), "MAX_REQUEST_BYTES", size):
+                self.assertEqual(handoff.encode_request(1, prompt), (encoded, digest))
+            with mock.patch.object(type(handoff), "MAX_REQUEST_BYTES", size - 1):
+                with self.assertRaisesRegex(SystemExit, "native handoff request 1/1 exceeds"):
+                    handoff.encode_request(1, prompt)
+        finally:
+            handoff.close()
 
     def test_admitted_model_is_validated_and_reported_without_a_default_timeout(self):
         for actual in ("fixture/permitted", "fixture/unselected"):

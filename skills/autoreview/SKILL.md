@@ -211,13 +211,28 @@ Other engines/platforms retain their normal isolation.
 
 Do not edit captured inputs during review; sources are verified before sending
 and publishing. Text is never truncated or capped by file count/size. Large inputs
-are partitioned; every change is reviewed against every evidence batch. Intact
+are partitioned; by default every change is reviewed against every evidence batch. Intact
 instructions and required context must fit per pass, or preparation fails.
 Each pass must finish its own assessment; a failed pass never yields partial clean.
 
+For a large committed branch with distinct owner contracts, opt in to
+`--review-batches <repo-relative-manifest.json>`. The versioned operator allocation
+binds one complete frozen range, assigns whole changed-file units and whole source
+contracts, and declares cross-owner integration obligations. Every change and
+declared context must be covered; missing evidence or an incomplete assignment
+blocks aggregate clean. This does not change existing context flags, engine,
+isolation, or budgets. Read the [allocation contract](references/git-and-context.md#explicit-branch-allocations)
+before constructing a manifest; a mechanical coverage check is not a correctness review.
+
 Advancing heartbeats mean progress; use `--stream-engine-output`, not extra runs.
 `--dry-run` checks preparation/startup without a reviewer. Both print planned
-passes and prompt bytes. `--max-review-passes N` (or
+passes and prompt bytes. `--max-prompt-bytes N` sets the positive UTF-8 byte
+budget per prompt (default: `512000`). Use an explicit larger budget when the
+selected review route can accept the complete required context; the helper
+never raises it automatically or changes model context/token limits. Dry-run
+and live review use the same budget, keep intact context whole, and refuse any
+oversized final prompt before starting a reviewer.
+`--max-review-passes N` (or
 `AUTOREVIEW_MAX_REVIEW_PASSES`) rejects an over-budget plan before startup;
 there is no default ceiling. `--engine-timeout-seconds` limits each process attempt.
 These controls are not token hard caps and do not bound reasoning or tool use.

@@ -3,6 +3,10 @@
 ## Unreleased
 
 - Add `autoreview --no-codex-model-fallback` to keep reviews on the selected Codex model and report access failures without trying another model.
+- Add an explicit Autoreview `--max-prompt-bytes` planning budget for complete required context, keeping the 512,000-byte default, intact inputs, pass limits, and reviewer isolation unchanged. Native handoffs check all encoded requests against their existing transport limit before publishing any pass.
+
+- Pin the Linux installed-source helper check to Python 3.11.18 for its patched certificate trust, while retaining the existing compatibility matrix. Thanks @joshavant. (#341)
+
 - Check report output readiness before starting Autoreview, preserving existing reports and refusing unusable destinations early. Thanks @JeanFrancoisGagne.
 - Run native macOS sandbox and Git-boundary CI checks on the `xcode-27` Apple Silicon image.
 

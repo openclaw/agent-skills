@@ -182,6 +182,62 @@ class CodexInferenceRouteTests(unittest.TestCase):
         ):
             return self.helper["resolve_engine_binary"](self.args, self.repo)
 
+    def test_https_gateway_base_url_reaches_client_unchanged(self):
+        for base_url in (
+            "https://gateway.example.invalid/v1",
+            "https://gateway.example.invalid:8443/inference/v1/",
+            "https://[::1]:8443/v1",
+            "https://gateway.example.invalid",
+            "HTTPS://Gateway.Example.Invalid/v1/%23responses",
+        ):
+            with self.subTest(base_url=base_url):
+                self.provider["base_url"] = base_url
+                self.args.model = "openai/gpt-6.1-sol"
+                self.write_config()
+                observed = self.run_review()
+                flags = observed["command"]
+                key = "model_providers.review_api.base_url="
+                self.assertEqual(
+                    [flags[index + 1] for index, part in enumerate(flags)
+                     if part == "-c" and flags[index + 1].startswith(key)],
+                    [key + json.dumps(base_url)],
+                )
+                self.assertEqual(flags[flags.index("--model") + 1], self.args.model)
+                self.assertEqual(observed["report"], '{"findings": []}')
+                self.assertEqual(self.available(), (True, None))
+
+    def test_invalid_base_url_refuses_in_run_and_preflight(self):
+        for base_url in (
+            "http://gateway.example.invalid/v1", "http://127.0.0.1/v1",
+            "https://user:password@gateway.example.invalid/v1",
+            "https://user@gateway.example.invalid/v1",
+            "https://@gateway.example.invalid/v1",
+            "https://gateway.example.invalid/v1?key=synthetic",
+            "https://gateway.example.invalid/v1#fragment",
+            "https://gateway.example.invalid/v1?", "https://gateway.example.invalid/v1#",
+            "not-a-url", "", "//gateway.example.invalid/v1", "https:///v1",
+            "https://", "https://[invalid/v1",
+            "https://gateway.example.invalid:bad/v1",
+            "https://gateway.example.invalid:65536/v1",
+            "https://gateway.example.invalid:0/v1",
+            "https://gateway.example.invalid:/v1",
+            " https://gateway.example.invalid/v1",
+            "https://gateway.example.invalid/v1\n",
+            "https://gate way.example.invalid/v1",
+            "https://gateway.example.invalid\\other/v1",
+            "https://gateway.example.invalid/v1/%invalid",
+            "https://gate%20way.example.invalid/v1",
+            "https://gateway.example.invalid%2fother/v1",
+            42, False, [], {},
+        ):
+            with self.subTest(base_url=base_url):
+                self.provider["base_url"] = base_url
+                self.write_config()
+                self.assert_route_refused()
+        self.provider.pop("base_url")
+        self.write_config()
+        self.assert_route_refused()
+
     def assert_route_refused(self):
         prepare_auth = mock.Mock()
         with self.assertRaisesRegex(SystemExit, "inference|Codex config") as caught:
@@ -341,7 +397,6 @@ class CodexInferenceRouteTests(unittest.TestCase):
         provider = copy.deepcopy(self.provider)
         auth = copy.deepcopy(self.auth)
         cases = [
-            ("provider", {**provider, "base_url": "https://example.invalid/v1"}),
             ("provider", {**provider, "http_headers": {"Authorization": "synthetic"}}),
             ("provider", {**provider, "requires_openai_auth": True}),
             ("provider", {**provider, "requires_openai_auth": "false"}),
