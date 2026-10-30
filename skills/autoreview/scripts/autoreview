@@ -5746,6 +5746,15 @@ CODEX_AUTH_RECOVERY_MARKERS = (
 CODEX_AUTH_TERMINAL_MARKERS = (
     "refresh_token_reused", "refresh token has already been used", "token_expired",
     "missing bearer", "invalid api key",
+    # Codex emits these permanent token failures without their original error code.
+    # Full messages exclude transient refresh logs and guarded account changes.
+    "your access token could not be refreshed because your refresh token has expired. "
+    "please log out and sign in again.",
+    "your access token could not be refreshed because your refresh token was already used. "
+    "please log out and sign in again.",
+    "your access token could not be refreshed because your refresh token was revoked. "
+    "please log out and sign in again.",
+    "your access token could not be refreshed. please log out and sign in again.",
 )
 CODEX_AUTH_FAILURE_MARKERS = CODEX_AUTH_RECOVERY_MARKERS + CODEX_AUTH_TERMINAL_MARKERS
 
@@ -5928,9 +5937,12 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         dir=temp_root,
     ) as output_file:
         output_path = Path(output_file.name)
+    # Enforce the invocation's identity boundary even for internal callers that
+    # supply a fallback_model directly instead of using reviewer_args.
+    allow_fallback = not getattr(args, "codex_no_fallback", False)
     models = [args.model]
     fallback_model = getattr(args, "fallback_model", None)
-    if fallback_model and fallback_model != args.model:
+    if allow_fallback and fallback_model and fallback_model != args.model:
         models.append(fallback_model)
     primary_failure: subprocess.CompletedProcess[str] | None = None
     try:
@@ -5953,7 +5965,10 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             overrides = codex_config_overrides(args)
             route = load_codex_inference_route(repo, overrides)
             command_auth = any(flag.startswith("model_provider=") for flag in route[0])
-            auth_fallback = load_codex_auth_fallback_route(repo, overrides, command_auth=command_auth)
+            auth_fallback = (
+                load_codex_auth_fallback_route(repo, overrides, command_auth=command_auth)
+                if allow_fallback else None
+            )
             if auth_fallback is not None and codex_subscription_login_missing(
                 resolve_command(args.codex_bin, repo), temp_root,
             ):
@@ -6028,8 +6043,10 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                         raise ReviewerUnavailable("codex engine failed: missing-report; provider diagnostics suppressed",
                                                   reason="invalid_report", result=result)
                     return output or result.stdout
-                auth_fallback = load_codex_auth_fallback_route(
-                    repo, overrides, result, command_auth=command_auth,
+                auth_fallback = (
+                    load_codex_auth_fallback_route(
+                        repo, overrides, result, command_auth=command_auth,
+                    ) if allow_fallback else None
                 )
                 if auth_fallback is not None:
                     provider, route = auth_fallback
@@ -7525,6 +7542,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--openclaw-config", help="Optional external operator config for direct OpenClaw execution. Omit to inherit normal native configuration and authentication.")
     parser.add_argument("--codex-bin", default=os.environ.get("CODEX_BIN", "codex"))
     parser.add_argument(
+        "--codex-no-fallback",
+        action="store_true",
+        help="Keep the selected Codex model and authentication route; do not substitute another model or configured provider.",
+    )
+    parser.add_argument(
         "--codex-config",
         action="append",
         help='Codex "-c key=value" tuning override (TOML value). Select model_provider=<id> to project the matching trusted external route. Repeatable; one provider selector. Command-, path-, and provider-definition keys are refused. Env default: AUTOREVIEW_CODEX_CONFIG (semicolon-separated).',
@@ -7847,6 +7869,8 @@ def parse_keyed_options(values: list[str] | None, option: str) -> tuple[str | No
 
 
 def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
+    if getattr(args, "codex_no_fallback", False) and args.engine != "codex":
+        raise SystemExit("--codex-no-fallback is only supported for codex; no codex reviewer selected")
     if args.engine == "kimi":
         raise SystemExit(KIMI_PRIVATE_INPUT_UNSUPPORTED)
     global_model, model_by_engine = parse_keyed_options(args.model, "model")
@@ -7892,6 +7916,8 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
             or env_fallback_by_engine.get(engine)
             or env_global_fallback
         )
+    elif engine == "codex" and getattr(args, "codex_no_fallback", False):
+        fallback_model = None
     elif engine == "codex" and model == DEFAULT_MODEL_BY_ENGINE["codex"]:
         fallback_model = DEFAULT_CODEX_ACCESS_FALLBACK_MODEL
     elif engine == "codex" and model == "gpt-6-sol":
@@ -8735,6 +8761,8 @@ def main_with_args(args: argparse.Namespace) -> int:
     if reviewer.thinking:
         print(f"thinking: {reviewer.thinking}", flush=True)
     if reviewer.engine == "codex":
+        if getattr(reviewer, "codex_no_fallback", False):
+            print("codex_fallback: disabled (model and authentication route)", flush=True)
         config_keys = codex_config_keys(reviewer)
         if config_keys:
             print(f"codex_config_keys: {', '.join(config_keys)}", flush=True)

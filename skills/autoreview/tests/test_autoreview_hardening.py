@@ -3697,6 +3697,68 @@ class AutoreviewHardeningTests(unittest.TestCase):
                         self.assertNotIn("\x1b", result.stderr)
 
 
+    @unittest.skipIf(os.name == "nt", "the executable fixture is POSIX-only")
+    def test_cli_codex_model_fallback_opt_out_preserves_failed_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            git(repo, "commit", "-q", "--allow-empty", "-m", "base")
+            (repo / "source.txt").write_text("review me\n")
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith("AUTOREVIEW_") or key == "AUTOREVIEW_GIT"}
+            env.update({"HOME": str(root), "USERPROFILE": str(root), "CODEX_HOME": str(root),
+                        "AUTOREVIEW_FAKE_RECORD": str(root / "record.json")})
+            for primary, fallback in (("gpt-6.1-sol", "gpt-6-sol"), ("gpt-6-sol", "gpt-6-luna"), ("gpt-5.6-sol", "gpt-5.6-terra")):
+                # Even a schema-valid output file cannot override the failing child exit.
+                failure = (
+                    'model = args[args.index("--model") + 1]\n'
+                    f'if model == {primary!r}:\n'
+                    '    print(json.dumps({"type": "error", "message": '
+                    'f"The model {model} does not exist or you do not have access to it."}))\n'
+                    '    raise SystemExit(17)\n'
+                )
+                executable = write_executable(root / "codex", fake_codex_script().replace(
+                    'print("fake codex ok")', failure + 'print("fake codex ok")',
+                ))
+                for disabled in (True, False):
+                    with self.subTest(primary=primary, disabled=disabled):
+                        outputs = root / f"{primary}-{disabled}"
+                        outputs.mkdir()
+                        invocations = outputs / "invocations.jsonl"
+                        sidecar, report = outputs / "status.json", outputs / "result.json"
+                        env["AUTOREVIEW_FAKE_CODEX_INVOCATIONS"] = str(invocations)
+                        argv = [sys.executable, str(SCRIPT), "--mode", "local", "--engine", "codex",
+                                "--model", primary, "--no-web-search", "--codex-bin", str(executable),
+                                "--status-output", str(sidecar), "--json-output", str(report)]
+                        if disabled:
+                            argv.append("--codex-no-fallback")
+                        planned = subprocess.run(argv + ["--dry-run"], cwd=repo, env=env, text=True, capture_output=True, timeout=30)
+                        self.assertEqual(planned.returncode, 0, planned.stdout + planned.stderr)
+                        policy = "codex_fallback: disabled (model and authentication route)"
+                        self.assertEqual(policy in planned.stdout, disabled)
+                        self.assertEqual(f"fallback_model: {fallback}" in planned.stdout, not disabled)
+                        self.assertFalse(report.exists())
+                        result = subprocess.run(argv, cwd=repo, env=env, text=True, capture_output=True, timeout=30)
+                        self.assertEqual(result.returncode, 1 if disabled else 0, result.stdout + result.stderr)
+                        self.assertEqual(policy in result.stdout, disabled)
+                        self.assertEqual(f"fallback_model: {fallback}" in result.stdout, not disabled)
+                        attempts = [json.loads(line)["argv"] for line in invocations.read_text().splitlines()]
+                        models = [args[args.index("--model") + 1] for args in attempts if "exec" in args]
+                        self.assertEqual(models, [primary] if disabled else [primary, fallback])
+                        outcome = json.loads(sidecar.read_text())
+                        self.assertEqual(outcome["status"], "reviewer_unavailable" if disabled else "scoped-clean")
+                        self.assertEqual(outcome["report_produced"], not disabled)
+                        if disabled:
+                            self.assertEqual(outcome["reason"], "engine_failed")
+                            self.assertEqual(outcome["reviewer_exit_code"], 17)
+                            self.assertFalse(outcome["timed_out"])
+                            self.assertFalse(report.exists())
+                            self.assertNotIn("scoped-clean:", result.stdout)
+                            self.assertNotIn("retrying with", result.stderr)
+                        else:
+                            self.assertEqual(json.loads(report.read_text())["findings"], [])
+                            self.assertIn(f"retrying with {fallback}", result.stderr)
+
     def test_tracked_binary_changes_are_blocked_in_all_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
