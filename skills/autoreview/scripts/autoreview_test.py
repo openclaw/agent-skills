@@ -1836,6 +1836,43 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         self.assertEqual(reviewer.fallback_model, "gpt-6-sol")
         self.assertEqual(AUTOREVIEW.codex_speed_override(reviewer), 'service_tier="ultrafast"')
 
+    def test_no_codex_model_fallback_preserves_primary_selection(self) -> None:
+        for model, fallback in (("gpt-6.1-sol", "gpt-6-sol"), ("gpt-6-sol", "gpt-6-luna"), ("gpt-5.6-sol", "gpt-5.6-terra")):
+            selections = (
+                (["--model", model], {}),
+                (["--model", "codex=" + model], {}),
+                ([], {"AUTOREVIEW_CODEX_MODEL": model}),
+            )
+            for model_args, env in selections:
+                for disabled in (False, True):
+                    with self.subTest(model=model, model_args=model_args, disabled=disabled), \
+                            mock.patch.dict(os.environ, env, clear=True), mock.patch.object(
+                                sys, "argv", ["autoreview", *model_args, "--thinking", "high", "--codex-speed", "fast",
+                                              *(["--no-codex-model-fallback"] if disabled else [])],
+                            ):
+                        reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+                    self.assertEqual(reviewer.model, model)
+                    self.assertEqual(reviewer.thinking, "high")
+                    self.assertEqual(AUTOREVIEW.codex_speed_override(reviewer), 'service_tier="fast"')
+                    self.assertEqual(reviewer.fallback_model, None if disabled else fallback)
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            sys, "argv", ["autoreview", "--no-codex-model-fallback"],
+        ):
+            args = AUTOREVIEW.parse_args()
+            self.assertIsNone(AUTOREVIEW.reviewer_args(args)[0].fallback_model)
+            del args.no_codex_model_fallback
+            self.assertEqual(AUTOREVIEW.reviewer_args(args)[0].fallback_model, "gpt-6-sol")
+
+    def test_no_codex_model_fallback_rejects_other_engines_before_preparation(self) -> None:
+        for engine in AUTOREVIEW.ENGINES:
+            if engine == "codex":
+                continue
+            with self.subTest(engine=engine), mock.patch.dict(os.environ, {}, clear=True), \
+                    mock.patch.object(sys, "argv", ["autoreview", "--engine", engine, "--no-codex-model-fallback"]), \
+                    mock.patch.object(AUTOREVIEW, "preflight_git", side_effect=AssertionError("unexpected preparation")):
+                with self.assertRaisesRegex(SystemExit, "--no-codex-model-fallback is only supported for codex"):
+                    AUTOREVIEW.main_impl()
+
     def test_codex_speed_default_yields_to_explicit_and_raw_service_tier(self) -> None:
         cases = (
             (["--codex-speed", "fast"], {}, 'service_tier="fast"'),

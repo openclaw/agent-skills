@@ -121,6 +121,10 @@ slowness or rate limits. If no route is eligible, report unavailable.
 The helper's Codex engine defaults to **GPT-6.1 Sol (`gpt-6.1-sol`), medium reasoning, Ultrafast**.
 It retries GPT-6 Sol once only for account-access failure, without chaining to Luna.
 Network, rate-limit, capacity, and unsupported-effort errors do not trigger fallback.
+Use `--no-codex-model-fallback` when only the selected Codex model is authorized.
+An access failure then stays `reviewer_unavailable`; no other model is tried.
+This disables helper model fallback, not the separate same-model auth recovery
+or retry behavior inside Codex itself.
 An effort-only override keeps the model. `--engine`, `--model`, and `--thinking`
 override defaults; per-engine environment overrides use `AUTOREVIEW_<ENGINE>_*`.
 Ultrafast requires model-catalog support, otherwise Codex sends the standard tier.

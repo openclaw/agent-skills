@@ -22,6 +22,11 @@ produces no helper-validated machine status or helper isolation guarantees.
 - Codex tier: Ultrafast when active model catalog lists it; otherwise Codex silently
   sends standard tier. Raw `--codex-config service_tier=...` keeps its value.
 - `--codex-speed fast`: priority service. `--codex-speed default`: standard tier.
+- `--no-codex-model-fallback`: use only the selected Codex model, including the
+  default. Disables all helper access-only model retries listed above. An access
+  failure remains `reviewer_unavailable` with no validated report. Codex-only;
+  does not change provider selection, same-model auth recovery, or retries inside
+  Codex itself, and does not grant model access.
 - Only Claude accepts `--fallback-model`.
 - Per-engine environment overrides: `AUTOREVIEW_<ENGINE>_*`.
 

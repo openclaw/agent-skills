@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add `autoreview --no-codex-model-fallback` to keep reviews on the selected Codex model and report access failures without trying another model.
 - Check report output readiness before starting Autoreview, preserving existing reports and refusing unusable destinations early. Thanks @JeanFrancoisGagne.
 - Run native macOS sandbox and Git-boundary CI checks on the `xcode-27` Apple Silicon image.
 

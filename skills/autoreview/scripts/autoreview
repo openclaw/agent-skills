@@ -7316,6 +7316,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--openclaw-config", help="Optional external operator config for direct OpenClaw execution. Omit to inherit normal native configuration and authentication.")
     parser.add_argument("--codex-bin", default=os.environ.get("CODEX_BIN", "codex"))
     parser.add_argument(
+        "--no-codex-model-fallback",
+        action="store_true",
+        help="Use only the selected Codex model; do not retry another model after an access failure.",
+    )
+    parser.add_argument(
         "--codex-config",
         action="append",
         help='Codex "-c key=value" tuning override (TOML value). Select model_provider=<id> to project the matching trusted external route. Repeatable; one provider selector. Command-, path-, and provider-definition keys are refused. Env default: AUTOREVIEW_CODEX_CONFIG (semicolon-separated).',
@@ -7637,6 +7642,8 @@ def parse_keyed_options(values: list[str] | None, option: str) -> tuple[str | No
 
 
 def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
+    if getattr(args, "no_codex_model_fallback", False) and args.engine != "codex":
+        raise SystemExit("--no-codex-model-fallback is only supported for codex; no codex reviewer selected")
     if args.engine == "kimi":
         raise SystemExit(KIMI_PRIVATE_INPUT_UNSUPPORTED)
     global_model, model_by_engine = parse_keyed_options(args.model, "model")
@@ -7682,6 +7689,8 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
             or env_fallback_by_engine.get(engine)
             or env_global_fallback
         )
+    elif engine == "codex" and getattr(args, "no_codex_model_fallback", False):
+        fallback_model = None
     elif engine == "codex" and model == DEFAULT_MODEL_BY_ENGINE["codex"]:
         fallback_model = DEFAULT_CODEX_ACCESS_FALLBACK_MODEL
     elif engine == "codex" and model == "gpt-6-sol":
