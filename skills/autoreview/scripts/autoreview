@@ -5863,6 +5863,9 @@ def codex_command(
     cmd = [resolve_command(args.codex_bin, source_repo), "--ask-for-approval", "never"]
     if args.web_search:
         cmd.append("--search")
+    else:
+        # Omitting --search leaves Codex's cached search enabled.
+        cmd.extend(["-c", 'web_search="disabled"'])
     if model:
         cmd.extend(["--model", model])
     # User overrides go before the isolation flags so isolation stays authoritative on conflicts.

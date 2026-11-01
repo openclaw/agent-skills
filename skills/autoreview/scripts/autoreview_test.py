@@ -1827,6 +1827,22 @@ class AutoreviewExecutableDiscoveryTests(unittest.TestCase):
 
 
 class AutoreviewCompatibilityTests(unittest.TestCase):
+    def test_codex_web_search_selection_reaches_native_command(self) -> None:
+        for flags, enabled in (([], True), (["--no-web-search"], False)):
+            with self.subTest(enabled=enabled), mock.patch.dict(os.environ, {}, clear=True), \
+                    mock.patch.object(sys, "argv", ["autoreview", *flags]), \
+                    mock.patch.object(AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex"), \
+                    tempfile.TemporaryDirectory() as tmpdir:
+                args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
+                root = Path(tmpdir)
+                command = AUTOREVIEW.codex_command(
+                    args, root, root, root, root / "schema.json", root / "output.json",
+                    args.model, auth_config=[],
+                )
+                configs = [command[i + 1] for i, arg in enumerate(command) if arg == "-c"]
+                self.assertEqual("--search" in command, enabled)
+                self.assertEqual('web_search="disabled"' in configs, not enabled)
+
     def test_default_reviewer_uses_sol_61_medium_ultrafast_with_sol_6_access_retry(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(sys, "argv", ["autoreview"]):
             reviewer = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
@@ -2208,6 +2224,8 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             self.assertEqual(Path(env["CODEX_HOME"]).name, "codex-home")
             self.assertNotEqual(env["CODEX_HOME"], str((Path.home() / ".codex").resolve()))
             self.assertIn("features.shell_snapshot=false", observed["command"])
+            self.assertIn('web_search="disabled"', observed["command"])
+            self.assertNotIn("--search", observed["command"])
             self.assertIn("features.hooks=false", observed["command"])
             self.assertIn("features.plugins=false", observed["command"])
             self.assertIn("skills.include_instructions=false", observed["command"])

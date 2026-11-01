@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Make `autoreview --no-web-search` explicitly disable Codex web search instead of leaving cached search enabled.
 - Add `autoreview --codex-no-fallback` to keep reviews on the selected Codex model and authentication route, refusing model or configured-provider substitution while preserving native recovery within that route.
 - Recognize current Codex terminal refresh-token messages, preserving configured-provider recovery by default and sanitized refusal when fallback is disabled.
 - Add an explicit Autoreview `--max-prompt-bytes` planning budget for complete required context, keeping the 512,000-byte default, intact inputs, pass limits, and reviewer isolation unchanged. Native handoffs check all encoded requests against their existing transport limit before publishing any pass.
