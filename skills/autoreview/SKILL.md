@@ -128,8 +128,11 @@ selection and native recovery within the same route remain unchanged; failure
 stays `reviewer_unavailable`. Defaults remain unchanged when the flag is absent.
 An effort-only override keeps the model. `--engine`, `--model`, and `--thinking`
 override defaults; per-engine environment overrides use `AUTOREVIEW_<ENGINE>_*`.
-Ultrafast requires model-catalog support, otherwise Codex sends the standard tier.
-`--codex-speed fast` selects priority; `default` selects standard. A raw
+For the default speed, the helper checks the Codex model catalog and requests Fast
+when that model advertises Fast but not Ultrafast. A failed or unavailable check
+retains Ultrafast; catalog data does not prove account entitlement or actual service.
+Explicit speed settings are never changed. `--codex-speed fast` selects priority;
+`default` selects standard. A raw
 `--codex-config service_tier=...` retains its value.
 
 Read [engine options](references/engines.md) before selecting another model/effort,
