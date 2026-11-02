@@ -1,0 +1,111 @@
+name: Isolated validation dependency proof
+
+on:
+  push:
+    branches: [investigate/ci-validation-proof-20261102]
+
+permissions:
+  contents: read
+
+jobs:
+  cold:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, candidate]
+    env:
+      NPM_CONFIG_CACHE: ${{ runner.temp }}/validation-proof-npm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: harness
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ matrix.variant == 'baseline' && '82ed255a43c1bc141f94f0b1053566910d3a32bf' || '4a9d6b6b6410a8d6c0d17093ceff4cec47d36f34' }}
+          path: source
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: source/requirements-dev.txt
+      - name: Isolate exact native cache input
+        run: |
+          python -c 'from pathlib import Path; import os; Path(os.environ["RUNNER_TEMP"], "validation-proof-lock").write_bytes(Path("source/package-lock.json").read_bytes() + b"\nvalidation-typechecker-proof-v1-20261102")'
+          test ! -d "$NPM_CONFIG_CACHE"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        id: node
+        with:
+          node-version: '26.12.1'
+          cache: ${{ matrix.variant == 'baseline' && 'npm' || '' }}
+          cache-dependency-path: ${{ runner.temp }}/validation-proof-lock
+      - name: Require genuine cold npm cache
+        env:
+          CACHE_HIT: ${{ steps.node.outputs.cache-hit }}
+        run: test "$CACHE_HIT" != true
+      - name: Install unchanged Python dependencies
+        run: python -m pip install -r source/requirements-dev.txt
+      - name: Actual cold boundary group
+        env:
+          PROOF_VARIANT: ${{ matrix.variant }}
+          PROOF_PHASE: cold
+        run: python -B harness/scripts/ci-validation-proof.py
+
+  restored:
+    needs: cold
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, candidate]
+    env:
+      NPM_CONFIG_CACHE: ${{ runner.temp }}/validation-proof-npm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: harness
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ matrix.variant == 'baseline' && '82ed255a43c1bc141f94f0b1053566910d3a32bf' || '4a9d6b6b6410a8d6c0d17093ceff4cec47d36f34' }}
+          path: source
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: matrix.variant == 'candidate'
+        with:
+          ref: 82ed255a43c1bc141f94f0b1053566910d3a32bf
+          path: hot-baseline
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: source/requirements-dev.txt
+      - name: Isolate exact native cache input
+        run: |
+          python -c 'from pathlib import Path; import os; Path(os.environ["RUNNER_TEMP"], "validation-proof-lock").write_bytes(Path("source/package-lock.json").read_bytes() + b"\nvalidation-typechecker-proof-v1-20261102")'
+          test ! -d "$NPM_CONFIG_CACHE"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        id: node
+        with:
+          node-version: '26.12.1'
+          cache: ${{ matrix.variant == 'baseline' && 'npm' || '' }}
+          cache-dependency-path: ${{ runner.temp }}/validation-proof-lock
+      - name: Require restored baseline or absent candidate cache
+        env:
+          CACHE_HIT: ${{ steps.node.outputs.cache-hit }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          if [[ "$VARIANT" = baseline ]]; then test "$CACHE_HIT" = true; else test "$CACHE_HIT" != true; fi
+      - name: Install unchanged Python dependencies
+        run: python -m pip install -r source/requirements-dev.txt
+      - name: Actual fresh restored boundary group and hot install component
+        env:
+          PROOF_VARIANT: ${{ matrix.variant }}
+          PROOF_PHASE: restored
+        run: python -B harness/scripts/ci-validation-proof.py
