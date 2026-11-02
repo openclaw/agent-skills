@@ -12,9 +12,9 @@ Use when the user explicitly asks to beam, publish, or share the current local c
 - Treat invoking this skill as approval for one snapshot upload to the named destination.
 - Never upload raw JSONL, reasoning, system/developer prompts, tool output, environment values, credentials, browser state, cookies, or local paths.
 - The helper is self-contained: it resolves and parses exact Claude Code or Codex transcripts, then uploads only locally redacted user/assistant messages and compact tool counts.
-- Beam is a read-only projection. Do not connect a node, expose a terminal, resume the local harness remotely, or grant the receiver filesystem/tool access.
+- Beam is a read-only projection. Authorized staff can continue by copying the shared transcript into a new Team session, not by resuming the local harness remotely. Do not connect a node, expose a terminal, or grant the receiver filesystem/tool access.
 - Require HTTPS except for loopback development endpoints.
-- Authenticate with `BEAM_ACCESS_TOKEN`, `BEAM_AUTH_TOKEN`, or an interactive `cloudflared access login`. Never print those values.
+- Guests use their existing personal Cloudflare Access sign-in or `BEAM_ACCESS_TOKEN`; never request, share, or copy a Gateway token for guest uploads. `BEAM_AUTH_TOKEN` remains the ordinary operator Gateway-auth fallback, not a guest credential. Never print token values.
 - Live synchronization is opt-in persistent behavior. Do not install hooks unless the user explicitly asks for live Beam updates.
 
 ## Snapshot
@@ -22,7 +22,7 @@ Use when the user explicitly asks to beam, publish, or share the current local c
 Set or obtain the destination receiver URL first:
 
 ```bash
-export BEAM_ENDPOINT="https://example.internal/api/v1/beam/sessions"
+export BEAM_ENDPOINT="https://gateway.example.com/api/v1/beam/sessions"
 ```
 
 Prefer the harness-specific exact identifier. Resolve the directory containing this `SKILL.md` as `BEAM_SKILL_DIR` first.
@@ -64,6 +64,10 @@ node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --dry-ru
 
 On success, return only the Beam URL and a short disclosure summary: source harness, shared message count, whether older entries were truncated, and whether the beam is complete. The URL uses the endpoint-derived Control UI base path followed by `/beam/<title-slug>-<id-prefix>`, for example `https://gateway.example.com/beam/fix-upload-flow-0123456789ab`. The title comes from `--title` or the first shared user message. The stable ID suffix identifies the session; links with an earlier title remain valid.
 
+If the receipt includes `canView: false`, say that the upload succeeded and the link is for authorized Team operators; upload-only access does not let the guest open it. Do not present it as a guest-viewable link. Staff and older receipts may omit `canView`; omission is not a new access grant.
+
+Restricted guest uploads require receiver-side support and operator authorization; sender support alone does not mean they are deployed. That receiver mode permits creating or refreshing only the publisher's own snapshots, not listing, reading, deleting, or continuing the catalog. Guests need no shared secret. If personal access expires, sign in again outside hooks or refresh the personal `BEAM_ACCESS_TOKEN`; revoked access needs an authorized operator to restore it. Never blindly retry an uncertain upload.
+
 The helper also accepts bare `/beam/<id-prefix>` links and, during rollout, the current server's exact `/chat/<agent>?catalog=beam&host=gateway&thread=<full-beam-id>` response. It still rejects the obsolete `?session=catalog:...` beta form.
 
 ## Live Hooks
@@ -79,7 +83,7 @@ Configure root `Stop` hooks for turn-by-turn updates. Claude Code can also use `
 - `references/claude-code-hooks.json`
 - `references/codex-hooks.toml`
 
-Hook failures must not block the coding session. Keep them quiet on success; log one concise redacted error on failure.
+Hook failures must not block the coding session. Keep them quiet on success (including upload-only receipts); log one concise redacted error on failure. Hooks never start interactive authentication.
 
 Full installation, authentication, data-boundary, and hook documentation:
 [`README.md`](README.md).

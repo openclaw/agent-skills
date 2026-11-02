@@ -24,8 +24,8 @@ The `beam` helper is self-contained. It does not require `agent-transcript`,
 4. It strips internal hook wrappers and redacts credentials, auth headers,
    private keys, email addresses, phone numbers, secret query parameters, and
    broad local paths.
-5. It uploads a closed, size-bounded JSON payload. The receiver is expected to
-   expose it as a passive catalog, not a resumable session.
+5. It uploads a closed, size-bounded JSON payload. The receiver exposes a passive
+   transcript projection, not remote access to the local coding session.
 
 Beam refuses fuzzy discovery. If an exact session cannot be resolved or multiple
 exact candidates exist, publication stops without choosing the newest nearby
@@ -80,6 +80,18 @@ form, for example:
 Beamed session: https://gateway.example.com/beam/fix-upload-flow-0123456789ab
 ```
 
+When a receiver returns `canView: false`, the upload still succeeded, but Beam
+instead prints:
+
+```text
+Beam upload succeeded: https://gateway.example.com/beam/fix-upload-flow-0123456789ab
+This link is for authorized Team operators; upload-only access does not let you open it.
+```
+
+Share that link with the authorized Team operator for the handoff; do not promise
+the guest can view it. Staff and older receipts may omit `canView`; the helper
+preserves their existing output without treating omission as a new access grant.
+
 A Gateway mounted below a base path returns that same base path, such as
 `https://gateway.example.com/openclaw/beam/fix-upload-flow-0123456789ab`.
 
@@ -109,24 +121,50 @@ node "$BEAM_SKILL_DIR/scripts/beam" publish \
 
 ## Authentication
 
-For ordinary Gateway token or password authentication:
+### Personal guest access
 
-```sh
-export BEAM_AUTH_TOKEN="..."
-```
-
-For a Cloudflare Access application token:
+Restricted guest uploads require receiver-side support and explicit operator
+authorization. This sender support does **not** announce deployed guest access.
+Once enabled, guests use their existing personal Cloudflare Access sign-in or a
+personal application token:
 
 ```sh
 export BEAM_ACCESS_TOKEN="..."
 ```
 
 For an interactive snapshot, Beam can ask the installed `cloudflared` CLI for
-an application token. Browser authentication stays between Cloudflare and the
-configured identity provider; Beam does not receive a GitHub token.
+an application token, using a cached sign-in or opening browser login when needed.
+Browser authentication stays between Cloudflare and the configured identity
+provider; Beam does not receive a GitHub token. Use only the receiver endpoint
+provided by the authorized operator.
+
+Guests need no shared secret. Do not distribute or request a shared Gateway
+token, password, or another person's Access token for guest uploads. Upload-only
+authorization permits creating or refreshing the publisher's own snapshots; it
+does not permit listing, reading, deleting, or continuing the Beam catalog.
+
+Expired Access credentials can cause authentication failure. Sign in again outside
+hooks (for example, `cloudflared access login https://gateway.example.com` for the
+configured application), or replace the expired personal `BEAM_ACCESS_TOKEN`.
+If access was revoked, reauthentication does not restore permission: an authorized
+operator must restore it. Do not work around a denial with a shared Gateway token.
+Beam does not automatically retry uploads. After a timeout or uncertain response,
+ask the operator to confirm receipt before trying again.
+
+### Ordinary operator access
+
+Existing Gateway token or password authentication remains available to operators:
+
+```sh
+export BEAM_AUTH_TOKEN="..."
+```
+
+`BEAM_ACCESS_TOKEN` takes precedence over `BEAM_AUTH_TOKEN`. The bearer fallback
+is not a guest onboarding mechanism.
 
 Lifecycle hooks never start interactive authentication. Configure one of the
-token variables before enabling live hooks.
+appropriate personal/operator token variables before enabling live hooks; expired
+or revoked access yields a concise error rather than browser login inside a hook.
 
 ## Live updates
 
@@ -152,16 +190,29 @@ hook decision.
 
 ## Receiver contract
 
-The OpenClaw Beam plugin accepts `POST /api/v1/beam/sessions` through normal
-Gateway HTTP authentication. Uploads require `operator.write` or
-`operator.admin`. Every `operator.read` client on that Gateway can view the
-catalog, so a separate Gateway remains the isolation boundary between teams.
+The OpenClaw Beam plugin accepts `POST /api/v1/beam/sessions`. Ordinary Gateway
+HTTP-authenticated uploads require `operator.write` or `operator.admin`. Every
+`operator.read` client on that Gateway can view the catalog, so a separate Gateway
+remains the isolation boundary between teams. Restricted personal guest uploads
+add no Gateway auth scopes and require receiver-side support; they allow only
+create/refresh of publisher-owned snapshots, not catalog access.
+
+The request remains version `1`. The normal receipt remains
+`{ "ok": true, "beamId": "...", "url": "..." }`; a restricted guest receipt adds
+`"canView": false`. Staff and older receivers may omit `canView`; if present it
+must be a boolean. This is an upload receipt, not a credential or an access grant.
+The same origin, endpoint-derived base path, and Beam ID URL checks apply whether
+or not the publisher can view the result.
 
 The receiver rejects transcript item text longer than 6,000 characters.
 Accordingly, explicit `--entry-max-chars` values above 6,000 fail locally
 before upload.
 
-The catalog has no continue, archive, terminal, tool, or node capability.
+Authorized staff can continue from the catalog by copying the shared transcript
+into a new Team session. This is a transcript handoff, not remote access to the
+publisher's machine or continuation of the local harness; it grants no terminal,
+tool, filesystem, credential, or node access. Upload-only guests cannot continue
+the catalog.
 
 For rollout compatibility, the helper also accepts the current server's exact
 `/chat/<agent>?catalog=beam&host=gateway&thread=<full-beam-id>` URL. This is a

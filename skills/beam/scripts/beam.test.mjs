@@ -33,7 +33,7 @@ function run(args, options = {}) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [script, ...args], {
       cwd: path.resolve("."),
-      env: { ...process.env, ...options.env },
+      env: { ...process.env, BEAM_ACCESS_TOKEN: "", BEAM_AUTH_TOKEN: "", ...options.env },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -50,7 +50,7 @@ function run(args, options = {}) {
   });
 }
 
-async function beamReceiverEndpoint(t, urlForPayload, basePath = "") {
+async function beamReceiverEndpoint(t, urlForPayload, basePath = "", receiptFields = {}) {
   const server = http.createServer((request, response) => {
     let body = "";
     request.setEncoding("utf8");
@@ -63,7 +63,12 @@ async function beamReceiverEndpoint(t, urlForPayload, basePath = "") {
         "content-type": "application/json",
         connection: "close",
       });
-      response.end(JSON.stringify({ ok: true, url: urlForPayload(payload, request) }));
+      response.end(JSON.stringify({
+        ok: true,
+        beamId: payload.beamId,
+        url: urlForPayload(payload, request),
+        ...receiptFields,
+      }));
     });
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -1101,6 +1106,108 @@ test("publish sends Cloudflare Access auth and normalized session JSON", async (
   assert.equal(payload.completed, false);
 });
 
+test("publish distinguishes upload-only receipts while preserving older and staff output", async (t) => {
+  const session = claudeSession();
+  const receipt = {};
+  const requests = [];
+  const endpoint = await beamReceiverEndpoint(t, (payload, request) => {
+    requests.push(payload);
+    assert.equal(request.method, "POST");
+    assert.equal(request.headers["cf-access-token"], "synthetic-personal-access");
+    assert.equal(request.headers.authorization, undefined);
+    return `/team/beam/upload-flow-${payload.beamId.slice(0, 12)}`;
+  }, "/team", receipt);
+
+  for (const canView of [undefined, true, false]) {
+    if (canView === undefined) delete receipt.canView;
+    else receipt.canView = canView;
+    const result = await run(["publish", "--endpoint", endpoint, "--session", session], {
+      env: { BEAM_ACCESS_TOKEN: "synthetic-personal-access" },
+    });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stderr, "");
+    const target = endpoint.replace(/\/api\/v1\/beam\/sessions$/,
+      `/beam/upload-flow-${requests.at(-1).beamId.slice(0, 12)}`);
+    assert.equal(result.stdout, canView === false
+      ? `Beam upload succeeded: ${target}\nThis link is for authorized Team operators; upload-only access does not let you open it.\n`
+      : `Beamed session: ${target}\n`);
+    assert.equal(requests.at(-1).version, 1);
+    assert.equal(Object.hasOwn(requests.at(-1), "canView"), false);
+    assert.doesNotMatch(JSON.stringify(requests.at(-1)), /abcdefghijklmnopqrstuvwxyz123456|hidden compact summary|synthetic-personal-access/);
+  }
+  assert.equal(requests.length, 3);
+  assert.equal(new Set(requests.map(({ beamId }) => beamId)).size, 1);
+});
+
+test("upload-only success stays quiet for publish and lifecycle hooks", async (t) => {
+  const session = claudeSession();
+  let requests = 0;
+  const endpoint = await beamReceiverEndpoint(t, ({ beamId }) => {
+    requests++;
+    return `/beam/${beamId.slice(0, 12)}`;
+  }, "", { canView: false });
+
+  for (const command of ["publish", "hook"]) {
+    const result = await run([command, "--endpoint", endpoint, "--quiet",
+      ...(command === "publish" ? ["--session", session] : [])], {
+      stdin: command === "hook"
+        ? JSON.stringify({ transcript_path: session, hook_event_name: "Stop" })
+        : undefined,
+    });
+    assert.deepEqual(result, { code: 0, stdout: "", stderr: "" });
+  }
+  assert.equal(requests, 2);
+});
+
+test("publish rejects malformed provided canView without retry or success output", async (t) => {
+  const session = claudeSession();
+  const receipt = {};
+  let requests = 0;
+  const endpoint = await beamReceiverEndpoint(t, ({ beamId }) => {
+    requests++;
+    return `/beam/${beamId.slice(0, 12)}`;
+  }, "", receipt);
+
+  const malformed = [null, "false", "true", 0, 1, {}, [], [false]];
+  for (const canView of malformed) {
+    receipt.canView = canView;
+    const result = await run(["publish", "--endpoint", endpoint, "--session", session]);
+    assert.equal(result.code, 1, JSON.stringify(canView));
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /invalid canView receipt field/);
+  }
+  assert.equal(requests, malformed.length);
+});
+
+test("upload-only receipts still require safe origin, base path, and exact session ID", async (t) => {
+  const session = claudeSession();
+  let makeUrl;
+  let requests = 0;
+  const endpoint = await beamReceiverEndpoint(t, (payload) => {
+    requests++;
+    return makeUrl(payload);
+  }, "/team", { canView: false });
+  const cases = [
+    [true, ({ beamId }) => `/team/chat/main?catalog=beam&host=gateway&thread=${beamId}`],
+    [false, ({ beamId }) => `https://example.test/team/beam/${beamId.slice(0, 12)}`],
+    [false, ({ beamId }) => `/beam/${beamId.slice(0, 12)}`],
+    [false, ({ beamId }) => `/team/beam/${beamId[0] === "0" ? "1" : "0"}${beamId.slice(1, 12)}`],
+    [false, () => "/team/chat/main?catalog=beam&host=gateway&thread=other"],
+    [false, ({ beamId }) => `/team/beam/${beamId.slice(0, 12)}\n`],
+  ];
+  for (const [accepted, urlForPayload] of cases) {
+    makeUrl = urlForPayload;
+    const result = await run(["publish", "--endpoint", endpoint, "--session", session]);
+    assert.equal(result.code, accepted ? 0 : 1, result.stderr);
+    if (accepted) assert.match(result.stdout, /authorized Team operators/);
+    else {
+      assert.equal(result.stdout, "");
+      assert.match(result.stderr, /unsafe session URL/);
+    }
+  }
+  assert.equal(requests, cases.length);
+});
+
 test("publish refuses redirects without forwarding the Access token or payload", async (t) => {
   const session = claudeSession();
   let redirectedRequests = 0;
@@ -1364,8 +1471,11 @@ test("publish rejects malformed rollout catalog URLs", async (t) => {
 
 test("publish never prints access tokens on receiver errors", async (t) => {
   const session = claudeSession();
+  let status;
+  let requests = 0;
   const server = http.createServer((_request, response) => {
-    response.writeHead(401, { "content-type": "application/json" });
+    requests++;
+    response.writeHead(status, { "content-type": "application/json" });
     const escape = String.fromCharCode(27);
     response.end(
       JSON.stringify({
@@ -1378,16 +1488,20 @@ test("publish never prints access tokens on receiver errors", async (t) => {
   t.after(() => server.close());
   const address = server.address();
 
-  const result = await run(
-    ["publish", "--endpoint", `http://127.0.0.1:${address.port}/api/v1/beam/sessions`, "--session", session],
-    { env: { BEAM_ACCESS_TOKEN: "super-secret-access-token" } },
-  );
+  for (status of [401, 403]) {
+    const result = await run(
+      ["publish", "--endpoint", `http://127.0.0.1:${address.port}/api/v1/beam/sessions`, "--session", session],
+      { env: { BEAM_ACCESS_TOKEN: "super-secret-access-token" } },
+    );
 
-  assert.equal(result.code, 1);
-  assert.match(result.stderr, /Beam upload failed: HTTP 401/);
-  assert.equal(result.stderr.includes(String.fromCharCode(27)), false);
-  assert.doesNotMatch(result.stderr, /\nforged/);
-  assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /super-secret-access-token/);
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, new RegExp(`Beam upload failed: HTTP ${status}`));
+    assert.equal(result.stderr.includes(String.fromCharCode(27)), false);
+    assert.doesNotMatch(result.stderr, /\nforged/);
+    assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /super-secret-access-token/);
+  }
+  assert.equal(requests, 2);
 });
 
 test("CLI loads its native module format without loader warnings", async () => {
