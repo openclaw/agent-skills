@@ -25,6 +25,7 @@ Environment:
   BEAM_ACCESS_TOKEN   Cloudflare Access application token (sent as cf-access-token)
   BEAM_AUTH_TOKEN     Gateway bearer token fallback (sent as Authorization: Bearer)
 
+Guests use their own Cloudflare Access sign-in or BEAM_ACCESS_TOKEN, never a shared Gateway token.
 The hook command reads Claude Code or Codex hook JSON from stdin. Raw transcripts never leave the machine.`);
 }
 
@@ -399,6 +400,9 @@ async function publish(payload, options) {
     const message = safeReceiverMessage(result?.error, `HTTP ${response.status}`, auth.secrets);
     throw new Error(`Beam upload failed: ${message}`);
   }
+  if (Object.hasOwn(result, "canView") && typeof result.canView !== "boolean") {
+    throw new Error("Beam receiver returned an invalid canView receipt field");
+  }
   if (typeof result.url === "string") {
     const printableUrl = printableReceiverText(result.url);
     if (printableUrl !== result.url) {
@@ -443,7 +447,14 @@ async function main() {
   const result = await publish(payload, options);
   if (!options.quiet) {
     const target = result.url || payload.beamId;
-    console.log(options["dry-run"] ? "Beam dry run complete." : `Beamed session: ${target}`);
+    if (options["dry-run"]) {
+      console.log("Beam dry run complete.");
+    } else if (result.canView === false) {
+      console.log(`Beam upload succeeded: ${target}`);
+      console.log("This link is for authorized Team operators; upload-only access does not let you open it.");
+    } else {
+      console.log(`Beamed session: ${target}`);
+    }
   }
 }
 
