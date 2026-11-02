@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Avoid installing or caching the development typechecker in Python-only CI validation groups; retain typechecking in the full and core groups.
 - Make `autoreview --no-web-search` explicitly disable Codex web search instead of leaving cached search enabled.
 - Add `autoreview --codex-no-fallback` to keep reviews on the selected Codex model and authentication route, refusing model or configured-provider substitution while preserving native recovery within that route.
 - Recognize current Codex terminal refresh-token messages, preserving configured-provider recovery by default and sanitized refusal when fallback is disabled.
