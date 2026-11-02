@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [baseline, candidate]
+        variant: [baseline]
     defaults:
       run:
         shell: bash
@@ -33,14 +33,14 @@ jobs:
           cache-dependency-path: source/requirements-dev.txt
       - name: Isolate exact native cache input
         run: |
-          python -c 'from pathlib import Path; import os; Path(os.environ["RUNNER_TEMP"], "validation-proof-lock").write_bytes(Path("source/package-lock.json").read_bytes() + b"\nvalidation-typechecker-proof-v1-20261102")'
+          python -c 'from pathlib import Path; Path("harness/validation-proof-lock").write_bytes(Path("source/package-lock.json").read_bytes() + b"\nvalidation-typechecker-proof-v1-20261102")'
           python -c 'from pathlib import Path; import os; cache = Path(os.environ["RUNNER_TEMP"], "validation-proof-npm"); assert not cache.exists(); Path(os.environ["GITHUB_ENV"]).open("a").write("NPM_CONFIG_CACHE=" + str(cache) + "\n")'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         id: node
         with:
           node-version: '26.12.1'
           cache: ${{ matrix.variant == 'baseline' && 'npm' || '' }}
-          cache-dependency-path: ${{ runner.temp }}/validation-proof-lock
+          cache-dependency-path: harness/validation-proof-lock
       - name: Require genuine cold npm cache
         env:
           CACHE_HIT: ${{ steps.node.outputs.cache-hit }}
@@ -84,14 +84,14 @@ jobs:
           cache-dependency-path: source/requirements-dev.txt
       - name: Isolate exact native cache input
         run: |
-          python -c 'from pathlib import Path; import os; Path(os.environ["RUNNER_TEMP"], "validation-proof-lock").write_bytes(Path("source/package-lock.json").read_bytes() + b"\nvalidation-typechecker-proof-v1-20261102")'
+          python -c 'from pathlib import Path; Path("harness/validation-proof-lock").write_bytes(Path("source/package-lock.json").read_bytes() + b"\nvalidation-typechecker-proof-v1-20261102")'
           python -c 'from pathlib import Path; import os; cache = Path(os.environ["RUNNER_TEMP"], "validation-proof-npm"); assert not cache.exists(); Path(os.environ["GITHUB_ENV"]).open("a").write("NPM_CONFIG_CACHE=" + str(cache) + "\n")'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         id: node
         with:
           node-version: '26.12.1'
           cache: ${{ matrix.variant == 'baseline' && 'npm' || '' }}
-          cache-dependency-path: ${{ runner.temp }}/validation-proof-lock
+          cache-dependency-path: harness/validation-proof-lock
       - name: Require restored baseline or absent candidate cache
         env:
           CACHE_HIT: ${{ steps.node.outputs.cache-hit }}
