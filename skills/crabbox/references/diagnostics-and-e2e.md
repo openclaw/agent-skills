@@ -62,9 +62,10 @@ blacksmith testbox status --id <tbx_id>
 
 - Provider/CLI old: follow consumer's trusted Crabbox update path.
 - Config/auth: `config show`, `doctor`, `whoami`.
-- Sync quiet/stale: `--debug --timing-json`, then `--full-resync` once.
-- Testbox capacity: stop task-owned request, report it, run locally.
-  Never wait on queue or chain providers.
+- Sync quiet/stale: inspect `--debug --timing-json`. Direct providers support
+  `--full-resync`; Testbox uses native sync and the skill's
+  [input checks](../SKILL.md#verify-synced-inputs).
+- Testbox capacity: follow the [proof and capacity rules](../SKILL.md#crabbox).
 - Command failure: read phase, failed test, JUnit, skipped shell segment. Focused
   rerun first.
 - Cleanup unclear: list exact provider. Stop only owned ids.
