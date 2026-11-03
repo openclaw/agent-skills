@@ -13,7 +13,8 @@ proxy (Cloudflare Access).
 One Gateway request, as the operator's own identity. No browser automation, no
 SSH, no polling.
 
-Script: `scripts/team-handoff.sh`
+Resolve `HANDOFF_SKILL_DIR` to the directory containing this `SKILL.md`.
+Invoke that installation without changing the consumer's working directory.
 
 ## Setup (once per machine)
 
@@ -57,13 +58,13 @@ scopes, which cover `sessions.create`.
 ## Use
 
 ```sh
-bash scripts/team-handoff.sh probe
-bash scripts/team-handoff.sh create \
+bash "$HANDOFF_SKILL_DIR/scripts/team-handoff.sh" probe
+bash "$HANDOFF_SKILL_DIR/scripts/team-handoff.sh" create \
   --label "Installed-package entry cap durable fix" \
   --name tree-cap-fix --base origin/main \
   --message-file /path/to/handoff.md
-bash scripts/team-handoff.sh status <sessionKey>
-bash scripts/team-handoff.sh archive <sessionKey> <sessionId>
+bash "$HANDOFF_SKILL_DIR/scripts/team-handoff.sh" status <sessionKey>
+bash "$HANDOFF_SKILL_DIR/scripts/team-handoff.sh" archive <sessionKey> <sessionId>
 ```
 
 `create` prints `url:` in the Control UI form

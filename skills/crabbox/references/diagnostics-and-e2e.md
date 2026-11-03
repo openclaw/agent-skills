@@ -20,7 +20,10 @@ Prefer built-ins:
 
 ## Real E2E
 
-“Test in Crabbox” = user path, not merely remote unit tests.
+Follow the requested proof scope and the consumer repository's requirements.
+Remote focused tests or builds prove only those checks.
+Use this recipe when the user or consumer requires real user-path proof.
+Never describe remote unit tests as real E2E.
 
 1. Reproduce entrypoint when feasible.
 2. Patch. Narrow local test.

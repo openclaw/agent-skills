@@ -133,7 +133,6 @@ Read only relevant recipe; routing + immediate-availability rules still apply:
   exact provider commands, broker auth, paid macOS quota/no-spend preflight, desktop
   handoff. No silent substitution; never commit proof assets to product repo.
 - [Diagnostics and real E2E](references/diagnostics-and-e2e.md): capture/env flags,
-  failure layers, user-path proof. “Test in Crabbox” = real
-  install/update/onboard/CLI/service/API path, not merely remote unit tests.
+  failure layers, and the recipe for requested or consumer-required user-path proof.
   Full-screen CLIs: real PTY. Compare Testbox revisions within one synced invocation
   using detached temporary worktrees; later runs resync local source.
