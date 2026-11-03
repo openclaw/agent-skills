@@ -102,8 +102,8 @@ Several commands: save id, reuse, stop:
 
 - One lease, one active command; no sync/reclaim during run. `--reclaim` only
   for deliberate checkout-path ownership transfer.
-- Native Testbox runs sync even with reused ids. Never rely on `--no-sync` for
-  baseline, even unchanged rerun; may be silently ignored.
+- Native Testbox runs sync even with reused ids. `--no-sync` is unsupported and
+  exits with code 2 before provider activity. It cannot preserve a remote baseline.
 - Base/head changed: stop + rewarm; never override stale lease.
   Crabbox `warmup --blacksmith-ref` (native `blacksmith testbox warmup --ref`):
   branch/tag only, never raw SHA. Never checkout refs in synced root.

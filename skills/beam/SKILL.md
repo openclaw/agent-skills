@@ -66,7 +66,11 @@ On success, return only the Beam URL and a short disclosure summary: source harn
 
 If the receipt includes `canView: false`, say that the upload succeeded and the link is for authorized Team operators; upload-only access does not let the guest open it. Do not present it as a guest-viewable link. Staff and older receipts may omit `canView`; omission is not a new access grant.
 
-Restricted guest uploads require receiver-side support and operator authorization; sender support alone does not mean they are deployed. That receiver mode permits creating or refreshing only the publisher's own snapshots, not listing, reading, deleting, or continuing the catalog. Guests need no shared secret. If personal access expires, sign in again outside hooks or refresh the personal `BEAM_ACCESS_TOKEN`; revoked access needs an authorized operator to restore it. Never blindly retry an uncertain upload.
+Guest access requires receiver-side support and operator authorization. Sender support alone does not mean it is deployed.
+Current Visitor-enabled receivers let active verified publishers create, refresh, list, and read only their own snapshots.
+They grant no shared-catalog access, deletion, or continuation. Older upload-only receivers can return `canView: false`; honor that receipt.
+Guests need no shared secret. If personal access expires, sign in again outside hooks or refresh the personal `BEAM_ACCESS_TOKEN`.
+Revoked access needs an authorized operator to restore it. Never blindly retry an uncertain upload.
 
 The helper also accepts bare `/beam/<id-prefix>` links and, during rollout, the current server's exact `/chat/<agent>?catalog=beam&host=gateway&thread=<full-beam-id>` response. It still rejects the obsolete `?session=catalog:...` beta form.
 

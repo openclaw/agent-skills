@@ -139,9 +139,11 @@ provider; Beam does not receive a GitHub token. Use only the receiver endpoint
 provided by the authorized operator.
 
 Guests need no shared secret. Do not distribute or request a shared Gateway
-token, password, or another person's Access token for guest uploads. Upload-only
-authorization permits creating or refreshing the publisher's own snapshots; it
-does not permit listing, reading, deleting, or continuing the Beam catalog.
+token, password, or another person's Access token for guest uploads.
+Current Visitor-enabled receivers let active verified publishers create, refresh,
+list, and read their own snapshots. These routes grant no access to other
+publishers' snapshots or permission to delete or continue sessions.
+Older upload-only receivers can return `canView: false`; honor that restriction.
 
 Expired Access credentials can cause authentication failure. Sign in again outside
 hooks (for example, `cloudflared access login https://gateway.example.com` for the
@@ -193,14 +195,18 @@ hook decision.
 The OpenClaw Beam plugin accepts `POST /api/v1/beam/sessions`. Ordinary Gateway
 HTTP-authenticated uploads require `operator.write` or `operator.admin`. Every
 `operator.read` client on that Gateway can view the catalog, so a separate Gateway
-remains the isolation boundary between teams. Restricted personal guest uploads
-add no Gateway auth scopes and require receiver-side support; they allow only
-create/refresh of publisher-owned snapshots, not catalog access.
+remains the isolation boundary between teams. Restricted personal guest access
+requires receiver-side support and an active verified Visitor identity. It grants
+no `operator.read` scope or shared-catalog access. Separate publisher-bound routes
+allow listing and reading only that publisher's snapshots. They recheck current
+authority and ownership before returning data. Guests cannot delete or continue sessions.
 
 The request remains version `1`. The normal receipt remains
-`{ "ok": true, "beamId": "...", "url": "..." }`; a restricted guest receipt adds
-`"canView": false`. Staff and older receivers may omit `canView`; if present it
-must be a boolean. This is an upload receipt, not a credential or an access grant.
+`{ "ok": true, "beamId": "...", "url": "..." }`. Current guest receipts add
+`"canView": true` for owned-snapshot viewing. Older upload-only receivers can
+return `"canView": false`. Staff and older receivers may omit `canView`; if present
+it must be a boolean. The receipt is not a credential or an access grant.
+Viewing still requires current publisher authority and snapshot ownership.
 The same origin, endpoint-derived base path, and Beam ID URL checks apply whether
 or not the publisher can view the result.
 
@@ -211,8 +217,8 @@ before upload.
 Authorized staff can continue from the catalog by copying the shared transcript
 into a new Team session. This is a transcript handoff, not remote access to the
 publisher's machine or continuation of the local harness; it grants no terminal,
-tool, filesystem, credential, or node access. Upload-only guests cannot continue
-the catalog.
+tool, filesystem, credential, or node access. Guests cannot continue sessions,
+including snapshots they can view.
 
 For rollout compatibility, the helper also accepts the current server's exact
 `/chat/<agent>?catalog=beam&host=gateway&thread=<full-beam-id>` URL. This is a

@@ -60,7 +60,19 @@ find "${CODEX_HOME:-$HOME/.codex}/sessions" -name 'rollout-*.jsonl' -type f | so
 ls -t "${CODEX_HOME:-$HOME/.codex}"/sessions/*/*/*/rollout-*.jsonl | head
 ```
 
-OpenClaw/Pi:
+Current OpenClaw stores session indexes and transcripts in per-agent SQLite databases.
+Use native session discovery:
+
+```bash
+openclaw sessions --agent "<agentId>" --json
+```
+
+This lists sessions; it does not export a JSONL transcript.
+The viewer requires a supported JSONL transcript, not a SQLite database or session-list JSON.
+Use OpenClaw's native session view when no compatible JSONL export is available.
+See the [OpenClaw sessions reference](https://docs.openclaw.ai/cli/sessions).
+
+Legacy OpenClaw JSONL:
 
 ```bash
 AGENT_ID="<agentId>"
@@ -69,7 +81,8 @@ ls -t "$SESSION_DIR"/*.jsonl | head
 find "${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/agents" -path '*/sessions/*.jsonl' -type f | sort
 ```
 
-Use `sessions.json` in the same directory to map session keys to session ids.
+Only legacy file stores use `sessions.json` beside those transcripts to map session keys to ids.
+For standalone Pi, select its actual JSONL transcript rather than assuming the OpenClaw directory layout.
 
 Claude Code:
 
