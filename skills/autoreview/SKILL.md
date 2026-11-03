@@ -11,7 +11,8 @@ let the reviewer choose the analysis. Verify findings before acting.
 
 ## Hosted review requests
 
-ClawSweeper reviews are opt-in for maintainer-authored PRs and issues. Request
+ClawSweeper's service policy owns automatic review admission, including first
+reviews of newer maintainer PRs. The rules here govern agent-issued requests. Request
 `@clawsweeper review` only when the maintainer asks for it or the owning workflow
 specifically requires ClawSweeper, after the work and validation are complete.
 A generic independent-review requirement does not require a hosted bot review.
