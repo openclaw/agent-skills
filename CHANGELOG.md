@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Scan main daily with CodeQL while preserving pull request and manual scans and the existing skill validation and release gates.
+
 - Resolve Agent Transcript and Team Handoff commands from their installed skill directories. Keep Crabbox E2E guidance conditional on the requested or consumer-required proof scope.
 - Avoid installing or caching the development typechecker in Python-only CI validation groups; retain typechecking in the full and core groups.
 - Make `autoreview --no-web-search` explicitly disable Codex web search instead of leaving cached search enabled.
