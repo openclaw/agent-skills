@@ -114,6 +114,21 @@ class AutoreviewVersionTests(unittest.TestCase):
                 path.write_text("preserved fixture\n", encoding="utf-8")
             installed = []
             for mode in ("copy", "symlink"):
+                if mode == "symlink":
+                    # A restricted Windows test process may lack both Developer
+                    # Mode and symlink privilege. Probe the OS separately so an
+                    # installer regression never becomes a capability skip.
+                    probe = root / "symlink-capability-probe"
+                    try:
+                        os.symlink(repo / "skills/autoreview", probe, target_is_directory=True)
+                    except OSError as error:
+                        if os.name != "nt" or getattr(error, "winerror", None) != 1314:
+                            raise
+                        with self.subTest(mode=mode):
+                            self.skipTest(f"directory symlink privilege unavailable: {error}")
+                        continue
+                    else:
+                        probe.unlink()
                 target = root / mode
                 result = subprocess.run([
                     sys.executable, "-B", str(repo / "scripts/install-skills"),

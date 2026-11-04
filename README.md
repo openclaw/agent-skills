@@ -217,21 +217,27 @@ macOS CI job uses the `xcode-27` Apple Silicon runner and installs a pinned Code
 controls without a reviewer account or provider request.
 
 On Windows, `scripts/check-skills` and `scripts/installed-autoreview.test.py`
-prepare a restricted primary process when the original token has elevated
-integrity, privileges, or group grants beyond the ordinary test profile. Invoke these files directly with
+prepare a restricted primary process when the current invocation does not meet
+the ordinary test profile. Invoke these files directly with
 Python; module (`-m`), command (`-c`), or mutated argument forms are unsupported.
 They retain the selected Python interpreter, flags, arguments, working
 directory, environment, standard streams,
-and exit status. Failure to create or verify that process fails the test command;
+and exit status. With a shared console, the child handles Ctrl+C while the parent
+waits for its result. Failure to create or verify that process fails the test command;
 it does not omit tests or change the installed skill's runtime behavior.
 The child must have medium or lower integrity; lowering its integrity leaves the
-original parent token unchanged. Local/domain and Entra account identities are
+original parent token unchanged. New objects default to the child’s user as owner,
+so owner rights on private directories apply to that user.
+Local/domain and Entra account identities are
 supported; system and virtual-service identities are not. This does not classify
 how domain accounts are used. The account domain's Domain Users grant is retained;
 other custom group grants may be removed by the restricted test profile.
+The full native proof suite requires permission to duplicate and adjust the
+current process token and create its restricted child. Missing those test
+capabilities fails the requested proof even when read-only admission succeeds.
 
-Before the restricted launch, the original Windows process runs native bootstrap
-proofs: a restricted thread cannot hide its original primary authority, a marker
+When the original primary token does not meet that profile, the parent runs
+native bootstrap proofs before launching the child: a restricted thread cannot hide its original primary authority, a marker
 cannot bypass admission, a failed parent check stops execution, and a real child
 preserves invocation details. These auxiliary checks run noninteractively; an
 interactive flag still applies to the requested child, without a second prompt

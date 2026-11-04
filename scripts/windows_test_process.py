@@ -239,6 +239,32 @@ def _token_identity(api, token):
     return sid, _sid_string(api, users)
 
 
+def _token_owner(api, token):
+    buffer, length = _token_data(api, token, 4)  # TokenOwner
+    if length < api.c.sizeof(api.c.c_void_p):
+        raise RuntimeError("truncated native token owner")
+    owner = api.c.c_void_p.from_buffer(buffer)
+    return _sid_string(api, owner)
+
+
+def _set_token_user_owner(api, token):
+    buffer, length = _token_data(api, token, 1)  # TokenUser
+    if length < api.c.sizeof(api.SidAndAttributes):
+        raise RuntimeError("truncated native token user")
+    user = api.SidAndAttributes.from_buffer(buffer)
+    user_sid = _sid_string(api, user.sid)
+    if _token_owner(api, token) == user_sid:
+        return
+    # Called only for the fresh restricted token. CPython's private temporary
+    # directories grant OWNER RIGHTS, so their default owner must be this user,
+    # rather than the Administrators group whose allow grants were removed.
+    owner = api.c.c_void_p(user.sid)
+    if not api.security.SetTokenInformation(token, 4, api.c.byref(owner), api.c.sizeof(owner)):
+        raise api.c.WinError(api.c.get_last_error())
+    if _token_owner(api, token) != user_sid:
+        raise RuntimeError("native restricted token did not retain its user as default owner")
+
+
 def _token_integrity(api, token):
     buffer, length = _token_data(api, token, 25)  # TokenIntegrityLevel
     if length < api.c.sizeof(api.SidAndAttributes):
@@ -300,12 +326,17 @@ def _status(api, token):
     user_sid, domain_users_sid = _token_identity(api, token)
     supported_identity = _supported_identity(user_sid)
     integrity_level = _token_integrity(api, token)
+    owner_sid = _token_owner(api, token)
+    # Private directories must default to this user, including OWNER RIGHTS ACLs.
+    primary_eligible = (primary and not extra_privileges and not unsafe_groups
+                        and supported_identity and integrity_level <= _MEDIUM_INTEGRITY
+                        and owner_sid == user_sid)
     return {
         "native": True,
-        "eligible": (primary and not impersonating and not extra_privileges
-                     and not unsafe_groups and supported_identity
-                     and integrity_level <= _MEDIUM_INTEGRITY),
+        "eligible": primary_eligible and not impersonating,
+        "primary_eligible": primary_eligible,
         "user_sid": user_sid,
+        "owner_sid": owner_sid,
         "supported_identity": supported_identity,
         "domain_users_sid": domain_users_sid,
         "integrity_level": integrity_level,
@@ -320,10 +351,10 @@ def _status(api, token):
 def windows_test_process_status() -> dict:
     """Inspect actual native primary authority and the presence of impersonation."""
     if os.name != "nt":
-        return {"native": False, "eligible": False, "primary_token": False,
+        return {"native": False, "eligible": False, "primary_eligible": False, "primary_token": False,
                 "primary_token_id": None, "thread_impersonating": False,
                 "nonordinary_privileges": 0, "nonordinary_groups": 0,
-                "user_sid": None, "supported_identity": False,
+                "user_sid": None, "owner_sid": None, "supported_identity": False,
                 "domain_users_sid": None, "integrity_level": None}
     api = _windows_api()
     with _process_token(api) as token:
@@ -359,12 +390,14 @@ def _restricted_primary(api, source):
     ):
         raise api.c.WinError(api.c.get_last_error())
     try:
+        _set_token_user_owner(api, restricted)
         _lower_integrity(api, restricted)
         # Check the created primary token itself before it can launch anything.
         state = _status(api, restricted)
         if (not state["primary_token"] or state["nonordinary_privileges"]
                 or state["nonordinary_groups"] or not state["supported_identity"]
-                or state["integrity_level"] > _MEDIUM_INTEGRITY):
+                or state["integrity_level"] > _MEDIUM_INTEGRITY
+                or state["owner_sid"] != state["user_sid"]):
             raise RuntimeError("native restriction did not remove primary authority")
         yield restricted
     finally:
@@ -381,6 +414,12 @@ def _launch(api, token, command, environment):
     attribute_buffer = None
     attributes_initialized = False
     finished = False
+    control_handler = None
+    control_registered = False
+    accept_shared_interrupt = True
+    retained_handlers = getattr(api, "_launch_control_handlers", None)
+    if retained_handlers is None:
+        retained_handlers = api._launch_control_handlers = []
     try:
         current = api.kernel.GetCurrentProcess()
         for identifier, field in ((-10, "stdin"), (-11, "stdout"), (-12, "stderr")):
@@ -394,30 +433,63 @@ def _launch(api, token, command, environment):
                 raise c.WinError(c.get_last_error())
             handles.append(duplicate)
             setattr(startup.startup, field, duplicate.value)
+        if not handles:
+            # STARTF_USESTDHANDLES requires inheritance even when all streams
+            # are NULL. A fresh inert event makes the explicit allow-list
+            # nonempty without admitting any unrelated inheritable handle.
+            create_event = api.kernel.CreateEventW
+            create_event.restype = w.HANDLE
+            create_event.argtypes = [c.c_void_p, w.BOOL, w.BOOL, w.LPCWSTR]
+            sentinel = create_event(None, False, False, None)
+            if not sentinel:
+                raise c.WinError(c.get_last_error())
+            handles.append(w.HANDLE(sentinel))
+            set_handle_information = api.kernel.SetHandleInformation
+            set_handle_information.restype = w.BOOL
+            set_handle_information.argtypes = [w.HANDLE, w.DWORD, w.DWORD]
+            if not set_handle_information(sentinel, 1, 1):  # HANDLE_FLAG_INHERIT
+                raise c.WinError(c.get_last_error())
         creation_flags = 0x00000400  # CREATE_UNICODE_ENVIRONMENT
-        if handles:
-            size = c.c_size_t()
-            result = api.kernel.InitializeProcThreadAttributeList(None, 1, 0, c.byref(size))
-            if result or c.get_last_error() != 122 or not 0 < size.value <= 1048576:
-                raise RuntimeError("cannot size native process attribute list")
-            attribute_buffer = c.create_string_buffer(size.value)
-            startup.attributes = c.cast(attribute_buffer, c.c_void_p)
-            if not api.kernel.InitializeProcThreadAttributeList(startup.attributes, 1, 0, c.byref(size)):
-                raise c.WinError(c.get_last_error())
-            attributes_initialized = True
-            inherited = (w.HANDLE * len(handles))(*(handle.value for handle in handles))
-            if not api.kernel.UpdateProcThreadAttribute(
-                startup.attributes, 0, 0x00020002, inherited, c.sizeof(inherited), None, None,
-            ):  # PROC_THREAD_ATTRIBUTE_HANDLE_LIST
-                raise c.WinError(c.get_last_error())
-            startup.startup.cb = c.sizeof(startup)
-            creation_flags |= 0x00080000  # EXTENDED_STARTUPINFO_PRESENT
+        size = c.c_size_t()
+        result = api.kernel.InitializeProcThreadAttributeList(None, 1, 0, c.byref(size))
+        if result or c.get_last_error() != 122 or not 0 < size.value <= 1048576:
+            raise RuntimeError("cannot size native process attribute list")
+        attribute_buffer = c.create_string_buffer(size.value)
+        startup.attributes = c.cast(attribute_buffer, c.c_void_p)
+        if not api.kernel.InitializeProcThreadAttributeList(startup.attributes, 1, 0, c.byref(size)):
+            raise c.WinError(c.get_last_error())
+        attributes_initialized = True
+        inherited = (w.HANDLE * len(handles))(*(handle.value for handle in handles))
+        if not api.kernel.UpdateProcThreadAttribute(
+            startup.attributes, 0, 0x00020002, inherited, c.sizeof(inherited), None, None,
+        ):  # PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+            raise c.WinError(c.get_last_error())
+        startup.startup.cb = c.sizeof(startup)
+        creation_flags |= 0x00080000  # EXTENDED_STARTUPINFO_PRESENT
         command_line = c.create_unicode_buffer(subprocess.list2cmdline(command))
         block = c.create_string_buffer(environment)
-        # Inherit only the three duplicated standard handles. The restricted
-        # token and the parent's process/token handles never enter this list.
+        handler_type = c.WINFUNCTYPE(w.BOOL, w.DWORD)
+
+        @handler_type
+        def control_handler(event):
+            # Console Ctrl+C reaches the child as well. Only the child decides
+            # whether to exit or continue; other events keep their normal path.
+            return bool(event == 0 and process.process and accept_shared_interrupt)
+
+        control = api.kernel.SetConsoleCtrlHandler
+        control.restype = w.BOOL
+        control.argtypes = [handler_type, w.BOOL]
+        retained_handlers.append(control_handler)
+        control_registered = True
+        if not control(control_handler, True):
+            control_registered = False
+            retained_handlers.remove(control_handler)
+            raise c.WinError(c.get_last_error())
+        # This callback is process-local, unlike the inheritable ignore flag
+        # set by SetConsoleCtrlHandler(NULL, TRUE). The child handles Ctrl+C.
+        # Only the standard handles (or inert sentinel) enter the allow-list.
         if not api.security.CreateProcessAsUserW(
-            token, command[0], command_line, None, None, bool(handles), creation_flags,
+            token, command[0], command_line, None, None, True, creation_flags,
             block, os.getcwd(), c.byref(startup.startup), c.byref(process),
         ):
             raise c.WinError(c.get_last_error())
@@ -433,17 +505,26 @@ def _launch(api, token, command, environment):
             raise c.WinError(c.get_last_error())
         return c.c_int32(code.value).value
     finally:
-        if process.process and not finished:
-            api.kernel.TerminateProcess(process.process, 130)
-            api.kernel.WaitForSingleObject(process.process, 5000)
-        if process.thread:
-            api.kernel.CloseHandle(process.thread)
-        if process.process:
-            api.kernel.CloseHandle(process.process)
-        if attributes_initialized:
-            api.kernel.DeleteProcThreadAttributeList(startup.attributes)
-        for handle in handles:
-            api.kernel.CloseHandle(handle)
+        try:
+            if process.process and not finished:
+                api.kernel.TerminateProcess(process.process, 130)
+                api.kernel.WaitForSingleObject(process.process, 5000)
+            if process.thread:
+                api.kernel.CloseHandle(process.thread)
+            if process.process:
+                api.kernel.CloseHandle(process.process)
+            if attributes_initialized:
+                api.kernel.DeleteProcThreadAttributeList(startup.attributes)
+            for handle in handles:
+                api.kernel.CloseHandle(handle)
+        finally:
+            accept_shared_interrupt = False
+            if control_registered:
+                if not control(control_handler, False):
+                    raise c.WinError(c.get_last_error())
+                # Keep even a removed callback pinned for this test process:
+                # an already-dispatched native handler thread may still be
+                # waiting to enter Python. Its inactive closure returns FALSE.
 
 
 def _native_environment_block(api) -> bytes:
@@ -485,12 +566,17 @@ def _flush_standard_streams():
             stream.flush()
 
 
+def _exit_status(status: int) -> int:
+    # Windows subprocess exposes a DWORD; os._exit accepts a signed C int.
+    return (status + 0x80000000) % 0x100000000 - 0x80000000 if os.name == "nt" else status
+
+
 def exit_test_process(status: int):
     """Exit the waiting wrapper without a second -i/PYTHONINSPECT prompt."""
     try:
         _flush_standard_streams()
     finally:
-        os._exit(status)
+        os._exit(_exit_status(status))
 
 
 def ensure_windows_test_process(
@@ -499,9 +585,9 @@ def ensure_windows_test_process(
     """Continue if suitable, or run the exact test command in a restricted child.
 
     ``argv`` excludes the script name. ``parent_check`` is an optional trusted
-    native regression command that must pass before an unsuitable parent starts
-    its restricted child. A returned integer is the status the caller must exit
-    with; ``None`` means the current process may continue.
+    native regression command that must pass before a parent with unsuitable
+    primary authority starts its restricted child. A returned integer is the
+    status the caller must exit with; ``None`` means the current process may continue.
     """
     if os.name != "nt":
         return None
@@ -513,14 +599,25 @@ def ensure_windows_test_process(
             return None
         if os.environ.get(_CHILD_MARKER):
             raise RuntimeError("restricted test child still has unsuitable native token authority")
-        if parent_check is not None:
+        # A thread-only impersonation problem needs a clean child, but a proof
+        # subprocess inherits the already-suitable primary and has no excess
+        # primary authority to test. Preserve the proof for every other case.
+        if parent_check is not None and not state["primary_eligible"]:
             if not parent_check:
                 raise ValueError("native parent regression command is empty")
             parent_environment = {key: value for key, value in os.environ.items()
-                                  if key.upper() != "PYTHONINSPECT"}
-            result = subprocess.run(parent_check, check=False, env=parent_environment)
+                                  if not key.upper().startswith("PYTHON")}
+            # Auxiliary unittest reporters need real streams even when the
+            # requested invocation has NULL handles. These pipes belong only
+            # to the proof process; the requested child retains its handles.
+            result = subprocess.run(parent_check, check=False, env=parent_environment,
+                                    capture_output=True, text=True, errors="replace")
+            for stream, output in ((sys.stdout, result.stdout), (sys.stderr, result.stderr)):
+                if stream is not None:
+                    stream.write(output)
+                    stream.flush()
             if result.returncode:
-                return result.returncode
+                return _exit_status(result.returncode)
         script = os.fspath(entrypoint)
         if not Path(script).is_file() or not sys.executable:
             raise ValueError("test entrypoint and interpreter must name existing files")
