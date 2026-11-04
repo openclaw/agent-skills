@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP = runpy.run_path(str(ROOT / "scripts" / "windows_test_process.py"))
 PRODUCT = runpy.run_path(str(ROOT / "skills" / "autoreview" / "scripts" / "autoreview"))
 

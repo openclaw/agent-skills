@@ -599,8 +599,7 @@ class NativeParentTests(unittest.TestCase):
                         "parent token state changed")
 
     def test_autoreview_product_custody_before_primary_restriction(self):
-        proof = (Path(__file__).resolve().parent.parent / "skills" / "autoreview"
-                 / "tests" / "test_windows_primary_custody.py")
+        proof = Path(__file__).resolve().with_name("windows-product-custody.test.py")
         result = subprocess.run(
             [sys.executable, "-u", "-I", "-S", "-B", "-X", "utf8=1", str(proof)],
             capture_output=True, encoding="utf-8", errors="replace", timeout=60,

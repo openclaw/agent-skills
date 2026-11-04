@@ -377,6 +377,12 @@ class StageTests(unittest.TestCase):
                     self.assertFalse(hasattr(inner.call_args.args[0],'_engine_stage'))
                     persist.assert_not_called()
     def main_fixture(self, *, unavailable=False, fail_persistence=False):
+        # Admit real output parents outside the repository discovered by the caller.
+        repo = (self.root / 'repo').resolve()
+        repo.mkdir()
+        git_fixture = runpy.run_path(str(SOURCE.with_name('test-review-harness.py')))
+        git_fixture['fixture_git'](repo, 'init', '-q', check=True,
+                                   capture_output=True, timeout=5)
         args=self.parse(['--engine-stage-dir',str(self.output),'--stream-engine-output','--status-output',str(self.root/'status.json'),'--json-output',str(self.root/'report.json')])
         report={'findings':[],'overall_correctness':'patch is correct','overall_explanation':'synthetic','overall_confidence':1.0}
         captured=types.SimpleNamespace(mixed=(),text='synthetic',images=())
@@ -392,13 +398,16 @@ class StageTests(unittest.TestCase):
         replacements={'preflight_git':lambda:True,
           'capture_source_context_inputs':lambda *a:evidence,
           'require_image_engine':lambda *a:None,
-          'parse_args':lambda:args,'repo_root':lambda:self.root,'prepare_output_paths':lambda *a:None,
+          'parse_args':lambda:args,
           'choose_target':lambda *a:('diff',None),'current_branch':lambda *a:'synthetic','codex_config_keys':lambda *a:[],
           'codex_speed_override':lambda *a:None,'capture_evidence_inputs':lambda *a:evidence,
           'source_tree_snapshot':lambda *a:'same','build_bundle':lambda *a:captured,
           'prepare_review_prompts':lambda *a:['synthetic'],'verify_evidence':lambda *a:None,
           'verify_mixed_sources':lambda *a:None,'run_review_passes':passes,'print_report':lambda *a,**kw:None}
         with contextlib.ExitStack() as stack:
+            previous_cwd = Path.cwd()
+            os.chdir(repo)
+            stack.callback(os.chdir, previous_cwd)
             for name,value in replacements.items(): stack.enter_context(mock.patch.object(M,name,value))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
