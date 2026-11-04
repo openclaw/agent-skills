@@ -125,6 +125,8 @@ directories and source roots are excluded from host executable selection, child
 trusted wrappers. A trusted `PATH` directory is excluded if
 any entry redirects into a source root. Paths with source-owned intermediate
 symlinks are also rejected, even when their final target is outside the source tree.
+The same entry checks apply to selected executables' original and resolved
+installation directories, including directories outside `PATH`.
 Reports, status files and diagnostic outputs must stay outside every source root
 and its Git metadata, including linked-worktree common directories and object
 stores. Git rejects source-owned `HOME`, default ignore files and global
