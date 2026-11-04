@@ -8,6 +8,7 @@ import copy
 import io
 import json
 import os
+import py_compile
 import re
 import runpy
 import shutil
@@ -1587,6 +1588,28 @@ class AutoreviewBinaryDeletionTests(unittest.TestCase):
 
 
 class AutoreviewHardeningTests(unittest.TestCase):
+    def test_windows_supervisor_loads_source_instead_of_conflicting_bytecode(self) -> None:
+        # Both normal and redirected Python caches are outside the admitted
+        # source-file contract. A valid cache must not choose the implementation.
+        for redirected in (False, True):
+            with self.subTest(redirected=redirected), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                source = root / "windows-owned-process.py"
+                prefix = str(root / "bytecode") if redirected else None
+                with mock.patch.object(sys, "pycache_prefix", prefix):
+                    source.write_text("ORIGIN = 'cached'\n", encoding="utf-8")
+                    cache = py_compile.compile(
+                        str(source), doraise=True,
+                        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+                    )
+                    self.assertTrue(Path(cache).is_file())
+                    source.write_text("ORIGIN = 'source'\n", encoding="utf-8")
+                    module = self.helper["_load_windows_process_module"](str(source))
+                self.assertEqual(module.ORIGIN, "source")
+                self.assertEqual(module.__name__, "autoreview_windows_process")
+                self.assertEqual(module.__file__, str(source))
+                self.assertEqual(module.__spec__.origin, str(source))
+
     def setUp(self) -> None:
         self.helper = load_helper()
 

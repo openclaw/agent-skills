@@ -1982,7 +1982,10 @@ def _load_windows_process_module(path: str) -> Any:
     if spec is None or spec.loader is None:
         raise RuntimeError("Windows process supervisor could not be loaded")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Admission covers this source file, not Python's potentially redirected
+    # bytecode cache. Preserve module metadata but execute only admitted bytes.
+    source = Path(path).read_bytes()
+    exec(compile(source, path, "exec", dont_inherit=True), module.__dict__)
     return module
 
 
