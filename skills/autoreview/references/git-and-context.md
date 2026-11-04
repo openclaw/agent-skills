@@ -92,6 +92,58 @@ authentication, sandbox and mutation checks remain enabled.
 "$AUTOREVIEW" --mode branch --base origin/main --source-context-file src/token_count.py
 ```
 
+## External committed source
+
+When a change integrates another repository, supply its required source with
+`--external-source-context-file <repo-relative-manifest.json>`. The manifest lives
+in the reviewed repository; an ignored directory keeps it out of the change.
+The source checkout must be a separate, canonical absolute Git worktree path.
+The helper does not clone, fetch, install dependencies, or execute source code.
+
+```json
+{
+  "version": 1,
+  "root": "/absolute/path/to/upstream-checkout",
+  "commit": "<full source commit OID>",
+  "files": [
+    {"path": "src/owner.ts", "blob": "<blob OID at that commit>", "mode": "100644"}
+  ]
+}
+```
+
+Resolve the exact commit and each blob/mode with Git before constructing this
+inventory. Mutable refs, unknown fields, duplicate paths, missing files and
+blob/mode mismatches fail preparation. Both SHA-1 and SHA-256 repositories are
+supported. A linked worktree is permitted; symlinked roots, source paths and Git
+metadata paths are not. Alternate object stores are unsupported. The source root
+cannot contain or be inside the reviewed repository. Before Git preflight, every
+declared source root and the reviewed repository are excluded from host executable
+selection, child `PATH`, authentication and configuration paths. This includes
+reviewer probes and trusted wrappers.
+
+The helper reads complete UTF-8 regular-file blobs from the declared commit,
+not the source checkout's working bytes. Headers retain the original path,
+source worktree, commit, blob and mode. Existing committed-source protections
+still reject credential directories, stores and keyfiles. This role does not
+relax `--prompt-file` or `--dataset` filename rules. Do not rename or concatenate
+blocked evidence to bypass those rules.
+
+The manifest, source paths, checkout identity, Git metadata/object-store paths
+and captured source fingerprints are revalidated before sends and publication.
+Changes fail the review rather than silently rebinding a source. Freeze source
+checkouts during the review, including their working files and metadata.
+
+External source is context only. It does not add finding targets or certify the
+upstream repository, release provenance, or runtime behavior. The operator must
+establish that the chosen source commit matches the dependency being reviewed.
+Report missing required contracts instead of inferring them from a source pin.
+
+This option is repeatable, supports committed branch/commit mode, and composes
+with `--review-batches`. Every selected external file stays whole in **every**
+pass, including allocated passes. It cannot be partitioned by an allocation.
+The complete input must fit the explicit prompt budget and model context; an
+oversized plan fails before a reviewer starts.
+
 ## Runtime diagnostics
 
 - Before repository detection/target selection: Git must pass `--version` within

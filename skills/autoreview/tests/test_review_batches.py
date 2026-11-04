@@ -7,6 +7,8 @@ import io
 import json
 import os
 import runpy
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -76,12 +78,15 @@ class ReviewBatchTests(unittest.TestCase):
     def write_manifest(self, repo, manifest):
         (repo / ".review/batches.json").write_bytes(json.dumps(manifest).encode("utf-8"))
 
-    def invoke(self, repo, *options, engine=None):
+    def invoke(self, repo, *options, engine=None, allocated=True, real_engine_probe=False):
         argv = [str(SCRIPT), "--mode", "branch", "--base", "HEAD^", "--engine", "codex",
                 "--max-priority", "P2", "--review-batches", ".review/batches.json",
                 "--source-context-file", "global.md", "--max-prompt-bytes", "80000",
                 "--max-review-passes", "2", "--json-output", str(repo.parent / "result.json"),
                 *options]
+        if not allocated:
+            offset = argv.index("--review-batches")
+            del argv[offset:offset + 2]
         with mock.patch.object(sys, "argv", argv):
             args = self.helper["parse_args"]()
         sends = []
@@ -98,7 +103,9 @@ class ReviewBatchTests(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.dict(self.helper["main_with_args"].__globals__, {
             "repo_root": lambda: repo, "run_engine": run,
-            "resolve_engine_binary": lambda *_: (True, None),
+            "discover_repo_root": lambda _: repo,
+            "resolve_engine_binary": (self.helper["resolve_engine_binary"] if real_engine_probe
+                                      else lambda *_: (True, None)),
         }), contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             try:
                 status = self.helper["main_with_args"](args)
@@ -107,6 +114,339 @@ class ReviewBatchTests(unittest.TestCase):
             except self.helper["ReviewerUnavailable"] as exc:
                 status = str(exc)
         return status, sends, output.getvalue()
+
+    @contextlib.contextmanager
+    def external_fixture(self, path="src/client-credential-operations.ts", content=None,
+                         object_format="sha1"):
+        with self.fixture() as repo:
+            upstream = repo.parent / "upstream"
+            upstream.mkdir()
+            self.git(upstream, "init", "-q", "--object-format=" + object_format)
+            self.git(upstream, "config", "user.name", "Autoreview Test")
+            self.git(upstream, "config", "user.email", "autoreview@example.invalid")
+            self.git(upstream, "config", "core.autocrlf", "false")
+            source = upstream / path
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(content if content is not None else b"// full external contract\r\n")
+            self.git(upstream, "add", ".")
+            self.git(upstream, "commit", "-qm", "external contract")
+            manifest = {
+                "version": 1, "root": str(upstream),
+                "commit": self.git(upstream, "rev-parse", "HEAD"),
+                "files": [{"path": path, "blob": self.git(upstream, "rev-parse", "HEAD:" + path),
+                           "mode": "100644"}],
+            }
+            (repo / ".review/external.json").write_text(json.dumps(manifest))
+            self.write_manifest(repo, self.manifest(repo))
+            yield repo, upstream, source, manifest
+
+    def test_external_linked_worktree_sha256_and_executable_blob(self):
+        with self.external_fixture(object_format="sha256") as (repo, upstream, source, manifest):
+            self.git(upstream, "update-index", "--chmod=+x", manifest["files"][0]["path"])
+            self.git(upstream, "commit", "-qm", "executable owner")
+            linked = repo.parent / "linked"
+            self.git(upstream, "worktree", "add", "--detach", str(linked), "HEAD")
+            manifest.update(root=str(linked), commit=self.git(linked, "rev-parse", "HEAD"))
+            manifest["files"][0]["mode"] = "100755"
+            (repo / ".review/external.json").write_text(json.dumps(manifest))
+            status, sends, output = self.invoke(repo, "--external-source-context-file", ".review/external.json")
+            self.assertEqual(status, 0, output)
+            self.assertEqual(len(sends), 2)
+            self.assertEqual(len(manifest["commit"]), 64)
+            self.assertIn("mode=100755", sends[0])
+
+    def test_external_source_refuses_duplicate_keys_and_alternate_object_stores(self):
+        with self.external_fixture() as (repo, upstream, _, manifest):
+            duplicate = json.dumps(manifest).replace('"version": 1', '"version": 1, "version": 1')
+            (repo / ".review/external.json").write_text(duplicate)
+            status, sends, _ = self.invoke(repo, "--external-source-context-file", ".review/external.json")
+            self.assertNotEqual(status, 0)
+            self.assertFalse(sends)
+
+            (repo / ".review/external.json").write_text(json.dumps(manifest))
+            (upstream / ".git/objects/info/alternates").write_text("")
+            status, sends, _ = self.invoke(repo, "--external-source-context-file", ".review/external.json")
+            self.assertNotEqual(status, 0)
+            self.assertFalse(sends)
+
+    def test_external_source_without_allocation_ignores_git_redirection(self):
+        with self.external_fixture() as (repo, upstream, source, manifest):
+            original = source.read_bytes().decode()
+            source.write_text("// replacement must not become review context\n")
+            self.git(upstream, "commit", "-qam", "replacement")
+            self.git(upstream, "replace", manifest["commit"], "HEAD")
+            with mock.patch.dict(os.environ, {
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(repo / "missing-object-store"),
+                "GIT_OBJECT_DIRECTORY": str(repo / "missing-object-store"),
+                "GIT_DIR": str(repo / ".git"),
+                "GIT_WORK_TREE": str(repo),
+                "GIT_NO_LAZY_FETCH": "0",
+            }):
+                for options in ((), ("--mode", "commit", "--commit", "HEAD")):
+                    with self.subTest(options=options):
+                        status, sends, output = self.invoke(
+                            repo, "--external-source-context-file", ".review/external.json",
+                            *options, allocated=False,
+                        )
+                        self.assertEqual(status, 0, output)
+                        self.assertTrue(sends)
+                        for prompt in sends:
+                            self.assertIn(original, prompt)
+                            self.assertNotIn("replacement must not", prompt)
+
+    @unittest.skipIf(os.name == "nt", "uses executable shell wrappers")
+    def test_external_source_cannot_supply_the_reviewer_probe(self):
+        with self.external_fixture() as (repo, upstream, _, _):
+            marker = repo.parent / "untrusted-reviewer-executed"
+            binary = upstream / "codex"
+            binary.write_text("#!/bin/sh\ntouch " + shlex.quote(str(marker)) + "\nexit 99\n")
+            binary.chmod(0o755)
+            status, sends, _ = self.invoke(
+                repo, "--external-source-context-file", ".review/external.json",
+                "--codex-bin", str(binary), "--dry-run", real_engine_probe=True,
+            )
+            self.assertNotEqual(status, 0)
+            self.assertFalse(sends)
+            self.assertFalse(marker.exists(), "source-owned reviewer executed during preflight")
+            trusted = repo.parent / "trusted-codex"
+            shutil.copy2(binary, trusted)
+            config = repo.parent / "operator-config"
+            config.mkdir()
+            (upstream / "config.toml").write_text('cli_auth_credentials_store="keyring"\n')
+            (config / "config.toml").symlink_to(upstream / "config.toml")
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(config)}):
+                status, sends, _ = self.invoke(
+                    repo, "--external-source-context-file", ".review/external.json",
+                    "--codex-bin", str(trusted), "--dry-run", real_engine_probe=True,
+                )
+            self.assertNotEqual(status, 0)
+            self.assertFalse(sends)
+            self.assertFalse(marker.exists(), "reviewer probe admitted source-owned configuration")
+
+    @unittest.skipIf(os.name == "nt", "uses executable shell wrappers")
+    def test_external_source_cannot_supply_host_configuration_or_authentication(self):
+        with self.external_fixture() as (repo, upstream, _, _):
+            binary = upstream / "auth-helper"
+            binary.write_text("#!/bin/sh\nexit 99\n")
+            binary.chmod(0o755)
+            config = repo.parent / "operator-config"
+            config.mkdir()
+            (config / "config.toml").write_text(
+                'model_provider="review_api"\n[model_providers.review_api]\n'
+                'name="Example"\nbase_url="https://api.openai.com/v1"\n'
+                'wire_api="responses"\nrequires_openai_auth=false\n'
+                '[model_providers.review_api.auth]\ncommand=' + json.dumps(str(binary)) + "\n"
+            )
+            boundary = self.helper["UNTRUSTED_SOURCE_ROOTS"]
+            token = boundary.set((repo, upstream))
+            try:
+                with mock.patch.dict(os.environ, {"CODEX_HOME": str(config), "HOME": str(repo.parent)}):
+                    with self.assertRaisesRegex(SystemExit, "authentication executable must be outside"):
+                        self.helper["load_codex_inference_route"](repo, ['model_provider="review_api"'])
+                with mock.patch.dict(os.environ, {
+                    "CODEX_HOME": str(upstream), "HOME": str(upstream),
+                    "SSL_CERT_FILE": str(binary), "PATH": str(upstream) + os.pathsep + os.environ["PATH"],
+                }):
+                    environment = self.helper["safe_engine_env"](repo, engine="codex")
+                    for key in ("HOME", "CODEX_HOME", "SSL_CERT_FILE"):
+                        self.assertNotIn(key, environment)
+                    self.assertNotIn(str(upstream), environment["PATH"].split(os.pathsep))
+                    with self.assertRaisesRegex(SystemExit, "trusted caller HOME"):
+                        self.helper["codex_auth_helper_home"](repo)
+                    with self.assertRaises(SystemExit):
+                        self.helper["resolve_command"](str(binary), repo)
+                # The login-status subprocess must use the same filtered host PATH.
+                marker = repo.parent / "unsafe-login-environment"
+                wrapper = repo.parent / "trusted-login-wrapper"
+                wrapper.write_text(
+                    '#!/bin/sh\ncase ":$PATH:" in *' + shlex.quote(":" + str(upstream) + ":")
+                    + '*) touch ' + shlex.quote(str(marker)) + '; exit 99;; esac\n'
+                    'test "$CODEX_HOME" = ' + shlex.quote(str(config)) + ' || exit 98\n'
+                    'test "$HOME" = ' + shlex.quote(str(repo.parent)) + ' || exit 97\n'
+                    'echo "not logged in"\nexit 1\n'
+                )
+                wrapper.chmod(0o755)
+                with mock.patch.dict(os.environ, {
+                    "PATH": str(upstream) + os.pathsep + os.environ["PATH"],
+                    "HOME": str(repo.parent), "CODEX_HOME": str(config),
+                }):
+                    self.assertTrue(self.helper["codex_subscription_login_missing"](str(wrapper), repo.parent, repo))
+                self.assertFalse(marker.exists())
+            finally:
+                boundary.reset(token)
+
+    def test_external_source_platform_environment_is_refused_before_any_process(self):
+        with self.external_fixture() as (repo, upstream, _, _):
+            for key in ("SystemRoot", "COMSPEC", "SHELL", "TMPDIR"):
+                with self.subTest(key=key), mock.patch.dict(os.environ, {key: str(upstream)}):
+                    probe = mock.Mock(side_effect=AssertionError("process admission must not run"))
+                    with mock.patch.dict(self.helper["main_with_args"].__globals__, {"preflight_git": probe}):
+                        status, sends, _ = self.invoke(repo, "--external-source-context-file", ".review/external.json")
+                    self.assertNotEqual(status, 0)
+                    self.assertFalse(sends)
+                    probe.assert_not_called()
+                    self.assertEqual(self.helper["UNTRUSTED_SOURCE_ROOTS"].get(), ())
+
+    @unittest.skipIf(os.name == "nt", "uses executable shell wrappers")
+    def test_external_sources_exclude_all_source_roots_before_git_admission(self):
+        with self.external_fixture() as (repo, upstream, _, manifest):
+            other = repo.parent / "other-source"
+            shutil.copytree(upstream, other)
+            other_manifest = {**manifest, "root": str(other)}
+            (repo / ".review/other.json").write_text(json.dumps(other_manifest))
+            marker = repo.parent / "untrusted-executed"
+            trusted_git = shutil.which("git")
+            self.assertIsNotNone(trusted_git)
+            directories = [root / "bin" for root in (repo, upstream, other)]
+            for directory in directories:
+                directory.mkdir()
+                candidate = directory / "git"
+                candidate.write_text("#!/bin/sh\ntouch " + shlex.quote(str(marker)) + "\nexit 99\n")
+                candidate.chmod(0o755)
+            wrapper = repo.parent / "trusted-git-wrapper"
+            wrapper.write_text("#!/bin/sh\n" + "\n".join(
+                'case ":$PATH:" in *' + shlex.quote(":" + str(directory) + ":")
+                + '*) touch ' + shlex.quote(str(marker)) + '; exit 98;; esac'
+                for directory in directories
+            ) + "\nexec " + shlex.quote(trusted_git) + ' "$@"\n')
+            wrapper.chmod(0o755)
+            for selected in ("git", str(wrapper), str(directories[2] / "git")):
+                with self.subTest(selected=selected), mock.patch.dict(os.environ, {
+                    "PATH": os.pathsep.join(map(str, directories)) + os.pathsep + os.environ["PATH"],
+                    "AUTOREVIEW_GIT": selected,
+                }):
+                    status, sends, output = self.invoke(
+                        repo, "--external-source-context-file", ".review/external.json",
+                        "--external-source-context-file", ".review/other.json",
+                    )
+                    if selected == str(directories[2] / "git"):
+                        self.assertNotEqual(status, 0)
+                        self.assertFalse(sends)
+                    else:
+                        self.assertEqual(status, 0, output)
+                        self.assertEqual(len(sends), 2)
+                    self.assertFalse(marker.exists(), "a declared source supplied executable code")
+                    self.assertEqual(self.helper["UNTRUSTED_SOURCE_ROOTS"].get(), ())
+
+    def test_external_committed_source_is_whole_in_every_assignment(self):
+        content = ("// external contract 🦊\r\n" * 120 + "// final line").encode()
+        with self.external_fixture(content=content) as (repo, upstream, source, manifest):
+            # A committed source role must not substitute the caller's dirty checkout.
+            source.write_text("dirty external body must not be sent")
+            status, sends, output = self.invoke(
+                repo, "--external-source-context-file", ".review/external.json",
+            )
+            self.assertEqual(status, 0, output)
+            self.assertEqual(len(sends), 2)
+            for prompt in sends:
+                self.assertEqual(prompt.count(content.decode()), 1)
+                self.assertNotIn("dirty external body", prompt)
+                self.assertIn(manifest["commit"], prompt)
+                self.assertIn(manifest["files"][0]["blob"], prompt)
+                self.assertIn(str(upstream), prompt)
+                self.assertNotIn(source.name, prompt.split("# Change Bundle\n", 1)[1])
+            result = json.loads((repo.parent / "result.json").read_text())
+            self.assertEqual(len(result["review_allocation"]["units"]), 3)
+
+    def test_external_source_rejects_ambiguous_or_unpinned_manifests_before_send(self):
+        with self.external_fixture() as (repo, upstream, source, original):
+            changes = {
+                "relative root": lambda m: m.update(root="../upstream"),
+                "review root": lambda m: m.update(root=str(repo)),
+                "parent root": lambda m: m.update(root=str(repo.parent)),
+                "not root": lambda m: m.update(root=str(source.parent)),
+                "mutable ref": lambda m: m.update(commit="HEAD"),
+                "wrong blob": lambda m: m["files"][0].update(blob="0" * 40),
+                "wrong mode": lambda m: m["files"][0].update(mode="100755"),
+                "traversal": lambda m: m["files"][0].update(path="../upstream/" + m["files"][0]["path"]),
+                "absent source": lambda m: m["files"][0].update(path="missing.ts"),
+                "duplicate": lambda m: m["files"].append({**m["files"][0], "path": "./" + m["files"][0]["path"]}),
+                "unknown field": lambda m: m.update(command="not executed"),
+            }
+            for name, change in changes.items():
+                with self.subTest(name=name):
+                    manifest = json.loads(json.dumps(original))
+                    change(manifest)
+                    (repo / ".review/external.json").write_text(json.dumps(manifest))
+                    status, sends, _ = self.invoke(repo, "--external-source-context-file", ".review/external.json")
+                    self.assertNotEqual(status, 0)
+                    self.assertFalse(sends)
+            (repo / ".review/external.json").write_text(json.dumps(original))
+            status, sends, _ = self.invoke(repo, "--mode", "local", "--external-source-context-file", ".review/external.json")
+            self.assertNotEqual(status, 0)
+            self.assertFalse(sends)
+
+    def test_external_source_retains_sensitive_directory_and_keyfile_refusals(self):
+        for path in ("credentials/owner.ts", ".aws/owner.ts", "private/owner.ts", ".env", "key.pem"):
+            with self.subTest(path=path), self.external_fixture(path=path) as (repo, _, _, _):
+                status, sends, output = self.invoke(repo, "--external-source-context-file", ".review/external.json")
+                self.assertNotEqual(status, 0)
+                self.assertIn("sensitive", str(status) + output)
+                self.assertFalse(sends)
+
+    def test_external_source_mutation_stops_later_pass_and_publication(self):
+        for mutation in ("bytes", "manifest", "object store", "git pointer"):
+            with self.subTest(mutation=mutation), self.external_fixture() as (repo, upstream, source, _):
+                def mutate(_count, report):
+                    if mutation == "bytes":
+                        source.write_text("changed after first send")
+                    elif mutation == "manifest":
+                        (repo / ".review/external.json").write_text("{}")
+                    elif mutation == "object store":
+                        objects = upstream / ".git/objects"
+                        objects.rename(upstream / ".git/old-objects")
+                        # Preserve all objects: repository identity, not missing data, must fail.
+                        shutil.copytree(upstream / ".git/old-objects", objects)
+                    else:
+                        (upstream / ".git").rename(upstream / "metadata")
+                        (upstream / ".git").write_text("gitdir: metadata\n")
+                    return report
+                status, sends, output = self.invoke(
+                    repo, "--external-source-context-file", ".review/external.json", engine=mutate,
+                )
+                self.assertNotEqual(status, 0, output)
+                self.assertEqual(len(sends), 1)
+                self.assertFalse((repo.parent / "result.json").exists())
+
+    @unittest.skipIf(os.name == "nt", "requires local symlink privilege")
+    def test_external_source_refuses_symlink_roots_paths_and_object_stores(self):
+        for mutation in ("root", "source", "objects"):
+            with self.subTest(mutation=mutation), self.external_fixture() as (repo, upstream, source, manifest):
+                if mutation == "root":
+                    alias = repo.parent / "alias"
+                    alias.symlink_to(upstream, target_is_directory=True)
+                    manifest["root"] = str(alias)
+                    (repo / ".review/external.json").write_text(json.dumps(manifest))
+                else:
+                    path = source if mutation == "source" else upstream / ".git/objects"
+                    moved = path.with_name("moved-" + path.name)
+                    path.rename(moved)
+                    path.symlink_to(moved, target_is_directory=moved.is_dir())
+                status, sends, _ = self.invoke(repo, "--external-source-context-file", ".review/external.json")
+                self.assertNotEqual(status, 0)
+                self.assertFalse(sends)
+
+    def test_external_source_never_gains_finding_authority(self):
+        with self.external_fixture() as (repo, _, source, manifest):
+            def outside(_count, report):
+                report["findings"] = [{
+                    "title": "External context defect", "body": "Not a selected change.",
+                    "priority": "P2", "confidence": 1, "category": "bug",
+                    "code_location": {"file_path": manifest["files"][0]["path"], "line": 1},
+                }]
+                report["overall_correctness"] = "patch is incorrect"
+                return report
+            status, _, _ = self.invoke(repo, "--external-source-context-file", ".review/external.json", engine=outside)
+            self.assertEqual(status, 2)
+            result = json.loads((repo.parent / "result.json").read_text())
+            self.assertEqual(result["findings"], [])
+            self.assertTrue(result["scope_rejected_findings"])
+
+    def test_external_source_budget_refuses_instead_of_truncating(self):
+        with self.external_fixture(content=b"// required contract\n" * 5000) as (repo, _, _, _):
+            status, sends, _ = self.invoke(repo, "--external-source-context-file", ".review/external.json")
+            self.assertNotEqual(status, 0)
+            self.assertFalse(sends)
 
     def test_whole_units_metadata_overlap_and_contracts_retain_full_range(self):
         with self.fixture() as repo:

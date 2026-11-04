@@ -7,6 +7,7 @@ import base64
 import binascii
 import bisect
 import contextlib
+import contextvars
 import copy
 import functools
 import hashlib
@@ -260,10 +261,17 @@ class SourceContext(NamedTuple):
     fingerprint: tuple[str, int, int, str]
 
 
+class ExternalSourceContext(NamedTuple):
+    root: Path
+    binding: tuple[tuple[str, tuple[tuple[int, int, int], ...]], ...]
+    metadata_files: tuple[tuple[str, tuple[str, int, int, str]], ...]
+    source: SourceContext
+
+
 class EvidenceInputs(NamedTuple):
     prompt: str
     datasets: list[ReviewDataset]
-    files: list[EvidenceFile | SourceContext]
+    files: list[EvidenceFile | SourceContext | ExternalSourceContext]
 
 
 class PreparationProgress:
@@ -571,6 +579,11 @@ def run(
     return result
 
 
+UNTRUSTED_SOURCE_ROOTS: contextvars.ContextVar[tuple[Path, ...]] = contextvars.ContextVar(
+    "untrusted_source_roots", default=(),
+)
+
+
 def safe_git_env(repo: Path) -> dict[str, str]:
     platform_keys = ("COMSPEC", "DEVELOPER_DIR", "PATHEXT", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "WINDIR")
     caller_home = os.environ.get("HOME")
@@ -582,8 +595,10 @@ def safe_git_env(repo: Path) -> dict[str, str]:
     if developer := env.get("DEVELOPER_DIR"):
         bases = (Path(developer), Path(developer) / "Contents" / "Developer")
         paths = (base / suffix for base in bases for suffix in (".", "usr/bin/xcrun", "usr/bin/git"))
-        if any(not path.is_absolute() or is_within(Path(os.path.abspath(path)), repo.resolve())
-               or not external_env_path(repo, str(path)) for path in paths):
+        if any(not path.is_absolute() or any(
+                is_within(Path(os.path.abspath(path)), root.resolve())
+                or not external_env_path(root, str(path))
+                for root in (repo, *UNTRUSTED_SOURCE_ROOTS.get())) for path in paths):
             raise SystemExit("Git refuses relative or repository-owned DEVELOPER_DIR")
     env.update({
         "GIT_CONFIG_GLOBAL": os.devnull,
@@ -678,7 +693,7 @@ def global_excludes_file(repo: Path) -> Path | None:
         resolved = candidate.resolve(strict=True)
     except OSError:
         return None
-    if is_within(resolved, repo.resolve()) or not resolved.is_file():
+    if not external_env_path(repo, str(resolved)) or not resolved.is_file():
         return None
     return resolved
 
@@ -691,8 +706,6 @@ def global_excludes_git_args(repo: Path) -> list[str]:
 
 def safe_engine_path(repo: Path, extra_paths: list[Path] | None = None) -> str:
     entries: list[str] = []
-    resolved_repo = repo.resolve()
-
     def add(path: str | Path) -> None:
         candidate = Path(path).expanduser()
         try:
@@ -701,7 +714,7 @@ def safe_engine_path(repo: Path, extra_paths: list[Path] | None = None) -> str:
             resolved = candidate.resolve()
         except OSError:
             return
-        if is_within(resolved, resolved_repo):
+        if not external_env_path(repo, str(resolved)):
             return
         value = str(resolved)
         if value not in entries:
@@ -730,7 +743,8 @@ def external_env_path(repo: Path, value: str) -> bool:
         resolved = Path(value).expanduser().resolve()
     except OSError:
         return False
-    return not is_within(resolved, repo.resolve())
+    return not any(is_within(resolved, root.resolve())
+                   for root in (repo, *UNTRUSTED_SOURCE_ROOTS.get()))
 
 
 def normalize_external_env_path_value(
@@ -747,7 +761,7 @@ def normalize_external_env_path_value(
             resolved = Path(item).expanduser().resolve()
         except OSError:
             return None
-        if is_within(resolved, repo.resolve()):
+        if not external_env_path(repo, str(resolved)):
             return None
         normalized.append(str(resolved))
     return os.pathsep.join(normalized) if normalized else None
@@ -769,7 +783,7 @@ def safe_temp_root(repo: Path, *, engine: str | None = None) -> Path:
         root = Path(tempfile.gettempdir()).resolve(strict=True)
     except OSError as exc:
         raise SystemExit(f"unable to resolve temporary directory: {exc}") from exc
-    if is_within(root, repo.resolve()):
+    if not external_env_path(repo, str(root)):
         raise SystemExit(
             "temporary directory must be outside the reviewed repository; "
             "unset or relocate TMPDIR/TMP/TEMP"
@@ -2183,14 +2197,13 @@ def preflight_git() -> bool:
 
 def find_command(name: str, repo: Path) -> str | None:
     command = Path(name)
+    roots = (repo, *UNTRUSTED_SOURCE_ROOTS.get())
     if has_directory_component(name, command):
         base = command if command.is_absolute() else repo / command
-        if is_within(
-            Path(os.path.abspath(base)),
-            Path(os.path.abspath(repo)),
-        ):
+        if any(is_within(Path(os.path.abspath(base)), Path(os.path.abspath(root))) for root in roots):
             return None
-        return first_executable_candidate(base, reject_root=repo.resolve())
+        found = first_executable_candidate(base, reject_root=repo.resolve())
+        return found if found and external_env_path(repo, found) else None
     for part in os.environ.get("PATH", "").split(os.pathsep):
         if not part or part == ".":
             continue
@@ -2202,10 +2215,10 @@ def find_command(name: str, repo: Path) -> str | None:
             resolved_repo = repo.resolve()
         except OSError:
             continue
-        if is_within(resolved_part, resolved_repo):
+        if any(is_within(resolved_part, root.resolve()) for root in roots):
             continue
         found = first_executable_candidate(resolved_part / name, reject_root=resolved_repo)
-        if found:
+        if found and external_env_path(repo, found):
             return found
     return None
 
@@ -3811,15 +3824,154 @@ def capture_source_context_inputs(
                 chunks.append(render_datasets([dataset]))
             else:
                 datasets.append(dataset)
-    return EvidenceInputs("\n\n".join(chunks), datasets, files)
+    return capture_external_source_inputs(
+        args, repo, captured, EvidenceInputs("\n\n".join(chunks), datasets, files),
+    )
 
 
-def verify_evidence(repo: Path, files: list[EvidenceFile | SourceContext]) -> None:
+def external_source_binding(repo: Path, root: Path) -> tuple[
+    tuple[tuple[str, tuple[tuple[int, int, int], ...]], ...],
+    tuple[tuple[str, tuple[str, int, int, str]], ...],
+]:
+    if (not root.is_absolute() or root.resolve() != root
+            or is_within(root, repo.resolve()) or is_within(repo.resolve(), root)):
+        raise SystemExit("external source root must be a canonical, separate absolute worktree")
+
+    def topology(path: Path) -> tuple[tuple[int, int, int], ...]:
+        return evidence_topology(Path(path.anchor), path.relative_to(path.anchor).as_posix())
+
+    # Validate the root before Git can follow a substituted checkout or .git link.
+    paths = [root, root / ".git"]
+    initial = tuple((str(path), topology(path)) for path in paths)
+    if Path(git(root, "rev-parse", "--show-toplevel").strip()).resolve() != root:
+        raise SystemExit("external source root must be a Git worktree root")
+    for option in ("--absolute-git-dir", "--git-common-dir"):
+        path = Path(git(root, "rev-parse", option).strip())
+        paths.append(path if path.is_absolute() else root / path)
+    objects = Path(git(root, "rev-parse", "--git-path", "objects").strip())
+    paths.append(objects if objects.is_absolute() else root / objects)
+    binding = tuple((str(path), topology(path)) for path in paths)
+    if binding[:2] != initial:
+        raise SystemExit("external source repository changed while being captured")
+    # Linked-worktree redirection and alternate object-store changes are inputs too.
+    metadata = [paths[-1] / "info" / "alternates", paths[-3] / "commondir"]
+    if (root / ".git").is_file():
+        metadata.append(root / ".git")
+    records = []
+    for path in metadata:
+        if path.exists() or path.is_symlink():
+            topology(path)
+        records.append((str(path), source_file_fingerprint(path)))
+    if records[0][1][0] != "missing":
+        raise SystemExit("external source alternate object stores are unsupported")
+    return binding, tuple(records)
+
+
+def capture_external_source_context(
+    repo: Path, root: Path, path: str, commit: str,
+) -> ExternalSourceContext:
+    # Keep direct captures safe too; ordinary runs already include every declared
+    # source root before any host executable or configuration is admitted.
+    token = UNTRUSTED_SOURCE_ROOTS.set((*UNTRUSTED_SOURCE_ROOTS.get(), repo, root))
+    try:
+        binding, metadata = external_source_binding(repo, root)
+        source = capture_source_context(root, path, commit)
+        if external_source_binding(repo, root) != (binding, metadata):
+            raise SystemExit("external source repository changed while being captured")
+        return ExternalSourceContext(root, binding, metadata, source)
+    finally:
+        UNTRUSTED_SOURCE_ROOTS.reset(token)
+
+
+def read_external_source_manifests(args: argparse.Namespace, repo: Path) -> list[tuple[EvidenceFile, dict[str, Any]]]:
+    manifests = getattr(args, "external_source_context_file", None) or []
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise SystemExit("duplicate external source manifest key")
+            result[key] = value
+        return result
+
+    documents = []
+    for manifest_path in manifests:
+        manifest = capture_evidence_file(repo, manifest_path, "--external-source-context-file")
+        try:
+            document = json.loads(manifest.content, object_pairs_hook=unique_object)
+        except (ValueError, RecursionError) as exc:
+            raise SystemExit("invalid external source manifest JSON") from exc
+        if (not isinstance(document, dict) or set(document) != {"version", "root", "commit", "files"}
+                or type(document["version"]) is not int or document["version"] != 1
+                or not isinstance(document["root"], str) or not document["root"]
+                or not isinstance(document["commit"], str)
+                or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", document["commit"])
+                or not isinstance(document["files"], list) or not document["files"]):
+            raise SystemExit("invalid external source manifest fields")
+        root = Path(document["root"])
+        if (not root.is_absolute() or root.resolve() != root
+                or is_within(root, repo.resolve()) or is_within(repo.resolve(), root)):
+            raise SystemExit("external source root must be a canonical, separate absolute worktree")
+        for item in document["files"]:
+            if (not isinstance(item, dict) or set(item) != {"path", "blob", "mode"}
+                    or not isinstance(item["path"], str) or not item["path"]
+                    or not isinstance(item["blob"], str)
+                    or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", item["blob"])
+                    or item["mode"] not in ("100644", "100755")):
+                raise SystemExit("invalid external source file fields")
+        documents.append((manifest, document))
+    return documents
+
+
+def capture_external_source_inputs(
+    args: argparse.Namespace, repo: Path, captured: CapturedBundle, evidence: EvidenceInputs,
+) -> EvidenceInputs:
+    documents = getattr(args, "external_source_manifests", [])
+    if documents and captured.commit is None:
+        raise SystemExit("--external-source-context-file requires a committed branch or commit review")
+    chunks = [evidence.prompt] if evidence.prompt else []
+    files = list(evidence.files)
+    sources: dict[tuple[Path, str, str], ExternalSourceContext] = {}
+    for manifest, document in documents:
+        if capture_evidence_file(repo, manifest.raw_path, manifest.label) != manifest:
+            raise SystemExit("external source manifest changed after executable admission")
+        root = Path(document["root"])
+        files.append(manifest)
+        manifest_paths: set[str] = set()
+        for item in document["files"]:
+            record = capture_external_source_context(repo, root, item["path"], document["commit"])
+            source = record.source
+            if source.raw_path in manifest_paths:
+                raise SystemExit("duplicate external source path")
+            manifest_paths.add(source.raw_path)
+            if source.source.identity != f"git:{item['blob']}:{item['mode']}":
+                raise SystemExit("external source blob/mode mismatch")
+            key = (root, source.commit, source.raw_path)
+            if key in sources:
+                if sources[key] != record:
+                    raise SystemExit("external source changed while being captured")
+                continue
+            sources[key] = record
+            files.append(record)
+            assert source.source.content is not None
+            block = render_datasets([ReviewDataset(
+                source.raw_path, source.source.content,
+                provenance=(source.commit, item["blob"], item["mode"]),
+            )])
+            chunks.append(f"# External source worktree: {json.dumps(str(root))}\n{block}")
+    return EvidenceInputs("\n\n".join(chunks), evidence.datasets, files)
+
+
+def verify_evidence(repo: Path, files: list[EvidenceFile | SourceContext | ExternalSourceContext]) -> None:
     for record in files:
         try:
-            current = (capture_source_context(repo, record.raw_path, record.commit)
-                       if isinstance(record, SourceContext)
-                       else capture_evidence_file(repo, record.raw_path, record.label))
+            if isinstance(record, ExternalSourceContext):
+                current = capture_external_source_context(
+                    repo, record.root, record.source.raw_path, record.source.commit,
+                )
+            else:
+                current = (capture_source_context(repo, record.raw_path, record.commit)
+                           if isinstance(record, SourceContext)
+                           else capture_evidence_file(repo, record.raw_path, record.label))
         except SystemExit as exc:
             raise SystemExit("evidence changed or became unsafe; rerun autoreview") from exc
         if current != record:
@@ -5063,11 +5215,12 @@ def codex_source_home(repo: Path) -> Path | None:
         resolved = candidate.resolve()
     except OSError:
         return None
-    return (
-        resolved
-        if resolved.is_dir() and external_env_path(repo, str(resolved))
-        else None
-    )
+    if not resolved.is_dir() or not external_env_path(repo, str(resolved)):
+        return None
+    for name in ("config.toml", "auth.json"):
+        if not external_env_path(repo, str(resolved / name)):
+            raise SystemExit("Codex configuration and authentication must be outside reviewed source roots")
+    return resolved
 
 
 def codex_auth_config_flags(
@@ -5077,7 +5230,10 @@ def codex_auth_config_flags(
     if codex_home is None:
         return ["-c", 'cli_auth_credentials_store="file"'] if force_file else []
     if config is None:
-        config = load_codex_auth_config(codex_home / "config.toml")
+        config_path = codex_home / "config.toml"
+        if not external_env_path(repo, str(config_path)):
+            raise SystemExit("Codex authentication config must be outside reviewed source roots")
+        config = load_codex_auth_config(config_path)
 
     allowed_values = {
         "forced_login_method": {"chatgpt", "api"},
@@ -5113,7 +5269,8 @@ def codex_auth_helper_home(repo: Path) -> Path:
         resolved = home.resolve(strict=True)
         if not home.is_absolute() or not resolved.is_dir():
             raise ValueError("unavailable HOME")
-        roots = (repo.absolute(), repo.resolve())
+        roots = tuple(path for root in (repo, *UNTRUSTED_SOURCE_ROOTS.get())
+                      for path in (root.absolute(), root.resolve()))
         pending = [home, *home.parents]
         seen: set[Path] = set()
         while pending:
@@ -5303,7 +5460,10 @@ def codex_file_auth_source(repo: Path) -> Path | None:
     source_home = codex_source_home(repo)
     if source_home is None:
         return None
-    config = load_codex_auth_config(source_home / "config.toml")
+    config_path = source_home / "config.toml"
+    if not external_env_path(repo, str(config_path)):
+        return None
+    config = load_codex_auth_config(config_path)
     credential_store = config.get("cli_auth_credentials_store")
     if credential_store not in {None, "file"}:
         return None
@@ -5812,10 +5972,12 @@ def load_codex_auth_fallback_route(
     return provider, route
 
 
-def codex_subscription_login_missing(codex_bin: str, cwd: Path) -> bool:
+def codex_subscription_login_missing(codex_bin: str, cwd: Path, source_repo: Path) -> bool:
     try:
         result = subprocess.run(
-            [codex_bin, "login", "status"], cwd=cwd, env=os.environ.copy(),
+            [codex_bin, "login", "status"], cwd=cwd,
+            env=(safe_engine_env(source_repo, engine="codex") if UNTRUSTED_SOURCE_ROOTS.get()
+                 else os.environ.copy()),
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding=SUBPROCESS_TEXT_ENCODING, errors=SUBPROCESS_TEXT_ERRORS,
             timeout=10, check=False,
@@ -5973,7 +6135,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                 if allow_fallback else None
             )
             if auth_fallback is not None and codex_subscription_login_missing(
-                resolve_command(args.codex_bin, repo), temp_root,
+                resolve_command(args.codex_bin, repo), temp_root, repo,
             ):
                 provider, route = auth_fallback
                 command_auth = True
@@ -7577,6 +7739,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", action="append", help="Extra evidence file to include in the review bundle.")
     parser.add_argument("--source-context", action="append", help="Repo-relative source path from the reviewed commit; branch/commit modes only, context without finding authority.")
     parser.add_argument("--source-context-file", action="append", help="Repo-relative source from the reviewed commit, kept intact in every pass; branch/commit modes only, context without finding authority.")
+    parser.add_argument("--external-source-context-file", action="append", help="Repo-relative manifest pinning a separate Git worktree, commit and source blobs; kept intact in every pass, context without finding authority.")
     parser.add_argument("--review-batches", help="Repo-relative v1 allocation manifest for one frozen branch range. Whole change units and declared source contracts; no dataset/source-context partitioning. See references/git-and-context.md.")
     parser.add_argument(
         "--max-priority",
@@ -8178,7 +8341,7 @@ def run_reviewer(
     prompt: str | ReviewPass,
     changed_paths: set[str] | CapturedBundle,
     required: list[str],
-    evidence: list[EvidenceFile | SourceContext] | None = None,
+    evidence: list[EvidenceFile | SourceContext | ExternalSourceContext] | None = None,
 ) -> ReviewResult:
     mixed = changed_paths.mixed if isinstance(changed_paths, CapturedBundle) else ()
     paths = changed_paths.paths if isinstance(changed_paths, CapturedBundle) else changed_paths
@@ -8296,7 +8459,7 @@ def run_review_passes(
     repo: Path,
     prompts: list[str] | list[ReviewPass],
     changed_paths: set[str] | CapturedBundle,
-    evidence: list[EvidenceFile | SourceContext] | None = None,
+    evidence: list[EvidenceFile | SourceContext | ExternalSourceContext] | None = None,
 ) -> list[tuple[str, ReviewResult]]:
     chunk_reports: list[tuple[str, ReviewResult]] = []
     args.review_usage = reviewers[0].review_usage = []
@@ -8736,11 +8899,36 @@ def main_impl() -> int:
 
 
 def main_with_args(args: argparse.Namespace) -> int:
+    # Discover only by filesystem before Git admission: all declared source roots
+    # must already be untrusted when selecting host executables and configuration.
+    start = Path.cwd().resolve()
+    root = discover_repo_root(start) or start
+    args.external_source_manifests = read_external_source_manifests(args, root)
+    if not args.external_source_manifests:
+        return main_with_source_boundary(args, root)
+    token = UNTRUSTED_SOURCE_ROOTS.set(tuple(
+        [root, *(Path(document["root"]) for _, document in args.external_source_manifests)]
+    ))
+    try:
+        # Some platform launch/cleanup code reads these directly from the host
+        # environment. Refuse source-owned values before creating any process.
+        for key in ("SystemRoot", "SYSTEMROOT", "WINDIR", "COMSPEC", "SHELL", "TEMP", "TMP", "TMPDIR"):
+            value = os.environ.get(key)
+            if value and not external_env_path(root, value):
+                raise SystemExit(f"{key} must be outside reviewed source roots")
+        return main_with_source_boundary(args, root)
+    finally:
+        UNTRUSTED_SOURCE_ROOTS.reset(token)
+
+
+def main_with_source_boundary(args: argparse.Namespace, discovered_root: Path) -> int:
     reviewers = reviewer_args(args)
     if not preflight_git():
         return 2
     with PreparationProgress("target selection"):
         repo = repo_root()
+        if args.external_source_manifests and repo != discovered_root:
+            raise SystemExit("reviewed repository changed after external source admission")
         prepare_output_paths(args, repo)
         if not args.dry_run and getattr(args, "status_output", None):
             Path(args.status_output).unlink(missing_ok=True)
