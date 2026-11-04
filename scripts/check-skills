@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib
 import importlib.util
 import shutil
 import subprocess
@@ -84,13 +85,14 @@ def repository_test_suite(root: Path, group: str) -> unittest.TestSuite:
         for entry in TEST_MODULES[group_name]:
             name = entry.removesuffix(".py").replace("/", ".")
             path = root.joinpath(*name.split(".")).with_suffix(".py")
-            spec = importlib.util.spec_from_file_location(name, path)
-            assert spec is not None and spec.loader is not None
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[name] = module
-            spec.loader.exec_module(module)
-            parent, _, leaf = name.rpartition(".")
-            setattr(sys.modules[parent], leaf, module)
+            # Reuse forward-imported siblings so tests and patches see the
+            # same module. Refuse any resolver or cached origin outside this file.
+            spec = importlib.util.find_spec(name)
+            if spec is None or spec.origin is None or Path(spec.origin).resolve() != path.resolve():
+                raise ValueError(f"test module did not resolve to its checkout file: {name}")
+            module = importlib.import_module(name)
+            if Path(module.__file__).resolve() != path.resolve():
+                raise ValueError(f"test module did not load from its checkout file: {name}")
             tests.extend(flatten(loader.loadTestsFromModule(module)))
     if loader.errors:
         raise ValueError("; ".join(loader.errors))

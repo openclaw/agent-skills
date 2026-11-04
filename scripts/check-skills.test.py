@@ -20,6 +20,22 @@ MAIN = HELPER["main"]
 
 
 class CheckSkillsTest(unittest.TestCase):
+    def test_manifest_covers_checkout_test_files_in_their_groups(self) -> None:
+        root = SCRIPT.resolve().parent.parent
+        core = "skills/autoreview/scripts/autoreview_test.py"
+        hardening = "skills/autoreview/tests/test_autoreview_hardening.py"
+        discovered = {path.relative_to(root).as_posix()
+                      for path in (root / "skills/autoreview/tests").glob("test_*.py")}
+        self.assertTrue((root / core).is_file())
+        self.assertIn(hardening, discovered)
+        expected = {"core": {core}, "hardening": {hardening},
+                    "boundaries": discovered - {hardening}}
+        self.assertEqual(set(HELPER["TEST_MODULES"]), set(expected))
+        for group, paths in expected.items():
+            actual = [entry if entry.endswith(".py") else entry.replace(".", "/") + ".py"
+                      for entry in HELPER["TEST_MODULES"][group]]
+            self.assertCountEqual(actual, paths, group)
+
     def commands(self, args: list[str]) -> list[list[str]]:
         with mock.patch("shutil.which", side_effect=lambda name: name), \
                 mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run, \
@@ -71,8 +87,8 @@ class CheckSkillsTest(unittest.TestCase):
         self.assertIn("required executable not found:", error.getvalue())
 
     @contextlib.contextmanager
-    def fixture(self):
-        with tempfile.TemporaryDirectory() as directory:
+    def fixture(self, *, parent=None, forward_import=False):
+        with tempfile.TemporaryDirectory(dir=parent) as directory:
             root = Path(directory) / "repo"
             (root / "scripts").mkdir(parents=True)
             shutil.copy2(SCRIPT, root / "scripts/check-skills")
@@ -83,7 +99,9 @@ class CheckSkillsTest(unittest.TestCase):
                     name = entry.removesuffix(".py").replace("/", ".")
                     path = root.joinpath(*name.split(".")).with_suffix(".py")
                     path.parent.mkdir(parents=True, exist_ok=True)
-                    body = "import os, unittest\nfrom pathlib import Path\nSENTINEL = 'local checkout'\n"
+                    body = "import importlib, os, unittest\nfrom pathlib import Path\nSENTINEL = 'local checkout'\n"
+                    if forward_import and name.endswith("test_native_handoff"):
+                        body += "from skills.autoreview.tests import test_openclaw_exec as forward\n"
                     # Exercise the same sibling-import forms as the real suite.
                     if name.endswith("test_openclaw_exec"):
                         body += "from skills.autoreview.tests import test_native_handoff as native\nassert native.SENTINEL == SENTINEL\n"
@@ -96,14 +114,17 @@ class CheckSkillsTest(unittest.TestCase):
                         body += (f"    def test_{index}(self):\n"
                                  f"        with Path(os.environ['CHECK_TEST_LOG']).open('a') as stream: stream.write({label!r} + '\\n')\n"
                                  f"        self.assertNotEqual(os.environ.get('CHECK_FAIL_TEST'), {label!r})\n")
-                    path.write_text(body)
+                        if forward_import and name.endswith("test_native_handoff"):
+                            body += "        self.assertIs(forward, importlib.import_module('skills.autoreview.tests.test_openclaw_exec'))\n"
+                    path.write_text(body, encoding="utf-8")
             foreign = Path(directory) / "installed"
             (foreign / "skills").mkdir(parents=True)
             marker = foreign / "imported"
             (foreign / "skills/__init__.py").write_text(
                 "from pathlib import Path\n"
                 f"Path({str(marker)!r}).write_text('unrelated package imported')\n"
-                "raise RuntimeError('unrelated installed skills package')\n"
+                "raise RuntimeError('unrelated installed skills package')\n",
+                encoding="utf-8",
             )
             log = Path(directory) / "executed"
             environment = {**os.environ, "PYTHONPATH": str(foreign), "PYTHONNOUSERSITE": "1",
@@ -144,6 +165,40 @@ class CheckSkillsTest(unittest.TestCase):
             self.assertIn("FAILED (failures=1)", result.stderr)
             self.assertFalse(marker.exists())
 
+    def test_forward_sibling_import_preserves_module_identity(self) -> None:
+        with self.fixture(forward_import=True) as (root, foreign, marker, log, environment, groups):
+            result = self.invoke(root, foreign, environment, "boundaries", tests_only=False)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertCountEqual(log.read_text().splitlines(), groups["boundaries"])
+            self.assertFalse(marker.exists())
+
+    def test_fixture_source_supports_unicode_paths_under_a_narrow_locale(self) -> None:
+        # Change the text locale after interpreter startup so the filesystem
+        # retains Unicode support while default text writes use a narrow codec.
+        code = r'''
+import locale, runpy, sys, tempfile
+from pathlib import Path
+case = runpy.run_path(sys.argv[1])["CheckSkillsTest"]()
+with tempfile.TemporaryDirectory() as temporary:
+    parent = Path(temporary) / "\u674e"
+    parent.mkdir()
+    locale.setlocale(locale.LC_CTYPE, "C")
+    try:
+        "\u674e".encode(locale.getpreferredencoding(False))
+    except UnicodeEncodeError:
+        pass
+    else:
+        raise AssertionError("fixture must exercise a narrow text locale")
+    with case.fixture(parent=parent) as (root, foreign, marker, log, environment, groups):
+        result = case.invoke(root, foreign, environment, "boundaries")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not marker.exists()
+        assert sorted(log.read_text().splitlines()) == sorted(groups["boundaries"])
+'''
+        result = subprocess.run([sys.executable, "-X", "utf8=0", "-S", "-c", code, str(Path(__file__).resolve())],
+                                text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_empty_and_broken_discovery_fail_before_running_tests(self) -> None:
         with self.fixture() as (root, foreign, marker, log, environment, groups):
             path = root / "skills/autoreview/tests/test_autoreview_hardening.py"
@@ -154,7 +209,7 @@ class CheckSkillsTest(unittest.TestCase):
                  "hardening-2", "shard has no test IDs"),
             ):
                 with self.subTest(group=group, diagnostic=diagnostic):
-                    path.write_text(content)
+                    path.write_text(content, encoding="utf-8")
                     result = self.invoke(root, foreign, environment, group)
                     self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                     self.assertIn(diagnostic, result.stderr)
