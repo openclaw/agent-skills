@@ -846,6 +846,11 @@ else:
                             raise MemoryError('synthetic cleanup metadata failure')
                     return info
                 def body(_args):
+                    # The substituted review body still performs real output
+                    # admission before exercising diagnostic cleanup failures.
+                    _args._review_source_roots = (self.home,)
+                    M.validate_output_source_paths(_args, self.home)
+                    _args._output_sources_validated = True
                     if primary is not None:
                         raise primary
                     return 47

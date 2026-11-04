@@ -777,7 +777,7 @@ def external_env_path(repo: Path, value: str) -> bool:
             for ancestor in (path, *path.parents):
                 try:
                     identity = ancestor.stat()
-                except FileNotFoundError:
+                except (FileNotFoundError, NotADirectoryError):
                     continue
                 if (identity.st_dev, identity.st_ino) in identities:
                     return True
@@ -807,14 +807,22 @@ def external_env_path(repo: Path, value: str) -> bool:
             # resolve outside now and be retargeted before a child consumes them.
             try:
                 metadata = entry.lstat()
-            except FileNotFoundError:
+            except (FileNotFoundError, NotADirectoryError):
                 metadata = None
-            if owned(entry):
-                return False
             # Path.is_junction is unavailable on supported Python 3.10/3.11.
             junction = (os.name == "nt" and getattr(metadata, "st_reparse_tag", 0)
                         == stat.IO_REPARSE_TAG_MOUNT_POINT)
-            if (metadata is not None and stat.S_ISLNK(metadata.st_mode)) or junction:
+            is_link = (metadata is not None and stat.S_ISLNK(metadata.st_mode)) or junction
+            # A plain root/.. escape is controlled by the root's parent. Do not
+            # extend this allowance to source-owned descendants or redirectors.
+            root_parent_escape = (
+                metadata is not None and stat.S_ISDIR(metadata.st_mode) and not is_link
+                and pending and pending[-1] == ".."
+                and (metadata.st_dev, metadata.st_ino) in identities
+            )
+            if owned(entry) and not root_parent_escape:
+                return False
+            if is_link:
                 links += 1
                 if links > 40:
                     return False

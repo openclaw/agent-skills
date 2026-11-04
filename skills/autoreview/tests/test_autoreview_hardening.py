@@ -6649,6 +6649,17 @@ else:
             boundary = self.helper["UNTRUSTED_SOURCE_ROOTS"]
             token = boundary.set((repo, source))
             try:
+                # An exact root/.. escape keeps the ordinary output/credential
+                # spelling, but a mutable source descendant cannot gain it.
+                for owner in (repo, source):
+                    raw = owner / ".." / "outside" / "identity"
+                    self.assertEqual(self.helper["normalize_external_env_path_value"](
+                        repo, "AWS_CONFIG_FILE", str(raw)), str(outside / "identity"))
+                (source / "child").mkdir()
+                mutable = source / "child" / ".." / ".." / "outside" / "identity"
+                self.assertEqual(mutable.resolve(), outside / "identity")
+                self.assertIsNone(self.helper["normalize_external_env_path_value"](
+                    repo, "AWS_CONFIG_FILE", str(mutable)))
                 for raw in (source / "link" / ".." / "identity", root / "alias" / ".." / "identity"):
                     self.assertEqual(raw.resolve(), outside / "identity")
                     self.assertIsNone(self.helper["normalize_external_env_path_value"](
