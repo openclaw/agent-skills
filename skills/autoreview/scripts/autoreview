@@ -1968,6 +1968,35 @@ def unregister_owned_process(proc: subprocess.Popen[str]) -> None:
             owned.job.close()
 
 
+
+def finish_owned_process(proc: subprocess.Popen[str], terminate: Callable[[], None] | None = None) -> None:
+    """Release all owned resources even when explicit termination fails."""
+    errors: list[BaseException] = []
+    try:
+        if terminate is not None:
+            terminate()
+    except BaseException as exc:
+        errors.append(exc)
+    finally:
+        try:
+            # On Windows the last job handle is the fallback lifetime owner.
+            # Close it before a pipe close can wait on a surviving child.
+            unregister_owned_process(proc)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except BaseException as exc:
+                        errors.append(exc)
+    if errors:
+        primary = errors[0]
+        primary.cleanup_errors = (*getattr(primary, "cleanup_errors", ()), *errors[1:])
+        raise primary
+
+
 def _owned_windows_job(proc: subprocess.Popen[str]) -> Any:
     with _OWNED_PROCESS_LOCK:
         owned = _OWNED_PROCESSES.get(proc.pid)
@@ -2017,18 +2046,15 @@ def start_owned_process(
                 proc = subprocess.Popen(args, cwd=cwd, **kwargs, **process_group_popen_kwargs())
                 register_owned_process(proc)
         return proc
-    except BaseException:
+    except BaseException as failure:
         if proc is not None:
             try:
-                if startup is not None:
-                    startup.abort()
-                else:
-                    terminate_process_group(proc)
-            finally:
-                for stream in (proc.stdin, proc.stdout, proc.stderr):
-                    if stream is not None:
-                        stream.close()
-                unregister_owned_process(proc)
+                finish_owned_process(proc, startup.abort if startup is not None
+                                     else lambda: terminate_process_group(proc))
+            except BaseException as cleanup_error:
+                # A cleanup timeout must never replace post-GO uncertainty with
+                # a retryable pre-start timeout. Retain the original cause too.
+                failure.cleanup_errors = (*getattr(failure, "cleanup_errors", ()), cleanup_error)
         raise
 
 
@@ -2521,12 +2547,7 @@ def run_with_heartbeat(
             exc.stdout = timeout_output_text(drain_timeout.output)
         raise
     finally:
-        if not deadline.terminated:
-            terminate_process_group(proc)
-        for stream in (proc.stdin, proc.stdout, proc.stderr):
-            if stream is not None:
-                stream.close()
-        unregister_owned_process(proc)
+        finish_owned_process(proc, None if deadline.terminated else lambda: terminate_process_group(proc))
 
 
 def run_with_stream(
@@ -2935,9 +2956,7 @@ def preflight_git() -> bool:
             except subprocess.TimeoutExpired:
                 reason = "timed out after 10s"
             finally:
-                with contextlib.suppress(PermissionError):
-                    terminate_process_group(proc, grace_seconds=0.1)
-                unregister_owned_process(proc)
+                finish_owned_process(proc, lambda: terminate_process_group(proc, grace_seconds=0.1))
         except subprocess.TimeoutExpired:
             reason = "timed out after 10s"
         except OSError as exc:

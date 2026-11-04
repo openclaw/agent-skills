@@ -6068,11 +6068,19 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
     def test_windows_lost_start_acknowledgement_terminates_owned_target(self) -> None:
+        self.assert_lost_acknowledgement_cleanup(abort_fails=False)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_lost_acknowledgement_survives_abort_timeout(self) -> None:
+        self.assert_lost_acknowledgement_cleanup(abort_fails=True)
+
+    def assert_lost_acknowledgement_cleanup(self, *, abort_fails: bool) -> None:
         supervisor = str(SCRIPT.with_name("windows-owned-process.py"))
         module = self.helper["_load_windows_process_module"](supervisor)
         real_spawn = module.spawn
         real_write_frame = module.write_frame
         startups = []
+        cleanup_error = subprocess.TimeoutExpired("private-target-argument", 2)
         target_waits = []
         injected = []
         target_code = (
@@ -6094,6 +6102,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
             def observe_spawn(*args, **kwargs):
                 startup = real_spawn(*args, **kwargs)
                 startups.append(startup)
+                if abort_fails:
+                    # The native target really starts; inject only a failed wait
+                    # during abort, after native job termination was requested.
+                    handles.enter_context(mock.patch.object(startup.process, "wait", side_effect=cleanup_error))
                 return startup
 
             def lose_acknowledgement(descriptor, frame):
@@ -6122,6 +6134,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     )
 
             self.assertIsInstance(raised.exception.__cause__, EOFError)
+            if abort_fails:
+                self.assertEqual(raised.exception.cleanup_errors, (cleanup_error,))
+                self.assertIn("cleanup also failed: TimeoutExpired", str(raised.exception))
+                self.assertNotIn("private-target-argument", str(raised.exception))
             self.assertEqual(injected, [True])
             self.assertEqual(len(startups), 1)
             self.assertEqual(len(target_waits), 1)

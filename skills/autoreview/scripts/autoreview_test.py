@@ -3270,6 +3270,97 @@ class AutoreviewPreflightTests(unittest.TestCase):
                 self.assertEqual(diagnostic.read_text(), "diagnostic sentinel")
 
 
+class OwnedProcessCleanupTests(unittest.TestCase):
+    def test_buffered_cleanup_releases_streams_and_owner_after_termination_failure(self):
+        for close_fails in (False, True):
+            with self.subTest(close_fails=close_fails), tempfile.TemporaryDirectory() as directory:
+                processes = []
+                jobs = []
+                terminate_error = RuntimeError("injected termination failure")
+                close_error = OSError("injected stdout close failure")
+                start = AUTOREVIEW.start_owned_process
+                with contextlib.ExitStack() as patches:
+                    def observe_start(*args, **kwargs):
+                        proc = start(*args, **kwargs)
+                        processes.append(proc)
+                        jobs.append(AUTOREVIEW._OWNED_PROCESSES[proc.pid].job)
+                        if close_fails:
+                            close = proc.stdout.close
+
+                            def close_then_fail():
+                                close()
+                                raise close_error
+
+                            patches.enter_context(mock.patch.object(proc.stdout, "close", close_then_fail))
+                        return proc
+
+                    patches.enter_context(mock.patch.object(AUTOREVIEW, "start_owned_process", observe_start))
+                    patches.enter_context(mock.patch.object(AUTOREVIEW, "terminate_process_group",
+                                                            side_effect=terminate_error))
+                    try:
+                        # The real child completes. Only explicit teardown fails;
+                        # its pipes and registered lifetime owner must still close.
+                        with self.assertRaises(RuntimeError) as raised:
+                            AUTOREVIEW.run_with_heartbeat(
+                                [sys.executable, "-I", "-S", "-c", "print(42)"],
+                                Path(directory).resolve(), label="cleanup-failure", max_runtime_seconds=10,
+                            )
+                        self.assertIs(raised.exception, terminate_error)
+                        if close_fails:
+                            self.assertIn(close_error, raised.exception.cleanup_errors)
+                        self.assertEqual(len(processes), 1)
+                        proc = processes[0]
+                        self.assertIsNotNone(proc.poll())
+                        self.assertTrue(proc.stdout.closed)
+                        self.assertTrue(proc.stderr.closed)
+                        self.assertNotIn(proc.pid, AUTOREVIEW._OWNED_PROCESSES)
+                        if jobs[0] is not None:
+                            self.assertIsNone(jobs[0].handle)
+                    finally:
+                        patches.close()
+                        for proc in processes:
+                            if proc.poll() is None:
+                                proc.kill()
+                                proc.wait(timeout=5)
+                            AUTOREVIEW.unregister_owned_process(proc)
+                            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                                if stream is not None:
+                                    stream.close()
+
+    def test_git_preflight_unregisters_owner_after_termination_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory).resolve()
+            processes = []
+            jobs = []
+            start = AUTOREVIEW.start_owned_process
+            failure = RuntimeError("injected preflight termination failure")
+
+            def observe_start(*args, **kwargs):
+                proc = start(*args, **kwargs)
+                processes.append(proc)
+                jobs.append(AUTOREVIEW._OWNED_PROCESSES[proc.pid].job)
+                return proc
+
+            with mock.patch.object(Path, "cwd", return_value=cwd), \
+                    mock.patch.object(AUTOREVIEW, "start_owned_process", observe_start), \
+                    mock.patch.object(AUTOREVIEW, "terminate_process_group", side_effect=failure):
+                try:
+                    with self.assertRaises(RuntimeError) as raised:
+                        AUTOREVIEW.preflight_git()
+                    self.assertIs(raised.exception, failure)
+                    self.assertEqual(len(processes), 1)
+                    self.assertIsNotNone(processes[0].poll())
+                    self.assertNotIn(processes[0].pid, AUTOREVIEW._OWNED_PROCESSES)
+                    if jobs[0] is not None:
+                        self.assertIsNone(jobs[0].handle)
+                finally:
+                    for proc in processes:
+                        if proc.poll() is None:
+                            proc.kill()
+                            proc.wait(timeout=5)
+                        AUTOREVIEW.unregister_owned_process(proc)
+
+
 @unittest.skipUnless(os.name == "nt", "requires native Windows process jobs")
 class WindowsOwnedProcessTransportTests(unittest.TestCase):
     def test_stdio_environment_working_directory_and_exit_status(self):

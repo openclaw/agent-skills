@@ -24,6 +24,13 @@ SETTLE_SECONDS = 2.0
 class LaunchIndeterminate(RuntimeError):
     """The target may have started; availability fallback or retry is unsafe."""
 
+    def __str__(self):
+        message = super().__str__()
+        if errors := getattr(self, "cleanup_errors", ()):
+            # Exception text can contain target argv; expose only failure kinds.
+            message += "; cleanup also failed: " + ", ".join(type(error).__name__ for error in errors)
+        return message
+
 
 class Native:
     def __init__(self):
