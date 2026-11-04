@@ -930,8 +930,44 @@ class ReviewBatchTests(unittest.TestCase):
                 )
             self.assertNotEqual(status, 0)
             self.assertFalse(sends)
-            self.assertIn("Codex configuration and authentication must be outside reviewed source roots", output)
+            self.assertIn("outside reviewed source roots", output)
             self.assertFalse(marker.exists(), "reviewer probe admitted source-owned configuration")
+
+            (config / "config.toml").unlink()
+            # Even outside source roots, writable shared inodes lack independent custody.
+            for name, content in (("config.toml", 'cli_auth_credentials_store="file"\n'),
+                                  ("auth.json", '{"fixture":"synthetic"}')):
+                with self.subTest(name=name), contextlib.ExitStack() as cleanup:
+                    original = repo.parent / ("shared-" + name)
+                    original.write_text(content)
+                    original.chmod(0o600)
+                    selected = config / name
+                    cleanup.callback(selected.unlink, missing_ok=True)
+                    cleanup.callback(marker.unlink, missing_ok=True)
+                    os.link(original, selected)
+                    with mock.patch.dict(os.environ, {"CODEX_HOME": str(config)}):
+                        status, sends, output = self.invoke(
+                            repo, "--external-source-context-file", ".review/external.json",
+                            "--codex-bin", str(trusted), "--dry-run", real_engine_probe=True,
+                        )
+                    self.assertNotEqual(status, 0)
+                    self.assertFalse(sends)
+                    self.assertIn("Codex " + name + " was refused", output)
+                    self.assertIn("independent file custody", output)
+                    self.assertIn("use an independent private copy", output)
+                    self.assertFalse(marker.exists(), "probe ran with caller-owned hardlinked input")
+                    # A private copy admits the same bytes and reaches the local probe.
+                    selected.unlink()
+                    shutil.copy2(original, selected)
+                    with mock.patch.dict(os.environ, {"CODEX_HOME": str(config)}):
+                        status, sends, _ = self.invoke(
+                            repo, "--external-source-context-file", ".review/external.json",
+                            "--codex-bin", str(trusted), "--dry-run", real_engine_probe=True,
+                        )
+                    self.assertNotEqual(status, 0)  # The synthetic probe exits 99.
+                    self.assertFalse(sends)
+                    self.assertTrue(marker.exists(), "independent copy did not reach the local probe")
+                    self.assertEqual(original.read_text(), content)
 
     @unittest.skipIf(os.name == "nt", "uses executable shell wrappers")
     def test_external_source_cannot_supply_host_configuration_or_authentication(self):

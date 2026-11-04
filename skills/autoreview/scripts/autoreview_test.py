@@ -2965,7 +2965,7 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
         source_auth.write_text('{"fixture": "synthetic"}')
         os.link(source_auth, self.repo / "auth-alias.json")
         launched = mock.Mock()
-        with self.assertRaisesRegex(SystemExit, "authentication must be outside"):
+        with self.assertRaisesRegex(SystemExit, r"Codex auth\.json was refused:.*outside reviewed source roots.*independent file custody"):
             self.run_codex_attempts([], inspect_attempt=launched)
         launched.assert_not_called()
         self.assertEqual(source_auth.stat().st_nlink, 2)

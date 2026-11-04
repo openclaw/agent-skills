@@ -6197,7 +6197,11 @@ def codex_source_home(repo: Path) -> Path | None:
         return None
     for name in ("config.toml", "auth.json"):
         if not external_env_path(repo, str(resolved / name)):
-            raise SystemExit("Codex configuration and authentication must be outside reviewed source roots")
+            raise SystemExit(
+                f"Codex {name} was refused: configuration and authentication files must stay "
+                "outside reviewed source roots and have independent file custody. "
+                "For caller-owned hardlinked files, use an independent private copy."
+            )
     return resolved
 
 

@@ -62,6 +62,8 @@ Default: ChatGPT subscription; preserve only user authentication settings.
 File-auth refreshes persist through per-attempt links. Without symlink support
 or permission, run reviews sharing that auth source sequentially; an existing
 hardlink alias fails source-custody checks.
+Caller-owned hardlinked `config.toml` or `auth.json` files require an independent
+private copy in the selected `CODEX_HOME`, outside reviewed source roots.
 Live authentication failure → stop attempt fast; retry pass once on operator's
 validated configured named command-auth route, including context + catalogue.
 Definite credential failure → immediate stop; generic auth failure → stop after
