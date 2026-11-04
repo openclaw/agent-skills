@@ -267,8 +267,11 @@ An already ordinary local invocation uses the regular suite's real system-DLL
 custody tests rather than launching the pre-restriction proof. The dedicated proof
 sets a 30-second deadline where the reduced process handle is owned and attempts
 to terminate the child on timeout. Failed termination or a cleanup wait exceeding
-five seconds fails the proof. File-backed output capture lets the caller report
-that failure even if the child still holds its output handles. Missing native
+five seconds fails the proof. A separate 60-second watchdog covers the entire
+proof interpreter, including token preparation and native launch. Its owned job
+contains the interpreter before it runs and terminates the whole process tree on
+timeout; teardown waits are bounded. File-backed output capture lets the caller
+report failures even if a process still holds its output handles. Missing native
 fixtures or failed operations also fail the proof. The bootstrap retains user
 identity grants and does not provision accounts or rewrite file or desktop permissions. Hosts that require removed administrative
 grants for their interpreter or checkout must fix that access before testing.
