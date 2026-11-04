@@ -216,6 +216,16 @@ are development-only; installed skills do not need `npm install`. The separate
 macOS CI job uses the `xcode-27` Apple Silicon runner and installs a pinned Codex CLI to exercise native sandbox access
 controls without a reviewer account or provider request.
 
+Python autoreview suites run through `check-skills` with a fresh temporary
+directory beneath the caller's home and without inherited reviewer settings or
+provider credentials. The caller's home must be writable and have private storage
+ancestry; do not point it at shared `/tmp`. Each fixture supplies its own
+configuration. The runner preserves executable lookup,
+the OS temporary directory, locale, and selected Python dependency settings,
+including `PYTHONPATH`; use a trusted toolchain and dependency path. This
+isolation does not apply to direct `python -m unittest` invocations, including
+the separate macOS sandbox job, or to the runner's other validation commands.
+
 For a quick frontmatter-only check, run `scripts/validate-skills`. It checks
 every `skills/*/SKILL.md` for YAML frontmatter plus required `name` and
 `description` strings. Frontmatter must be a mapping enclosed by standalone
