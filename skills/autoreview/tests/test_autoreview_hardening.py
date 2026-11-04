@@ -6834,7 +6834,7 @@ else:
                 boundary.reset(token)
 
     @unittest.skipIf(os.name == "nt", "uses executable POSIX fixtures and symbolic links")
-    def test_certificate_directory_entries_are_filtered_before_probe_and_live_launch(self) -> None:
+    def test_unsafe_certificate_directory_stops_before_probe_and_live_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             repo, source, certs, trusted = (root / name for name in ("repo", "source", "certs", "trusted"))
@@ -6867,10 +6867,12 @@ else:
                                 entry = certs / name
                                 entry.symlink_to(leaf)
                                 try:
-                                    self.helper["run_claude"](args, repo, "fixture review")
-                                    launches = [json.loads(line) for line in calls.read_text().splitlines()]
-                                    self.assertGreaterEqual(len(launches), 3)
-                                    self.assertTrue(all(launch["certs"] is None for launch in launches))
+                                    # No child may fall back to a compiled default that
+                                    # selects this same rejected certificate directory.
+                                    with self.assertRaisesRegex(SystemExit, "^unsafe SSL_CERT_DIR;"):
+                                        self.helper["run_claude"](args, repo, "fixture review")
+                                    self.assertFalse(calls.exists())
+                                    self.assertFalse(record.exists())
                                 finally:
                                     entry.unlink()
                                     calls.unlink(missing_ok=True)
@@ -6898,8 +6900,20 @@ else:
                     "PATH": os.environ.get("PATH", ""), "HOME": str(root), "USERPROFILE": str(root),
                     "SSL_CERT_DIR": str(certs),
                 }, clear=True):
-                    self.assertNotIn("SSL_CERT_DIR", self.helper["safe_engine_env"](repo, engine="codex"))
-                    self.assertNotIn("SSL_CERT_DIR", self.helper["safe_git_env"](repo))
+                    for engine in self.helper["ENGINES"]:
+                        with self.subTest(engine=engine), self.assertRaisesRegex(SystemExit, "^unsafe SSL_CERT_DIR;"):
+                            self.helper["safe_engine_env"](repo, engine=engine)
+                    with self.assertRaisesRegex(SystemExit, "^unsafe SSL_CERT_DIR;"):
+                        self.helper["safe_git_env"](repo)
+                    # Unset and empty selectors retain the caller's implicit
+                    # default policy; the helper has not rejected a store.
+                    for selector in (None, ""):
+                        if selector is None:
+                            os.environ.pop("SSL_CERT_DIR")
+                        else:
+                            os.environ["SSL_CERT_DIR"] = selector
+                        self.assertNotIn("SSL_CERT_DIR", self.helper["safe_engine_env"](repo, engine="codex"))
+                        self.assertNotIn("SSL_CERT_DIR", self.helper["safe_git_env"](repo))
                 self.assertEqual(self.helper["normalize_external_env_path_value"](
                     repo, "OPENCLAW_INCLUDE_ROOTS", os.pathsep.join((str(certs), str(root / "missing")))),
                     os.pathsep.join((str(certs), str(root / "missing"))))
@@ -8973,8 +8987,11 @@ class AuthenticatedProxyTests(unittest.TestCase):
                             key: str(path) for key in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
                                                       "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE")
                         }, clear=True):
+                            with self.assertRaisesRegex(SystemExit, "^unsafe SSL_CERT_DIR;"):
+                                self.helper["safe_engine_env"](repo, engine=engine)
+                            os.environ.pop("SSL_CERT_DIR")
                             env = self.helper["safe_engine_env"](repo, engine=engine)
-                            for key in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+                            for key in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE",
                                         "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
                                 self.assertNotIn(key, env)
 

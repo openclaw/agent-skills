@@ -149,8 +149,12 @@ process, not temporary impersonation. Normalized `PATH`, `SSL_CERT_DIR` and
 `OPENCLAW_INCLUDE_ROOTS` entries must survive path-list serialization unchanged.
 `SSL_CERT_DIR` also checks its directory entries for source ownership and file
 custody, including certificate and CRL links.
-Malformed certificate/include lists are omitted from reviewer environments;
-an empty filtered executable `PATH` fails preparation.
+An unsafe or malformed nonempty `SSL_CERT_DIR` stops preparation before a child
+starts: removing it could select the same rejected store through TLS defaults.
+Configure independently held certificate directories outside the source roots.
+Unset or empty selectors retain normal default lookup; implicit system stores
+are not inventoried. Malformed include lists are omitted from reviewer
+environments; an empty filtered executable `PATH` fails preparation.
 
 The helper reads complete UTF-8 regular-file blobs from the declared commit,
 not the source checkout's working bytes. Headers retain the original path,

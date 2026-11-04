@@ -616,6 +616,10 @@ def safe_git_env(repo: Path, *, selected_git: str | None = None) -> dict[str, st
 
 
 def _safe_git_base_env(repo: Path) -> dict[str, str]:
+    if certificate_directory := os.environ.get("SSL_CERT_DIR"):
+        # Git omits caller TLS selectors, so reject a store that its default
+        # certificate lookup could otherwise select again.
+        normalize_external_env_path_value(repo, "SSL_CERT_DIR", certificate_directory)
     platform_keys = ("COMSPEC", "DEVELOPER_DIR", "PATHEXT", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "WINDIR")
     caller_home = os.environ.get("HOME")
     if caller_home is None:
@@ -1376,6 +1380,22 @@ def safe_certificate_directory(repo: Path, directory: Path) -> bool:
 
 
 def normalize_external_env_path_value(
+    repo: Path,
+    key: str,
+    value: str,
+) -> str | None:
+    normalized = _normalize_external_env_path_value(repo, key, value)
+    if key == "SSL_CERT_DIR" and value and normalized is None:
+        # Removing this selector can reselect the same store through a child's
+        # compiled TLS defaults. Do not launch with that ambiguous fallback.
+        raise SystemExit(
+            "unsafe SSL_CERT_DIR; configure certificate directories outside reviewed "
+            "source roots with independently held certificate files"
+        )
+    return normalized
+
+
+def _normalize_external_env_path_value(
     repo: Path,
     key: str,
     value: str,

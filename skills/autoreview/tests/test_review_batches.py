@@ -2438,6 +2438,12 @@ class ExecutableCustodyTests(unittest.TestCase):
                     run_root = self.root / (key + str(trusted))
                     run_root.mkdir()
                     with mock.patch.dict(os.environ, {key: value}):
+                        if key == "SSL_CERT_DIR" and not trusted:
+                            with self.assertRaisesRegex(SystemExit, "^unsafe SSL_CERT_DIR;"):
+                                self.helper["openclaw_runtime_env"](
+                                    self.repo, str(self.installed / "openclaw"), run_root,
+                                )
+                            continue
                         env = self.helper["openclaw_runtime_env"](
                             self.repo, str(self.installed / "openclaw"), run_root,
                         )
