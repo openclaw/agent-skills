@@ -142,7 +142,7 @@ Guests need no shared secret. Do not distribute or request a shared Gateway
 token, password, or another person's Access token for guest uploads.
 Current Visitor-enabled receivers let active verified publishers create, refresh,
 list, and read their own snapshots. These routes grant no access to other
-publishers' snapshots or permission to delete or continue sessions.
+publishers' snapshots or permission to delete them. Updated receivers permit authorized continuation of an explicitly released owned Beam, using normal destination permissions.
 Older upload-only receivers can return `canView: false`; honor that restriction.
 
 Expired Access credentials can cause authentication failure. Sign in again outside
@@ -199,7 +199,7 @@ remains the isolation boundary between teams. Restricted personal guest access
 requires receiver-side support and an active verified Visitor identity. It grants
 no `operator.read` scope or shared-catalog access. Separate publisher-bound routes
 allow listing and reading only that publisher's snapshots. They recheck current
-authority and ownership before returning data. Guests cannot delete or continue sessions.
+authority and ownership before returning data. Guests cannot delete snapshots; continuing an owned, released Beam still requires normal destination creation, session and model access.
 
 The request remains version `1`. The normal receipt remains
 `{ "ok": true, "beamId": "...", "url": "..." }`. Current guest receipts add
@@ -214,11 +214,45 @@ The receiver rejects transcript item text longer than 6,000 characters.
 Accordingly, explicit `--entry-max-chars` values above 6,000 fail locally
 before upload.
 
-Authorized staff can continue from the catalog by copying the shared transcript
-into a new Team session. This is a transcript handoff, not remote access to the
-publisher's machine or continuation of the local harness; it grants no terminal,
-tool, filesystem, credential, or node access. Guests cannot continue sessions,
-including snapshots they can view.
+## Live logical conversation handoff
+
+A snapshot is read-only until its original verified publisher explicitly releases
+it with `beam handoff`. The helper freezes sanitized source history and durably
+retires that Beam identity before network dispatch. It records the receiver-issued
+publication generation, then sends an existing-only release. A retry cannot
+create another incarnation after snapshot expiry. An uncertain release keeps the
+source retired; recover with `handoff --beam-id ID` at the same endpoint.
+
+The first authorized continuation creates one Team conversation and imports the
+frozen history once. Later Team and source Beam continuations use that same
+conversation. `beam read` observes Team history; with no destination yet it reports
+a pending handoff and creates nothing. `beam continue --message TEXT` uses the
+operator's existing normal OpenClaw remote profile, returns the normal run
+acknowledgment, and exposes a request ID before dispatch. After a lost response,
+retry the same message with `--request-id ID` rather than creating another turn.
+
+Read and continue require `--profile-dir DIR` pointing at the user's existing
+`gateway.mode=remote` profile for this exact endpoint. Requests preserve configured
+authentication and use the CLI's destination guard. Revoked access, a deleted or
+reset destination, and a changed Gateway stop the operation. No provider account,
+credential, source access or native runtime session ID transfers.
+
+Source model metadata comes from the native transcript when present. The Gateway
+normalizes model/version aliases against its available permitted catalog; an
+unavailable preference leaves ordinary configured-default resolution in charge.
+Original local harness processes are not stopped or controlled. Independent local
+turns after release are not canonical Team turns, and late snapshot uploads are
+rejected without changing history or refreshing retention.
+
+Requires Node 22.13+ for handoff state. The local SQLite store defaults to
+`.local/state/openclaw-beam/handoffs.sqlite` under the user's home; `--state FILE`
+selects an explicit store. It holds sanitized pending history until acknowledgment,
+then only ownership and destination metadata. Do not delete pending or acknowledged
+retirement state to recover a source. Receiver ownership metadata survives snapshot
+expiry and archive without retaining transcript items. Ownerless/shared-token
+snapshots cannot be claimed: use the original publisher's verified identity.
+
+See [the handoff commands](SKILL.md#live-logical-handoff) for usage and scope.
 
 For rollout compatibility, the helper also accepts the current server's exact
 `/chat/<agent>?catalog=beam&host=gateway&thread=<full-beam-id>` URL. This is a
@@ -233,6 +267,7 @@ https://docs.openclaw.ai/plugins/beam
 ```sh
 node --check skills/beam/scripts/beam
 node --check skills/beam/scripts/beam-session.js
-node --test skills/beam/scripts/beam.test.mjs
+node --check skills/beam/scripts/beam-handoff.js
+node --test skills/beam/scripts/beam.test.mjs skills/beam/scripts/beam-handoff.test.mjs
 python scripts/validate-skills
 ```

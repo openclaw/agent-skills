@@ -1129,8 +1129,8 @@ test("publish distinguishes upload-only receipts while preserving older and staf
     const target = endpoint.replace(/\/api\/v1\/beam\/sessions$/,
       `/beam/upload-flow-${requests.at(-1).beamId.slice(0, 12)}`);
     assert.equal(result.stdout, canView === false
-      ? `Beam upload succeeded: ${target}\nThis link is for authorized Team operators; upload-only access does not let you open it.\n`
-      : `Beamed session: ${target}\n`);
+      ? `Beam upload succeeded: ${target}\nThis link is for authorized Team operators; upload-only access does not let you open it.\nSnapshot is read-only. To continue in Team, its authenticated original publisher must run beam handoff with the same endpoint and source transcript selector.\n`
+      : `Beamed session: ${target}\nSnapshot is read-only. To continue in Team, its authenticated original publisher must run beam handoff with the same endpoint and source transcript selector.\n`);
     assert.equal(requests.at(-1).version, 1);
     assert.equal(Object.hasOwn(requests.at(-1), "canView"), false);
     assert.doesNotMatch(JSON.stringify(requests.at(-1)), /abcdefghijklmnopqrstuvwxyz123456|hidden compact summary|synthetic-personal-access/);
@@ -1523,4 +1523,20 @@ test("copied Beam runs inside a CommonJS project without dependencies", () => {
     env: { ...process.env, NODE_OPTIONS: "", NODE_NO_WARNINGS: "" },
   });
   assert.match(output, /Usage:/);
+});
+
+
+test("source model metadata follows the native conversation without exporting account settings", () => {
+  const dir = tempDir();
+  const file = path.join(dir, "model-session.jsonl");
+  writeJsonl(file, [
+    { type: "session_meta", payload: { id: "model-thread", model_provider: "openai", settings: { token: "not-exported" } } },
+    { type: "turn_context", payload: { model: "gpt-6.1-sol" } },
+    { type: "event_msg", payload: { type: "user_message", message: "Continue the task" } },
+  ]);
+  assert.deepEqual(renderSession(file, { source: "codex" }).sourceModel, { provider: "openai", model: "gpt-6.1-sol" });
+  writeJsonl(file, [
+    { type: "assistant", sessionId: "model-session", message: { role: "assistant", model: "claude-opus-4-6", content: "Result" } },
+  ]);
+  assert.deepEqual(renderSession(file, { source: "claude" }).sourceModel, { provider: "anthropic", model: "claude-opus-4-6" });
 });

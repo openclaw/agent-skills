@@ -6654,7 +6654,9 @@ def format_version(version: tuple[int, int, int]) -> str:
     return ".".join(str(part) for part in version)
 
 
+CODEX_MAX_INPUT_TEXT_CHARS = 4_194_304
 SAFE_CODEX_CONFIG_KEYS = {
+    "app_server.max_input_text_chars",
     "hide_agent_reasoning",
     "model_provider",
     "model_auto_compact_token_limit",
@@ -6687,8 +6689,15 @@ def codex_config_overrides(args: argparse.Namespace) -> list[str]:
         if key not in SAFE_CODEX_CONFIG_KEYS:
             raise SystemExit(
                 f"unsafe Codex config override refused: {key}; "
-                "only model/response tuning and validated provider selection are allowed"
+                "only model/response tuning, bounded input size and validated provider selection are allowed"
             )
+        if key == "app_server.max_input_text_chars":
+            value = value.strip()
+            if not re.fullmatch(r"[1-9][0-9]{0,6}", value) or int(value) > CODEX_MAX_INPUT_TEXT_CHARS:
+                raise SystemExit(
+                    "app_server.max_input_text_chars must be a decimal integer from 1 to 4194304"
+                )
+            item = f"{key}={value}"
         overrides.append(item)
     return overrides
 

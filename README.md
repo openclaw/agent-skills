@@ -216,6 +216,56 @@ are development-only; installed skills do not need `npm install`. The separate
 macOS CI job uses the `xcode-27` Apple Silicon runner and installs a pinned Codex CLI to exercise native sandbox access
 controls without a reviewer account or provider request.
 
+Python autoreview suites run through `check-skills` with a fresh temporary
+directory beneath the caller's home and without inherited reviewer settings or
+provider credentials. The caller's home must be writable and have private storage
+ancestry; do not point it at shared `/tmp`. Each fixture supplies its own
+configuration. The runner preserves executable lookup,
+the OS temporary directory, locale, and selected Python dependency settings,
+including `PYTHONPATH`; use a trusted toolchain and dependency path. This
+isolation does not apply to direct `python -m unittest` invocations, including
+the separate macOS sandbox job, or to the runner's other validation commands.
+
+On Windows, `scripts/check-skills` and `scripts/installed-autoreview.test.py`
+prepare a restricted primary process when the current invocation does not meet
+the ordinary test profile. Invoke these files directly with
+Python; module (`-m`), command (`-c`), or mutated argument forms are unsupported.
+They retain the selected Python interpreter, flags, arguments, working
+directory, environment, standard streams,
+and exit status. With a shared console, the child handles Ctrl+C while the parent
+waits for its result. Failure to create or verify that process fails the test command;
+it does not omit tests or change the installed skill's runtime behavior.
+The child must have medium or lower integrity; lowering its integrity leaves the
+original parent token unchanged. New objects default to the child’s user as owner.
+The fresh token grants access to that user and SYSTEM, with matching defaults for
+new objects that do not receive inherited or explicit permissions. Existing source
+permissions are unchanged.
+Local/domain and Entra account identities are
+supported; system and virtual-service identities are not. This does not classify
+how domain accounts are used. The account domain's Domain Users grant is retained;
+other custom group grants may be removed by the restricted test profile.
+The full native proof suite requires permission to duplicate and adjust the
+current process token and create its restricted child. Missing those test
+capabilities fails the requested proof even when read-only admission succeeds.
+
+When the original primary token does not meet that profile, the parent runs
+native bootstrap proofs before launching the child: a restricted thread cannot hide its original primary authority, a marker
+cannot bypass admission, a failed parent check stops execution, and a real child
+preserves invocation details. These auxiliary checks run noninteractively; an
+interactive flag still applies to the requested child, without a second prompt
+in the waiting parent. The restricted child runs the requested suites and
+the regular invocation check. Bootstrap checks establish the test process boundary.
+A separate autoreview proof calls the real shared-file admission policy before
+restriction: the privileged parent and its restricted thread must refuse the
+same system DLL that an ordinary primary child admits. Hosted Windows CI must
+execute the privileged-negative subcase without a skip. An ordinary local primary
+without nonordinary privileges skips only that inapplicable subcase; the real
+reduced-child positive control still runs. Missing native fixtures or failed
+operations fail the proof. The bootstrap retains user identity grants and does
+not provision accounts or
+rewrite file or desktop permissions. Hosts that require removed administrative
+grants for their interpreter or checkout must fix that access before testing.
+
 For a quick frontmatter-only check, run `scripts/validate-skills`. It checks
 every `skills/*/SKILL.md` for YAML frontmatter plus required `name` and
 `description` strings. Frontmatter must be a mapping enclosed by standalone
