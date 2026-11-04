@@ -19,6 +19,12 @@ ORACLE_TOOLS = runpy.run_path(str(SCRIPT.with_name("test-review-harness.py")))
 IMAGE_TESTS = runpy.run_path(str(SCRIPT.with_name("autoreview_test.py")))
 
 
+def configuration_git_environment() -> dict[str, str]:
+    # Configuration tests need an independent installation: Homebrew's shared
+    # bin can contain caller-owned hardlinks. Native/discovery tests select Git themselves.
+    return {"AUTOREVIEW_GIT": "/usr/bin/git"} if sys.platform == "darwin" else {}
+
+
 def write_python_fixture(path: Path, source: str) -> None:
     path.write_text(
         "#!/bin/sh\n"
@@ -346,7 +352,8 @@ class GitGlobalExcludesTests(unittest.TestCase):
                 for name in ("default.tmp", "later.tmp", "visible.txt"):
                     (repo / name).write_text("reviewable content\n")
                 helper = load_helper()
-                with mock.patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}):
+                with mock.patch.dict(os.environ, {**configuration_git_environment(),
+                                                  "HOME": str(home), "USERPROFILE": str(home)}):
                     # Missing config must leave Git's default ignore effective.
                     self.assertEqual(set(helper["untracked_sources"](repo).files),
                                      {"later.tmp", "visible.txt"})
@@ -461,6 +468,7 @@ print("maintenance")
             repo = init_repo(root)
             helper = load_helper()
             with mock.patch.dict(os.environ, {
+                **configuration_git_environment(),
                 "HOME": str(root), "GH_CONFIG_DIR": "", "XDG_CONFIG_HOME": "",
                 "SSL_CERT_FILE": "", "SSL_CERT_DIR": "",
             }):
@@ -505,6 +513,7 @@ class GhConfigPathTests(unittest.TestCase):
             xdg.mkdir()
             helper = load_helper()
             env = {key: os.environ[key] for key in ("PATH", "DEVELOPER_DIR") if key in os.environ}
+            env.update(configuration_git_environment())
             for parent, extra in ((home / ".config", {}), (xdg, {"XDG_CONFIG_HOME": str(xdg)})):
                 parent.mkdir(exist_ok=True)
                 directory = parent / "gh"
@@ -530,11 +539,13 @@ class DeveloperGitBoundaryTests(unittest.TestCase):
             repo = init_repo(root)
             helper = load_helper()
             for directory in ("Developer", str(repo / "Developer")):
-                with self.subTest(directory=directory), mock.patch.dict(os.environ, {"DEVELOPER_DIR": directory}):
+                with self.subTest(directory=directory), mock.patch.dict(os.environ, {
+                    **configuration_git_environment(), "DEVELOPER_DIR": directory,
+                }):
                     with self.assertRaisesRegex(SystemExit, "DEVELOPER_DIR"):
                         helper["safe_git_env"](repo)
             external = str(root / "ExternalDeveloper")
-            with mock.patch.dict(os.environ, {"DEVELOPER_DIR": external}):
+            with mock.patch.dict(os.environ, {**configuration_git_environment(), "DEVELOPER_DIR": external}):
                 self.assertEqual(helper["safe_git_env"](repo)["DEVELOPER_DIR"], external)
 
     @unittest.skipUnless(sys.platform == "darwin", "native macOS developer-tool shim")

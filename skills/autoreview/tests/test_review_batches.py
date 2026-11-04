@@ -343,7 +343,7 @@ class ReviewBatchTests(unittest.TestCase):
                 "--json-output", str(alias / "HEAD"), engine=retarget,
             )
             self.assertEqual(len(sends), 2)
-            self.assertIn("output must point outside", str(status))
+            self.assertIn("output parent changed after admission", str(status))
             self.assertEqual(destination.read_bytes(), before)
             self.assertEqual(list(outside.iterdir()), [])
             self.assertEqual(self.git(linked, "rev-parse", "HEAD"), manifest["commit"])
@@ -610,7 +610,7 @@ class ReviewBatchTests(unittest.TestCase):
                 "--json-output", str(alias / source.name), engine=retarget,
             )
             self.assertEqual(len(sends), 2)
-            self.assertIn("output must point outside", str(status))
+            self.assertIn("output parent changed after admission", str(status))
             self.assertEqual(source.read_bytes(), before)
             self.assertEqual(list(outside.iterdir()), [])
 
@@ -633,7 +633,7 @@ class ReviewBatchTests(unittest.TestCase):
                 repo, "--json-output", str(alias / source.name), engine=retarget,
             )
             self.assertEqual(len(sends), 2)
-            self.assertIn("output must point outside", str(status))
+            self.assertIn("output parent changed after admission", str(status))
             self.assertEqual(source.read_bytes(), before)
             self.assertEqual(list(outside.iterdir()), [])
             self.assertEqual(self.helper["UNTRUSTED_SOURCE_ROOTS"].get(), ())
@@ -968,7 +968,8 @@ class ReviewBatchTests(unittest.TestCase):
                         self.helper["resolve_command"](str(binary), repo)
                 # The login-status subprocess must use the same filtered host PATH.
                 marker = repo.parent / "unsafe-login-environment"
-                wrapper = repo.parent / "trusted-login-wrapper"
+                (repo.parent / "trusted-bin").mkdir()
+                wrapper = repo.parent / "trusted-bin" / "trusted-login-wrapper"
                 wrapper.write_text(
                     '#!/bin/sh\ncase ":$PATH:" in *' + shlex.quote(":" + str(upstream) + ":")
                     + '*) touch ' + shlex.quote(str(marker)) + '; exit 99;; esac\n'

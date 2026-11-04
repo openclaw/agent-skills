@@ -187,6 +187,9 @@ oversized plan fails before a reviewer starts.
   inaccessible explicit executable override still fails preflight.
 - Set `AUTOREVIEW_GIT` to trusted external Git executable: override every
   helper-owned Git invocation.
+  If an installation directory contains a rejected shared hardlink, select an
+  independently admitted installation; the override still checks its directory
+  entries. The diagnostic names the first rejected entry and reason.
 - macOS, broken selected Xcode: use
   `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` for invocation.
 - Git sanitized environment additionally retains only absolute, external
