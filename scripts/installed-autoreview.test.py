@@ -36,8 +36,10 @@ def _source_git(*arguments: str) -> bytes:
     environment = {key: value for key, value in os.environ.items()
                    if key.upper() not in _GIT_REPOSITORY_ENV
                    and not key.upper().startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))}
+    # Archive identity must describe the named commit's actual objects.
     return subprocess.check_output(
-        ["git", "-c", f"safe.directory={ROOT}", *arguments], cwd=ROOT, env=environment,
+        ["git", "--no-replace-objects", "-c", f"safe.directory={ROOT}", *arguments],
+        cwd=ROOT, env=environment,
     )
 
 
@@ -57,6 +59,61 @@ def tree(root: Path) -> dict[str, tuple[str, bytes | str | None]]:
 
 
 class InstalledAutoreviewTests(unittest.TestCase):
+    def test_source_commit_identity_keeps_its_raw_tree_with_replacement_refs(self) -> None:
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.upper().startswith("GIT_")}
+        environment.update(GIT_CONFIG_SYSTEM=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                           GIT_CONFIG_GLOBAL=os.devnull, LC_ALL="C", LANG="C")
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "replacement source"
+            repository.mkdir()
+
+            def git(*arguments: str) -> bytes:
+                return subprocess.check_output(["git", *arguments], cwd=repository,
+                                               env=environment, stderr=subprocess.PIPE)
+
+            git("init", "--quiet")
+            source = repository / "source.txt"
+            for content in ("original source\n", "replacement source\n"):
+                source.write_text(content, encoding="utf-8")
+                git("add", "source.txt")
+                git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                    "commit", "--quiet", "--no-gpg-sign", "--no-verify", "-m", content.strip())
+                if content == "original source\n":
+                    original = git("rev-parse", "HEAD").decode("ascii").strip()
+                    original_tree = git("ls-tree", "-rz", original)
+            replacement = git("rev-parse", "HEAD").decode("ascii").strip()
+            replacement_tree = git("ls-tree", "-rz", replacement)
+            self.assertNotEqual(original_tree, replacement_tree)
+            git("update-ref", "HEAD", original)
+            git("replace", original, replacement)
+            # Replacements change object lookup, while HEAD still names A.
+            self.assertEqual(git("rev-parse", "HEAD").decode("ascii").strip(), original)
+            self.assertEqual(git("ls-tree", "-rz", original), replacement_tree)
+            scripts = repository / "scripts"
+            scripts.mkdir()
+            copied = scripts / Path(__file__).name
+            shutil.copyfile(__file__, copied)
+            probe = (
+                "import json, runpy, sys\n"
+                "module = runpy.run_path(sys.argv[1])\n"
+                "head = module['_source_git']('rev-parse', 'HEAD').decode('ascii').strip()\n"
+                "entries = module['_source_git']('ls-tree', '-rz', head)\n"
+                "print(json.dumps(dict(head=head, tree=entries.hex())))\n"
+            )
+            for inherited in ({}, {"GIT_NO_REPLACE_OBJECTS": "1"}):
+                with self.subTest(caller_disables_replacement=bool(inherited)):
+                    result = subprocess.run(
+                        [sys.executable, "-I", "-S", "-B", "-X", "utf8=1", "-c", probe, str(copied)],
+                        cwd=directory, env={**environment, **inherited},
+                        capture_output=True, encoding="utf-8",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    observed = json.loads(result.stdout)
+                    self.assertEqual(observed["head"], original)
+                    self.assertEqual(bytes.fromhex(observed["tree"]), original_tree)
+            self.assertEqual(git("rev-parse", f"refs/replace/{original}").decode("ascii").strip(), replacement)
+
     def test_source_reads_ignore_another_repositorys_environment(self) -> None:
         environment = {key: value for key, value in os.environ.items()
                        if not key.upper().startswith("GIT_")}
@@ -82,7 +139,7 @@ class InstalledAutoreviewTests(unittest.TestCase):
             foreign_head = git("rev-parse", "HEAD")
             config_before = config.read_bytes()
             repo_config_before = (other / ".git/config").read_bytes()
-            selected = ["git", "-c", f"safe.directory={ROOT}"]
+            selected = ["git", "--no-replace-objects", "-c", f"safe.directory={ROOT}"]
             head = subprocess.check_output([*selected, "rev-parse", "HEAD"], cwd=ROOT,
                                            env=environment)
             self.assertNotEqual(head, foreign_head)

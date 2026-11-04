@@ -257,7 +257,7 @@ class CheckSkillsTest(unittest.TestCase):
                 environment["PYTHONIOENCODING"] = "cp1252"
                 result = self.invoke(root, foreign, environment, "boundaries")
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertIn(str(parent), result.stderr)
+                self.assertIn(str(parent.resolve()), result.stderr)
                 self.assertIn("FAILED (failures=1)", result.stderr)
                 self.assertFalse(marker.exists())
 
