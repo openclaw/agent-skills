@@ -142,11 +142,20 @@ working-set and time-zone privileges; other available privileges fail custody
 even when disabled, in either the process primary or effective thread token.
 This conservative check applies only to shared inodes and does not assert
 universal immutability. Independent single-link files bypass this custody check,
-but copying a launcher does not fix elevated Windows startup: the mandatory
-system `taskkill.exe` must also pass. Elevated Windows invocation is not
-established; native positive verification requires a standard-user primary
-process, not temporary impersonation. Normalized `PATH`, `SSL_CERT_DIR` and
-`OPENCLAW_INCLUDE_ROOTS` entries must survive path-list serialization unchanged.
+but do not relax the checks for other selected files. Native positive
+verification uses a standard-user primary process, not temporary impersonation.
+
+Windows Git preflight and reviewer launches use an owned Job Object and the
+installed Python supervisor. These processes and their descendants join before
+they execute and remain owned after their leader exits. Cleanup does not invoke
+`taskkill.exe` or inspect its installation directory. The supervisor and Python
+installation still pass the ordinary source-boundary checks. An incompatible
+enclosing job fails startup; there is no breakaway or executable cleanup fallback.
+Lost startup acknowledgement after permission to launch is a terminal
+uncertain-launch error, so it cannot silently repeat a possibly executed command.
+
+Normalized `PATH`, `SSL_CERT_DIR` and `OPENCLAW_INCLUDE_ROOTS` entries must
+survive path-list serialization unchanged.
 `SSL_CERT_DIR` also checks its directory entries for source ownership and file
 custody, including certificate and CRL links.
 An unsafe or malformed nonempty `SSL_CERT_DIR` stops preparation before a child

@@ -3270,5 +3270,196 @@ class AutoreviewPreflightTests(unittest.TestCase):
                 self.assertEqual(diagnostic.read_text(), "diagnostic sentinel")
 
 
+@unittest.skipUnless(os.name == "nt", "requires native Windows process jobs")
+class WindowsOwnedProcessTransportTests(unittest.TestCase):
+    def test_stdio_environment_working_directory_and_exit_status(self):
+        with tempfile.TemporaryDirectory(prefix="owned-process-") as directory:
+            cwd = Path(directory).resolve() / "working directory 雪"
+            cwd.mkdir()
+            environment = os.environ.copy()
+            environment["AUTOREVIEW_JOB_TRANSPORT"] = "environment 雪"
+            script = (
+                "import json, os, sys; "
+                "print(json.dumps([sys.argv[1:], os.getcwd(), "
+                "os.environ['AUTOREVIEW_JOB_TRANSPORT'], sys.stdin.read()])); "
+                "print('diagnostic 雪', file=sys.stderr); sys.exit(37)"
+            )
+            arguments = [sys.executable, "-I", "-S", "-X", "utf8=1", "-c", script,
+                         "argument with spaces", "雪"]
+            for streamed in (False, True):
+                with self.subTest(streamed=streamed), contextlib.redirect_stdout(io.StringIO()):
+                    result = AUTOREVIEW.run_with_heartbeat(
+                        arguments, cwd, input_text="input 雪", label="transport",
+                        stream_output=streamed, env=environment, max_runtime_seconds=10,
+                    )
+                self.assertEqual(result.returncode, 37)
+                self.assertEqual(json.loads(result.stdout),
+                                 [["argument with spaces", "雪"], str(cwd),
+                                  "environment 雪", "input 雪"])
+                self.assertEqual(result.stderr.strip(), "diagnostic 雪")
+                self.assertFalse(AUTOREVIEW._OWNED_PROCESSES)
+
+    def test_owned_launch_can_nest_inside_an_owned_job(self):
+        with tempfile.TemporaryDirectory(prefix="owned-process-") as directory:
+            cwd = Path(directory).resolve()
+            nested_owner = (
+                "import json, pathlib, runpy, sys\n"
+                "helper = runpy.run_path(sys.argv[1])\n"
+                "result = helper['run_with_heartbeat'](\n"
+                " [sys.executable, '-I', '-S', '-c', 'print(42)'], pathlib.Path.cwd(),\n"
+                " label='inner-job', max_runtime_seconds=10)\n"
+                "print(json.dumps([result.returncode, result.stdout, result.stderr,\n"
+                " not helper['_OWNED_PROCESSES']]))\n"
+            )
+            # The inner owner itself runs inside a real outer owned job. This
+            # establishes nesting independently of the CI runner's own policy.
+            result = AUTOREVIEW.run_with_heartbeat(
+                [sys.executable, "-I", "-S", "-c", nested_owner, str(SCRIPT_PATH.resolve())],
+                cwd, label="outer-job", max_runtime_seconds=20,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), [0, "42\n", "", True])
+            self.assertFalse(AUTOREVIEW._OWNED_PROCESSES)
+
+    def test_target_closing_stdin_does_not_block_prompt_past_deadline(self):
+        with tempfile.TemporaryDirectory(prefix="owned-process-") as directory:
+            cwd = Path(directory).resolve()
+            owner_code = (
+                "import json, pathlib, runpy, sys\n"
+                "helper = runpy.run_path(sys.argv[1])\n"
+                "target = 'import os,time; os.close(0); print(42, flush=True); time.sleep(120)'\n"
+                "result = helper['run_with_heartbeat'](\n"
+                " [sys.executable, '-I', '-S', '-c', target], pathlib.Path.cwd(),\n"
+                " input_text='x' * 1000000, label='closed-stdin', max_runtime_seconds=3)\n"
+                "print(json.dumps([isinstance(result, helper['TimedOutEngineProcess']),\n"
+                " result.returncode, result.stdout, not helper['_OWNED_PROCESSES']]))\n"
+            )
+            # The outer owner bounds the regression itself: retaining the
+            # supervisor's stdin read end would block communicate's prompt write
+            # before its timeout code could run. Owner loss closes the real job.
+            owner = subprocess.Popen(
+                [sys.executable, "-I", "-S", "-c", owner_code, str(SCRIPT_PATH.resolve())],
+                cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            )
+            try:
+                output, error = owner.communicate(timeout=20)
+                self.assertEqual(owner.returncode, 0, error)
+                self.assertEqual(json.loads(output), [True, 124, "42\n", True])
+            finally:
+                if owner.poll() is None:
+                    owner.kill()
+                    owner.wait(timeout=5)
+                owner.stdout.close()
+                owner.stderr.close()
+
+    def test_merged_output_reaches_eof_before_target_exit(self):
+        with tempfile.TemporaryDirectory(prefix="owned-process-") as directory:
+            cwd = Path(directory).resolve()
+            owner_code = (
+                "import json, pathlib, runpy, subprocess, sys\n"
+                "helper = runpy.run_path(sys.argv[1])\n"
+                "target = 'import os,time; os.close(1); os.close(2); time.sleep(120)'\n"
+                "proc = helper['start_owned_process'](\n"
+                " [sys.executable, '-I', '-S', '-c', target], pathlib.Path.cwd(),\n"
+                " stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,\n"
+                " stderr=subprocess.STDOUT, text=True)\n"
+                "try:\n"
+                " output = proc.stdout.read()\n"
+                " alive = proc.poll() is None\n"
+                "finally:\n"
+                " helper['terminate_process_group'](proc)\n"
+                " helper['unregister_owned_process'](proc)\n"
+                " proc.stdout.close()\n"
+                "print(json.dumps([output, alive, not helper['_OWNED_PROCESSES']]))\n"
+            )
+            # Retained or aliased supervisor output handles would keep read()
+            # blocked until target exit, despite the target closing both outputs.
+            owner = subprocess.Popen(
+                [sys.executable, "-I", "-S", "-c", owner_code, str(SCRIPT_PATH.resolve())],
+                cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            )
+            try:
+                output, error = owner.communicate(timeout=20)
+                self.assertEqual(owner.returncode, 0, error)
+                self.assertEqual(json.loads(output), ["", True, True])
+            finally:
+                if owner.poll() is None:
+                    owner.kill()
+                    owner.wait(timeout=5)
+                owner.stdout.close()
+                owner.stderr.close()
+
+    def test_expired_startup_deadline_never_launches_target(self):
+        with tempfile.TemporaryDirectory(prefix="owned-process-") as directory:
+            cwd = Path(directory).resolve()
+            marker = cwd / "target-started"
+            command = [sys.executable, "-I", "-S", "-c",
+                       "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(marker)]
+            with self.assertRaises(subprocess.TimeoutExpired):
+                AUTOREVIEW.start_owned_process(
+                    command, cwd, deadline=time.monotonic() - 1,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            self.assertFalse(marker.exists())
+            self.assertFalse(AUTOREVIEW._OWNED_PROCESSES)
+
+    def test_absent_inherited_standard_handles_preserve_stdin_eof(self):
+        with tempfile.TemporaryDirectory(prefix="owned-process-") as directory:
+            cwd = Path(directory).resolve()
+            result_path = cwd / "result.json"
+            owner_code = (
+                "import json, pathlib, runpy, sys\n"
+                "helper = runpy.run_path(sys.argv[1])\n"
+                "result = helper['run_with_heartbeat'](\n"
+                " [sys.executable, '-I', '-S', '-c', 'import sys; print(repr(sys.stdin.read()))'],\n"
+                " pathlib.Path.cwd(), label='absent-stdin', max_runtime_seconds=10)\n"
+                "pathlib.Path(sys.argv[2]).write_text(\n"
+                " json.dumps([result.returncode, result.stdout, result.stderr]), encoding='utf-8')\n"
+            )
+            # A detached caller can have no standard handles. The ordinary
+            # Popen boundary supplies EOF for absent stdin; the supervisor must
+            # preserve it while forwarding the requested output pipes.
+            startup = subprocess.STARTUPINFO(
+                dwFlags=subprocess.STARTF_USESTDHANDLES,
+                hStdInput=0, hStdOutput=0, hStdError=0,
+            )
+            owner = subprocess.Popen(
+                [sys.executable, "-I", "-S", "-c", owner_code,
+                 str(SCRIPT_PATH.resolve()), str(result_path)],
+                cwd=cwd, startupinfo=startup, close_fds=True,
+            )
+            try:
+                self.assertEqual(owner.wait(timeout=20), 0)
+            finally:
+                if owner.poll() is None:
+                    owner.kill()
+                    owner.wait(timeout=5)
+            self.assertEqual(json.loads(result_path.read_text(encoding="utf-8")),
+                             [0, "''\n", ""])
+
+    def test_native_startup_error_and_full_dword_exit_code(self):
+        with tempfile.TemporaryDirectory(prefix="owned-process-") as directory:
+            cwd = Path(directory).resolve()
+            missing = str(cwd / "missing.exe")
+            with self.assertRaises(FileNotFoundError) as caught:
+                AUTOREVIEW.start_owned_process(
+                    [missing], cwd, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            self.assertEqual(caught.exception.filename, missing)
+            self.assertFalse(AUTOREVIEW._OWNED_PROCESSES)
+            result = AUTOREVIEW.run_with_heartbeat(
+                [sys.executable, "-I", "-S", "-c",
+                 "import ctypes; stop=ctypes.windll.kernel32.ExitProcess; "
+                 "stop.argtypes=[ctypes.c_uint]; stop(0xC1234567)"],
+                cwd, label="exit-status", max_runtime_seconds=10,
+            )
+            self.assertEqual(result.returncode, 0xC1234567)
+            self.assertFalse(AUTOREVIEW._OWNED_PROCESSES)
+
+
 if __name__ == "__main__":
     unittest.main()

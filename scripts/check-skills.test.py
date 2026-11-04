@@ -105,6 +105,7 @@ class CheckSkillsTest(unittest.TestCase):
             "scripts/validate-skills", "scripts/validate-skills.test.py",
             "scripts/check-skills", "scripts/check-skills.test.py",
             "skills/autoreview/scripts/autoreview",
+            "skills/autoreview/scripts/windows-owned-process.py",
             "skills/autoreview/scripts/test-review-harness.py",
             "skills/autoreview/scripts/autoreview_test.py",
         )

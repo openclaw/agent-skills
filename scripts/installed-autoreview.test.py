@@ -294,6 +294,23 @@ class InstalledAutoreviewTests(unittest.TestCase):
                 before = tree(scratch)
                 helper = installed / "scripts/autoreview"
                 if os.name == "nt":
+                    # Execute the installed process owner, including its sibling
+                    # supervisor, with real pipes and no checkout imports.
+                    owned_probe = (
+                        "import pathlib, runpy, sys\n"
+                        "helper = runpy.run_path(sys.argv[1])\n"
+                        "result = helper['run_with_heartbeat'](\n"
+                        " [sys.executable, '-I', '-S', '-c',\n"
+                        "  'import sys; print(sys.stdin.read()); print(42, file=sys.stderr)'],\n"
+                        " pathlib.Path.cwd(), input_text='installed owned job',\n"
+                        " label='installed', max_runtime_seconds=10)\n"
+                        "assert result.returncode == 0, result\n"
+                        "assert result.stdout.strip() == 'installed owned job', result\n"
+                        "assert result.stderr.strip() == '42', result\n"
+                        "assert not helper['_OWNED_PROCESSES']\n"
+                    )
+                    run([sys.executable, "-I", "-S", "-B", "-c", owned_probe, str(helper)],
+                        stage="installed Windows owned job")
                     powershell = shutil.which("powershell") or shutil.which("pwsh")
                     self.assertIsNotNone(powershell, "native PowerShell is required for this platform proof")
                     # The real launcher must choose the isolated proof interpreter,

@@ -5995,107 +5995,204 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 os.environ.clear()
                 os.environ.update(old)
 
-    def test_terminate_process_group_uses_windows_process_api(self) -> None:
-        proc = mock.Mock(pid=1234)
-        fake_taskkill = r"C:\Windows\System32\taskkill.exe"
-        with mock.patch.object(os, "name", "nt"), mock.patch.dict(
-            self.helper["terminate_process_group"].__globals__,
-            {"_resolve_windows_taskkill": lambda: fake_taskkill},
-        ), mock.patch(
-            "subprocess.run",
-            return_value=subprocess.CompletedProcess([], 0),
-        ) as run:
-            self.helper["terminate_process_group"](proc, grace_seconds=0.01)
-        argv = run.call_args.args[0]
-        self.assertEqual(argv, [fake_taskkill, "/PID", "1234", "/T", "/F"])
-        # A repo-local taskkill.exe on PATH/CWD must never be reachable here:
-        # the resolved argv[0] has to be an absolute path, never the bare name.
-        self.assertTrue(PureWindowsPath(argv[0]).is_absolute())
-        self.assertNotEqual(argv[0], "taskkill")
-        proc.kill.assert_not_called()
+    def wait_for_process_witness(self, path: Path) -> str:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if path.exists():
+                value = path.read_text(encoding="utf-8")
+                if value:
+                    return value
+            time.sleep(0.01)
+        self.fail(f"process did not write {path.name}")
 
-    def test_successful_windows_taskkill_still_waits_for_owned_processes(self) -> None:
+    @contextlib.contextmanager
+    def windows_process_handle(self, pid: int):
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel.TerminateProcess.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        # Retain the exact process identity even after its PID becomes reusable.
+        handle = kernel.OpenProcess(0x00100001, False, pid)  # SYNCHRONIZE | TERMINATE
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            yield lambda milliseconds: kernel.WaitForSingleObject(handle, milliseconds)
+        finally:
+            try:
+                if kernel.WaitForSingleObject(handle, 0) == 258:
+                    if not kernel.TerminateProcess(handle, 1):
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    self.assertEqual(kernel.WaitForSingleObject(handle, 5000), 0)
+            finally:
+                kernel.CloseHandle(handle)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_jobs_retain_descendants_after_leader_exit(self) -> None:
+        child_code = (
+            "import os, pathlib, sys, time; "
+            "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8'); "
+            "time.sleep(120)"
+        )
+        leader_code = (
+            "import subprocess, sys; "
+            "subprocess.Popen([sys.executable, '-I', '-S', '-c', sys.argv[1], sys.argv[2]])"
+        )
         for batched in (False, True):
-            for force_required in (False, True):
-                with self.subTest(batched=batched, force_required=force_required):
-                    events = []
-                    processes = []
-                    for pid in ((1234, 5678) if batched else (1234,)):
-                        proc = mock.Mock(pid=pid, returncode=None)
-                        proc.poll.side_effect = lambda proc=proc: proc.returncode
-
-                        def wait(*, timeout, proc=proc):
-                            events.append(("wait", proc.pid))
-                            self.assertGreater(timeout, 0)
-                            if force_required and not proc.kill.called:
-                                raise subprocess.TimeoutExpired("reviewer", timeout)
-                            proc.returncode = 1
-                            return proc.returncode
-
-                        proc.wait.side_effect = wait
-                        processes.append(proc)
-
-                    def taskkill(argv, **kwargs):
-                        events.append(("signal", int(argv[2])))
-                        # Success can precede the owned handle becoming signaled.
-                        self.assertTrue(all(proc.returncode is None for proc in processes))
-                        return subprocess.CompletedProcess(argv, 0)
-
-                    with mock.patch.object(os, "name", "nt"), mock.patch.dict(
-                        self.helper["terminate_process_group"].__globals__,
-                        {"_resolve_windows_taskkill": lambda: r"C:\Windows\System32\taskkill.exe"},
-                    ), mock.patch("subprocess.run", side_effect=taskkill):
+            with self.subTest(batched=batched), tempfile.TemporaryDirectory() as temp:
+                cwd = Path(temp).resolve()
+                processes = []
+                unrelated = subprocess.Popen(
+                    [sys.executable, "-I", "-S", "-c", "import time; time.sleep(120)"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                try:
+                    with contextlib.ExitStack() as handles:
+                        descendants = []
+                        for index in range(2 if batched else 1):
+                            witness = cwd / f"descendant-{index}.pid"
+                            proc = self.helper["start_owned_process"](
+                                [sys.executable, "-I", "-S", "-c", leader_code,
+                                 child_code, str(witness)], cwd,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                            processes.append(proc)
+                            pid = int(self.wait_for_process_witness(witness))
+                            wait = handles.enter_context(self.windows_process_handle(pid))
+                            descendants.append(wait)
+                            self.assertEqual(proc.wait(timeout=10), 0)
+                            # The leader and supervisor are gone; the live child
+                            # must remain owned by the retained job, not their PID tree.
+                            self.assertEqual(wait(0), 258)
                         if batched:
-                            for proc in processes:
-                                self.helper["register_owned_process"](proc)
-                            try:
-                                self.helper["terminate_owned_processes"]()
-                            finally:
-                                for proc in processes:
-                                    self.helper["unregister_owned_process"](proc)
+                            self.helper["terminate_owned_processes"]()
                         else:
                             self.helper["terminate_process_group"](processes[0])
-
-                    self.assertEqual(events[:len(processes)], [
-                        ("signal", proc.pid) for proc in processes
-                    ])
+                        for wait in descendants:
+                            self.assertEqual(wait(5000), 0)
+                        self.assertIsNone(unrelated.poll())
+                finally:
                     for proc in processes:
-                        self.assertIsNotNone(proc.returncode)
-                        self.assertEqual(proc.wait.call_count, 2 if force_required else 1)
-                        self.assertEqual(proc.kill.call_count, int(force_required))
+                        try:
+                            self.helper["terminate_process_group"](proc)
+                        finally:
+                            self.helper["unregister_owned_process"](proc)
+                    unrelated.kill()
+                    unrelated.wait(timeout=5)
 
-    def test_terminate_process_group_skips_taskkill_when_unresolved(self) -> None:
-        proc = mock.Mock(pid=1234)
-        proc.poll.return_value = None
-        with mock.patch.object(os, "name", "nt"), mock.patch.dict(
-            self.helper["terminate_process_group"].__globals__,
-            {"_resolve_windows_taskkill": lambda: None},
-        ), mock.patch("subprocess.run") as run:
-            self.helper["terminate_process_group"](proc, grace_seconds=0.01)
-        run.assert_not_called()
-        proc.kill.assert_called_once()
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_owned_job_disallows_child_breakaway(self) -> None:
+        target_code = r'''import json, subprocess, sys
+child_code = "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text('escaped', encoding='utf-8')"
+try:
+    child = subprocess.Popen(
+        [sys.executable, "-I", "-S", "-c", child_code, sys.argv[1]],
+        creationflags=subprocess.CREATE_BREAKAWAY_FROM_JOB)
+except OSError as error:
+    print(json.dumps({"winerror": error.winerror}))
+else:
+    child.wait(timeout=5)
+    print(json.dumps({"unexpected_child": child.pid}))
+'''
+        with tempfile.TemporaryDirectory() as temp:
+            cwd = Path(temp).resolve()
+            witness = cwd / "escaped.txt"
+            proc = self.helper["start_owned_process"](
+                [sys.executable, "-I", "-S", "-c", target_code, str(witness)], cwd,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                stdout, stderr = proc.communicate(timeout=10)
+                self.assertEqual(proc.returncode, 0, stderr)
+                # Both implicit and explicitly requested escape must be denied:
+                # the supported owner never sets either job breakaway flag.
+                self.assertEqual(json.loads(stdout), {"winerror": 5})
+                self.assertFalse(witness.exists())
+            finally:
+                try:
+                    self.helper["terminate_process_group"](proc)
+                finally:
+                    self.helper["unregister_owned_process"](proc)
+                    proc.stdout.close()
+                    proc.stderr.close()
 
-    def test_terminate_process_group_attempts_taskkill_when_leader_already_exited(
-        self,
-    ) -> None:
-        # Regression for detached descendants leaking: taskkill /T is still
-        # worth attempting even once the leader PID has exited (it can still
-        # fell the tree while the PID is valid), but the direct-kill fallback
-        # only ever makes sense for a leader that is still alive.
-        proc = mock.Mock(pid=1234)
-        proc.poll.return_value = 0
-        fake_taskkill = r"C:\Windows\System32\taskkill.exe"
-        with mock.patch.object(os, "name", "nt"), mock.patch.dict(
-            self.helper["terminate_process_group"].__globals__,
-            {"_resolve_windows_taskkill": lambda: fake_taskkill},
-        ), mock.patch(
-            "subprocess.run",
-            return_value=subprocess.CompletedProcess([], 1),
-        ) as run:
-            self.helper["terminate_process_group"](proc, grace_seconds=0.01)
-        self.assertEqual(run.call_args.args[0][0], fake_taskkill)
-        proc.kill.assert_not_called()
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_jobs_fail_closed_when_owner_dies(self) -> None:
+        owner_code = r'''import json, pathlib, runpy, sys, time
+helper_path, directory, mode = sys.argv[1:]
+cwd = pathlib.Path(directory)
+helper = runpy.run_path(helper_path, run_name="autoreview_under_test")
+child_code = "import time; time.sleep(120)"
+target_code = (
+    "import json, os, pathlib, subprocess, sys, time; "
+    "child = subprocess.Popen([sys.executable, '-I', '-S', '-c', sys.argv[2]]); "
+    "pathlib.Path(sys.argv[1]).write_text(json.dumps([os.getpid(), child.pid]), encoding='utf-8'); "
+    "time.sleep(120)"
+)
+argv = [sys.executable, "-I", "-S", "-c", target_code, str(cwd / "target.json"), child_code]
+import subprocess
+stdio = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+if mode == "before-go":
+    supervisor = str(pathlib.Path(helper_path).with_name("windows-owned-process.py"))
+    helper["admit_executable_directories"](
+        cwd, selected_executables=[sys.executable, supervisor], include_search_path=False)
+    module = helper["_load_windows_process_module"](supervisor)
+    startup = module.spawn(sys.executable, supervisor, argv, cwd=cwd, **stdio)
+    helper["register_owned_process"](startup.process, startup.job)
+    # Observe the real supervisor's assignment acknowledgement, but never grant GO.
+    if module.read_frame(startup.reader) != {"version": 1, "operation": "ready"}:
+        raise RuntimeError("supervisor did not become ready")
+    proc = startup.process
+else:
+    proc = helper["start_owned_process"](argv, cwd, **stdio)
+(cwd / "owner-ready.pid").write_text(str(proc.pid), encoding="utf-8")
+time.sleep(120)
+'''
+        for phase in ("before-go", "after-started"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temp:
+                cwd = Path(temp).resolve()
+                # This owner is deliberately outside the owned job: killing it
+                # must close its last job handle without invoking Python cleanup.
+                owner = subprocess.Popen(
+                    [sys.executable, "-I", "-S", "-c", owner_code, str(SCRIPT),
+                     str(cwd), phase], stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                )
+                try:
+                    with contextlib.ExitStack() as handles:
+                        supervisor_pid = int(self.wait_for_process_witness(cwd / "owner-ready.pid"))
+                        waits = [handles.enter_context(self.windows_process_handle(supervisor_pid))]
+                        if phase == "after-started":
+                            target_pids = json.loads(self.wait_for_process_witness(cwd / "target.json"))
+                            waits.extend(handles.enter_context(self.windows_process_handle(pid))
+                                         for pid in target_pids)
+                        else:
+                            self.assertFalse((cwd / "target.json").exists())
+                        for wait in waits:
+                            self.assertEqual(wait(0), 258)
+                        owner.kill()
+                        owner.wait(timeout=5)
+                        for wait in waits:
+                            self.assertEqual(wait(5000), 0)
+                        if phase == "before-go":
+                            self.assertFalse((cwd / "target.json").exists())
+                finally:
+                    if owner.poll() is None:
+                        owner.kill()
+                    _, errors = owner.communicate(timeout=5)
+                    self.assertNotIn(b"Traceback", errors)
 
+    @unittest.skipIf(os.name == "nt", "POSIX registry sequencing; Windows requires real jobs")
     def test_owned_process_registry_terminates_all_tracked_groups(self) -> None:
         terminated: list[object] = []
         proc_a = mock.Mock(pid=111)
@@ -6117,6 +6214,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.helper["unregister_owned_process"](proc_b)
         self.assertEqual(set(terminated), {proc_a, proc_b})
 
+    @unittest.skipIf(os.name == "nt", "POSIX registry sequencing; Windows requires real jobs")
     def test_terminate_owned_processes_signals_all_groups_before_grace_wait(
         self,
     ) -> None:

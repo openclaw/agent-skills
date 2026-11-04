@@ -14,7 +14,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1225,152 +1224,6 @@ class ReviewBatchTests(unittest.TestCase):
                             self.helper["safe_git_env"](repo)
             finally:
                 self.helper["UNTRUSTED_SOURCE_ROOTS"].reset(token)
-
-    @unittest.skipIf(os.name == "nt", "uses POSIX symlinks; native junction case is separate")
-    def test_windows_cleanup_rejects_source_selected_executable_before_preflight(self):
-        with self.external_fixture() as (repo, upstream, _, _):
-            trusted = repo.parent / "installed"
-            trusted.mkdir()
-            (trusted / "taskkill.exe").write_bytes(b"inert installed executable")
-            (upstream / "taskkill.exe").write_bytes(b"inert source executable")
-            # Exercise both descendants omitted by the old SystemRoot-only
-            # check, plus a source-owned selector whose final target is safe.
-            for kind in ("directory", "leaf", "source-selector"):
-                with self.subTest(kind=kind):
-                    system = repo.parent / ("system-" + kind)
-                    system.mkdir()
-                    system32 = system / "System32"
-                    if kind == "directory":
-                        system32.symlink_to(upstream, target_is_directory=True)
-                    elif kind == "leaf":
-                        system32.mkdir()
-                        (system32 / "taskkill.exe").symlink_to(upstream / "taskkill.exe")
-                    else:
-                        selector = upstream / "selector"
-                        selector.symlink_to(trusted, target_is_directory=True)
-                        system32.symlink_to(selector, target_is_directory=True)
-                    probe = mock.Mock(side_effect=AssertionError("preflight must not start"))
-                    # Change only the helper's platform dispatch; Path and all
-                    # filesystem resolution remain real POSIX operations.
-                    windows = types.SimpleNamespace(**{**vars(os), "name": "nt"})
-                    windows_stat = types.SimpleNamespace(**{**vars(stat), "IO_REPARSE_TAG_MOUNT_POINT": 0xA0000003})
-                    with mock.patch.dict(os.environ, {"SystemRoot": str(system)}), mock.patch.dict(
-                        self.helper["main_with_args"].__globals__, {"os": windows, "stat": windows_stat, "preflight_git": probe}
-                    ):
-                        status, sends, _ = self.invoke(
-                            repo, "--external-source-context-file", ".review/external.json")
-                    self.assertIn("trusted System32/taskkill.exe", str(status))
-                    self.assertFalse(sends)
-                    probe.assert_not_called()
-                    self.assertIsNone(self.helper["WINDOWS_TASKKILL"].get())
-
-    def test_windows_cleanup_binding_pins_identity_and_source_roots(self):
-        with tempfile.TemporaryDirectory() as directory:
-            parent = Path(directory).resolve()
-            repo = parent / "repo"
-            repo.mkdir()
-            source = parent / "source"
-            source.mkdir()
-            system = parent / "system"
-            system32 = system / "System32"
-            system32.mkdir(parents=True)
-            executable = system32 / "taskkill.exe"
-            executable.write_bytes(b"inert installed executable")
-            sources = self.helper["UNTRUSTED_SOURCE_ROOTS"]
-            token = sources.set((repo, source))
-            try:
-                with mock.patch.dict(os.environ, {"SystemRoot": str(system)}):
-                    binding = self.helper["_capture_windows_taskkill"](repo)
-            finally:
-                sources.reset(token)
-            bound = self.helper["WINDOWS_TASKKILL"].set(binding)
-            try:
-                # Environment changes cannot select a new executable during
-                # cleanup, even once the original source context has unwound.
-                with mock.patch.dict(os.environ, {"SystemRoot": str(source)}):
-                    self.assertEqual(self.helper["_resolve_windows_taskkill"](), str(executable))
-                # A later source boundary (e.g. linked Git metadata) still
-                # constrains the already admitted executable.
-                added = sources.set((system,))
-                try:
-                    self.assertIsNone(self.helper["_resolve_windows_taskkill"]())
-                finally:
-                    sources.reset(added)
-                replacement = system32 / "replacement.exe"
-                replacement.write_bytes(executable.read_bytes())
-                replacement.replace(executable)
-                self.assertIsNone(self.helper["_resolve_windows_taskkill"]())
-            finally:
-                self.helper["WINDOWS_TASKKILL"].reset(bound)
-
-    @unittest.skipIf(os.name == "nt", "uses POSIX symlinks; native junction case is separate")
-    def test_windows_cleanup_rechecks_raw_selector_after_source_context_unwinds(self):
-        with tempfile.TemporaryDirectory() as directory:
-            parent = Path(directory).resolve()
-            repo = parent / "repo"
-            repo.mkdir()
-            source = parent / "source"
-            source.mkdir()
-            system = parent / "system"
-            system.mkdir()
-            installed = parent / "installed"
-            installed.mkdir()
-            executable = installed / "taskkill.exe"
-            executable.write_bytes(b"inert installed executable")
-            alias = system / "System32"
-            alias.symlink_to(installed, target_is_directory=True)
-            sources = self.helper["UNTRUSTED_SOURCE_ROOTS"]
-            token = sources.set((repo, source))
-            try:
-                with mock.patch.dict(os.environ, {"SystemRoot": str(system)}):
-                    binding = self.helper["_capture_windows_taskkill"](repo)
-            finally:
-                sources.reset(token)
-            bound = self.helper["WINDOWS_TASKKILL"].set(binding)
-            try:
-                self.assertEqual(self.helper["_resolve_windows_taskkill"](), str(executable))
-                # The final target and its identity stay unchanged. Only the
-                # raw selector now traverses a retained source-owned link.
-                selector = source / "selector"
-                selector.symlink_to(installed, target_is_directory=True)
-                alias.unlink()
-                alias.symlink_to(selector, target_is_directory=True)
-                self.assertEqual(alias.resolve(), installed)
-                self.assertIsNone(self.helper["_resolve_windows_taskkill"]())
-                windows = types.SimpleNamespace(**{**vars(os), "name": "nt"})
-                windows_stat = types.SimpleNamespace(**{**vars(stat), "IO_REPARSE_TAG_MOUNT_POINT": 0xA0000003})
-                with mock.patch.dict(self.helper["_signal_owned_process_group"].__globals__, {"os": windows, "stat": windows_stat}), mock.patch(
-                    "subprocess.run", side_effect=AssertionError("untrusted taskkill must not execute")
-                ) as launch:
-                    self.assertTrue(self.helper["_signal_owned_process_group"](mock.Mock(pid=1234)))
-                launch.assert_not_called()
-            finally:
-                self.helper["WINDOWS_TASKKILL"].reset(bound)
-
-    @unittest.skipUnless(os.name == "nt", "requires native Windows directory junctions")
-    def test_windows_cleanup_rejects_native_system32_junction(self):
-        with tempfile.TemporaryDirectory() as directory:
-            parent = Path(directory).resolve()
-            repo = parent / "repo"
-            repo.mkdir()
-            source = parent / "source"
-            source.mkdir()
-            (source / "taskkill.exe").write_bytes(b"inert source executable")
-            system = parent / "system"
-            system.mkdir()
-            system32 = system / "System32"
-            cmd = Path(os.environ["SystemRoot"]) / "System32" / "cmd.exe"
-            subprocess.run([str(cmd), "/c", "mklink", "/J", str(system32), str(source)],
-                           check=True, capture_output=True)
-            token = self.helper["UNTRUSTED_SOURCE_ROOTS"].set((repo, source))
-            try:
-                with mock.patch.dict(os.environ, {"SystemRoot": str(system)}):
-                    with self.assertRaisesRegex(SystemExit, "trusted System32/taskkill.exe"):
-                        self.helper["_capture_windows_taskkill"](repo)
-                    self.assertIsNone(self.helper["_resolve_windows_taskkill"]())
-            finally:
-                self.helper["UNTRUSTED_SOURCE_ROOTS"].reset(token)
-                system32.rmdir()
 
     def test_external_source_platform_environment_is_refused_before_any_process(self):
         with self.external_fixture() as (repo, upstream, _, _):
@@ -2729,16 +2582,6 @@ class WindowsHardlinkCustodyTests(unittest.TestCase):
         after = library.stat()
         self.assertEqual((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns),
                          (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns))
-        # Exercise the mandatory native cleanup selection and the real system
-        # search directory; accepting one DLL alone does not prove startup.
-        with tempfile.TemporaryDirectory(prefix="autoreview-windows-system-") as directory:
-            repo = Path(directory).resolve()
-            binding = self.helper["_capture_windows_taskkill"](repo)
-            with mock.patch.dict(os.environ, {"PATH": str(library.parent)}):
-                admitted = self.helper["safe_engine_path"](repo).split(os.pathsep)
-            self.assertIn(str(library.parent.resolve()), admitted)
-            result = subprocess.run([str(binding.path), "/?"], capture_output=True, timeout=15)
-            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_native_descriptor_failure_reports_only_stage_and_error(self):
         with tempfile.TemporaryDirectory(prefix="autoreview-windows-custody-") as directory:
@@ -2756,6 +2599,87 @@ class WindowsHardlinkCustodyTests(unittest.TestCase):
                 # RevertToSelf can recover the original primary authority. The
                 # original process token is never changed by this fixture.
                 self.assertFalse(self.helper["windows_file_custody"](library))
+
+
+@unittest.skipUnless(os.name == "nt", "requires native Windows process jobs")
+class WindowsOwnedProcessAdmissionTests(unittest.TestCase):
+    def setUp(self):
+        self.helper = runpy.run_path(str(SCRIPT))
+        temporary = tempfile.TemporaryDirectory(prefix="autoreview-owned-admission-")
+        self.addCleanup(temporary.cleanup)
+        self.repo = Path(temporary.name).resolve()
+
+    def run_owned(self, command):
+        proc = self.helper["start_owned_process"](
+            command, self.repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            encoding="utf-8", errors="strict",
+        )
+        try:
+            output, error = proc.communicate(timeout=15)
+            self.assertEqual(proc.returncode, 0, error)
+            return output
+        finally:
+            try:
+                self.helper["terminate_process_group"](proc)
+            finally:
+                self.helper["unregister_owned_process"](proc)
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream is not None:
+                        stream.close()
+
+    def test_owned_startup_does_not_require_system_directory_admission(self):
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_directory = kernel.GetSystemDirectoryW
+        get_directory.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+        get_directory.restype = wintypes.UINT
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = get_directory(buffer, len(buffer))
+        self.assertTrue(0 < length < len(buffer))
+        system_directory = Path(buffer.value).resolve()
+        source_roots = self.helper["UNTRUSTED_SOURCE_ROOTS"]
+        token = source_roots.set((system_directory,))
+        try:
+            # Native job cleanup must work even when the system installation
+            # directory is explicitly excluded from executable admission.
+            self.assertFalse(self.helper["external_env_path"](self.repo, str(system_directory)))
+            output = self.run_owned([
+                sys.executable, "-I", "-S", "-X", "utf8=1", "-c",
+                "print('owned process completed')",
+            ])
+            self.assertEqual(output, "owned process completed\n")
+        finally:
+            source_roots.reset(token)
+
+    def test_owned_startup_refuses_source_owned_supervisor_and_interpreter(self):
+        marker = self.repo / "target-started"
+        command = [
+            sys.executable, "-I", "-S", "-c",
+            "from pathlib import Path; Path('target-started').write_bytes(b'started')",
+        ]
+        supervisor = SCRIPT.resolve().with_name("windows-owned-process.py")
+        interpreter = Path(sys.executable).absolute()
+        source_roots = self.helper["UNTRUSTED_SOURCE_ROOTS"]
+        for selected in (supervisor, interpreter):
+            with self.subTest(selected=selected.name):
+                token = source_roots.set((selected.parent,))
+                try:
+                    # Exclude the actual installed artifact; do not replace a
+                    # native launch or security decision with a test double.
+                    with self.assertRaisesRegex(
+                        SystemExit, "selected executable requires trusted installation",
+                    ) as refused:
+                        self.run_owned(command)
+                    self.assertIn(f"selected {str(selected)!r}", str(refused.exception))
+                    self.assertFalse(marker.exists(), "refused startup executed the target")
+                finally:
+                    source_roots.reset(token)
+        # The identical command is usable when both selected artifacts have
+        # their normal independent custody; refusal was a source-boundary check.
+        self.run_owned(command)
+        self.assertEqual(marker.read_bytes(), b"started")
 
 
 @unittest.skipIf(os.name == "nt", "POSIX Python launcher and filesystem links")

@@ -11,6 +11,7 @@ import contextvars
 import copy
 import functools
 import hashlib
+import importlib.util
 import io
 import json
 import math
@@ -1930,8 +1931,13 @@ class EngineInterrupted(BaseException):
         self.stdout = ""
 
 
+class OwnedProcess(NamedTuple):
+    process: subprocess.Popen[str]
+    job: Any = None
+
+
 _OWNED_PROCESS_LOCK = threading.RLock()
-_OWNED_PROCESSES: dict[int, subprocess.Popen[str]] = {}
+_OWNED_PROCESSES: dict[int, OwnedProcess] = {}
 _OWNED_PROCESS_GRACE_SECONDS = 2.0
 _TIMED_OUT_STREAM_DRAIN_SECONDS = 1.0
 
@@ -1948,119 +1954,113 @@ def process_group_popen_kwargs() -> dict[str, Any]:
     return {"start_new_session": True}
 
 
-def register_owned_process(proc: subprocess.Popen[str]) -> None:
+def register_owned_process(proc: subprocess.Popen[str], job: Any = None) -> None:
+    if os.name == "nt" and job is None:
+        raise RuntimeError("Windows process registration requires an owned job")
     with _OWNED_PROCESS_LOCK:
-        _OWNED_PROCESSES[proc.pid] = proc
+        _OWNED_PROCESSES[proc.pid] = OwnedProcess(proc, job)
 
 
 def unregister_owned_process(proc: subprocess.Popen[str]) -> None:
     with _OWNED_PROCESS_LOCK:
-        _OWNED_PROCESSES.pop(proc.pid, None)
+        owned = _OWNED_PROCESSES.pop(proc.pid, None)
+        if owned is not None and owned.job is not None:
+            owned.job.close()
+
+
+def _owned_windows_job(proc: subprocess.Popen[str]) -> Any:
+    with _OWNED_PROCESS_LOCK:
+        owned = _OWNED_PROCESSES.get(proc.pid)
+        if owned is None or owned.process is not proc or owned.job is None:
+            raise RuntimeError("Windows cleanup requires the registered process job")
+        return owned.job
+
+
+@functools.cache
+def _load_windows_process_module(path: str) -> Any:
+    spec = importlib.util.spec_from_file_location("autoreview_windows_process", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Windows process supervisor could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def start_owned_process(
+    args: list[str], cwd: Path, *, deadline: float | None = None, **kwargs: Any,
+) -> subprocess.Popen[str]:
+    """Register the lifetime owner before permitting a Windows target to start."""
+    startup = None
+    proc = None
+    try:
+        if os.name == "nt":
+            supervisor = Path(__file__).absolute().with_name("windows-owned-process.py")
+            interpreter = Path(sys.executable).absolute()
+            # Both the parent-loaded support code and child interpreter obey the
+            # same source boundary as other selected executable installations.
+            admit_executable_directories(
+                cwd, selected_executables=[str(interpreter), str(supervisor)],
+                include_search_path=False,
+            )
+            module = _load_windows_process_module(str(supervisor))
+            with deferred_owned_process_signals():
+                startup = module.spawn(str(interpreter), str(supervisor), args, cwd=cwd, **kwargs)
+                proc = startup.process
+                register_owned_process(proc, startup.job)
+            startup.finish(min(time.monotonic() + 10, deadline) if deadline is not None
+                           else time.monotonic() + 10)
+        else:
+            with deferred_owned_process_signals():
+                proc = subprocess.Popen(args, cwd=cwd, **kwargs, **process_group_popen_kwargs())
+                register_owned_process(proc)
+        return proc
+    except BaseException:
+        if proc is not None:
+            try:
+                if startup is not None:
+                    startup.abort()
+                else:
+                    terminate_process_group(proc)
+            finally:
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream is not None:
+                        stream.close()
+                unregister_owned_process(proc)
+        raise
 
 
 def terminate_owned_processes() -> None:
     with _OWNED_PROCESS_LOCK:
-        processes = list(_OWNED_PROCESSES.values())
+        owned = list(_OWNED_PROCESSES.values())
+    processes = [entry.process for entry in owned]
+    # Keep the exact job references even if another worker unregisters while
+    # this cancellation sweep runs. Closing a job is synchronized and idempotent.
+    jobs = {entry.process: entry.job for entry in owned} if os.name == "nt" else {}
     # Phase 1: signal every owned group up front. Phase 2/3 then pay one
     # shared grace window for the whole batch instead of one grace window
     # per registered engine process, which used to make interrupt handling
     # take grace_seconds * len(processes).
-    survivors = [proc for proc in processes if _signal_owned_process_group(proc)]
+    survivors = [proc for proc in processes if (
+        _signal_owned_process_group(proc, job=jobs[proc]) if jobs
+        else _signal_owned_process_group(proc)
+    )]
     if not survivors:
         return
     _await_owned_process_groups(survivors, _OWNED_PROCESS_GRACE_SECONDS)
     for proc in survivors:
-        _enforce_owned_process_group(proc, _OWNED_PROCESS_GRACE_SECONDS)
+        if jobs:
+            _enforce_owned_process_group(proc, _OWNED_PROCESS_GRACE_SECONDS, job=jobs[proc])
+        else:
+            _enforce_owned_process_group(proc, _OWNED_PROCESS_GRACE_SECONDS)
 
 
-class WindowsTaskkill(NamedTuple):
-    raw_path: Path
-    path: Path
-    roots: tuple[Path, ...]
-    identity: tuple[int, int, int, int, int]
-
-
-WINDOWS_TASKKILL: contextvars.ContextVar[WindowsTaskkill | None] = contextvars.ContextVar(
-    "windows_taskkill", default=None,
-)
-
-
-def _capture_windows_taskkill(repo: Path) -> WindowsTaskkill:
-    # Check the complete caller spelling before resolving: an external
-    # SystemRoot can still contain source-owned System32 or taskkill links.
-    system_root = os.environ.get("SystemRoot") or r"C:\Windows"
-    raw_path = Path(system_root) / "System32" / "taskkill.exe"
-    roots = tuple(dict.fromkeys((repo, *UNTRUSTED_SOURCE_ROOTS.get())))
-    try:
-        if not raw_path.is_absolute() or any(
-            not external_env_path(root, str(raw_path)) for root in roots
-        ):
-            raise ValueError("source-owned executable path")
-        path = raw_path.resolve(strict=True)
-        info = path.stat()
-        if not stat.S_ISREG(info.st_mode) or any(
-            not external_env_path(root, str(path)) for root in roots
-        ):
-            raise ValueError("untrusted executable")
-        validate_selected_executable(repo, str(raw_path))
-        identity = (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns)
-        return WindowsTaskkill(raw_path, path, roots, identity)
-    except (OSError, RuntimeError, ValueError, SystemExit) as exc:
-        raise SystemExit("Windows cleanup requires a trusted System32/taskkill.exe outside reviewed source roots") from exc
-
-
-def _resolve_windows_taskkill() -> str | None:
-    """Revalidate the admitted cleanup executable without searching PATH or CWD."""
-    binding = WINDOWS_TASKKILL.get()
-    if binding is None:
-        # Direct helper callers still require complete path admission. The CLI
-        # binds before preflight and keeps that identity for the whole review.
-        try:
-            binding = _capture_windows_taskkill(Path.cwd().resolve())
-        except SystemExit:
-            return None
-    try:
-        if any(not external_env_path(root, str(path))
-               for root in binding.roots for path in (binding.raw_path, binding.path)):
-            return None
-        if binding.raw_path.resolve(strict=True) != binding.path:
-            return None
-        info = binding.path.stat()
-        identity = (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns)
-        if identity != binding.identity:
-            return None
-        for root in binding.roots:
-            validate_selected_executable(root, str(binding.raw_path))
-    except (OSError, RuntimeError, ValueError, SystemExit):
-        return None
-    # Launch the admitted absolute target, never the mutable caller alias.
-    return str(binding.path)
-
-
-def _signal_owned_process_group(proc: subprocess.Popen) -> bool:
-    """Phase 1: send the initial termination attempt to one owned group.
-
-    Returns True if phase 2/3 enforcement may still be needed. The
-    taskkill attempt is made even if the leader has already exited:
-    it can still fell descendants while the PID is valid, and skipping
-    it would leave live descendants of an already-reaped leader running.
-    """
+def _signal_owned_process_group(proc: subprocess.Popen, *, job: Any = None) -> bool:
+    """Signal the durable lifetime owner, even after its leader exits."""
     if os.name == "nt":
-        taskkill = _resolve_windows_taskkill()
-        if taskkill is None:
-            return True
-        try:
-            subprocess.run(
-                [taskkill, "/PID", str(proc.pid), "/T", "/F"],
-                capture_output=True,
-                text=True,
-                timeout=_OWNED_PROCESS_GRACE_SECONDS,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        # taskkill success does not collect this Popen's exit status. Always
-        # wait on its process handle, then enforce if termination is pending.
+        (job if job is not None else _owned_windows_job(proc)).terminate()
+        # A newly registered supervisor may not yet have assigned itself.
+        if proc.poll() is None:
+            proc.kill()
         return True
     try:
         os.killpg(proc.pid, signal.SIGTERM)
@@ -2098,20 +2098,21 @@ def _await_owned_process_groups(procs: list[subprocess.Popen], grace_seconds: fl
             time.sleep(remaining)
 
 
-def _enforce_owned_process_group(proc: subprocess.Popen, grace_seconds: float) -> None:
+def _enforce_owned_process_group(
+    proc: subprocess.Popen, grace_seconds: float, *, job: Any = None,
+) -> None:
     """Phase 3: force-kill survivors of the phase-1 termination attempt."""
     if os.name == "nt":
-        # No durable process-group boundary on Windows: taskkill /T can
-        # only walk the tree from a still-resolvable PID, so descendants
-        # that outlive the leader are not guaranteed to be owned (a
-        # durable Job-Object boundary is future work). The direct kill
-        # here only ever targets a still-live leader.
-        if proc.poll() is None:
-            proc.kill()
-            try:
-                proc.wait(timeout=grace_seconds)
-            except subprocess.TimeoutExpired:
-                pass
+        job = job if job is not None else _owned_windows_job(proc)
+        if job.active_count() or proc.poll() is None:
+            job.terminate()
+            if proc.poll() is None:
+                proc.kill()
+            deadline = time.monotonic() + grace_seconds
+            while job.active_count() or proc.poll() is None:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Windows owned process job did not terminate")
+                time.sleep(0.01)
         return
     try:
         os.killpg(proc.pid, signal.SIGKILL)
@@ -2133,9 +2134,8 @@ def terminate_process_group(
     ``terminate_owned_processes`` sweep. On POSIX, SIGKILL is sent to the
     group even if the leader has already exited: engines can fork
     children that outlive the leader but stay in its process group, and
-    those would otherwise be orphaned. On Windows there is no equivalent
-    process-group boundary -- descendants that outlive the leader are
-    not guaranteed to be owned (see ``_enforce_owned_process_group``).
+    those would otherwise be orphaned. Windows retains its job handle until
+    unregister, so descendants remain owned after the supervisor exits.
     """
     if not _signal_owned_process_group(proc):
         return
@@ -2475,20 +2475,17 @@ def run_with_heartbeat(
             stop_on_output=stop_on_output,
         )
     started = time.monotonic()
-    with deferred_owned_process_signals():
-        proc = subprocess.Popen(
-            args,
-            cwd=cwd,
+    try:
+        proc = start_owned_process(
+            args, cwd, deadline=deadline.expires_at,
             stdin=subprocess.PIPE if input_text is not None else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding=SUBPROCESS_TEXT_ENCODING,
-            errors=SUBPROCESS_TEXT_ERRORS,
-            env=env,
-            **process_group_popen_kwargs(),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding=SUBPROCESS_TEXT_ENCODING, errors=SUBPROCESS_TEXT_ERRORS, env=env,
         )
-        register_owned_process(proc)
+    except subprocess.TimeoutExpired:
+        if deadline.expired():
+            return deadline.completed_process(args, "", "")
+        raise
     try:
         first_communicate = True
         while True:
@@ -2546,21 +2543,19 @@ def run_with_stream(
     terminal = "collector_failure"
     try:
         deadline = deadline or EngineRuntimeDeadline(label, None)
-        with deferred_owned_process_signals():
-            proc = subprocess.Popen(
-                args,
-                cwd=cwd,
+        try:
+            proc = start_owned_process(
+                args, cwd, deadline=deadline.expires_at,
                 stdin=subprocess.PIPE if input_text is not None else None,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding=SUBPROCESS_TEXT_ENCODING,
-                errors=SUBPROCESS_TEXT_ERRORS,
-                bufsize=1,
-                env=env,
-                **process_group_popen_kwargs(),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                encoding=SUBPROCESS_TEXT_ENCODING, errors=SUBPROCESS_TEXT_ERRORS,
+                bufsize=1, env=env,
             )
-            register_owned_process(proc)
+        except subprocess.TimeoutExpired:
+            if deadline.expired():
+                terminal = "engine_timeout"
+                return deadline.completed_process(args, "", "")
+            raise
         collection_entered = False
         try:
             if engine_stage is not None:
@@ -2923,15 +2918,14 @@ def preflight_git() -> bool:
                   else "executable or environment missing or untrusted")
     else:
         try:
-            with deferred_owned_process_signals():
-                proc = subprocess.Popen(
-                    [selected, "--version"], cwd=repo, env=git_env,
-                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL, **process_group_popen_kwargs(),
-                )
-                register_owned_process(proc)
+            expires_at = time.monotonic() + 10
+            proc = start_owned_process(
+                [selected, "--version"], repo, deadline=expires_at, env=git_env,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
             try:
-                code = proc.wait(timeout=10)
+                code = proc.wait(timeout=max(0, expires_at - time.monotonic()))
                 if code == 0:
                     return True
                 reason = f"exit {code}"
@@ -2941,6 +2935,8 @@ def preflight_git() -> bool:
                 with contextlib.suppress(PermissionError):
                     terminate_process_group(proc, grace_seconds=0.1)
                 unregister_owned_process(proc)
+        except subprocess.TimeoutExpired:
+            reason = "timed out after 10s"
         except OSError as exc:
             reason = f"could not execute (errno {exc.errno})"
     print(
@@ -10489,10 +10485,7 @@ def main_with_args(args: argparse.Namespace) -> int:
     token = UNTRUSTED_SOURCE_ROOTS.set(args._review_source_roots)
     metadata_token = SOURCE_METADATA_BINDINGS.set(bindings)
     external_token = EXTERNAL_SOURCE_REVIEW.set(bool(args.external_source_manifests))
-    cleanup_token = None
     try:
-        if os.name == "nt":
-            cleanup_token = WINDOWS_TASKKILL.set(_capture_windows_taskkill(root))
         if args.external_source_manifests:
             # Some platform launch/cleanup code reads these directly from the host
             # environment. Refuse source-owned values before creating any process.
@@ -10502,8 +10495,6 @@ def main_with_args(args: argparse.Namespace) -> int:
                     raise SystemExit(f"{key} must be outside reviewed source roots")
         return main_with_source_boundary(args, root)
     finally:
-        if cleanup_token is not None:
-            WINDOWS_TASKKILL.reset(cleanup_token)
         EXTERNAL_SOURCE_REVIEW.reset(external_token)
         SOURCE_METADATA_BINDINGS.reset(metadata_token)
         UNTRUSTED_SOURCE_ROOTS.reset(token)
