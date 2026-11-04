@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 
 _CHILD_MARKER = "AGENT_SKILLS_WINDOWS_TEST_CHILD"
@@ -518,7 +519,7 @@ def _restricted_primary(api, source):
         api.kernel.CloseHandle(restricted)
 
 
-def _launch(api, token, command, environment):
+def _launch(api, token, command, environment, *, timeout=None):
     c, w = api.c, api.w
     startup = api.StartupInfoEx()
     startup.startup.cb = c.sizeof(startup.startup)
@@ -607,8 +608,15 @@ def _launch(api, token, command, environment):
             block, os.getcwd(), c.byref(startup.startup), c.byref(process),
         ):
             raise c.WinError(c.get_last_error())
+        # The process owner enforces the proof deadline. Killing an outer
+        # capture process would leave this child holding its output pipes open.
+        deadline = None if timeout is None else time.monotonic() + timeout
         while True:
-            waited = api.kernel.WaitForSingleObject(process.process, 1000)
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            wait_ms = 1000 if remaining is None else min(1000, max(1, int(remaining * 1000)))
+            waited = api.kernel.WaitForSingleObject(process.process, wait_ms)
             if waited == 0:
                 finished = True
                 break
@@ -620,9 +628,13 @@ def _launch(api, token, command, environment):
         return c.c_int32(code.value).value
     finally:
         try:
+            cleanup_error = None
             if process.process and not finished:
-                api.kernel.TerminateProcess(process.process, 130)
-                api.kernel.WaitForSingleObject(process.process, 5000)
+                if not api.kernel.TerminateProcess(process.process, 130):
+                    cleanup_error = c.WinError(c.get_last_error())
+                waited = api.kernel.WaitForSingleObject(process.process, 5000)
+                if waited != 0 and cleanup_error is None:
+                    cleanup_error = RuntimeError("native test child did not terminate within cleanup deadline")
             if process.thread:
                 api.kernel.CloseHandle(process.thread)
             if process.process:
@@ -631,6 +643,8 @@ def _launch(api, token, command, environment):
                 api.kernel.DeleteProcThreadAttributeList(startup.attributes)
             for handle in handles:
                 api.kernel.CloseHandle(handle)
+            if cleanup_error is not None:
+                raise cleanup_error
         finally:
             accept_shared_interrupt = False
             if control_registered:

@@ -292,6 +292,29 @@ if mode == "parent-streams-subject":
     raise SystemExit(29)
 
 
+if mode == "deadline-parent":
+    import subprocess
+    command = [sys.executable, "-u", "-I", "-S", "-B", "-X", "utf8=1",
+               str(Path(__file__).resolve()), helper_path, "deadline-leaf", receipt_path]
+    with helper["_process_token"](api, for_launch=True) as source:
+        with helper["_restricted_primary"](api, source) as restricted:
+            try:
+                helper["_launch"](api, restricted, command, helper["_native_environment_block"](api),
+                                  timeout=5)
+            except subprocess.TimeoutExpired:
+                Path(receipt_path).write_text(json.dumps({"timed_out": True}), encoding="utf-8")
+                raise SystemExit(31)
+    raise AssertionError("stalled native child did not reach its owned deadline")
+
+if mode == "deadline-leaf":
+    import time
+    print("native child holds stdout", flush=True)
+    print("native child holds stderr", file=sys.stderr, flush=True)
+    # Bounded even on a regression: this fixture must not leak a permanent child.
+    time.sleep(30)
+    raise SystemExit(29)
+
+
 if mode == "environment-seed":
     marker = helper["_CHILD_MARKER"]
     entries = [entry for entry in raw_entries()
@@ -378,6 +401,18 @@ class NativeLaunchProofs(unittest.TestCase):
         self.assertEqual(result.returncode, expected_exit, result.stdout + result.stderr)
         result_path = Path(str(receipt) + receipt_suffix)
         return result, json.loads(result_path.read_text(encoding="utf-8")), receipt
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows process creation")
+    def test_owned_deadline_terminates_reduced_child_and_closes_capture_pipes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            started = time.monotonic()
+            result, data, _ = self.run_driver(Path(directory), "deadline-parent", expected_exit=31)
+            # Completion before the leaf's natural exit proves it no longer
+            # holds either pipe; both readiness lines prove the child ran.
+            self.assertLess(time.monotonic() - started, 20)
+            self.assertEqual(data, {"timed_out": True})
+            self.assertEqual(result.stdout, "native child holds stdout\n")
+            self.assertEqual(result.stderr, "native child holds stderr\n")
 
     @unittest.skipUnless(os.name == "nt", "requires native Windows process creation")
     def test_native_environment_retains_hidden_drive_and_replaces_marker(self):
@@ -600,17 +635,29 @@ class NativeParentTests(unittest.TestCase):
 
     def test_autoreview_product_custody_before_primary_restriction(self):
         proof = Path(__file__).resolve().with_name("windows-product-custody.test.py")
-        result = subprocess.run(
-            [sys.executable, "-u", "-I", "-S", "-B", "-X", "utf8=1", str(proof)],
-            capture_output=True, encoding="utf-8", errors="replace", timeout=60,
-        )
-        # Keep native CI evidence explicit: an inapplicable local negative is
-        # reported as skipped, while the real reduced-child control still runs.
-        for stream, output in ((sys.stdout, result.stdout), (sys.stderr, result.stderr)):
+        # File-backed capture cannot wait for pipe EOF if native cleanup fails
+        # and a reduced child survives the proof interpreter. Read only the
+        # extent present when the interpreter exits, then report its failure.
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            result = subprocess.run(
+                [sys.executable, "-u", "-I", "-S", "-B", "-X", "utf8=1", str(proof)],
+                stdout=stdout_file, stderr=stderr_file,
+            )
+            outputs = []
+            for captured in (stdout_file, stderr_file):
+                extent = os.fstat(captured.fileno()).st_size
+                captured.seek(0)
+                outputs.append(captured.read(extent).decode("utf-8", errors="replace"))
+        for stream, output in zip((sys.stdout, sys.stderr), outputs):
             if stream is not None:
                 stream.write(output)
                 stream.flush()
         self.assertEqual(result.returncode, 0, "native product custody proof failed; see output")
+        self.assertIn("Verified product custody admission for real reduced primary.", outputs[0])
+        before = HELPER["windows_test_process_status"]()
+        if before["nonordinary_privileges"] or os.environ.get("GITHUB_ACTIONS") == "true":
+            self.assertIn("Verified product custody refusal for privileged primary and restricted thread.",
+                          outputs[0])
 
     def test_parent_reporting_handles_absent_streams_before_real_child_launch(self):
         self.assertFalse(HELPER["windows_test_process_status"]()["eligible"],

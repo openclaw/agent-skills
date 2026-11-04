@@ -45,6 +45,11 @@ class NativeProductCustodyTests(unittest.TestCase):
         before = BOOTSTRAP["windows_test_process_status"]()
         self.assertTrue(before["primary_token"])
         self.assertFalse(before["thread_impersonating"])
+        if not before["nonordinary_privileges"]:
+            self.assertNotEqual(os.environ.get("GITHUB_ACTIONS"), "true",
+                                "hosted qualification requires the privileged negative proof")
+            self.skipTest("ordinary primary has no nonordinary privilege; negative proof inapplicable")
+        self.assertFalse(before["primary_eligible"])
         original = self.library.stat()
 
         api = self.api
@@ -60,51 +65,58 @@ class NativeProductCustodyTests(unittest.TestCase):
                 self.assertTrue(reduced["primary_eligible"])
                 self.assertTrue(reduced["owner_sid"] == reduced["user_sid"],
                                 "restricted token owner must be its user")
-                with self.subTest(proof="privileged-primary-refusal"):
-                    if not before["nonordinary_privileges"]:
-                        self.skipTest("ordinary primary has no nonordinary privilege; negative proof inapplicable")
-                    self.assertFalse(before["primary_eligible"])
-                    self.assert_product_custody(False)
-                    impersonation = api.w.HANDLE()
-                    if not duplicate(restricted, 2, api.c.byref(impersonation)):
+                self.assert_product_custody(False)
+                impersonation = api.w.HANDLE()
+                if not duplicate(restricted, 2, api.c.byref(impersonation)):
+                    raise api.c.WinError(api.c.get_last_error())
+                installed = False
+                try:
+                    if not install(None, impersonation):
                         raise api.c.WinError(api.c.get_last_error())
-                    installed = False
+                    installed = True
+                    during = BOOTSTRAP["windows_test_process_status"]()
+                    self.assertTrue(during["thread_impersonating"])
+                    self.assertTrue(during["primary_token_id"] == before["primary_token_id"],
+                                    "impersonation changed the parent primary token")
+                    # Reverting this thread restores privileged authority. A
+                    # thread-only product check would incorrectly accept it.
+                    self.assert_product_custody(False)
+                finally:
                     try:
-                        if not install(None, impersonation):
+                        if installed and not install(None, None):
                             raise api.c.WinError(api.c.get_last_error())
-                        installed = True
-                        during = BOOTSTRAP["windows_test_process_status"]()
-                        self.assertTrue(during["thread_impersonating"])
-                        self.assertTrue(during["primary_token_id"] == before["primary_token_id"],
-                                        "impersonation changed the parent primary token")
-                        # Reverting this thread restores privileged authority. A
-                        # thread-only product check would incorrectly accept it.
-                        self.assert_product_custody(False)
                     finally:
-                        try:
-                            if installed and not install(None, None):
-                                raise api.c.WinError(api.c.get_last_error())
-                        finally:
-                            api.kernel.CloseHandle(impersonation)
-                    print("Verified product custody refusal for privileged primary and restricted thread.",
-                          flush=True)
-
-                # The same reduced token must really satisfy the product's
-                # ACL/ownership contract when it becomes a child's primary.
-                # This is a native process, not a mocked AccessCheck result.
-                command = [sys.executable, "-u", "-I", "-S", "-B", "-X", "utf8=1",
-                           str(Path(__file__).resolve()),
-                           "--reduced-child", str(self.library)]
-                code = BOOTSTRAP["_launch"](
-                    api, restricted, command, BOOTSTRAP["_native_environment_block"](api),
-                )
-                self.assertEqual(code, 0, "reduced primary failed the real product positive control")
+                        api.kernel.CloseHandle(impersonation)
+                print("Verified product custody refusal for privileged primary and restricted thread.",
+                      flush=True)
 
         self.assertTrue(BOOTSTRAP["windows_test_process_status"]() == before,
                         "product proof changed the parent token")
         after = self.library.stat()
         self.assertEqual((original.st_dev, original.st_ino, original.st_size, original.st_mtime_ns),
                          (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns))
+
+    def test_real_reduced_child_admits_system_library(self):
+        before = BOOTSTRAP["windows_test_process_status"]()
+        original = self.library.stat()
+        # Run independently of the privileged negative: an inapplicable local
+        # negative must not skip this actual reduced-primary positive control.
+        command = [sys.executable, "-u", "-I", "-S", "-B", "-X", "utf8=1",
+                   str(Path(__file__).resolve()), "--reduced-child", str(self.library)]
+        api = self.api
+        with BOOTSTRAP["_process_token"](api, for_launch=True) as source:
+            with BOOTSTRAP["_restricted_primary"](api, source) as restricted:
+                code = BOOTSTRAP["_launch"](
+                    api, restricted, command, BOOTSTRAP["_native_environment_block"](api),
+                    timeout=30,
+                )
+                self.assertEqual(code, 0, "reduced primary failed the real product positive control")
+        self.assertEqual(BOOTSTRAP["windows_test_process_status"](), before,
+                         "product proof changed the parent token")
+        after = self.library.stat()
+        self.assertEqual((original.st_dev, original.st_ino, original.st_size, original.st_mtime_ns),
+                         (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns))
+        print("Verified product custody admission for real reduced primary.", flush=True)
 
     def test_reduced_primary_positive_control(self):
         self.assertEqual(self.library, Path(EXPECTED_LIBRARY),
@@ -123,7 +135,8 @@ if __name__ == "__main__":
         EXPECTED_LIBRARY = sys.argv[2]
         selected = "NativeProductCustodyTests.test_reduced_primary_positive_control"
     elif len(sys.argv) == 1:
-        selected = "NativeProductCustodyTests.test_privileged_primary_remains_authoritative"
+        selected = ("NativeProductCustodyTests.test_privileged_primary_remains_authoritative",
+                    "NativeProductCustodyTests.test_real_reduced_child_admits_system_library")
     else:
         raise SystemExit("unexpected native custody proof arguments")
     unittest.main(argv=[sys.argv[0]], defaultTest=selected, verbosity=2)

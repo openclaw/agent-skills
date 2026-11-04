@@ -259,13 +259,18 @@ in the waiting parent. The restricted child runs the requested suites and
 the regular invocation check. Bootstrap checks establish the test process boundary.
 A separate autoreview proof calls the real shared-file admission policy before
 restriction: the privileged parent and its restricted thread must refuse the
-same system DLL that an ordinary primary child admits. Hosted Windows CI must
-execute the privileged-negative subcase without a skip. An ordinary local primary
-without nonordinary privileges skips only that inapplicable subcase; the real
-reduced-child positive control still runs. Missing native fixtures or failed
-operations fail the proof. The bootstrap retains user identity grants and does
-not provision accounts or
-rewrite file or desktop permissions. Hosts that require removed administrative
+same system DLL that an ordinary primary child admits. When selected on hosted
+Windows CI, this pre-restriction proof requires the privileged-negative subcase
+without a skip and reports completion of both controls. A local parent needing restriction but lacking nonordinary
+privileges skips only the negative; the separate reduced-child control still runs.
+An already ordinary local invocation uses the regular suite's real system-DLL
+custody tests rather than launching the pre-restriction proof. The dedicated proof
+sets a 30-second deadline where the reduced process handle is owned and attempts
+to terminate the child on timeout. Failed termination or a cleanup wait exceeding
+five seconds fails the proof. File-backed output capture lets the caller report
+that failure even if the child still holds its output handles. Missing native
+fixtures or failed operations also fail the proof. The bootstrap retains user
+identity grants and does not provision accounts or rewrite file or desktop permissions. Hosts that require removed administrative
 grants for their interpreter or checkout must fix that access before testing.
 
 Compilation uses a disposable bytecode cache instead of writing into the source
