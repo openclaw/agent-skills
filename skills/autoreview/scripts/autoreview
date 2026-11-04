@@ -7384,6 +7384,9 @@ def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         prefix="autoreview-claude-workspace.",
         dir=safe_temp_root(repo),
     ) as tempdir:
+        # Capability probes run after capture; recheck before sending the prompt.
+        if before_send := getattr(args, "_verify_review_inputs", None):
+            before_send()
         result = run_with_heartbeat(
             cmd,
             Path(tempdir),
@@ -7991,6 +7994,9 @@ def run_pi(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         prefix="autoreview-pi-run.",
         dir=safe_temp_root(repo),
     ) as tempdir:
+        # Capability probes run after capture; recheck before sending the prompt.
+        if before_send := getattr(args, "_verify_review_inputs", None):
+            before_send()
         result = run_with_heartbeat(
             cmd,
             Path(tempdir),

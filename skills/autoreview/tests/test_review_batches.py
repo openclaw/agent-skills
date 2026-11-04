@@ -156,6 +156,72 @@ class ReviewBatchTests(unittest.TestCase):
             yield repo, upstream, source, manifest
 
 
+    @unittest.skipUnless(os.name == "posix", "uses an inert local shell wrapper")
+    def test_claude_and_pi_recheck_external_evidence_after_capability_probe(self):
+        for engine in ("claude", "pi"):
+            for mutation in ("source", "manifest", None):
+                with self.subTest(engine=engine, mutation=mutation), self.external_fixture() as fixture:
+                    repo, _, source, _ = fixture
+                    trusted = repo.parent / "trusted-bin"
+                    trusted.mkdir()
+                    probes = repo.parent / "help-probes.txt"
+                    sent = repo.parent / "sent.json"
+                    program = trusted / "engine-fixture.py"
+                    # The live runner probes capabilities after evidence capture.
+                    # Mutate there, before the child can receive the prompt.
+                    # The child records stdin and stops, without model execution.
+                    program.write_text(
+                        "import json, sys\nfrom pathlib import Path\n"
+                        f"mutation = {mutation!r}\nsource = Path({str(source)!r})\n"
+                        f"manifest = Path({str(repo / '.review/external.json')!r})\n"
+                        f"probes = Path({str(probes)!r})\nsent = Path({str(sent)!r})\n"
+                        "args = sys.argv[1:]\n"
+                        "if '--version' in args:\n"
+                        "    print('99.0.0')\n"
+                        "elif '--help' in args:\n"
+                        "    count = int(probes.read_text()) + 1 if probes.exists() else 1\n"
+                        "    probes.write_text(str(count))\n"
+                        "    if count == 1 and mutation == 'source':\n"
+                        "        source.write_text('// changed during capability probe\\n')\n"
+                        "    elif count == 1 and mutation == 'manifest':\n"
+                        "        manifest.unlink()\n"
+                        "    print('--safe-mode --setting-sources --strict-mcp-config --disallowedTools --tools "
+                        "--print --no-approve --no-session --no-context-files --no-extensions "
+                        "--no-skills --no-prompt-templates --no-themes --no-tools --thinking')\n"
+                        "elif '--print' in args:\n"
+                        "    prompt = sys.stdin.read()\n"
+                        "    sent.write_text(json.dumps({'external_contract_received': '// full external contract' in prompt}))\n"
+                        "    sys.exit(17)\n"
+                        "else:\n"
+                        "    raise SystemExit('unexpected fixture arguments')\n"
+                    )
+                    wrapper = trusted / engine
+                    wrapper.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable)
+                                       + " -S " + shlex.quote(str(program)) + ' "$@"\n')
+                    wrapper.chmod(0o700)
+                    result = subprocess.run(
+                        [sys.executable, "-S", str(SCRIPT), "--mode", "branch", "--base", "HEAD^",
+                         "--engine", engine, "--" + engine + "-bin", str(wrapper),
+                         "--external-source-context-file", ".review/external.json",
+                         "--json-output", str(repo.parent / "result.json")],
+                        cwd=repo, env=os.environ.copy(), capture_output=True, text=True, timeout=90,
+                    )
+                    output = result.stdout + result.stderr
+                    self.assertTrue(probes.exists(), output)
+                    self.assertEqual(probes.read_text(), "1", output)
+                    self.assertNotEqual(result.returncode, 0, output)
+                    self.assertFalse((repo.parent / "result.json").exists(), output)
+                    if mutation:
+                        self.assertFalse(sent.exists(), "changed evidence reached the reviewer")
+                        self.assertIn("evidence changed", output)
+                        if mutation == "source":
+                            self.assertEqual(source.read_text(), "// changed during capability probe\n")
+                        else:
+                            self.assertFalse((repo / ".review/external.json").exists())
+                    else:
+                        self.assertTrue(sent.exists(), output)
+                        self.assertEqual(json.loads(sent.read_text()), {"external_contract_received": True})
+
     @contextlib.contextmanager
     def primary_linked_fixture(self):
         with self.external_fixture() as (repo, upstream, _, manifest):
