@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import process from "node:process";
@@ -9,6 +9,7 @@ import {
   resolveCodexSession,
   sanitizeVisibleText,
 } from "./beam-session.js";
+import { openHandoffs, releaseSource, transferredReceipt, useDestination } from "./beam-handoff.js";
 
 const MAX_UPLOAD_BYTES = 52 * 1024;
 const MAX_UPLOAD_ITEMS = 200;
@@ -19,6 +20,9 @@ function usage() {
   console.log(`Usage:
   beam publish --endpoint URL [--session FILE | --session-id ID | --thread-id ID] [--title TEXT] [--complete] [--dry-run]
   beam hook --endpoint URL [--quiet] [--dry-run]
+  beam handoff --endpoint URL [--session FILE | --session-id ID | --thread-id ID]
+  beam read --endpoint URL --beam-id ID --profile-dir DIR
+  beam continue --endpoint URL --beam-id ID --profile-dir DIR --message TEXT [--request-id ID]
 
 Environment:
   BEAM_ENDPOINT       Default receiver URL
@@ -250,6 +254,7 @@ function buildPayload(options, hook) {
       completed: Boolean(options.complete || hookEvent === "SessionEnd"),
       ...(rendered.truncated ? { truncated: true } : {}),
       ...(hookEvent ? { hookEvent } : {}),
+      ...(rendered.sourceModel ? { sourceModel: rendered.sourceModel } : {}),
       items,
     },
     positiveInteger(options["max-chars"], 48_000, "--max-chars", 32),
@@ -315,9 +320,10 @@ function endpointUrl(options) {
   const raw = options.endpoint || process.env.BEAM_ENDPOINT;
   if (!raw) throw new Error("--endpoint or BEAM_ENDPOINT is required");
   const url = new URL(raw);
-  if (url.protocol !== "https:" && !isLoopbackUrl(url)) {
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopbackUrl(url))) {
     throw new Error("Beam endpoints must use HTTPS unless they are loopback-local");
   }
+  if (url.username || url.password || url.search || url.hash) throw new Error("Beam endpoint must not contain credentials, query parameters or a fragment");
   return url;
 }
 
@@ -396,12 +402,15 @@ async function publish(payload, options) {
   } catch {
     throw new Error(`Beam receiver returned invalid JSON (HTTP ${response.status})`);
   }
-  if (!response.ok || result?.ok === false) {
+  if ((!response.ok || result?.ok === false) && !(response.status === 409 && transferredReceipt(result))) {
     const message = safeReceiverMessage(result?.error, `HTTP ${response.status}`, auth.secrets);
     throw new Error(`Beam upload failed: ${message}`);
   }
   if (Object.hasOwn(result, "canView") && typeof result.canView !== "boolean") {
     throw new Error("Beam receiver returned an invalid canView receipt field");
+  }
+  if (Object.hasOwn(result, "handoff") && (!transferredReceipt(result) || result.beamId !== payload.beamId || typeof result.url !== "string")) {
+    throw new Error("Beam receiver returned an invalid handoff receipt");
   }
   if (typeof result.url === "string") {
     const printableUrl = printableReceiverText(result.url);
@@ -428,7 +437,7 @@ async function main() {
     usage();
     return;
   }
-  if (command !== "publish" && command !== "hook") {
+  if (!["publish", "hook", "handoff", "read", "continue"].includes(command)) {
     usage();
     process.exitCode = 2;
     return;
@@ -443,12 +452,57 @@ async function main() {
   ) {
     return;
   }
-  const payload = buildPayload(options, hook);
-  const result = await publish(payload, options);
+  const payload = ["handoff", "read", "continue"].includes(command) && options["beam-id"]
+    ? { beamId: options["beam-id"] }
+    : buildPayload(options, hook);
+  if (!/^[a-f0-9]{32}$/.test(payload.beamId)) throw new Error("--beam-id must be a 32-character lowercase hex ID");
+  if (options["dry-run"]) {
+    if (!["publish", "hook"].includes(command)) throw new Error("--dry-run is only supported for snapshot publishing; no ownership change was made");
+    await publish(payload, options);
+    return;
+  }
+  const endpoint = endpointUrl(options).href;
+  let state = await openHandoffs(options, !["publish", "hook"].includes(command));
+  let result;
+  try {
+    if (command === "read" || command === "continue") {
+      if (command === "continue" && (typeof options.message !== "string" || !options.message.trim() || options.message.length > 32_000)) throw new Error("--message must contain 1-32000 characters");
+      if (command === "continue") {
+        options["request-id"] ||= randomUUID();
+        if (typeof options["request-id"] !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(options["request-id"])) throw new Error("--request-id must contain 1-128 letters, digits, underscores or hyphens");
+        console.error(`Beam request ID: ${options["request-id"]}; reuse --request-id after an uncertain send.`);
+      }
+      result = useDestination(state, endpoint, payload.beamId, options, command === "continue" ? options.message : undefined);
+      console.log(JSON.stringify(result));
+      return;
+    }
+    if (command === "handoff") {
+      result = await releaseSource(state, endpoint, payload, (frozen) => publish(frozen, options));
+    } else {
+      const retired = state?.get(endpoint, payload.beamId);
+      if (retired) {
+        if (!retired.receipt) throw new Error("Source retired with handoff pending. Retry handoff at this endpoint; do not publish or continue the local transcript.");
+        result = JSON.parse(retired.receipt);
+      } else {
+        result = await publish(payload, options);
+        if (transferredReceipt(result)) {
+          state ??= await openHandoffs(options);
+          state.begin(endpoint, payload);
+          state.acknowledge(endpoint, payload.beamId, result);
+        }
+      }
+    }
+  } finally {
+    state?.close();
+  }
+  if (options.quiet && transferredReceipt(result)) {
+    console.error(`Source Beam is retired. Use beam read/continue --beam-id ${payload.beamId} at this endpoint with your normal remote profile.`);
+  }
   if (!options.quiet) {
     const target = result.url || payload.beamId;
-    if (options["dry-run"]) {
-      console.log("Beam dry run complete.");
+    if (transferredReceipt(result)) {
+      console.log(`Conversation handed to Team: ${target}`);
+      console.log(`Source Beam is retired. Use beam read/continue --beam-id ${payload.beamId} with your own normal remote profile.`);
     } else if (result.canView === false) {
       console.log(`Beam upload succeeded: ${target}`);
       console.log("This link is for authorized Team operators; upload-only access does not let you open it.");

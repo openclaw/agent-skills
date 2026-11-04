@@ -681,6 +681,7 @@ function parseClaude(rows, options) {
   const items = [];
   const stats = { redactions: 0, toolCalls: 0, toolOutputsDropped: 0, toolFamilies: {} };
   let identity = null;
+  let sourceModel;
   for (const row of activeClaudeRows(rows)) {
     if (!isRecord(row)) continue;
     if (!identity && typeof row.sessionId === "string") identity = row.sessionId;
@@ -690,6 +691,8 @@ function parseClaude(rows, options) {
     const message = isRecord(row.message) ? row.message : row;
     if (message.isMeta === true || message.isCompactSummary === true) continue;
     const role = String(message.role || row.type || "").toLowerCase();
+    // Claude assistant messages carry the Anthropic SDK's response model ID.
+    if (role === "assistant") sourceModel = beamSourceModel("anthropic", message.model) || sourceModel;
     const content = message.content;
     if (Array.isArray(content)) {
       for (const block of content) {
@@ -703,7 +706,12 @@ function parseClaude(rows, options) {
     if (role === "user") pushMessage(items, "userMessage", visibleText(content ?? message), stats, options.maxChars);
     if (role === "assistant") pushMessage(items, "agentMessage", visibleText(content ?? message), stats, options.maxChars);
   }
-  return { source: "claude", identity, items, stats };
+  return { source: "claude", identity, items, stats, ...(sourceModel ? { sourceModel } : {}) };
+}
+
+function beamSourceModel(provider, model) {
+  if (typeof provider !== "string" || !/^[a-z0-9._-]{1,64}$/i.test(provider) || typeof model !== "string" || !/^[a-z0-9][a-z0-9._:/-]{0,255}$/i.test(model) || sanitizeVisibleText(model, { maxChars: 256 }) !== model) return undefined;
+  return { provider: provider.toLowerCase(), model };
 }
 
 function normalizedType(value) {
@@ -740,6 +748,8 @@ function parseCodex(rows, options) {
   const items = [];
   const stats = { redactions: 0, toolCalls: 0, toolOutputsDropped: 0, toolFamilies: {} };
   let identity = null;
+  let provider;
+  let sourceModel;
   const hasEventDialogue = rows.some((row) => {
     if (row?.type !== "event_msg") return false;
     const type = normalizedType(row?.payload?.type);
@@ -755,6 +765,11 @@ function parseCodex(rows, options) {
     const payload = isRecord(row.payload) ? row.payload : {};
     if (row.type === "session_meta" && typeof payload.id === "string") {
       identity = payload.id;
+      provider = payload.model_provider;
+      continue;
+    }
+    if (row.type === "turn_context") {
+      sourceModel = beamSourceModel(provider, payload.model) || sourceModel;
       continue;
     }
     if (row.type === "event_msg") {
@@ -782,7 +797,7 @@ function parseCodex(rows, options) {
     if (type.includes("output")) stats.toolOutputsDropped++;
     else if (type) addTool(stats, payload.name || payload.type);
   }
-  return { source: "codex", identity, items, stats };
+  return { source: "codex", identity, items, stats, ...(sourceModel ? { sourceModel } : {}) };
 }
 
 function toolSummary(stats) {

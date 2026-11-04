@@ -1524,3 +1524,19 @@ test("copied Beam runs inside a CommonJS project without dependencies", () => {
   });
   assert.match(output, /Usage:/);
 });
+
+
+test("source model metadata follows the native conversation without exporting account settings", () => {
+  const dir = tempDir();
+  const file = path.join(dir, "model-session.jsonl");
+  writeJsonl(file, [
+    { type: "session_meta", payload: { id: "model-thread", model_provider: "openai", settings: { token: "not-exported" } } },
+    { type: "turn_context", payload: { model: "gpt-6.1-sol" } },
+    { type: "event_msg", payload: { type: "user_message", message: "Continue the task" } },
+  ]);
+  assert.deepEqual(renderSession(file, { source: "codex" }).sourceModel, { provider: "openai", model: "gpt-6.1-sol" });
+  writeJsonl(file, [
+    { type: "assistant", sessionId: "model-session", message: { role: "assistant", model: "claude-opus-4-6", content: "Result" } },
+  ]);
+  assert.deepEqual(renderSession(file, { source: "claude" }).sourceModel, { provider: "anthropic", model: "claude-opus-4-6" });
+});
