@@ -31,7 +31,9 @@ class NativeProductCustodyTests(unittest.TestCase):
     def assert_product_custody(self, expected):
         # Exercise the real path-admission caller too: the DLL must reach the
         # shared-inode policy, not succeed through the single-link fast path.
-        self.assertIs(PRODUCT["windows_file_custody"](self.library), expected)
+        rejections = []
+        self.assertIs(PRODUCT["windows_file_custody"](self.library, on_rejection=rejections.append), expected)
+        self.assertEqual(rejections, [] if expected else ["primary token has nonordinary privileges"])
         self.assertIs(PRODUCT["independent_file_custody"](self.library), expected)
         # Create this boundary under the current token. An elevated parent's
         # private directory may not be accessible while impersonating a child.

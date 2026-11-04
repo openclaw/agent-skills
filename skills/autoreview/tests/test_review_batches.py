@@ -2350,7 +2350,10 @@ class WindowsHardlinkCustodyTests(unittest.TestCase):
                 for readonly in (False, True):
                     with self.subTest(readonly=readonly):
                         original.chmod(stat.S_IREAD if readonly else stat.S_IREAD | stat.S_IWRITE)
-                        self.assertFalse(self.helper["windows_file_custody"](alias))
+                        rejections = []
+                        self.assertFalse(self.helper["windows_file_custody"](alias, on_rejection=rejections.append))
+                        self.assertEqual(len(rejections), 1)
+                        self.assertRegex(rejections[0], r"^primary token permits file mutation \(mask 0x[0-9a-f]+\)$")
                         with mock.patch.dict(os.environ, {"PATH": os.pathsep.join(map(str, (outside, clean)))}):
                             admitted = self.helper["safe_engine_path"](repo).split(os.pathsep)
                         self.assertNotIn(str(outside), admitted)
@@ -2500,8 +2503,10 @@ class WindowsHardlinkCustodyTests(unittest.TestCase):
         # restricted token inside an elevated process does not satisfy it.
         library = self.system_library()
         before = library.stat()
-        self.assertTrue(self.helper["windows_file_custody"](library),
+        rejections = []
+        self.assertTrue(self.helper["windows_file_custody"](library, on_rejection=rejections.append),
                         "run native positive proof with an unprivileged primary token")
+        self.assertEqual(rejections, [])
         after = library.stat()
         self.assertEqual((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns),
                          (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns))
@@ -2515,6 +2520,14 @@ class WindowsHardlinkCustodyTests(unittest.TestCase):
             self.assertIn(str(library.parent.resolve()), admitted)
             result = subprocess.run([str(binding.path), "/?"], capture_output=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_native_descriptor_failure_reports_only_stage_and_error(self):
+        with tempfile.TemporaryDirectory(prefix="autoreview-windows-custody-") as directory:
+            missing = Path(directory) / "missing.dll"
+            rejections = []
+            self.assertFalse(self.helper["windows_file_custody"](missing, on_rejection=rejections.append))
+            self.assertEqual(len(rejections), 1)
+            self.assertRegex(rejections[0], r"^security descriptor unavailable \(error [0-9]+\)$")
 
     def test_windows_restricted_thread_cannot_hide_primary_authority(self):
         for remove in (False, True):

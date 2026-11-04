@@ -829,24 +829,32 @@ def _windows_file_custody_api():
     return ctypes, wintypes, GenericMapping, LuidAndAttributes, tuple(privilege_ids), kernel, security
 
 
-def windows_file_custody(path: str | Path) -> bool:
+def windows_file_custody(
+    path: str | Path, *, on_rejection: Callable[[str], None] | None = None,
+) -> bool:
     """Deny mutation by either the primary or effective Windows identity."""
-    if os.name != "nt":
+    def deny(reason: str, error: int | None = None) -> bool:
+        if on_rejection is not None:
+            detail = reason if error is None else f"{reason} (error {error})"
+            on_rejection(detail)
         return False
+
+    if os.name != "nt":
+        return deny("native Windows required")
     try:
         (ctypes, wintypes, GenericMapping, LuidAndAttributes,
          privilege_ids, kernel, security) = _windows_file_custody_api()
-    except (AttributeError, OSError, ValueError):
-        return False
+    except (AttributeError, OSError, ValueError) as exc:
+        return deny("native custody API unavailable", getattr(exc, "winerror", None))
     primary = wintypes.HANDLE()
     thread = wintypes.HANDLE()
     descriptor = ctypes.c_void_p()
 
-    def token_has_custody(token) -> bool:
+    def token_has_custody(token, role: str) -> bool:
         impersonation = wintypes.HANDLE()
         try:
             if not security.DuplicateToken(token, 2, ctypes.byref(impersonation)):
-                return False  # SecurityImpersonation
+                return deny(f"{role} token duplication failed", ctypes.get_last_error())  # SecurityImpersonation
             # Disabled token privileges can be enabled without acquiring authority.
             # Enumerate the current token: PrivilegeCheck sees only enabled rights.
             # Removed privileges are absent from TOKEN_PRIVILEGES altogether.
@@ -857,22 +865,23 @@ def windows_file_custody(path: str | Path) -> bool:
                     impersonation, 3, available, len(available), ctypes.byref(available_length),
                 ))  # TokenPrivileges
             if not read_privileges():
-                if ctypes.get_last_error() != 122 or not len(available) < available_length.value <= 65536:
-                    return False
+                error = ctypes.get_last_error()
+                if error != 122 or not len(available) < available_length.value <= 65536:
+                    return deny(f"{role} token privilege inspection failed", error)
                 available = ctypes.create_string_buffer(available_length.value)
                 if not read_privileges():
-                    return False
+                    return deny(f"{role} token privilege inspection failed", ctypes.get_last_error())
             offset = ctypes.sizeof(wintypes.DWORD)
             if not offset <= available_length.value <= len(available):
-                return False
+                return deny(f"{role} token privilege buffer length invalid")
             count = wintypes.DWORD.from_buffer(available).value
             stride = ctypes.sizeof(LuidAndAttributes)
             if count > (available_length.value - offset) // stride:
-                return False
+                return deny(f"{role} token privilege buffer count invalid")
             for index in range(count):
                 privilege = LuidAndAttributes.from_buffer(available, offset + index * stride)
                 if (privilege.luid.low, privilege.luid.high) not in privilege_ids:
-                    return False
+                    return deny(f"{role} token has nonordinary privileges")
             # FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS.
             mapping = GenericMapping(0x00120089, 0x00120116, 0x001200A0, 0x001F01FF)
             privileges = ctypes.create_string_buffer(1024)
@@ -885,18 +894,23 @@ def windows_file_custody(path: str | Path) -> bool:
                     ctypes.byref(length), ctypes.byref(granted), ctypes.byref(allowed),
                 ))
             if not check():
-                if ctypes.get_last_error() != 122 or not len(privileges) < length.value <= 65536:
-                    return False
+                error = ctypes.get_last_error()
+                if error != 122 or not len(privileges) < length.value <= 65536:
+                    return deny(f"{role} token access check failed", error)
                 privileges = ctypes.create_string_buffer(length.value)
                 if not check():
-                    return False
+                    return deny(f"{role} token access check failed", ctypes.get_last_error())
             # MAXIMUM_ALLOWED detects ANY grant, including implicit owner rights;
             # testing a combined requested mask could hide a partial mutation grant.
             # Cover data, append, extended attributes, attributes (read-only removal),
             # DACL and owner changes. No open-for-write probe: loaded DLL sharing and
             # the read-only bit must not disguise an ACL that permits later mutation.
             mutation_rights = 0x0002 | 0x0004 | 0x0010 | 0x0100 | 0x00040000 | 0x00080000
-            return bool(allowed.value) and not (granted.value & mutation_rights)
+            if not allowed.value:
+                return deny(f"{role} token access check denied")
+            if granted.value & mutation_rights:
+                return deny(f"{role} token permits file mutation (mask {granted.value & mutation_rights:#x})")
+            return True
         finally:
             if impersonation.value:
                 kernel.CloseHandle(impersonation)
@@ -905,17 +919,21 @@ def windows_file_custody(path: str | Path) -> bool:
         # RevertToSelf restores the primary identity without obtaining new
         # authority. A restricted thread token must not hide primary rights.
         if not security.OpenProcessToken(kernel.GetCurrentProcess(), 0x000A, ctypes.byref(primary)):
-            return False  # TOKEN_QUERY | TOKEN_DUPLICATE
+            return deny("primary token unavailable", ctypes.get_last_error())  # TOKEN_QUERY | TOKEN_DUPLICATE
         if not security.OpenThreadToken(kernel.GetCurrentThread(), 0x000A, True, ctypes.byref(thread)):
-            if ctypes.get_last_error() != 1008:  # ERROR_NO_TOKEN
-                return False
+            error = ctypes.get_last_error()
+            if error != 1008:  # ERROR_NO_TOKEN
+                return deny("thread token unavailable", error)
         # SE_FILE_OBJECT; owner/group/DACL are all required by AccessCheck.
-        if security.GetNamedSecurityInfoW(str(path), 1, 0x0007, None, None, None, None,
-                                          ctypes.byref(descriptor)) != 0 or not descriptor.value:
-            return False
-        return token_has_custody(primary) and (not thread.value or token_has_custody(thread))
-    except (AttributeError, OSError, ValueError):
-        return False
+        status = security.GetNamedSecurityInfoW(str(path), 1, 0x0007, None, None, None, None,
+                                                ctypes.byref(descriptor))
+        if status != 0:
+            return deny("security descriptor unavailable", status)
+        if not descriptor.value:
+            return deny("security descriptor missing")
+        return token_has_custody(primary, "primary") and (not thread.value or token_has_custody(thread, "thread"))
+    except (AttributeError, OSError, ValueError) as exc:
+        return deny("native custody inspection failed", getattr(exc, "winerror", None))
     finally:
         if descriptor.value:
             kernel.LocalFree(descriptor)
@@ -935,12 +953,15 @@ def independent_file_custody(path: str | Path) -> bool:
     return _independent_file_custody(path, metadata)
 
 
-def _independent_file_custody(path: str | Path, metadata: os.stat_result) -> bool:
+def _independent_file_custody(
+    path: str | Path, metadata: os.stat_result, *,
+    on_rejection: Callable[[str], None] | None = None,
+) -> bool:
     try:
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink <= 1:
             return True
         if os.name == "nt":
-            return windows_file_custody(path)
+            return windows_file_custody(path, on_rejection=on_rejection)
         if sys.platform.startswith("linux"):
             # A thread can enable any permitted capability without acquiring
             # new authority, including SETUID to assume the file owner's UID.
@@ -1006,7 +1027,10 @@ def admit_executable_directories(
                         metadata = os.stat(child.path) if os.name == "nt" else child.stat()
                     except (FileNotFoundError, NotADirectoryError):
                         metadata = None
-                    if metadata is not None and not _independent_file_custody(child.path, metadata):
+                    if metadata is not None and not _independent_file_custody(
+                        child.path, metadata,
+                        on_rejection=lambda reason: reject(inspected, f"independent file custody required: {reason}"),
+                    ):
                         reject(inspected, "independent file custody required")
                         return None
                     needs_check = not child.is_file(follow_symlinks=False)
