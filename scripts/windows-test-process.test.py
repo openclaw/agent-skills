@@ -225,7 +225,7 @@ def synthetic_values():
 
 
 def launch(next_mode, block, extra=()):
-    command = [sys.executable, "-I", "-S", "-B", str(Path(__file__).resolve()),
+    command = [sys.executable, "-I", "-S", "-B", "-X", "utf8=1", str(Path(__file__).resolve()),
                helper_path, next_mode, receipt_path, *extra]
     with helper["_process_token"](api, for_launch=True) as source:
         with helper["_restricted_primary"](api, source) as restricted:
@@ -254,7 +254,7 @@ if mode == "parent-streams-seed":
                 handles.append(value)
             setattr(startup, field, value)
         startup.lpAttributeList = {"handle_list": handles} if handles else {}
-        command = [sys.executable, "-I", "-S", "-B", str(Path(__file__).resolve()),
+        command = [sys.executable, "-I", "-S", "-B", "-X", "utf8=1", str(Path(__file__).resolve()),
                    helper_path, "parent-streams-subject", receipt_path, *options]
         process, thread, _, _ = _winapi.CreateProcess(
             sys.executable, subprocess.list2cmdline(command), None, None, bool(handles),
@@ -371,9 +371,9 @@ class NativeLaunchProofs(unittest.TestCase):
         script.write_text(textwrap.dedent(NATIVE_LAUNCH_DRIVER), encoding="utf-8")
         receipt = root / "receipt.json"
         result = subprocess.run(
-            [sys.executable, "-I", "-S", "-B", str(script), str(HELPER_PATH),
+            [sys.executable, "-I", "-S", "-B", "-X", "utf8=1", str(script), str(HELPER_PATH),
              mode, str(receipt), *options],
-            input="retained stdin", text=True, capture_output=True, timeout=60,
+            input="retained stdin", text=True, encoding="utf-8", capture_output=True, timeout=60,
         )
         self.assertEqual(result.returncode, expected_exit, result.stdout + result.stderr)
         result_path = Path(str(receipt) + receipt_suffix)
@@ -607,9 +607,9 @@ class NativeParentTests(unittest.TestCase):
                 script.write_text(textwrap.dedent(NATIVE_LAUNCH_DRIVER), encoding="utf-8")
                 receipt = root / "child.json"
                 result = subprocess.run(
-                    [sys.executable, "-I", "-S", "-B", str(script), str(HELPER_PATH),
+                    [sys.executable, "-I", "-S", "-B", "-X", "utf8=1", str(script), str(HELPER_PATH),
                      "parent-streams-seed", str(receipt), absent, str(proof_exit)],
-                    capture_output=True, text=True, timeout=60,
+                    capture_output=True, text=True, encoding="utf-8", timeout=60,
                 )
                 self.assertEqual(result.returncode, proof_exit or 29, result.stdout + result.stderr)
                 self.assertEqual(Path(str(receipt) + ".parent").read_text(), "reported")
@@ -672,12 +672,12 @@ class NativeParentTests(unittest.TestCase):
             "parent_check=[sys.executable, '-I', '-X', 'utf8=1', '-c', 'raise SystemExit(23)'])\n"
             "raise SystemExit(status if status is not None else 99)\n"
         )
-        command = [sys.executable, "-I", "-S", "-c", code, str(Path(__file__).resolve())]
-        ordinary = subprocess.run(command, text=True, capture_output=True, timeout=30)
+        command = [sys.executable, "-I", "-S", "-X", "utf8=1", "-c", code, str(Path(__file__).resolve())]
+        ordinary = subprocess.run(command, text=True, encoding="utf-8", capture_output=True, timeout=30)
         self.assertEqual(ordinary.returncode, 23, ordinary.stdout + ordinary.stderr)
         forged = subprocess.run(
             command, env={**os.environ, HELPER["_CHILD_MARKER"]: "1"},
-            text=True, capture_output=True, timeout=30,
+            text=True, encoding="utf-8", capture_output=True, timeout=30,
         )
         self.assertEqual(forged.returncode, 2, forged.stdout + forged.stderr)
         self.assertIn("still has unsuitable native token authority", forged.stderr)
@@ -739,10 +739,10 @@ class WindowsTestProcessTests(unittest.TestCase):
             ]:
                 with self.subTest(flags=flags, absent_streams=bool(extra)):
                     result = subprocess.run(
-                        [sys.executable, "-S", *flags, str(script), *extra],
+                        [sys.executable, "-S", "-X", "utf8=1", *flags, str(script), *extra],
                         env={**{key: value for key, value in os.environ.items()
                                 if not key.upper().startswith("PYTHON")}, "PYTHONINSPECT": "1"},
-                        input="raise SystemExit(99)\n", text=True, capture_output=True, timeout=30,
+                        input="raise SystemExit(99)\n", text=True, encoding="utf-8", capture_output=True, timeout=30,
                     )
                     self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
                     self.assertEqual(result.stdout, expected)
@@ -884,10 +884,10 @@ class NativeThreadOnlyTests(unittest.TestCase):
                 print('clean thread-only child')
                 raise SystemExit(23)
                 """), encoding="utf-8")
-            result = subprocess.run([sys.executable, "-I", "-S", str(script)],
+            result = subprocess.run([sys.executable, "-I", "-S", "-X", "utf8=1", str(script)],
                                     env={key: value for key, value in os.environ.items()
                                          if key != "AGENT_SKILLS_TEST_THREAD_STAGE"},
-                                    text=True, capture_output=True, timeout=60)
+                                    text=True, encoding="utf-8", capture_output=True, timeout=60)
             self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
             self.assertEqual(result.stdout, "clean thread-only child\n")
 
@@ -908,8 +908,8 @@ class NativeParentExitTests(unittest.TestCase):
             f"parent_check=[sys.executable, '-I', '-S', '-X', 'utf8=1', '-c', {exit_code!r}])\n"
             "helper['exit_test_process'](status if status is not None else 99)\n"
         )
-        result = subprocess.run([sys.executable, "-I", "-S", "-c", code],
-                                text=True, capture_output=True, timeout=30)
+        result = subprocess.run([sys.executable, "-I", "-S", "-X", "utf8=1", "-c", code],
+                                text=True, encoding="utf-8", capture_output=True, timeout=30)
         self.assertEqual(result.returncode, 0xC0000005, result.stdout + result.stderr)
 
 
@@ -930,7 +930,7 @@ def _lifecycle_native_api(helper):
 
 
 def _lifecycle_native_launch(helper, api, arguments, *, interactive=False):
-    command = [sys.executable, "-I", "-S", "-B"]
+    command = [sys.executable, "-I", "-S", "-B", "-X", "utf8=1"]
     if interactive:
         command.append("-i")
     command += [str(Path(__file__).resolve()), "--native-lifecycle-leaf", *arguments]
@@ -1069,9 +1069,9 @@ class NativeLifecycleProofs(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "requires native Windows process creation")
     def test_all_null_launch_excludes_unrelated_inheritable_handle(self):
         result = subprocess.run(
-            [sys.executable, "-I", "-S", "-B", str(Path(__file__).resolve()),
+            [sys.executable, "-I", "-S", "-B", "-X", "utf8=1", str(Path(__file__).resolve()),
              "--native-lifecycle-driver", "all-null", str(HELPER_PATH)],
-            text=True, capture_output=True, timeout=40,
+            text=True, encoding="utf-8", capture_output=True, timeout=40,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stderr, "")
@@ -1084,11 +1084,11 @@ class NativeLifecycleProofs(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "requires an isolated native Windows console")
     def test_shared_ctrl_c_keeps_child_interactive_and_restores_wrapper_handler(self):
         result = subprocess.run(
-            [sys.executable, "-I", "-S", "-B", str(Path(__file__).resolve()),
+            [sys.executable, "-I", "-S", "-B", "-X", "utf8=1", str(Path(__file__).resolve()),
              "--native-lifecycle-driver", "ctrl-c", str(HELPER_PATH)],
             creationflags=subprocess.CREATE_NEW_CONSOLE,
             input="print('interactive command after Ctrl+C', flush=True); raise SystemExit(37)\n",
-            text=True, capture_output=True, timeout=40,
+            text=True, encoding="utf-8", capture_output=True, timeout=40,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         lines = result.stdout.splitlines()

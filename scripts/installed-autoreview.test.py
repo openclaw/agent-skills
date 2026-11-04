@@ -19,13 +19,25 @@ from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parent.parent
+_GIT_REPOSITORY_ENV = frozenset({
+    # Git's local_repo_env inventory, plus namespace/discovery overrides.
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+    "GIT_SHALLOW_FILE", "GIT_COMMON_DIR", "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+})
 
 
 def _source_git(*arguments: str) -> bytes:
     # Token restriction can remove Git's Administrators ownership exception.
     # Trust only this script's selected checkout, for this command alone.
+    environment = {key: value for key, value in os.environ.items()
+                   if key.upper() not in _GIT_REPOSITORY_ENV
+                   and not key.upper().startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))}
     return subprocess.check_output(
-        ["git", "-c", f"safe.directory={ROOT}", *arguments], cwd=ROOT,
+        ["git", "-c", f"safe.directory={ROOT}", *arguments], cwd=ROOT, env=environment,
     )
 
 
@@ -45,6 +57,63 @@ def tree(root: Path) -> dict[str, tuple[str, bytes | str | None]]:
 
 
 class InstalledAutoreviewTests(unittest.TestCase):
+    def test_source_reads_ignore_another_repositorys_environment(self) -> None:
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.upper().startswith("GIT_")}
+        environment.update(GIT_CONFIG_SYSTEM=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                           GIT_CONFIG_GLOBAL=os.devnull, LC_ALL="C", LANG="C")
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            other = scratch / "other repository"
+            other.mkdir()
+            config = scratch / "external.gitconfig"
+            config.write_text("[fixture]\n\tmarker = unchanged\n", encoding="utf-8")
+            environment["GIT_CONFIG_GLOBAL"] = str(config)
+
+            def git(*arguments: str) -> bytes:
+                return subprocess.check_output(["git", *arguments], cwd=other, env=environment,
+                                               stderr=subprocess.PIPE)
+
+            git("init", "--quiet")
+            (other / "foreign.txt").write_text("other source\n", encoding="utf-8")
+            git("add", "foreign.txt")
+            git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                "commit", "--quiet", "--no-gpg-sign", "--no-verify", "-m", "foreign source")
+            foreign_head = git("rev-parse", "HEAD")
+            config_before = config.read_bytes()
+            repo_config_before = (other / ".git/config").read_bytes()
+            selected = ["git", "-c", f"safe.directory={ROOT}"]
+            head = subprocess.check_output([*selected, "rev-parse", "HEAD"], cwd=ROOT,
+                                           env=environment)
+            self.assertNotEqual(head, foreign_head)
+            probe = (
+                "import runpy, sys\n"
+                "module = runpy.run_path(sys.argv[1])\n"
+                "sys.stdout.buffer.write(module['_source_git'](*sys.argv[2:]))\n"
+            )
+            conflicting = {**environment, "GIT_DIR": str(other / ".git"),
+                           "GIT_WORK_TREE": str(other), "GIT_COMMON_DIR": str(other / ".git"),
+                           "GIT_OBJECT_DIRECTORY": str(other / ".git/objects"),
+                           "GIT_INDEX_FILE": str(other / ".git/index")}
+            # Establish that the inherited overrides really select the foreign
+            # source before checking the two supported metadata reads.
+            self.assertEqual(subprocess.check_output(["git", "rev-parse", "HEAD"],
+                                                     cwd=ROOT, env=conflicting), foreign_head)
+            for arguments in (("rev-parse", "HEAD"), ("ls-tree", "-rz", head.decode("ascii").strip())):
+                with self.subTest(command=arguments[0]):
+                    expected = subprocess.check_output([*selected, *arguments], cwd=ROOT,
+                                                       env=environment)
+                    result = subprocess.run(
+                        [sys.executable, "-I", "-S", "-B", "-c", probe,
+                         str(Path(__file__).resolve()), *arguments],
+                        cwd=other, env=conflicting, capture_output=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+                    self.assertEqual(result.stdout, expected)
+            self.assertEqual(config.read_bytes(), config_before)
+            self.assertEqual((other / ".git/config").read_bytes(), repo_config_before)
+            self.assertEqual(git("rev-parse", "HEAD"), foreign_head)
+
     def test_source_reads_remain_scoped_when_git_rejects_ownership(self) -> None:
         # Git's own ownership regression facility exercises its real rejection
         # path without changing checkout ownership or the operator's config.
