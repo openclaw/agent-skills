@@ -62,6 +62,44 @@ class OutputCustodyTests(unittest.TestCase):
             setattr(args, key, value)
         return args
 
+    def test_output_checks_all_retained_roots_once_after_context_unwinds(self):
+        roots = (self.repo, *(self.root / f'source-{number}' for number in range(25)))
+        for root in roots[1:]:
+            root.mkdir()
+        sources = self.helper.UNTRUSTED_SOURCE_ROOTS
+        token = sources.set(roots)
+        try:
+            with self.helper.OutputParent(self.outside / 'report.json') as parent:
+                boundary = mock.Mock(wraps=self.helper.capture_external_env_boundary)
+                with mock.patch.object(self.helper, 'capture_external_env_boundary', boundary):
+                    parent.check()
+                # A check must cover all roots with one boundary construction,
+                # rather than reconstructing all 26 roots once for each root.
+                self.assertEqual(boundary.call_count, 1)
+                self.assertEqual(sources.get(), roots)
+                nested = sources.set(())
+                try:
+                    parent.check()
+                    # The original context is gone; a later entry can still
+                    # target its last root and must not become an allowed output.
+                    (roots[-1] / 'sentinel').write_text('source bytes')
+                    parent.path.symlink_to(roots[-1] / 'sentinel')
+                    with self.assertRaisesRegex(SystemExit, 'outside the reviewed repository'):
+                        parent.check()
+                    self.assertEqual(sources.get(), ())
+                    parent.path.unlink()
+                finally:
+                    sources.reset(nested)
+                nested = sources.set((self.outside,))
+                try:
+                    with self.assertRaisesRegex(SystemExit, 'outside the reviewed repository'):
+                        parent.check()
+                    self.assertEqual(sources.get(), (self.outside,))
+                finally:
+                    sources.reset(nested)
+        finally:
+            sources.reset(token)
+
     def test_stale_deletion_does_not_follow_redirected_parent(self):
         # Metadata remains unchanged: only the previously admitted parent alias moves.
         for role in ('status_output', 'preflight_output'):

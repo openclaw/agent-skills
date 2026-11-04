@@ -597,6 +597,18 @@ EXTERNAL_SOURCE_REVIEW: contextvars.ContextVar[bool] = contextvars.ContextVar(
 )
 
 
+@contextlib.contextmanager
+def _retained_source_roots(roots: tuple[Path, ...]):
+    # Rebuild the complete boundary for this operation, including roots retained
+    # by an owner whose original source context has already unwound.
+    combined = tuple(dict.fromkeys((*UNTRUSTED_SOURCE_ROOTS.get(), *roots)))
+    token = UNTRUSTED_SOURCE_ROOTS.set(combined)
+    try:
+        yield combined
+    finally:
+        UNTRUSTED_SOURCE_ROOTS.reset(token)
+
+
 def safe_git_env(repo: Path, *, selected_git: str | None = None) -> dict[str, str]:
     env = _safe_git_base_env(repo)
     env["PATH"] = safe_git_path(repo, selected_executables=[selected_git or resolve_git(repo)])
@@ -9809,6 +9821,7 @@ class OutputParent:
 
     def __init__(self, path: Path, expected: tuple[str, int, int] | None = None) -> None:
         self.path = path
+        self.roots = UNTRUSTED_SOURCE_ROOTS.get()
         self.parent = path.parent.resolve(strict=True)
         self.fd = None
         self.windows = None
@@ -9848,8 +9861,9 @@ class OutputParent:
         if ((str(self.path.parent.resolve()), current.st_dev, current.st_ino)
                 != self.identity):
             raise SystemExit("output parent changed after admission")
-        for root in UNTRUSTED_SOURCE_ROOTS.get():
-            require_output_outside_sources(self.path, "output", root)
+        with _retained_source_roots(self.roots) as roots:
+            if roots:
+                require_output_outside_sources(self.path, "output", roots[0])
 
     def stat(self, name: str) -> os.stat_result:
         if self.windows is not None:
