@@ -10267,16 +10267,23 @@ class NativeHandoff:
                                     self.identity.st_dev, self.identity.st_ino))
         print(f"native pass ready: {number}/{self.pass_count}", flush=True)
         deadline = time.monotonic() + self.timeout if self.timeout is not None else None
-        ready_path = self.root / f"{number}.ready"
+        ready_name = f"{number}.ready"
         try:
-            while not ready_path.exists():
+            # Follow the admitted exchange, not its possibly redirected parent
+            # alias, throughout response polling and both bounded reads.
+            while True:
+                try:
+                    os.stat(ready_name, dir_fd=self.root_fd, follow_symlinks=False)
+                    break
+                except FileNotFoundError:
+                    pass
                 if deadline is not None and time.monotonic() >= deadline:
                     failure = ReviewerUnavailable("OpenClaw execution result timed out", reason="timeout")
                     failure.timed_out = True
                     raise failure
                 time.sleep(0.1 if deadline is None else min(0.1, max(0, deadline - time.monotonic())))
-            ready = json.loads(self.read_file(ready_path, 1024))
-            raw = self.read_file(self.root / f"{number}.result.json", self.MAX_RESULT_BYTES)
+            ready = json.loads(self.read_file(ready_name, 1024, dir_fd=self.root_fd))
+            raw = self.read_file(f"{number}.result.json", self.MAX_RESULT_BYTES, dir_fd=self.root_fd)
             if (not isinstance(ready, dict) or set(ready) != {"run_id", "pass", "bytes"}
                     or ready["run_id"] != self.run_id or type(ready["pass"]) is not int
                     or ready["pass"] != number or type(ready["bytes"]) is not int

@@ -2,6 +2,7 @@
 import argparse
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -209,6 +210,52 @@ class OutputCustodyTests(unittest.TestCase):
         args.engine_timeout_seconds = 1
         reviewer = argparse.Namespace(model='fixture/model', thinking='high', openclaw_models=[])
         return self.helper.NativeHandoff(args, reviewer, ['synthetic prompt'])
+
+    def test_native_response_stays_with_exchange_after_parent_redirect(self):
+        for replacement_ready in (False, True):
+            with self.subTest(replacement_ready=replacement_ready):
+                replacement = self.root / ('replacement-' + str(replacement_ready))
+                replacement.mkdir(mode=0o700)
+                decoy = replacement / 'exchange'
+                decoy.mkdir(mode=0o700)
+                if replacement_ready:
+                    (decoy / '1.ready').write_text('replacement ready sentinel')
+                    (decoy / '1.result.json').write_text('replacement result sentinel')
+                handoff = self.handoff()
+                publish = self.helper.atomic_write_text
+
+                def publish_then_redirect(path, *args, **kwargs):
+                    publish(path, *args, **kwargs)
+                    if kwargs.get('_parent') is not None:
+                        return
+                    exchange = self.outside / 'exchange'
+                    request = json.loads((exchange / '1.request.json').read_text())
+                    # The consumer received the original request. Redirect only
+                    # its parent's alias, then commit through the real consumer.
+                    self.alias.unlink()
+                    self.alias.symlink_to(replacement, target_is_directory=True)
+                    response = {key: request[key] for key in ('run_id', 'pass', 'prompt_sha256')}
+                    response.update(status='done', output=json.dumps({
+                        'ok': True, 'status': 'ok', 'provider': 'fixture', 'model': 'model',
+                        'final': 'original exchange completion'}))
+                    spool = self.outside / f"exchange.{request['run_id']}.1.response.json"
+                    spool.write_text(json.dumps(response))
+                    self.helper.submit_native_response(exchange, spool)
+                    self.assertFalse(spool.exists())
+
+                try:
+                    with mock.patch.object(self.helper, 'atomic_write_text', side_effect=publish_then_redirect):
+                        self.assertEqual(handoff.run('synthetic prompt'), 'original exchange completion')
+                finally:
+                    handoff.close()
+                    self.alias.unlink()
+                    self.alias.symlink_to(self.outside, target_is_directory=True)
+                self.assertFalse((self.outside / 'exchange').exists())
+                if replacement_ready:
+                    self.assertEqual((decoy / '1.ready').read_text(), 'replacement ready sentinel')
+                    self.assertEqual((decoy / '1.result.json').read_text(), 'replacement result sentinel')
+                else:
+                    self.assertEqual(list(decoy.iterdir()), [])
 
     def test_native_cleanup_ignores_metadata_refusal_and_parent_alias(self):
         handoff = self.handoff()
