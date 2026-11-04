@@ -6044,6 +6044,71 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 kernel.CloseHandle(handle)
 
     @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_lost_start_acknowledgement_terminates_owned_target(self) -> None:
+        supervisor = str(SCRIPT.with_name("windows-owned-process.py"))
+        module = self.helper["_load_windows_process_module"](supervisor)
+        real_spawn = module.spawn
+        real_write_frame = module.write_frame
+        startups = []
+        target_waits = []
+        injected = []
+        target_code = (
+            "import os, pathlib, sys, time; "
+            "witness = pathlib.Path(sys.argv[1]); "
+            "pending = witness.with_suffix('.pending'); "
+            "pending.write_text(str(os.getpid()), encoding='utf-8'); "
+            "pending.replace(witness); time.sleep(120)"
+        )
+        with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as handles:
+            cwd = Path(temp).resolve()
+            witness = cwd / "target.pid"
+            # Keep an actual EOF endpoint available without allocating descriptors
+            # after closing the owned response pipe. Only its contents change.
+            eof_reader, eof_writer = os.pipe()
+            os.close(eof_writer)
+            handles.callback(os.close, eof_reader)
+
+            def observe_spawn(*args, **kwargs):
+                startup = real_spawn(*args, **kwargs)
+                startups.append(startup)
+                return startup
+
+            def lose_acknowledgement(descriptor, frame):
+                real_write_frame(descriptor, frame)
+                self.assertEqual(len(startups), 1)
+                startup = startups[0]
+                self.assertEqual(descriptor, startup.writer)
+                pid = int(self.wait_for_process_witness(witness))
+                wait = handles.enter_context(self.windows_process_handle(pid))
+                target_waits.append(wait)
+                self.assertEqual(wait(0), 258)
+                # GO has reached the real supervisor and the real target is live.
+                # This worker has not begun its next read: replace its response
+                # endpoint with real EOF, discarding even an already buffered
+                # STARTED while preserving the fd for ordinary owner cleanup.
+                os.dup2(eof_reader, startup.reader, inheritable=False)
+                injected.append(True)
+
+            with mock.patch.object(module, "spawn", observe_spawn), mock.patch.object(
+                module, "write_frame", lose_acknowledgement,
+            ):
+                with self.assertRaises(module.LaunchIndeterminate) as raised:
+                    self.helper["run_with_heartbeat"](
+                        [sys.executable, "-I", "-S", "-c", target_code, str(witness)],
+                        cwd, label="lost-start-acknowledgement", max_runtime_seconds=20,
+                    )
+
+            self.assertIsInstance(raised.exception.__cause__, EOFError)
+            self.assertEqual(injected, [True])
+            self.assertEqual(len(startups), 1)
+            self.assertEqual(len(target_waits), 1)
+            # Check real cleanup before the observation handle's emergency
+            # teardown could terminate a process and conceal an ownership bug.
+            self.assertEqual(target_waits[0](5000), 0)
+            self.assertIsNotNone(startups[0].process.poll())
+            self.assertEqual(self.helper["_OWNED_PROCESSES"], {})
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
     def test_windows_jobs_retain_descendants_after_leader_exit(self) -> None:
         child_code = (
             "import os, pathlib, sys, time; "
