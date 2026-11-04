@@ -13,6 +13,7 @@ import json
 import os
 import runpy
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -3272,6 +3273,121 @@ class AutoreviewPreflightTests(unittest.TestCase):
 
 
 class OwnedProcessCleanupTests(unittest.TestCase):
+    def test_real_signal_survives_failed_sweep_and_reaches_other_children(self):
+        for streamed in (False, True):
+            with self.subTest(streamed=streamed), tempfile.TemporaryDirectory() as directory:
+                cwd = Path(directory).resolve()
+                processes = []
+                observed = []
+                start_process = AUTOREVIEW.start_owned_process
+                signal_group = AUTOREVIEW._signal_owned_process_group
+                terminate = AUTOREVIEW.terminate_process_group
+
+                def remember_process(*args, **kwargs):
+                    proc = start_process(*args, **kwargs)
+                    processes.append(proc)
+                    return proc
+
+                def fail_first_signal(proc, **kwargs):
+                    observed.append(proc)
+                    if proc is processes[0]:
+                        # A second real signal while a registry lock is held must
+                        # neither recurse nor replace the first signal's status.
+                        with AUTOREVIEW._OWNED_PROCESS_LOCK:
+                            signal.raise_signal(signal.SIGINT)
+                        raise OSError("private-sweep-detail")
+                    return signal_group(proc, **kwargs)
+
+                def fail_after_termination(proc, *args, **kwargs):
+                    terminate(proc, *args, **kwargs)
+                    raise RuntimeError("private-finalizer-detail")
+
+                def run_engine():
+                    return AUTOREVIEW.run_with_heartbeat(
+                        [sys.executable, "-I", "-S", "-c", "import time; time.sleep(30)"],
+                        cwd, label="signal test", heartbeat_seconds=0.01,
+                        max_runtime_seconds=10, stream_output=streamed,
+                    )
+
+                try:
+                    remember_process(
+                        [sys.executable, "-I", "-S", "-c", "import time; time.sleep(30)"], cwd,
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                    errors = io.StringIO()
+                    # Exercise the real handler and the real caller's unwind:
+                    # both the sweep and subsequent finalization can fail.
+                    with mock.patch.object(AUTOREVIEW, "start_owned_process", remember_process), \
+                            mock.patch.object(AUTOREVIEW, "_signal_owned_process_group", fail_first_signal), \
+                            mock.patch.object(AUTOREVIEW, "terminate_process_group", fail_after_termination), \
+                            mock.patch.object(AUTOREVIEW, "emit_heartbeat", lambda *args: signal.raise_signal(signal.SIGTERM)), \
+                            mock.patch.object(AUTOREVIEW, "main_impl", run_engine), \
+                            contextlib.redirect_stderr(errors):
+                        self.assertEqual(AUTOREVIEW.main(), 128 + signal.SIGTERM)
+                    self.assertEqual(observed[:2], processes)
+                    self.assertEqual(observed.count(processes[0]), 1)
+                    for proc in processes:
+                        proc.wait(timeout=5)
+                    self.assertNotIn(processes[1].pid, AUTOREVIEW._OWNED_PROCESSES)
+                    self.assertIn("process cleanup failed: OSError, RuntimeError", errors.getvalue())
+                    self.assertNotIn("private-sweep-detail", errors.getvalue())
+                    self.assertNotIn("private-finalizer-detail", errors.getvalue())
+                finally:
+                    for proc in processes:
+                        try:
+                            AUTOREVIEW.terminate_process_group(proc)
+                        finally:
+                            AUTOREVIEW.unregister_owned_process(proc)
+
+    def test_git_preflight_reports_startup_cleanup_failure_without_arguments(self):
+        for outcome in ("timeout", "oserror"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as patches:
+                cwd = Path(directory).resolve()
+                processes = []
+                failure = RuntimeError("private-cleanup-detail")
+                register = AUTOREVIEW.register_owned_process
+                terminate = AUTOREVIEW.terminate_process_group
+
+                def expire_after_registration(proc, job=None):
+                    register(proc, job)
+                    processes.append(proc)
+                    if job is not None:
+                        terminate_job = job.terminate
+
+                        def fail_after_job_termination():
+                            terminate_job()
+                            raise failure
+
+                        patches.enter_context(mock.patch.object(job, "terminate", fail_after_job_termination))
+                    if outcome == "timeout":
+                        raise subprocess.TimeoutExpired("private-git-argument", 10)
+                    raise OSError(5, "private-git-argument")
+
+                def fail_after_termination(proc, *args, **kwargs):
+                    terminate(proc, *args, **kwargs)
+                    raise failure
+
+                patches.enter_context(mock.patch.object(AUTOREVIEW, "register_owned_process", expire_after_registration))
+                patches.enter_context(mock.patch.object(AUTOREVIEW, "terminate_process_group", fail_after_termination))
+                errors = io.StringIO()
+                try:
+                    with mock.patch.object(Path, "cwd", return_value=cwd), contextlib.redirect_stderr(errors):
+                        self.assertFalse(AUTOREVIEW.preflight_git())
+                    self.assertEqual(len(processes), 1)
+                    self.assertNotIn(processes[0].pid, AUTOREVIEW._OWNED_PROCESSES)
+                    reason = "timed out after 10s" if outcome == "timeout" else "could not execute (errno 5)"
+                    self.assertIn(reason + "; startup cleanup failed: RuntimeError", errors.getvalue())
+                    self.assertNotIn("private-cleanup-detail", errors.getvalue())
+                    self.assertNotIn("private-git-argument", errors.getvalue())
+                finally:
+                    patches.close()
+                    for proc in processes:
+                        if proc.poll() is None:
+                            proc.kill()
+                        proc.wait(timeout=5)
+                        AUTOREVIEW.unregister_owned_process(proc)
+
+
     def test_startup_timeout_preserves_cleanup_cancellation_and_details(self):
         for streamed, outcome in itertools.product((False, True), ("error", "engine", "keyboard")):
             with self.subTest(streamed=streamed, outcome=outcome), \

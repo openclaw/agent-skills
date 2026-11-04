@@ -1936,6 +1936,7 @@ class OwnedProcess(NamedTuple):
     job: Any = None
 
 
+_ACTIVE_ENGINE_INTERRUPT: EngineInterrupted | None = None
 _OWNED_PROCESS_LOCK = threading.RLock()
 _OWNED_PROCESSES: dict[int, OwnedProcess] = {}
 _OWNED_PROCESS_GRACE_SECONDS = 2.0
@@ -1970,8 +1971,9 @@ def unregister_owned_process(proc: subprocess.Popen[str]) -> None:
 
 
 def finish_owned_process(proc: subprocess.Popen[str], terminate: Callable[[], None] | None = None,
-                         finalize: Callable[[], None] | None = None) -> None:
-    """Release all owned resources even when explicit termination fails."""
+                         finalize: Callable[[], None] | None = None, *, close_streams: bool = True) -> None:
+    """Release owned resources without replacing an active cancellation."""
+    active = sys.exc_info()[1]
     errors: list[BaseException] = []
     try:
         if terminate is not None:
@@ -1992,13 +1994,16 @@ def finish_owned_process(proc: subprocess.Popen[str], terminate: Callable[[], No
             except BaseException as exc:
                 errors.append(exc)
             finally:
-                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                for stream in (proc.stdin, proc.stdout, proc.stderr) if close_streams else ():
                     if stream is not None:
                         try:
                             stream.close()
                         except BaseException as exc:
                             errors.append(exc)
     if errors:
+        if isinstance(active, (EngineInterrupted, KeyboardInterrupt)):
+            active.cleanup_errors = (*getattr(active, "cleanup_errors", ()), *errors)
+            return
         # Cancellation must survive an earlier cleanup failure.
         primary = next((error for error in errors if not isinstance(error, Exception)), errors[0])
         primary.cleanup_errors = (*getattr(primary, "cleanup_errors", ()),
@@ -2091,18 +2096,36 @@ def terminate_owned_processes() -> None:
     # shared grace window for the whole batch instead of one grace window
     # per registered engine process, which used to make interrupt handling
     # take grace_seconds * len(processes).
-    survivors = [proc for proc in processes if (
-        _signal_owned_process_group(proc, job=jobs[proc]) if jobs
-        else _signal_owned_process_group(proc)
-    )]
-    if not survivors:
-        return
-    _await_owned_process_groups(survivors, _OWNED_PROCESS_GRACE_SECONDS)
-    for proc in survivors:
-        if jobs:
-            _enforce_owned_process_group(proc, _OWNED_PROCESS_GRACE_SECONDS, job=jobs[proc])
-        else:
-            _enforce_owned_process_group(proc, _OWNED_PROCESS_GRACE_SECONDS)
+    errors: list[BaseException] = []
+    survivors = []
+    for proc in processes:
+        try:
+            if (_signal_owned_process_group(proc, job=jobs[proc]) if jobs
+                    else _signal_owned_process_group(proc)):
+                survivors.append(proc)
+        except BaseException as error:
+            errors.append(error)
+            # A failed first signal still needs enforcement, and must not stop
+            # cancellation from reaching the other registered processes.
+            survivors.append(proc)
+    if survivors:
+        try:
+            _await_owned_process_groups(survivors, _OWNED_PROCESS_GRACE_SECONDS)
+        except BaseException as error:
+            errors.append(error)
+        for proc in survivors:
+            try:
+                if jobs:
+                    _enforce_owned_process_group(proc, _OWNED_PROCESS_GRACE_SECONDS, job=jobs[proc])
+                else:
+                    _enforce_owned_process_group(proc, _OWNED_PROCESS_GRACE_SECONDS)
+            except BaseException as error:
+                errors.append(error)
+    if errors:
+        primary = next((error for error in errors if not isinstance(error, Exception)), errors[0])
+        primary.cleanup_errors = (*getattr(primary, "cleanup_errors", ()),
+                                  *(error for error in errors if error is not primary))
+        raise primary
 
 
 def _signal_owned_process_group(proc: subprocess.Popen, *, job: Any = None) -> bool:
@@ -2195,8 +2218,17 @@ def terminate_process_group(
 
 
 def engine_signal_handler(signum: int, _frame: Any) -> None:
-    terminate_owned_processes()
-    raise EngineInterrupted(128 + signum)
+    global _ACTIVE_ENGINE_INTERRUPT
+    if _ACTIVE_ENGINE_INTERRUPT is not None:
+        return  # The first signal owns the sweep and subsequent unwind.
+    interrupted = _ACTIVE_ENGINE_INTERRUPT = EngineInterrupted(128 + signum)
+    try:
+        terminate_owned_processes()
+    except BaseException as error:
+        interrupted.cleanup_errors = (error, *getattr(error, "cleanup_errors", ()))
+    # A failing cancellation sweep cannot turn this signal into a timeout or a
+    # retryable launch failure. Keep raw cleanup diagnostics out of tracebacks.
+    raise interrupted from None
 
 
 def _handled_signal_numbers() -> list[int]:
@@ -2210,14 +2242,19 @@ class OwnedProcessSignalHandlers:
     """Install process-wide handlers so interrupts clean up owned engine groups."""
 
     def __enter__(self) -> "OwnedProcessSignalHandlers":
+        global _ACTIVE_ENGINE_INTERRUPT
+        self.previous_interrupt = _ACTIVE_ENGINE_INTERRUPT
+        _ACTIVE_ENGINE_INTERRUPT = None
         self.previous = {signum: signal.getsignal(signum) for signum in _handled_signal_numbers()}
         for signum in self.previous:
             signal.signal(signum, engine_signal_handler)
         return self
 
     def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        global _ACTIVE_ENGINE_INTERRUPT
         for signum, handler in self.previous.items():
             signal.signal(signum, handler)
+        _ACTIVE_ENGINE_INTERRUPT = self.previous_interrupt
 
 
 @contextlib.contextmanager
@@ -2569,11 +2606,12 @@ def run_with_heartbeat(
                     return deadline.completed_process(args, stdout, stderr)
                 emit_heartbeat(label, started, proc)
     except EngineInterrupted as exc:
-        terminate_process_group(proc)
         try:
             exc.stdout, _stderr = proc.communicate(timeout=_TIMED_OUT_STREAM_DRAIN_SECONDS)
         except subprocess.TimeoutExpired as drain_timeout:
             exc.stdout = timeout_output_text(drain_timeout.output)
+        except BaseException as error:
+            exc.cleanup_errors = (*getattr(exc, "cleanup_errors", ()), error)
         raise
     finally:
         finish_owned_process(proc, None if deadline.terminated else lambda: terminate_process_group(proc))
@@ -2635,34 +2673,12 @@ def run_with_stream(
             exc.stdout = "".join(stdout_parts)
             raise
         finally:
-            try:
-                if not deadline.terminated:
-                    terminate_process_group(proc)
-            finally:
-                try:
-                    if not collection_entered:
-                        # No collector readers/writer took ownership of these pipes.
-                        try:
-                            if proc.stdin is not None:
-                                try:
-                                    proc.stdin.close()
-                                except Exception:
-                                    pass
-                        finally:
-                            try:
-                                if proc.stdout is not None:
-                                    try:
-                                        proc.stdout.close()
-                                    except Exception:
-                                        pass
-                            finally:
-                                if proc.stderr is not None:
-                                    try:
-                                        proc.stderr.close()
-                                    except Exception:
-                                        pass
-                finally:
-                    unregister_owned_process(proc)
+            # Collector workers own their streams once entered; otherwise this
+            # finalizer owns them. In both cases release the registered lifetime.
+            finish_owned_process(
+                proc, None if deadline.terminated else lambda: terminate_process_group(proc),
+                close_streams=not collection_entered,
+            )
     except (EngineInterrupted, KeyboardInterrupt):
         terminal = "interrupted"
         raise
@@ -2986,10 +3002,14 @@ def preflight_git() -> bool:
                 reason = "timed out after 10s"
             finally:
                 finish_owned_process(proc, lambda: terminate_process_group(proc, grace_seconds=0.1))
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as failure:
             reason = "timed out after 10s"
+            if errors := getattr(failure, "cleanup_errors", ()):
+                reason += "; startup cleanup failed: " + ", ".join(type(error).__name__ for error in errors)
         except OSError as exc:
             reason = f"could not execute (errno {exc.errno})"
+            if errors := getattr(exc, "cleanup_errors", ()):
+                reason += "; startup cleanup failed: " + ", ".join(type(error).__name__ for error in errors)
     print(
         f"autoreview incomplete: Git preflight failed ({reason}); "
         f"executable: {display_escape(selected, 1000)}\n"
@@ -10486,6 +10506,10 @@ def main() -> int:
             # No longer a SystemExit subclass (see EngineInterrupted), so it
             # is not caught by internal `except SystemExit` guards on the
             # way up -- convert it to a plain exit code here instead.
+            if errors := getattr(exc, "cleanup_errors", ()):
+                with contextlib.suppress(Exception):
+                    print("autoreview interrupted; process cleanup failed: "
+                          + ", ".join(type(error).__name__ for error in errors), file=sys.stderr)
             return exc.code
 
 

@@ -6184,10 +6184,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertEqual(control_faults, [True])
                 self.assertEqual(launch_failure.cleanup_errors, (control_error,))
                 self.assertNotIn("private-control-detail", str(launch_failure))
-            # If even post-job finalization timed out, release the test-held pipe
-            # and observe the worker independently. Its finally must own both fds.
+            # Release the test-held pipe and independently join the worker.
+            # No second production finalizer may conceal missing fd ownership.
             held_writer.close()
-            startups[0].close()
+            startups[0].worker.join(timeout=5)
+            self.assertFalse(startups[0].worker.is_alive())
             self.assertIsNone(startups[0].reader)
             self.assertIsNone(startups[0].writer)
             for descriptor in control_descriptors:
@@ -6204,6 +6205,72 @@ class AutoreviewHardeningTests(unittest.TestCase):
             supervisor_waits[0](timeout=5)
             self.assertIsNotNone(startups[0].process.poll())
             self.assertEqual(self.helper["_OWNED_PROCESSES"], {})
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_stalled_startup_worker_does_not_hold_owner_exit(self) -> None:
+        owner_code = r'''import json, os, pathlib, runpy, subprocess, sys, time
+helper_path, directory = sys.argv[1:]
+cwd = pathlib.Path(directory)
+helper = runpy.run_path(helper_path, run_name="autoreview_under_test")
+module = helper["_load_windows_process_module"](str(pathlib.Path(helper_path).with_name("windows-owned-process.py")))
+real_spawn, real_write = module.spawn, module.write_frame
+startups = []
+def spawn(*args, **kwargs):
+    startup = real_spawn(*args, **kwargs)
+    startups.append(startup)
+    (cwd / "supervisor.pid").write_text(str(startup.process.pid))
+    def failed_wait(*args, **kwargs):
+        raise subprocess.TimeoutExpired("private-target", 2)
+    startup.process.wait = failed_wait
+    return startup
+def stall_response(descriptor, frame):
+    real_write(descriptor, frame)
+    deadline = time.monotonic() + 10
+    while not (cwd / "target.pid").exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("target did not start")
+        time.sleep(0.01)
+    # The outer harness owns this pipe's writer and keeps it open past owner exit.
+    os.dup2(sys.stdin.fileno(), startups[0].reader, inheritable=False)
+module.spawn, module.write_frame = spawn, stall_response
+code = "import os,pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(120)"
+try:
+    helper["run_with_heartbeat"]([sys.executable, "-I", "-S", "-c", code, str(cwd / "target.pid")],
+                               cwd, label="stalled-owner", max_runtime_seconds=5)
+except module.LaunchIndeterminate as error:
+    assert "acknowledgement timed out" in str(error)
+    assert isinstance(error.cleanup_errors[0], subprocess.TimeoutExpired)
+    print(json.dumps([startups[0].worker.is_alive(), startups[0].reader is not None,
+                      not helper["_OWNED_PROCESSES"]]), flush=True)
+else:
+    raise RuntimeError("stalled startup unexpectedly succeeded")
+'''
+        with tempfile.TemporaryDirectory() as temporary, contextlib.ExitStack() as handles:
+            cwd = Path(temporary).resolve()
+            interpreter = getattr(sys, "_base_executable", None) or sys.executable
+            owner = subprocess.Popen(
+                [interpreter, "-I", "-S", "-c", owner_code, str(SCRIPT), str(cwd)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8",
+            )
+            try:
+                supervisor = int(self.wait_for_process_witness(cwd / "supervisor.pid"))
+                target = int(self.wait_for_process_witness(cwd / "target.pid"))
+                waits = [handles.enter_context(self.windows_process_handle(pid))
+                         for pid in (supervisor, target)]
+                self.assertFalse(owner.stdin.closed)
+                # wait() does not close stdin. The owner must exit while its
+                # daemon exchange is still blocked on our live writer.
+                self.assertEqual(owner.wait(timeout=20), 0)
+                self.assertFalse(owner.stdin.closed)
+                output, error = owner.communicate(timeout=5)
+                self.assertEqual(json.loads(output), [True, True, True], error)
+                for wait in waits:
+                    self.assertEqual(wait(5000), 0)
+            finally:
+                if owner.poll() is None:
+                    owner.kill()
+                owner.communicate(timeout=5)
 
     @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
     def test_windows_jobs_retain_descendants_after_leader_exit(self) -> None:

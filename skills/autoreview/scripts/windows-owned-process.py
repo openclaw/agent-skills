@@ -298,7 +298,9 @@ class Startup:
                 raise RuntimeError("Windows startup was already aborted")
             self.deadline = deadline
         allowance = max(0, deadline - time.monotonic())
-        self.worker = threading.Thread(target=self._exchange, name="windows-startup")
+        # The worker owns its raw endpoints until I/O ends, but a broken peer
+        # must not turn bounded startup cleanup into an unbounded interpreter exit.
+        self.worker = threading.Thread(target=self._exchange, name="windows-startup", daemon=True)
         self.worker.start()
         if not self.done.wait(allowance):
             with self.state_lock:

@@ -156,6 +156,17 @@ are preserved. An incompatible enclosing job fails startup; there is no breakawa
 or executable cleanup fallback.
 Lost startup acknowledgement after permission to launch is a terminal
 uncertain-launch error, so it cannot silently repeat a possibly executed command.
+Startup cleanup waits are bounded. A stalled acknowledgement reader retains its
+pipe descriptors until its I/O ends, but cannot keep the helper alive after
+cleanup returns. Bounded waiting does not establish that failed cleanup completed.
+Git startup timeouts and execution errors report cleanup failure types without printing command
+arguments or raw exception messages.
+
+Handled interrupts attempt termination for every registered process even if one
+attempt fails. The first signal retains its exit status through buffered and
+streaming cleanup; later handled signals do not restart the sweep. Cleanup
+failures are reported by exception type, without changing cancellation into a
+retryable launch failure.
 
 Normalized `PATH`, `SSL_CERT_DIR` and `OPENCLAW_INCLUDE_ROOTS` entries must
 survive path-list serialization unchanged.
