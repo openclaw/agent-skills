@@ -1913,7 +1913,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                 ("cli", "keyed-cli", "environment", "global-environment"),
             ):
                 with self.subTest(model=model, effort=effort, source=source):
-                    argv = [sys.executable, str(SCRIPT_PATH), "--engine", "codex",
+                    argv = [sys.executable, "-S", str(SCRIPT_PATH), "--engine", "codex",
                             "--codex-bin", str(Path(tempdir) / "missing-codex")]
                     env = {key: value for key, value in os.environ.items()
                            if not key.startswith("AUTOREVIEW_")}
@@ -2403,6 +2403,11 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
         self.root = Path(self.temp.name).resolve()
         self.repo = self.root / "repo"
         self.repo.mkdir()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.codex_bin = self.bin / ("codex.cmd" if os.name == "nt" else "codex")
+        self.codex_bin.write_text("@exit /b 99\n" if os.name == "nt" else "#!/bin/sh\nexit 99\n")
+        self.codex_bin.chmod(0o755)
         self.home = self.root / "operator"
         self.home.mkdir()
         self.env = mock.patch.dict(os.environ, {
@@ -2652,9 +2657,9 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
                         [], returncode, stdout, stderr,
                     )) as probe, contextlib.redirect_stdout(io.StringIO()) as out, \
                     contextlib.redirect_stderr(io.StringIO()) as err:
-                self.assertEqual(AUTOREVIEW.codex_subscription_login_missing("/codex", self.root, self.repo), expected)
+                self.assertEqual(AUTOREVIEW.codex_subscription_login_missing(str(self.codex_bin), self.root, self.repo), expected)
                 self.assertEqual(out.getvalue() + err.getvalue(), "")
-                self.assertEqual(probe.call_args.args, (["/codex", "login", "status"],))
+                self.assertEqual(probe.call_args.args, ([str(self.codex_bin), "login", "status"],))
                 kwargs = probe.call_args.kwargs
                 self.assertEqual(kwargs["cwd"], self.root)
                 self.assertEqual(kwargs["env"], dict(os.environ))
@@ -2665,13 +2670,13 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
 
     def test_login_probe_errors_and_timeout_are_unknown(self) -> None:
         for error in (OSError("PRIVATE_SENTINEL"), subprocess.TimeoutExpired(
-            ["/codex", "login", "status"], 10, output="Not logged in PRIVATE_SENTINEL",
+            [str(self.codex_bin), "login", "status"], 10, output="Not logged in PRIVATE_SENTINEL",
         )):
             with self.subTest(error=type(error).__name__), \
                     mock.patch.object(AUTOREVIEW.subprocess, "run", side_effect=error), \
                     contextlib.redirect_stdout(io.StringIO()) as out, \
                     contextlib.redirect_stderr(io.StringIO()) as err:
-                self.assertFalse(AUTOREVIEW.codex_subscription_login_missing("/codex", self.root, self.repo))
+                self.assertFalse(AUTOREVIEW.codex_subscription_login_missing(str(self.codex_bin), self.root, self.repo))
                 self.assertEqual(out.getvalue() + err.getvalue(), "")
 
     def run_codex_attempts(
@@ -2888,6 +2893,49 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
                     self.assertEqual(output, "clean")
                     self.assertEqual(source_auth.read_text(), original)
 
+    def test_file_auth_refresh_survives_fallback_and_interruption_without_retained_alias(self) -> None:
+        source_auth = self.home / "auth.json"
+        refreshed = '{"tokens": {"refresh_token": "synthetic-refreshed-token"}}'
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted):
+                source_auth.write_text('{"tokens": {"refresh_token": "synthetic-old-token"}}')
+                aliases = []
+
+                def inspect(command, env, attempt):
+                    if attempt == 1:
+                        alias = Path(env["CODEX_HOME"]) / "auth.json"
+                        aliases.append(alias)
+                        self.assertTrue(os.path.samefile(alias, source_auth))
+                        alias.write_text(refreshed)
+                        if interrupted:
+                            raise KeyboardInterrupt()
+                    else:
+                        self.assertFalse(aliases[0].exists())
+                        self.assertEqual(source_auth.stat().st_nlink, 1)
+                        self.assertEqual(source_auth.read_text(), refreshed)
+
+                if interrupted:
+                    with self.assertRaises(KeyboardInterrupt):
+                        self.run_codex_attempts(["refresh_token_reused"], inspect_attempt=inspect)
+                else:
+                    _, _, output = self.run_codex_attempts(["refresh_token_reused"], inspect_attempt=inspect)
+                    self.assertEqual(output, "clean")
+                self.assertTrue(aliases)
+                self.assertFalse(aliases[0].exists())
+                self.assertEqual(source_auth.stat().st_nlink, 1)
+                self.assertEqual(source_auth.read_text(), refreshed)
+                self.assertEqual(AUTOREVIEW.codex_source_home(self.repo), self.home.resolve())
+
+    def test_file_auth_rejects_preexisting_source_owned_hardlink_before_launch(self) -> None:
+        source_auth = self.home / "auth.json"
+        source_auth.write_text('{"fixture": "synthetic"}')
+        os.link(source_auth, self.repo / "auth-alias.json")
+        launched = mock.Mock()
+        with self.assertRaisesRegex(SystemExit, "authentication must be outside"):
+            self.run_codex_attempts([], inspect_attempt=launched)
+        launched.assert_not_called()
+        self.assertEqual(source_auth.stat().st_nlink, 2)
+
     def test_explicit_route_authentication_failure_has_no_fallback_notice(self) -> None:
         commands, notice, output = self.run_codex_attempts(["401 Unauthorized"], explicit=True)
         self.assertEqual(len(commands), 1)
@@ -3070,10 +3118,10 @@ class AutoreviewPreflightTests(unittest.TestCase):
 
     def test_export_failure_preserves_native_outcome(self):
         original = AUTOREVIEW.atomic_write_text
-        def write(path, text):
+        def write(path, text, **kwargs):
             if path == self.block:
                 raise OSError("synthetic output error")
-            return original(path, text)
+            return original(path, text, **kwargs)
         self.block.write_text("stale block")
         with mock.patch.object(AUTOREVIEW, "atomic_write_text", side_effect=write):
             self.assertEqual(self.invoke(), 0)

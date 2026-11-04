@@ -41,6 +41,9 @@ Read for output-path edge cases, machine status, usage accounting, local stage o
 - Conservatively refuse case-only/Unicode-normalization aliases on every platform.
 - Tilde/relative paths expand once, anchored to invocation directory.
 - Atomic writes replace final symlink; never modify its target.
+- Windows output names must use ordinary file names. Device names (including
+  extension forms), alternate data streams, trailing dots or spaces, control
+  characters and `< > : " / \ | ? *` are refused before output probing.
 - After path and alias checks, probe report parents for file creation, writing,
   and atomic replacement before target selection or reviewer startup. Existing
   reports remain untouched; missing parents are not created. This checks current

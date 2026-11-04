@@ -114,17 +114,41 @@ The helper does not clone, fetch, install dependencies, or execute source code.
 Resolve the exact commit and each blob/mode with Git before constructing this
 inventory. Mutable refs, unknown fields, duplicate paths, missing files and
 blob/mode mismatches fail preparation. Both SHA-1 and SHA-256 repositories are
-supported. A linked worktree is permitted; symlinked roots, source paths and Git
-metadata paths are not. Alternate object stores are unsupported. The source root
-cannot contain or be inside the reviewed repository. Before Git preflight, every
-declared source root and the reviewed repository are excluded from host executable
-selection, child `PATH`, authentication and configuration paths. This includes
-reviewer probes and trusted wrappers. A trusted `PATH` directory is excluded if
+supported. A linked worktree is permitted. For both the reviewed repository and
+external sources, roots and Git metadata paths must not traverse symlinks or
+Windows junctions; alternate object stores are unsupported. External source paths
+have the same traversal restriction. The source root cannot contain or be inside
+the reviewed repository. Before any Git probe, the helper discovers the reviewed
+and external repositories' Git, common and object directories without running Git. These
+directories and source roots are excluded from host executable selection, child
+`PATH`, authentication and configuration paths, including reviewer probes and
+trusted wrappers. A trusted `PATH` directory is excluded if
 any entry redirects into a source root. Paths with source-owned intermediate
 symlinks are also rejected, even when their final target is outside the source tree.
-Reports, status files and diagnostic outputs must stay outside every source root.
-Git also rejects source-owned `HOME`, whose default ignore file could hide changes;
-trusted caller exclusions retain their existing behavior.
+Reports, status files and diagnostic outputs must stay outside every source root
+and its Git metadata, including linked-worktree common directories and object
+stores. Git rejects source-owned `HOME`, default ignore files and global
+configuration paths that could hide changes. Trusted caller exclusions retain
+their existing behavior.
+
+Shared hardlinks in executable search directories or selected executable,
+configuration, authentication and certificate files require custody independent
+of the caller. Caller-owned read-only hardlinks are insufficient; use independent
+single-link copies. On Linux, shared-file custody requires an empty permitted
+capability set. On Windows, it allows only traversal, shutdown, undocking,
+working-set and time-zone privileges; other available privileges fail custody
+even when disabled, in either the process primary or effective thread token.
+This conservative check applies only to shared inodes and does not assert
+universal immutability. Independent single-link files bypass this custody check,
+but copying a launcher does not fix elevated Windows startup: the mandatory
+system `taskkill.exe` must also pass. Elevated Windows invocation is not
+established; native positive verification requires a standard-user primary
+process, not temporary impersonation. Normalized `PATH`, `SSL_CERT_DIR` and
+`OPENCLAW_INCLUDE_ROOTS` entries must survive path-list serialization unchanged.
+`SSL_CERT_DIR` also checks its directory entries for source ownership and file
+custody, including certificate and CRL links.
+Malformed certificate/include lists are omitted from reviewer environments;
+an empty filtered executable `PATH` fails preparation.
 
 The helper reads complete UTF-8 regular-file blobs from the declared commit,
 not the source checkout's working bytes. Headers retain the original path,
@@ -133,9 +157,11 @@ still reject credential directories, stores and keyfiles. This role does not
 relax `--prompt-file` or `--dataset` filename rules. Do not rename or concatenate
 blocked evidence to bypass those rules.
 
-The manifest, source paths, checkout identity, Git metadata/object-store paths
-and captured source fingerprints are revalidated before every send, including
-helper-initiated retries, and before publication.
+The helper retains the initial Git metadata binding from before output preparation
+through source capture and publication. The manifest, source paths, checkout
+identity, Git metadata/object-store paths and captured source fingerprints are
+revalidated before every send, including helper-initiated retries, and before
+publication.
 Changes fail the review rather than silently rebinding a source. Freeze source
 checkouts during the review, including their working files and metadata.
 

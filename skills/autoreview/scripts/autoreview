@@ -261,6 +261,12 @@ class SourceContext(NamedTuple):
     fingerprint: tuple[str, int, int, str]
 
 
+class RepositoryMetadata(NamedTuple):
+    root: Path
+    paths: tuple[tuple[str, tuple[tuple[int, int, int], ...]], ...]
+    files: tuple[tuple[str, tuple[str, int, int, str]], ...]
+
+
 class ExternalSourceContext(NamedTuple):
     root: Path
     binding: tuple[tuple[str, tuple[tuple[int, int, int], ...]], ...]
@@ -583,9 +589,21 @@ def run(
 UNTRUSTED_SOURCE_ROOTS: contextvars.ContextVar[tuple[Path, ...]] = contextvars.ContextVar(
     "untrusted_source_roots", default=(),
 )
+SOURCE_METADATA_BINDINGS: contextvars.ContextVar[tuple[RepositoryMetadata, ...]] = contextvars.ContextVar(
+    "source_metadata_bindings", default=(),
+)
+EXTERNAL_SOURCE_REVIEW: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "external_source_review", default=False,
+)
 
 
-def safe_git_env(repo: Path) -> dict[str, str]:
+def safe_git_env(repo: Path, *, selected_git: str | None = None) -> dict[str, str]:
+    env = _safe_git_base_env(repo)
+    env["PATH"] = safe_git_path(repo, selected_executables=[selected_git or resolve_git(repo)])
+    return env
+
+
+def _safe_git_base_env(repo: Path) -> dict[str, str]:
     platform_keys = ("COMSPEC", "DEVELOPER_DIR", "PATHEXT", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "WINDIR")
     caller_home = os.environ.get("HOME")
     if caller_home is None:
@@ -618,23 +636,37 @@ def safe_git_env(repo: Path) -> dict[str, str]:
         "HOME": caller_home,
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
-        "PATH": safe_git_path(repo),
     })
+    validate_git_default_ignore(repo, env)
     return env
 
 
-def safe_git_path(repo: Path) -> str:
+def validate_git_default_ignore(repo: Path, env: dict[str, str]) -> None:
+    config_home = Path(env.get("XDG_CONFIG_HOME") or str(Path(env["HOME"]) / ".config"))
+    if not external_env_path(repo, str(config_home / "git" / "ignore")):
+        raise SystemExit("Git requires its default ignore file outside reviewed source roots")
+
+
+def safe_git_path(
+    repo: Path, extra_paths: list[Path] | None = None, *,
+    selected_executables: list[str] | None = None,
+) -> str:
     # Trusted Git wrappers can search PATH again for their native backend.
     # Exclude unsafe later candidates as well as the initially selected Git.
-    return os.pathsep.join(
-        directory for directory in safe_engine_path(repo).split(os.pathsep)
+    path = os.pathsep.join(
+        directory for directory in safe_engine_path(
+            repo, extra_paths, selected_executables=selected_executables,
+        ).split(os.pathsep)
         if (candidate := first_executable_candidate(Path(directory) / "git")) is None
         or external_env_path(repo, candidate)
     )
+    if not path:
+        raise SystemExit("no trusted executable search directories remain for Git")
+    return path
 
 
 def git_line_ending_args(repo: Path) -> list[str]:
-    env = safe_git_env(repo)
+    env = _safe_git_base_env(repo)
     home = Path(env["HOME"])
     if not home.is_absolute() or not external_env_path(repo, str(home)):
         return []
@@ -661,6 +693,7 @@ def git_line_ending_args(repo: Path) -> list[str]:
         return []
     if not any(source.is_file() for source in sources):
         return []
+    # git_bytes admits child executables immediately before the query launches.
     # Query the effective scalar only; diff/status keep global execution paths disabled.
     result = git_result(
         repo, "config", "--type=bool-or-str", "--get", "core.autocrlf", env=env, check=False,
@@ -676,11 +709,14 @@ def git_line_ending_args(repo: Path) -> list[str]:
 
 
 def global_excludes_file(repo: Path) -> Path | None:
-    env = safe_git_env(repo)
-    env.pop("GIT_CONFIG_GLOBAL", None)
+    env = _safe_git_base_env(repo)
     home = Path(env["HOME"]).expanduser()
-    if not external_env_path(repo, str(home)):
-        return None
+    # This query restores global configuration deliberately. Validate the
+    # effective leaves before Git follows their links, not only their HOME.
+    for config in (home / ".gitconfig", home / ".config" / "git" / "config"):
+        if not external_env_path(repo, str(config)):
+            raise SystemExit("Git requires global configuration outside reviewed source roots")
+    env.pop("GIT_CONFIG_GLOBAL", None)
     result = git_result(
         repo,
         "config", "--global", "--path", "--get", "core.excludesFile",
@@ -695,6 +731,8 @@ def global_excludes_file(repo: Path) -> Path | None:
     candidate = Path(raw_path).expanduser()
     if not candidate.is_absolute():
         candidate = home / candidate
+    if not external_env_path(repo, str(candidate)):
+        return None
     try:
         resolved = candidate.resolve(strict=True)
     except OSError:
@@ -710,43 +748,315 @@ def global_excludes_git_args(repo: Path) -> list[str]:
     return []
 
 
-def safe_engine_path(repo: Path, extra_paths: list[Path] | None = None) -> str:
+@functools.cache
+def _windows_file_custody_api():
+    # Cache only immutable FFI declarations, never tokens, descriptors or trust.
+    import ctypes
+    from ctypes import wintypes
+
+    class GenericMapping(ctypes.Structure):
+        _fields_ = [(name, wintypes.DWORD) for name in ("read", "write", "execute", "all")]
+
+    class Luid(ctypes.Structure):
+        _fields_ = [("low", wintypes.DWORD), ("high", wintypes.LONG)]
+
+    class LuidAndAttributes(ctypes.Structure):
+        _fields_ = [("luid", Luid), ("attributes", wintypes.DWORD)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    security = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel.GetCurrentThread.argtypes = []
+    kernel.GetCurrentThread.restype = wintypes.HANDLE
+    kernel.GetCurrentProcess.argtypes = []
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    security.OpenThreadToken.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL, ctypes.POINTER(wintypes.HANDLE),
+    ]
+    security.OpenThreadToken.restype = wintypes.BOOL
+    security.OpenProcessToken.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE),
+    ]
+    security.OpenProcessToken.restype = wintypes.BOOL
+    security.DuplicateToken.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.POINTER(wintypes.HANDLE),
+    ]
+    security.DuplicateToken.restype = wintypes.BOOL
+    security.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(Luid)]
+    security.LookupPrivilegeValueW.restype = wintypes.BOOL
+    security.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+    ]
+    security.GetTokenInformation.restype = wintypes.BOOL
+    security.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    security.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    security.AccessCheck.argtypes = [
+        ctypes.c_void_p, wintypes.HANDLE, wintypes.DWORD,
+        ctypes.POINTER(GenericMapping), ctypes.c_void_p,
+        ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    security.AccessCheck.restype = wintypes.BOOL
+    # These ordinary desktop privileges do not confer file mutation, identity
+    # changes or token acquisition. Reject every other available privilege.
+    privilege_ids = []
+    for name in ("SeChangeNotifyPrivilege", "SeShutdownPrivilege", "SeUndockPrivilege",
+                 "SeIncreaseWorkingSetPrivilege", "SeTimeZonePrivilege"):
+        luid = Luid()
+        if not security.LookupPrivilegeValueW(None, name, ctypes.byref(luid)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        privilege_ids.append((luid.low, luid.high))
+    return ctypes, wintypes, GenericMapping, LuidAndAttributes, tuple(privilege_ids), kernel, security
+
+
+def windows_file_custody(path: str | Path) -> bool:
+    """Deny mutation by either the primary or effective Windows identity."""
+    if os.name != "nt":
+        return False
+    try:
+        (ctypes, wintypes, GenericMapping, LuidAndAttributes,
+         privilege_ids, kernel, security) = _windows_file_custody_api()
+    except (AttributeError, OSError, ValueError):
+        return False
+    primary = wintypes.HANDLE()
+    thread = wintypes.HANDLE()
+    descriptor = ctypes.c_void_p()
+
+    def token_has_custody(token) -> bool:
+        impersonation = wintypes.HANDLE()
+        try:
+            if not security.DuplicateToken(token, 2, ctypes.byref(impersonation)):
+                return False  # SecurityImpersonation
+            # Disabled token privileges can be enabled without acquiring authority.
+            # Enumerate the current token: PrivilegeCheck sees only enabled rights.
+            # Removed privileges are absent from TOKEN_PRIVILEGES altogether.
+            available = ctypes.create_string_buffer(1024)
+            available_length = wintypes.DWORD()
+            def read_privileges() -> bool:
+                return bool(security.GetTokenInformation(
+                    impersonation, 3, available, len(available), ctypes.byref(available_length),
+                ))  # TokenPrivileges
+            if not read_privileges():
+                if ctypes.get_last_error() != 122 or not len(available) < available_length.value <= 65536:
+                    return False
+                available = ctypes.create_string_buffer(available_length.value)
+                if not read_privileges():
+                    return False
+            offset = ctypes.sizeof(wintypes.DWORD)
+            if not offset <= available_length.value <= len(available):
+                return False
+            count = wintypes.DWORD.from_buffer(available).value
+            stride = ctypes.sizeof(LuidAndAttributes)
+            if count > (available_length.value - offset) // stride:
+                return False
+            for index in range(count):
+                privilege = LuidAndAttributes.from_buffer(available, offset + index * stride)
+                if (privilege.luid.low, privilege.luid.high) not in privilege_ids:
+                    return False
+            # FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS.
+            mapping = GenericMapping(0x00120089, 0x00120116, 0x001200A0, 0x001F01FF)
+            privileges = ctypes.create_string_buffer(1024)
+            length = wintypes.DWORD(len(privileges))
+            granted = wintypes.DWORD()
+            allowed = wintypes.BOOL()
+            def check() -> bool:
+                return bool(security.AccessCheck(
+                    descriptor, impersonation, 0x02000000, ctypes.byref(mapping), privileges,
+                    ctypes.byref(length), ctypes.byref(granted), ctypes.byref(allowed),
+                ))
+            if not check():
+                if ctypes.get_last_error() != 122 or not len(privileges) < length.value <= 65536:
+                    return False
+                privileges = ctypes.create_string_buffer(length.value)
+                if not check():
+                    return False
+            # MAXIMUM_ALLOWED detects ANY grant, including implicit owner rights;
+            # testing a combined requested mask could hide a partial mutation grant.
+            # Cover data, append, extended attributes, attributes (read-only removal),
+            # DACL and owner changes. No open-for-write probe: loaded DLL sharing and
+            # the read-only bit must not disguise an ACL that permits later mutation.
+            mutation_rights = 0x0002 | 0x0004 | 0x0010 | 0x0100 | 0x00040000 | 0x00080000
+            return bool(allowed.value) and not (granted.value & mutation_rights)
+        finally:
+            if impersonation.value:
+                kernel.CloseHandle(impersonation)
+
+    try:
+        # RevertToSelf restores the primary identity without obtaining new
+        # authority. A restricted thread token must not hide primary rights.
+        if not security.OpenProcessToken(kernel.GetCurrentProcess(), 0x000A, ctypes.byref(primary)):
+            return False  # TOKEN_QUERY | TOKEN_DUPLICATE
+        if not security.OpenThreadToken(kernel.GetCurrentThread(), 0x000A, True, ctypes.byref(thread)):
+            if ctypes.get_last_error() != 1008:  # ERROR_NO_TOKEN
+                return False
+        # SE_FILE_OBJECT; owner/group/DACL are all required by AccessCheck.
+        if security.GetNamedSecurityInfoW(str(path), 1, 0x0007, None, None, None, None,
+                                          ctypes.byref(descriptor)) != 0 or not descriptor.value:
+            return False
+        return token_has_custody(primary) and (not thread.value or token_has_custody(thread))
+    except (AttributeError, OSError, ValueError):
+        return False
+    finally:
+        if descriptor.value:
+            kernel.LocalFree(descriptor)
+        if thread.value:
+            kernel.CloseHandle(thread)
+        if primary.value:
+            kernel.CloseHandle(primary)
+
+
+def independent_file_custody(path: str | Path) -> bool:
+    try:
+        metadata = Path(path).stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except (OSError, ValueError):
+        return False
+    try:
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink <= 1:
+            return True
+        if os.name == "nt":
+            return windows_file_custody(path)
+        if sys.platform.startswith("linux"):
+            # A thread can enable any permitted capability without acquiring
+            # new authority, including SETUID to assume the file owner's UID.
+            # Shared-inode custody requires an unprivileged caller; fail closed
+            # on every capability instead of maintaining an incomplete mask.
+            status = Path("/proc/thread-self/status").read_text()
+            permitted = re.findall(r"^CapPrm:[ \t]*([0-9a-fA-F]+)[ \t]*$", status, re.MULTILINE)
+            if len(permitted) != 1 or int(permitted[0], 16) != 0:
+                return False
+        access_options = {}
+        if os.access in os.supports_effective_ids:
+            access_options["effective_ids"] = True
+        elif os.getuid() != os.geteuid() or os.getgid() != os.getegid():
+            return False
+        # A caller-owned readonly inode can be made writable through another
+        # hardlink. Only independently owned, non-writable shared files qualify.
+        return (metadata.st_uid != os.geteuid()
+                and not metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                and not os.access(path, os.W_OK, **access_options))
+    except (OSError, ValueError, NotImplementedError):
+        return False
+
+
+def admit_executable_directories(
+    repo: Path, extra_paths: list[Path] | None = None, *,
+    selected_executables: list[str] | None = None, include_search_path: bool = True,
+) -> list[str]:
+    try:
+        boundary = capture_external_env_boundary(repo)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SystemExit("cannot inspect source roots for executable PATH admission") from exc
+    admission = ExternalEnvAdmission(boundary, {}, {})
     entries: list[str] = []
-    def add(path: str | Path) -> None:
+    admitted: set[Path] = set()
+
+    def inspect(path: str | Path) -> Path | None:
         candidate = Path(path).expanduser()
         try:
             if not candidate.is_absolute() or not candidate.is_dir():
-                return
-            if not external_env_path(repo, str(candidate)):
-                return
+                return None
+            if not external_env_path(repo, str(candidate), admission=admission):
+                return None
             resolved = candidate.resolve()
-            if str(resolved) in entries:
-                return
+            if resolved in admitted:
+                return resolved
             # A trusted launcher can use env or start arbitrary child commands.
-            # Ordinary files belong to this admitted parent; links, directories
-            # and reparse points need their own check, even when not executable.
+            # Shared regular inodes need independent custody, including files
+            # a launcher might import. Redirectors also need source-path checks.
             with os.scandir(resolved) as children:
                 for child in children:
+                    if not independent_file_custody(child.path):
+                        return None
                     needs_check = not child.is_file(follow_symlinks=False)
                     if os.name == "nt":
                         needs_check |= bool(child.stat(follow_symlinks=False).st_file_attributes
                                             & stat.FILE_ATTRIBUTE_REPARSE_POINT)
-                    if needs_check and not external_env_path(repo, child.path):
-                        return
+                    if needs_check and not external_env_path(repo, child.path, admission=admission):
+                        return None
         except (OSError, RuntimeError):
+            return None
+        admitted.add(resolved)
+        return resolved
+
+    # Launchers can import siblings independently of PATH. Require both the
+    # invoked spelling and resolved target's directory, even if neither is
+    # representable in PATH. This checks direct entries, not dependency trees.
+    for executable in selected_executables or []:
+        candidate = Path(executable)
+        try:
+            trusted = candidate.is_absolute() and external_env_path(repo, str(candidate), admission=admission)
+            target = candidate.resolve(strict=True) if trusted else None
+            trusted = (target is not None and target.is_file()
+                       and inspect(candidate.parent) is not None
+                       and inspect(target.parent) is not None)
+        except (OSError, RuntimeError):
+            trusted = False
+        if not trusted:
+            raise SystemExit("selected executable requires trusted installation directories outside reviewed source roots")
+
+    def add(path: str | Path) -> None:
+        candidate = Path(path).expanduser()
+        if os.pathsep in str(candidate):
+            return
+        resolved = inspect(candidate)
+        if resolved is None or os.pathsep in str(resolved):
             return
         value = str(resolved)
         if value not in entries:
             entries.append(value)
 
-    for path in extra_paths or []:
-        add(path)
-    for part in os.environ.get("PATH", "").split(os.pathsep):
-        if part:
-            add(part)
-    for path in DEFAULT_ENGINE_PATHS:
-        add(path)
-    return os.pathsep.join(entries)
+    if include_search_path:
+        for path in extra_paths or []:
+            add(path)
+        for part in os.environ.get("PATH", "").split(os.pathsep):
+            if part:
+                add(part)
+        for path in DEFAULT_ENGINE_PATHS:
+            add(path)
+    # Ownership observations live only for this admission. Recheck every one,
+    # including absent paths, before any resulting search path can be used.
+    try:
+        unchanged_paths = all(path_identity(path) == identity
+                              for path, identity in admission.observed.items())
+    except (OSError, RuntimeError, ValueError):
+        unchanged_paths = False
+    if not unchanged_paths:
+        raise SystemExit("filesystem paths changed during executable PATH admission")
+    # Reuse root identities only inside this admission, and reject a root
+    # replacement or redirection before exposing the resulting child PATH.
+    try:
+        unchanged = capture_external_env_boundary(repo) == boundary
+    except (OSError, RuntimeError, ValueError):
+        unchanged = False
+    if not unchanged:
+        raise SystemExit("source roots changed during executable PATH admission")
+    return entries
+
+
+def validate_selected_executable(repo: Path, executable: str) -> None:
+    admit_executable_directories(repo, selected_executables=[executable], include_search_path=False)
+
+
+def safe_engine_path(
+    repo: Path, extra_paths: list[Path] | None = None, *,
+    selected_executables: list[str] | None = None,
+) -> str:
+    entries = admit_executable_directories(repo, extra_paths, selected_executables=selected_executables)
+    serialized = os.pathsep.join(entries)
+    if not serialized:
+        raise SystemExit("no trusted executable search directories remain")
+    if serialized.split(os.pathsep) != entries:
+        raise SystemExit("cannot serialize trusted executable search directories")
+    return serialized
 
 
 def codex_tool_git_env() -> dict[str, str]:
@@ -757,31 +1067,87 @@ def codex_tool_git_env() -> dict[str, str]:
     return env
 
 
-def external_env_path(repo: Path, value: str) -> bool:
+class ExternalEnvBoundary(NamedTuple):
+    roots: frozenset[Path]
+    identities: frozenset[tuple[int, int]]
+
+
+class ExternalEnvAdmission(NamedTuple):
+    boundary: ExternalEnvBoundary
+    observed: dict[Path, tuple[str, int, int]]
+    owned: dict[Path, bool]
+
+
+def path_identity(path: Path) -> tuple[str, int, int]:
     try:
-        roots = tuple(dict.fromkeys(
-            path for root in (repo, *UNTRUSTED_SOURCE_ROOTS.get())
-            for path in (root.absolute(), root.resolve())
-        ))
-        identities = set()
-        for root in roots:
-            try:
-                identity = root.stat()
-                identities.add((identity.st_dev, identity.st_ino))
-            except FileNotFoundError:
-                pass
+        identity = path.stat()
+    except FileNotFoundError:
+        return ("missing", 0, 0)
+    except NotADirectoryError:
+        return ("not_directory", 0, 0)
+    return ("present", identity.st_dev, identity.st_ino)
+
+
+def capture_external_env_boundary(repo: Path) -> ExternalEnvBoundary:
+    roots = frozenset(
+        path for root in (repo, *UNTRUSTED_SOURCE_ROOTS.get())
+        for path in (root.absolute(), root.resolve())
+    )
+    identities = set()
+    for root in roots:
+        try:
+            identity = root.stat()
+            identities.add((identity.st_dev, identity.st_ino))
+        except FileNotFoundError:
+            pass
+    return ExternalEnvBoundary(roots, frozenset(identities))
+
+
+def external_env_path(
+    repo: Path, value: str, *, boundary: ExternalEnvBoundary | None = None,
+    admission: ExternalEnvAdmission | None = None,
+) -> bool:
+    return _external_path_allowed(
+        repo, value, require_custody=True, boundary=boundary, admission=admission,
+    )
+
+
+def external_output_path(repo: Path, value: str) -> bool:
+    # Output publication replaces or unlinks an entry; it never mutates the
+    # existing inode shared by other hardlinks. Input custody remains stricter.
+    return _external_path_allowed(repo, value, require_custody=False)
+
+
+def _external_path_allowed(
+    repo: Path, value: str, *, require_custody: bool,
+    boundary: ExternalEnvBoundary | None = None,
+    admission: ExternalEnvAdmission | None = None,
+) -> bool:
+    try:
+        if admission is not None:
+            boundary = admission.boundary
+        elif boundary is None:
+            boundary = capture_external_env_boundary(repo)
+        roots, identities = boundary
 
         def owned(path: Path) -> bool:
-            if any(is_within(path, root) for root in roots):
-                return True
-            for ancestor in (path, *path.parents):
-                try:
-                    identity = ancestor.stat()
-                except (FileNotFoundError, NotADirectoryError):
-                    continue
-                if (identity.st_dev, identity.st_ino) in identities:
-                    return True
-            return False
+            if admission is not None and path in admission.owned:
+                return admission.owned[path]
+            ancestors = (path, *path.parents)
+            result = not roots.isdisjoint(ancestors)
+            if not result:
+                for ancestor in ancestors:
+                    identity = admission.observed.get(ancestor) if admission is not None else None
+                    if identity is None:
+                        identity = path_identity(ancestor)
+                        if admission is not None:
+                            admission.observed[ancestor] = identity
+                    if identity[0] == "present" and identity[1:] in identities:
+                        result = True
+                        break
+            if admission is not None:
+                admission.owned[path] = result
+            return result
 
         candidate = Path(value).expanduser()
         # Native normalization can differ from component traversal (notably
@@ -834,7 +1200,21 @@ def external_env_path(repo: Path, value: str) -> bool:
                     pending.extend(reversed(target.parts))
             else:
                 current = entry
-        return not owned(current)
+        return not owned(current) and (not require_custody or independent_file_custody(current))
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def safe_certificate_directory(repo: Path, directory: Path) -> bool:
+    # OpenSSL uses hash names, but other TLS loaders consume arbitrary filenames.
+    try:
+        boundary = capture_external_env_boundary(repo)
+        return all(
+            external_env_path(repo, str(entry), boundary=boundary)
+            for entry in directory.iterdir()
+        )
+    except (FileNotFoundError, NotADirectoryError):
+        return True
     except (OSError, RuntimeError, ValueError):
         return False
 
@@ -844,7 +1224,8 @@ def normalize_external_env_path_value(
     key: str,
     value: str,
 ) -> str | None:
-    values = value.split(os.pathsep) if key == "SSL_CERT_DIR" else [value]
+    is_list = key in {"SSL_CERT_DIR", "OPENCLAW_INCLUDE_ROOTS"}
+    values = value.split(os.pathsep) if is_list else [value]
     normalized: list[str] = []
     for item in values:
         if not item:
@@ -857,8 +1238,15 @@ def normalize_external_env_path_value(
             return None
         if not external_env_path(repo, str(resolved)):
             return None
+        if is_list and os.pathsep in str(resolved):
+            return None
+        if key == "SSL_CERT_DIR" and not safe_certificate_directory(repo, resolved):
+            return None
         normalized.append(str(resolved))
-    return os.pathsep.join(normalized) if normalized else None
+    serialized = os.pathsep.join(normalized)
+    if not serialized or (is_list and serialized.split(os.pathsep) != normalized):
+        return None
+    return serialized
 
 
 def safe_dbus_session_address(repo: Path, value: str) -> bool:
@@ -1081,6 +1469,19 @@ class ProxyRedactedOutput:
             self.stream.flush()
 
 
+def validate_claude_settings(repo: Path) -> None:
+    # --setting-sources=user keeps this file active in both probe and live runs.
+    raw = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not raw and os.name == "nt" and not os.environ.get("USERPROFILE"):
+        raise SystemExit("Claude requires CLAUDE_CONFIG_DIR when USERPROFILE is unavailable")
+    try:
+        directory = Path(raw).expanduser() if raw else Path.home() / ".claude"
+        if not all(external_env_path(repo, str(path)) for path in (directory, directory / "settings.json")):
+            raise ValueError("source-owned Claude settings")
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SystemExit("Claude configuration and settings must be outside reviewed source roots") from exc
+
+
 def pi_config_directory(repo: Path) -> str:
     # Pi 0.79 loads these files even with project context and extensions disabled.
     # Pin the effective default too: a safe HOME may contain a reviewed worktree.
@@ -1103,6 +1504,7 @@ def safe_engine_env(
     extra: dict[str, str] | None = None,
     *,
     engine: str | None = None,
+    selected_executable: str | None = None,
 ) -> dict[str, str]:
     common_allowed_exact = {
         "ALL_PROXY",
@@ -1271,7 +1673,10 @@ def safe_engine_env(
             raise SystemExit(
                 f"malformed proxy URL in {key}; configure a valid proxy URL before running autoreview"
             )
-    env["PATH"] = safe_engine_path(repo, extra_paths)
+    env["PATH"] = safe_engine_path(
+        repo, extra_paths,
+        selected_executables=[selected_executable] if selected_executable is not None else None,
+    )
     for key in ("HOME", "USERPROFILE"):
         value = os.environ.get(key)
         if value and external_env_path(repo, value):
@@ -1283,8 +1688,11 @@ def safe_engine_env(
     }
     for key in engine_config_paths.get(engine or "", ()):
         value = os.environ.get(key)
-        if value and external_env_path(repo, value):
-            env[key] = value
+        normalized = normalize_external_env_path_value(repo, key, value) if value else None
+        if normalized:
+            env[key] = normalized
+    if engine == "claude":
+        validate_claude_settings(repo)
     if engine == "pi":
         env["PI_CODING_AGENT_DIR"] = pi_config_directory(repo)
     for key in TRANSPORT_TRUST_PATH_ENV_KEYS:
@@ -1389,19 +1797,68 @@ def terminate_owned_processes() -> None:
         _enforce_owned_process_group(proc, _OWNED_PROCESS_GRACE_SECONDS)
 
 
-def _resolve_windows_taskkill() -> str | None:
-    """Resolve taskkill.exe via an absolute path under %SystemRoot%\\System32.
+class WindowsTaskkill(NamedTuple):
+    raw_path: Path
+    path: Path
+    roots: tuple[Path, ...]
+    identity: tuple[int, int, int, int, int]
 
-    Windows' executable search order checks the current working directory
-    before System32, and that CWD can be the untrusted reviewed checkout --
-    a repo-local taskkill.exe there would otherwise run during cleanup.
-    find_command's PATH-based resolution needs a repo handle to exclude the
-    checkout, which signal-handler cleanup paths do not have, so resolve
-    the trusted system binary directly instead.
-    """
+
+WINDOWS_TASKKILL: contextvars.ContextVar[WindowsTaskkill | None] = contextvars.ContextVar(
+    "windows_taskkill", default=None,
+)
+
+
+def _capture_windows_taskkill(repo: Path) -> WindowsTaskkill:
+    # Check the complete caller spelling before resolving: an external
+    # SystemRoot can still contain source-owned System32 or taskkill links.
     system_root = os.environ.get("SystemRoot") or r"C:\Windows"
-    taskkill = Path(system_root) / "System32" / "taskkill.exe"
-    return str(taskkill) if taskkill.is_file() else None
+    raw_path = Path(system_root) / "System32" / "taskkill.exe"
+    roots = tuple(dict.fromkeys((repo, *UNTRUSTED_SOURCE_ROOTS.get())))
+    try:
+        if not raw_path.is_absolute() or any(
+            not external_env_path(root, str(raw_path)) for root in roots
+        ):
+            raise ValueError("source-owned executable path")
+        path = raw_path.resolve(strict=True)
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode) or any(
+            not external_env_path(root, str(path)) for root in roots
+        ):
+            raise ValueError("untrusted executable")
+        validate_selected_executable(repo, str(raw_path))
+        identity = (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns)
+        return WindowsTaskkill(raw_path, path, roots, identity)
+    except (OSError, RuntimeError, ValueError, SystemExit) as exc:
+        raise SystemExit("Windows cleanup requires a trusted System32/taskkill.exe outside reviewed source roots") from exc
+
+
+def _resolve_windows_taskkill() -> str | None:
+    """Revalidate the admitted cleanup executable without searching PATH or CWD."""
+    binding = WINDOWS_TASKKILL.get()
+    if binding is None:
+        # Direct helper callers still require complete path admission. The CLI
+        # binds before preflight and keeps that identity for the whole review.
+        try:
+            binding = _capture_windows_taskkill(Path.cwd().resolve())
+        except SystemExit:
+            return None
+    try:
+        if any(not external_env_path(root, str(path))
+               for root in binding.roots for path in (binding.raw_path, binding.path)):
+            return None
+        if binding.raw_path.resolve(strict=True) != binding.path:
+            return None
+        info = binding.path.stat()
+        identity = (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns)
+        if identity != binding.identity:
+            return None
+        for root in binding.roots:
+            validate_selected_executable(root, str(binding.raw_path))
+    except (OSError, RuntimeError, ValueError, SystemExit):
+        return None
+    # Launch the admitted absolute target, never the mutable caller alias.
+    return str(binding.path)
 
 
 def _signal_owned_process_group(proc: subprocess.Popen) -> bool:
@@ -2195,7 +2652,7 @@ def detect_pr_base(repo: Path) -> str | None:
     gh_bin = find_command("gh", repo)
     if not gh_bin:
         return None
-    env = safe_gh_env(repo)
+    env = safe_gh_env(repo, selected_gh=gh_bin)
     result = run(
         [gh_bin, "pr", "view", "--json", "baseRefName", "--jq", ".baseRefName"],
         repo, check=False, env=env,
@@ -2204,10 +2661,16 @@ def detect_pr_base(repo: Path) -> str | None:
     return f"origin/{base}" if result.returncode == 0 and base else None
 
 
-def safe_gh_env(repo: Path) -> dict[str, str]:
-    env = safe_git_env(repo)
+def safe_gh_env(repo: Path, *, selected_gh: str | None = None) -> dict[str, str]:
+    env = _safe_git_base_env(repo)
     git_bin = resolve_git(repo)
-    env["PATH"] = os.pathsep.join((str(Path(git_bin).parent), env["PATH"]))
+    try:
+        env["PATH"] = safe_git_path(
+            repo, [Path(git_bin).parent],
+            selected_executables=[git_bin, *([selected_gh] if selected_gh is not None else [])],
+        )
+    except SystemExit as exc:
+        raise SystemExit("PR-base discovery requires trusted executable installation directories; pass --base explicitly") from exc
     # gh resolves Git itself: an external PATH directory can still contain a
     # repository-owned executable symlink. Require the approved Git to win.
     env["NoDefaultCurrentDirectoryInExePath"] = "1"
@@ -2231,6 +2694,9 @@ def safe_gh_env(repo: Path) -> dict[str, str]:
         if normalized is None:
             raise SystemExit(f"PR-base discovery refuses repository-owned {key}; pass --base explicitly")
         env[key] = normalized
+    # gh restores XDG_CONFIG_HOME for its own configuration; nested Git also
+    # uses it for the default global ignore even with global config disabled.
+    validate_git_default_ignore(repo, env)
     if env.get("GH_CONFIG_DIR"):
         config_dir = Path(env["GH_CONFIG_DIR"])
     elif env.get("XDG_CONFIG_HOME"):
@@ -2264,6 +2730,7 @@ def resolve_command(name: str, repo: Path) -> str:
 
 
 def resolve_git(repo: Path) -> str:
+    verify_repository_metadata()
     return resolve_command(os.environ.get("AUTOREVIEW_GIT", "git"), repo)
 
 
@@ -2273,7 +2740,7 @@ def preflight_git() -> bool:
     selected = os.environ.get("AUTOREVIEW_GIT", "git")
     try:
         selected = resolve_git(repo)
-        git_env = safe_git_env(repo)
+        git_env = safe_git_env(repo, selected_git=selected)
     except SystemExit:
         reason = "executable or environment missing or untrusted"
     else:
@@ -2314,6 +2781,8 @@ def find_command(name: str, repo: Path) -> str | None:
     roots = (repo, *UNTRUSTED_SOURCE_ROOTS.get())
     if has_directory_component(name, command):
         base = command if command.is_absolute() else repo / command
+        if not external_env_path(repo, str(base)):
+            return None
         if any(is_within(Path(os.path.abspath(base)), Path(os.path.abspath(root))) for root in roots):
             return None
         found = first_executable_candidate(base, reject_root=repo.resolve())
@@ -2322,7 +2791,7 @@ def find_command(name: str, repo: Path) -> str | None:
         if not part or part == ".":
             continue
         path_part = Path(part)
-        if not path_part.is_absolute():
+        if not path_part.is_absolute() or not external_env_path(repo, str(path_part / name)):
             continue
         try:
             resolved_part = path_part.resolve()
@@ -2406,25 +2875,31 @@ def git_bytes(
     *args: str,
     check: bool = True,
     env: dict[str, str] | None = None,
+    input_bytes: bytes | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     line_ending_args = (
         git_line_ending_args(repo)
         if env is None and args and args[0] in {"diff", "status"}
         else []
     )
-    child_env = env if env is not None else safe_git_env(repo)
+    selected_git = resolve_git(repo)
+    child_env = dict(env) if env is not None else _safe_git_base_env(repo)
     filters_disabled = False
     if args and args[0] in {"diff", "status"}:
         child_env, filters_disabled = disable_git_filters(repo, child_env)
+    # Every launch, including nested and supplied-environment config queries,
+    # gets a fresh complete admission after any preparation subprocesses.
+    child_env["PATH"] = safe_git_path(repo, selected_executables=[selected_git])
     result = subprocess.run(
         [
-            resolve_git(repo),
+            selected_git,
             "--no-optional-locks",
             *SAFE_GIT_CONFIG_ARGS,
             *line_ending_args,
             *args,
         ],
         cwd=repo,
+        **({"input": input_bytes} if input_bytes is not None else {}),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=child_env,
@@ -3836,11 +4311,15 @@ def evidence_topology(repo: Path, raw_path: str) -> tuple[tuple[int, int, int], 
     for part in Path(raw_path).parts:
         current = current / part
         try:
-            info = os.stat(current, follow_symlinks=False)
+            info = current.lstat()
         except OSError as exc:
             raise SystemExit(f"evidence changed or became unreadable: {raw_path}") from exc
         if stat.S_ISLNK(info.st_mode):
             raise SystemExit("refusing symlinked evidence")
+        # Windows name-surrogate reparse points redirect path traversal, including
+        # junctions. lstat exposes their tag on supported Python 3.10/3.11 too.
+        if getattr(info, "st_reparse_tag", 0) & 0x20000000:
+            raise SystemExit("refusing redirected evidence")
         identities.append((info.st_dev, info.st_ino, info.st_mode))
     return tuple(identities)
 
@@ -3880,43 +4359,119 @@ def capture_evidence_inputs(args: argparse.Namespace, repo: Path) -> EvidenceInp
     return EvidenceInputs("\n\n".join(chunks), datasets, files)
 
 
+def committed_source_versions(repo: Path, commit: str, paths: list[str]) -> dict[str, SourceVersion]:
+    versions = {path: SourceVersion("absent", None, None) for path in paths}
+    # Bound path arguments for Windows command lines as well as large manifests.
+    # Blob requests contain only object IDs and travel through stdin.
+    selected = []
+    path_bytes = 0
+    batches = []
+    for path in paths:
+        size = len(path.encode("utf-8")) + 3
+        if selected and (path_bytes + size > 16_000 or len(selected) == 128):
+            batches.append(selected)
+            selected = []
+            path_bytes = 0
+        selected.append(path)
+        path_bytes += size
+    if selected:
+        batches.append(selected)
+    for selected in batches:
+        entries = git_path_list(repo, "--literal-pathspecs", "ls-tree", "-z", commit, "--", *selected)
+        for entry in entries:
+            metadata, actual = entry.split("\t", 1)
+            if actual not in versions:
+                continue
+            mode, kind, oid = metadata.split()
+            if mode == "040000" and kind == "tree":
+                continue
+            if mode not in {"100644", "100755"} or kind != "blob":
+                raise SystemExit(f"unsafe mixed source mode: {display_escape(actual, 500)} ({mode})")
+            if versions[actual].mode is not None:
+                raise SystemExit(f"duplicate committed source: {display_escape(actual, 500)}")
+            versions[actual] = SourceVersion(f"git:{oid}:{mode}", mode, None)
+    object_ids = list(dict.fromkeys(source.identity.split(":")[1]
+                                 for source in versions.values() if source.mode is not None))
+    if not object_ids:
+        return versions
+    result = git_bytes(repo, "cat-file", "--batch", input_bytes="".join(oid + "\n" for oid in object_ids).encode("ascii"))
+    offset = 0
+    contents = {}
+    for oid in object_ids:
+        end = result.stdout.find(b"\n", offset)
+        header = result.stdout[offset:end].split() if end >= 0 else []
+        if len(header) != 3 or header[0] != oid.encode("ascii") or header[1] != b"blob" or not header[2].isdigit():
+            raise SystemExit("invalid committed source batch response")
+        size = int(header[2])
+        offset = end + 1
+        data = result.stdout[offset:offset + size]
+        offset += size
+        if len(data) != size or result.stdout[offset:offset + 1] != b"\n":
+            raise SystemExit("truncated committed source batch response")
+        offset += 1
+        contents[oid] = data
+    if offset != len(result.stdout):
+        raise SystemExit("unexpected committed source batch response")
+    return {path: (source._replace(content=mixed_source_text(path, "source context", contents[source.identity.split(":")[1]]))
+                   if source.mode is not None else source) for path, source in versions.items()}
+
+
+def capture_source_contexts(repo: Path, requests: list[tuple[str, str]]) -> list[SourceContext]:
+    admitted = []
+    commits: dict[str, list[str]] = {}
+    for raw_path, commit in requests:
+        original = relative_evidence_path(repo, raw_path, "--source-context")
+        if original.anchor:
+            raise SystemExit("--source-context must be a repo-relative path")
+        rel = original.as_posix()
+        # This role admits tracked source filenames, never credential directories.
+        # The tracked-diff policy alone also admits private/ and credentials/ code.
+        if (path_has_sensitive_part(rel)
+                or any(TRACKED_CREDENTIAL_DIR_PATTERN.fullmatch(part) for part in Path(rel).parts[:-1])
+                or tracked_sensitive_repo_path_risk(rel)):
+            raise SystemExit(f"refusing sensitive --source-context: {display_escape(rel, 500)}")
+
+        if commit not in commits:
+            if (not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit)
+                    or validate_git_ref(repo, commit, "source context", pin=True) != commit):
+                raise SystemExit("--source-context requires the frozen reviewed commit")
+            commits[commit] = []
+        if rel not in commits[commit]:
+            commits[commit].append(rel)
+        topology = evidence_topology(repo, rel)
+        path = repo / original
+        if not is_within(path.resolve(), repo.resolve()):
+            raise SystemExit("--source-context must stay inside the reviewed repository")
+        fingerprint = source_file_fingerprint(path)
+        if fingerprint[0] != "file":
+            raise SystemExit("--source-context requires a regular checkout path")
+
+        admitted.append((rel, commit, path, topology, fingerprint))
+    versions = {commit: committed_source_versions(repo, commit, paths) for commit, paths in commits.items()}
+    records = []
+    for rel, commit, path, topology, fingerprint in admitted:
+        source = versions[commit][rel]
+        if source.mode is None:
+            raise SystemExit(f"--source-context is absent from the reviewed commit: {display_escape(rel, 500)}")
+        # Bind the bytes to the tree's blob, including on a damaged object store.
+        assert source.content is not None
+        data = source.content.encode("utf-8")
+        oid = source.identity.split(":")[1]
+        digest = hashlib.new("sha1" if len(oid) == 40 else "sha256")
+        digest.update(f"blob {len(data)}\0".encode("ascii"))
+        digest.update(data)
+        if digest.hexdigest() != oid:
+            raise SystemExit("--source-context bytes do not match the committed blob")
+        if (evidence_topology(repo, rel) != topology
+                or source_file_fingerprint(path) != fingerprint):
+            raise SystemExit("source context changed while being captured")
+
+        records.append(SourceContext(rel, commit, source, topology, fingerprint))
+    return records
+
+
 def capture_source_context(repo: Path, raw_path: str, commit: str) -> SourceContext:
-    original = relative_evidence_path(repo, raw_path, "--source-context")
-    if original.anchor:
-        raise SystemExit("--source-context must be a repo-relative path")
-    rel = original.as_posix()
-    # This role admits tracked source filenames, never credential directories.
-    # The tracked-diff policy alone also admits private/ and credentials/ code.
-    if (path_has_sensitive_part(rel)
-            or any(TRACKED_CREDENTIAL_DIR_PATTERN.fullmatch(part) for part in Path(rel).parts[:-1])
-            or tracked_sensitive_repo_path_risk(rel)):
-        raise SystemExit(f"refusing sensitive --source-context: {display_escape(rel, 500)}")
-    if (not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit)
-            or validate_git_ref(repo, commit, "source context", pin=True) != commit):
-        raise SystemExit("--source-context requires the frozen reviewed commit")
-    topology = evidence_topology(repo, rel)
-    path = repo / original
-    if not is_within(path.resolve(), repo.resolve()):
-        raise SystemExit("--source-context must stay inside the reviewed repository")
-    fingerprint = source_file_fingerprint(path)
-    if fingerprint[0] != "file":
-        raise SystemExit("--source-context requires a regular checkout path")
-    source = read_git_source(repo, rel, "source context", git_source_version(repo, rel, commit))
-    if source.mode is None:
-        raise SystemExit(f"--source-context is absent from the reviewed commit: {display_escape(rel, 500)}")
-    # Bind the bytes to the tree's blob, including on a damaged object store.
-    assert source.content is not None
-    data = source.content.encode("utf-8")
-    oid = source.identity.split(":")[1]
-    digest = hashlib.new("sha1" if len(oid) == 40 else "sha256")
-    digest.update(f"blob {len(data)}\0".encode("ascii"))
-    digest.update(data)
-    if digest.hexdigest() != oid:
-        raise SystemExit("--source-context bytes do not match the committed blob")
-    if (evidence_topology(repo, rel) != topology
-            or source_file_fingerprint(path) != fingerprint):
-        raise SystemExit("source context changed while being captured")
-    return SourceContext(rel, commit, source, topology, fingerprint)
+    return capture_source_contexts(repo, [(raw_path, commit)])[0]
 
 
 def capture_source_context_inputs(
@@ -3956,13 +4511,10 @@ def capture_source_context_inputs(
     )
 
 
-def external_source_binding(repo: Path, root: Path) -> tuple[
-    tuple[tuple[str, tuple[tuple[int, int, int], ...]], ...],
-    tuple[tuple[str, tuple[str, int, int, str]], ...],
-]:
-    if (not root.is_absolute() or root.resolve() != root
-            or is_within_physical(root, repo.resolve()) or is_within_physical(repo.resolve(), root)):
-        raise SystemExit("external source root must be a canonical, separate absolute worktree")
+def repository_metadata(root: Path) -> RepositoryMetadata:
+    """Read raw Git metadata without executing any command from that storage."""
+    if not root.is_absolute() or root.resolve() != root:
+        raise SystemExit("source root must be a canonical absolute worktree")
 
     def topology(path: Path) -> tuple[tuple[int, int, int], ...]:
         return evidence_topology(Path(path.anchor), path.relative_to(path.anchor).as_posix())
@@ -3978,7 +4530,7 @@ def external_source_binding(repo: Path, root: Path) -> tuple[
         before = source_file_fingerprint(path)
         if before[0] != "file":
             raise SystemExit("external source metadata pointer must be a regular file")
-        data = read_file_bytes(path).rstrip(b" \t\r\n\v\f")
+        data = read_file_bytes(path).rstrip(b"\r\n")
         if not data.startswith(prefix) or not data[len(prefix):] or b"\0" in data:
             raise SystemExit("invalid external source metadata pointer")
         if source_file_fingerprint(path) != before:
@@ -4011,35 +4563,106 @@ def external_source_binding(repo: Path, root: Path) -> tuple[
         raise SystemExit("external source alternate object stores are unsupported")
     if any(source_file_fingerprint(path) != before for path, before in pointers):
         raise SystemExit("external source repository changed while being captured")
-    if Path(git(root, "rev-parse", "--show-toplevel").strip()).resolve() != root:
-        raise SystemExit("external source root must be a Git worktree root")
-    for options, expected in ((("--absolute-git-dir",), git_dir),
-                              (("--git-common-dir",), common_dir),
-                              (("--git-path", "objects"), paths[-1])):
-        actual = Path(git(root, "rev-parse", *options).strip())
-        if (root / actual).resolve() != expected.resolve():
-            raise SystemExit("external source metadata does not match its raw pointers")
     if (binding[:2] != initial
             or tuple((str(path), topology(path)) for path in paths) != binding
             or metadata_records() != records):
         raise SystemExit("external source repository changed while being captured")
-    return binding, records
+    return RepositoryMetadata(root, binding, records)
+
+
+def verify_repository_metadata(bindings: tuple[RepositoryMetadata, ...] | None = None) -> None:
+    for expected in SOURCE_METADATA_BINDINGS.get() if bindings is None else bindings:
+        try:
+            current = repository_metadata(expected.root)
+        except (OSError, SystemExit) as exc:
+            raise SystemExit("reviewed Git metadata changed after admission") from exc
+        if current != expected:
+            raise SystemExit("reviewed Git metadata changed after admission")
+
+
+def metadata_source_roots(roots: tuple[Path, ...],
+                          bindings: tuple[RepositoryMetadata, ...]) -> tuple[Path, ...]:
+    protected = list(dict.fromkeys(roots))
+    metadata_roots = {Path(path).resolve() for record in bindings for path, _ in record.paths[2:]}
+    # Nested roots need no duplicate scan; the complete raw bindings remain intact.
+    for root in sorted(metadata_roots, key=lambda path: (len(path.parts), str(path))):
+        # Most metadata is already lexically contained in a worktree. Check all
+        # lexical roots before walking physical aliases of unrelated siblings.
+        if (not any(is_within(root, admitted) for admitted in protected)
+                and not any(is_within_physical(root, admitted) for admitted in protected)):
+            protected.append(root)
+    return tuple(protected)
+
+
+@contextlib.contextmanager
+def repository_metadata_scope(roots: tuple[Path, ...]):
+    verify_repository_metadata()
+    current_bindings = SOURCE_METADATA_BINDINGS.get()
+    current_roots = UNTRUSTED_SOURCE_ROOTS.get()
+    bindings = list(current_bindings)
+    for root in dict.fromkeys(roots):
+        if not any(record.root == root for record in bindings):
+            bindings.append(repository_metadata(root))
+    # Nested captures keep the admitted root set intact. The verification above
+    # remains fresh; rebuilding identical containment sets adds no protection.
+    protected = current_roots
+    if len(bindings) != len(current_bindings) or not all(root in current_roots for root in roots):
+        protected = metadata_source_roots((*current_roots, *roots), tuple(bindings))
+    source_token = UNTRUSTED_SOURCE_ROOTS.set(protected)
+    metadata_token = SOURCE_METADATA_BINDINGS.set(tuple(bindings))
+    try:
+        yield tuple(bindings)
+    finally:
+        SOURCE_METADATA_BINDINGS.reset(metadata_token)
+        UNTRUSTED_SOURCE_ROOTS.reset(source_token)
+
+
+def corroborate_repository_metadata(expected: RepositoryMetadata) -> None:
+    root = expected.root
+    verify_repository_metadata((expected,))
+    if Path(git(root, "rev-parse", "--show-toplevel").removesuffix("\n")).resolve() != root:
+        raise SystemExit("source root must be a Git worktree root")
+    for options, (path, _) in zip(
+        (("--absolute-git-dir",), ("--git-common-dir",), ("--git-path", "objects")),
+        expected.paths[2:],
+    ):
+        actual = Path(git(root, "rev-parse", *options).removesuffix("\n"))
+        if (root / actual).resolve() != Path(path).resolve():
+            raise SystemExit("external source metadata does not match its raw pointers")
+    verify_repository_metadata((expected,))
+
+
+def external_source_binding(repo: Path, root: Path) -> tuple[
+    tuple[tuple[str, tuple[tuple[int, int, int], ...]], ...],
+    tuple[tuple[str, tuple[str, int, int, str]], ...],
+]:
+    if (not root.is_absolute() or root.resolve() != root
+            or is_within_physical(root, repo.resolve()) or is_within_physical(repo.resolve(), root)):
+        raise SystemExit("external source root must be a canonical, separate absolute worktree")
+    # Direct callers protect both repositories before any Git corroboration.
+    with repository_metadata_scope((repo, root)) as bindings:
+        expected = next(record for record in bindings if record.root == root)
+        corroborate_repository_metadata(expected)
+        return expected.paths, expected.files
+
+
+def capture_external_source_contexts(
+    repo: Path, root: Path, requests: list[tuple[str, str]],
+) -> list[ExternalSourceContext]:
+    # Bind each root once around its complete capture, never across verification
+    # fences. Every Git subprocess still admits its executable and environment.
+    with repository_metadata_scope((repo, root)):
+        binding, metadata = external_source_binding(repo, root)
+        sources = capture_source_contexts(root, requests)
+        if external_source_binding(repo, root) != (binding, metadata):
+            raise SystemExit("external source repository changed while being captured")
+        return [ExternalSourceContext(root, binding, metadata, source) for source in sources]
 
 
 def capture_external_source_context(
     repo: Path, root: Path, path: str, commit: str,
 ) -> ExternalSourceContext:
-    # Keep direct captures safe too; ordinary runs already include every declared
-    # source root before any host executable or configuration is admitted.
-    token = UNTRUSTED_SOURCE_ROOTS.set((*UNTRUSTED_SOURCE_ROOTS.get(), repo, root))
-    try:
-        binding, metadata = external_source_binding(repo, root)
-        source = capture_source_context(root, path, commit)
-        if external_source_binding(repo, root) != (binding, metadata):
-            raise SystemExit("external source repository changed while being captured")
-        return ExternalSourceContext(root, binding, metadata, source)
-    finally:
-        UNTRUSTED_SOURCE_ROOTS.reset(token)
+    return capture_external_source_contexts(repo, root, [(path, commit)])[0]
 
 
 def read_external_source_manifests(args: argparse.Namespace, repo: Path) -> list[tuple[EvidenceFile, dict[str, Any]]]:
@@ -4090,6 +4713,14 @@ def capture_external_source_inputs(
     chunks = [evidence.prompt] if evidence.prompt else []
     files = list(evidence.files)
     sources: dict[tuple[Path, str, str], ExternalSourceContext] = {}
+    requests: dict[Path, list[tuple[str, str]]] = {}
+    for manifest, document in documents:
+        if capture_evidence_file(repo, manifest.raw_path, manifest.label) != manifest:
+            raise SystemExit("external source manifest changed after executable admission")
+        requests.setdefault(Path(document["root"]), []).extend(
+            (item["path"], document["commit"]) for item in document["files"])
+    captures = {root: iter(capture_external_source_contexts(repo, root, selected))
+                for root, selected in requests.items()}
     for manifest, document in documents:
         if capture_evidence_file(repo, manifest.raw_path, manifest.label) != manifest:
             raise SystemExit("external source manifest changed after executable admission")
@@ -4097,7 +4728,7 @@ def capture_external_source_inputs(
         files.append(manifest)
         manifest_paths: set[str] = set()
         for item in document["files"]:
-            record = capture_external_source_context(repo, root, item["path"], document["commit"])
+            record = next(captures[root])
             source = record.source
             if source.raw_path in manifest_paths:
                 raise SystemExit("duplicate external source path")
@@ -4121,19 +4752,27 @@ def capture_external_source_inputs(
 
 
 def verify_evidence(repo: Path, files: list[EvidenceFile | SourceContext | ExternalSourceContext]) -> None:
+    external: dict[Path, list[ExternalSourceContext]] = {}
     for record in files:
+        if isinstance(record, ExternalSourceContext):
+            external.setdefault(record.root, []).append(record)
+            continue
         try:
-            if isinstance(record, ExternalSourceContext):
-                current = capture_external_source_context(
-                    repo, record.root, record.source.raw_path, record.source.commit,
-                )
-            else:
-                current = (capture_source_context(repo, record.raw_path, record.commit)
-                           if isinstance(record, SourceContext)
-                           else capture_evidence_file(repo, record.raw_path, record.label))
+            current = (capture_source_context(repo, record.raw_path, record.commit)
+                       if isinstance(record, SourceContext)
+                       else capture_evidence_file(repo, record.raw_path, record.label))
         except SystemExit as exc:
             raise SystemExit("evidence changed or became unsafe; rerun autoreview") from exc
         if current != record:
+            raise SystemExit("evidence changed; rerun autoreview against the updated inputs")
+    for root, records in external.items():
+        try:
+            current = capture_external_source_contexts(
+                repo, root, [(record.source.raw_path, record.source.commit) for record in records],
+            )
+        except SystemExit as exc:
+            raise SystemExit("evidence changed or became unsafe; rerun autoreview") from exc
+        if current != records:
             raise SystemExit("evidence changed; rerun autoreview against the updated inputs")
 
 
@@ -5370,9 +6009,11 @@ def load_codex_auth_config(path: Path, *, strict: bool = False) -> dict[str, Any
 def codex_source_home(repo: Path) -> Path | None:
     raw = os.environ.get("CODEX_HOME", "").strip()
     candidate = Path(raw).expanduser() if raw else Path.home() / ".codex"
+    if not external_env_path(repo, str(candidate)):
+        return None
     try:
         resolved = candidate.resolve()
-    except OSError:
+    except (OSError, RuntimeError):
         return None
     if not resolved.is_dir() or not external_env_path(repo, str(resolved)):
         return None
@@ -5481,8 +6122,11 @@ def load_codex_inference_route(
         if not isinstance(value, str) or not value or (absolute and not Path(value).is_absolute()):
             refuse(f"{label} must be {'an absolute ' if absolute else 'an '}external path")
         try:
-            # Codex resolves path settings relative to their owning config file.
-            path = (source_home / Path(value).expanduser()).resolve(strict=True)
+            # Check the caller's spelling before resolution discards source-owned links.
+            candidate = source_home / Path(value).expanduser()
+            if not external_env_path(repo, str(candidate)):
+                refuse(f"{label} must be outside the reviewed repository")
+            path = candidate.resolve(strict=True)
         except (OSError, ValueError, RuntimeError):
             refuse(f"{label} is unavailable")
         if not external_env_path(repo, str(path)) or not (
@@ -5549,6 +6193,10 @@ def load_codex_inference_route(
     command = external_path(auth.get("command"), "authentication executable", absolute=True)
     if not os.access(command, os.X_OK):
         refuse("authentication executable is not executable")
+    try:
+        validate_selected_executable(repo, auth["command"])
+    except SystemExit:
+        refuse("authentication executable requires trusted installation directories outside reviewed source roots")
     if os.name != "nt":
         codex_auth_helper_home(repo)
     auth_cwd = external_path(auth.get("cwd", str(source_home)), "authentication cwd", directory=True)
@@ -5594,9 +6242,18 @@ def prepare_codex_inference_config(
     return [*flags, "-c", f"model_catalog_json={toml_string(str(catalogue.resolve()))}"]
 
 
+def validate_codex_auth_commands(repo: Path, flags: list[str]) -> None:
+    commands = []
+    for flag in flags:
+        key, separator, value = flag.partition("=")
+        if separator and re.fullmatch(r"model_providers\.[A-Za-z0-9_-]+\.auth\.command", key):
+            commands.append(json.loads(value))
+    if commands:
+        admit_executable_directories(repo, selected_executables=commands, include_search_path=False)
+
+
 def stage_codex_auth_helper(repo: Path, runtime_root: Path, flags: list[str]) -> list[str]:
-    if os.name == "nt":
-        return flags
+    validate_codex_auth_commands(repo, flags)
     staged = list(flags)
     for index, flag in enumerate(flags):
         key, separator, value = flag.partition("=")
@@ -5605,6 +6262,8 @@ def stage_codex_auth_helper(repo: Path, runtime_root: Path, flags: list[str]) ->
         # Route validation owns the absolute executable. Native command auth
         # runs outside the tool sandbox; only its launcher restores caller HOME.
         command = json.loads(value)
+        if os.name == "nt":
+            continue
         home = codex_auth_helper_home(repo)
         with tempfile.NamedTemporaryFile(
             "w", prefix="provider-auth.", dir=runtime_root, delete=False, encoding="utf-8",
@@ -5652,19 +6311,65 @@ def prepare_codex_runtime_auth(
         return False
     runtime_codex_home.mkdir(parents=True, exist_ok=True)
     runtime_auth = runtime_codex_home / "auth.json"
-    # Codex refreshes file auth in place. A filesystem link preserves those
-    # native writes without a copy-back race against another Codex process.
+    # Codex refreshes file auth in place. Prefer a symlink so concurrent reviews
+    # share those writes without making the source a writable hardlink alias.
     try:
-        os.link(source_auth, runtime_auth)
+        runtime_auth.symlink_to(source_auth)
     except OSError:
         try:
-            runtime_auth.symlink_to(source_auth)
+            os.link(source_auth, runtime_auth)
         except OSError as exc:
             raise SystemExit(
                 "unable to isolate Codex file authentication without "
                 "discarding refreshed credentials"
             ) from exc
     return True
+
+
+@contextlib.contextmanager
+def codex_runtime_auth(
+    repo: Path, runtime_codex_home: Path, *, expected_file_auth: bool,
+):
+    source_auth = codex_file_auth_source(repo)
+    if (source_auth is not None) != expected_file_auth:
+        raise SystemExit("Codex file authentication changed before reviewer launch")
+    if source_auth is None:
+        yield
+        return
+    source_identity = source_auth.stat()
+    if not prepare_codex_runtime_auth(repo, runtime_codex_home):
+        raise SystemExit("Codex file authentication changed before reviewer launch")
+    runtime_auth = runtime_codex_home / "auth.json"
+    identity = runtime_auth.lstat()
+    def remove_owned_link() -> None:
+        try:
+            current = runtime_auth.lstat()
+        except FileNotFoundError:
+            return
+        if (current.st_dev, current.st_ino, stat.S_IFMT(current.st_mode)) != (
+            identity.st_dev, identity.st_ino, stat.S_IFMT(identity.st_mode),
+        ):
+            raise SystemExit("Codex runtime authentication link was replaced; refusing cleanup")
+        runtime_auth.unlink()
+
+    # The alias exists only while Codex runs. Remove it before source custody
+    # checks on retry, without copying or losing in-place credential refreshes.
+    try:
+        linked_identity = runtime_auth.stat()
+        if (linked_identity.st_dev, linked_identity.st_ino) != (source_identity.st_dev, source_identity.st_ino):
+            raise SystemExit("Codex runtime authentication link changed before reviewer launch")
+        yield
+    except BaseException:
+        try:
+            remove_owned_link()
+        except (OSError, SystemExit):
+            try:
+                print("Codex runtime authentication cleanup failed; preserving original failure", file=sys.stderr)
+            except (OSError, ValueError):
+                pass
+        raise
+    else:
+        remove_owned_link()
 
 
 def codex_runtime_env(
@@ -5701,6 +6406,7 @@ def codex_runtime_env(
         repo,
         [Path(codex_bin).parent],
         engine="codex",
+        selected_executable=codex_bin,
         extra={
             "HOME": str(runtime_home),
             "USERPROFILE": str(runtime_home),
@@ -5812,6 +6518,7 @@ def ensure_claude_isolation_supported(args: argparse.Namespace, repo: Path) -> N
         repo,
         [Path(claude_bin).parent],
         engine="claude",
+        selected_executable=claude_bin,
     )
     temp_root = safe_temp_root(repo)
     result = run([claude_bin, "--version"], temp_root, check=False, env=engine_env)
@@ -5859,6 +6566,7 @@ def ensure_amp_isolation_supported(args: argparse.Namespace, repo: Path) -> str:
         repo,
         [Path(amp_bin).parent],
         engine="amp",
+        selected_executable=amp_bin,
         extra={"NO_COLOR": "1"},
     )
     with tempfile.TemporaryDirectory(
@@ -5892,7 +6600,7 @@ def ensure_amp_isolation_supported(args: argparse.Namespace, repo: Path) -> str:
 
 def ensure_pi_isolation_supported(args: argparse.Namespace, repo: Path) -> str:
     pi_bin = resolve_command(args.pi_bin, repo)
-    engine_env = safe_engine_env(repo, [Path(pi_bin).parent], engine="pi")
+    engine_env = safe_engine_env(repo, [Path(pi_bin).parent], engine="pi", selected_executable=pi_bin)
     with tempfile.TemporaryDirectory(
         prefix="autoreview-pi-probe.",
         dir=safe_temp_root(repo),
@@ -6132,11 +6840,20 @@ def load_codex_auth_fallback_route(
 
 
 def codex_subscription_login_missing(codex_bin: str, cwd: Path, source_repo: Path) -> bool:
+    if EXTERNAL_SOURCE_REVIEW.get():
+        env = safe_engine_env(source_repo, engine="codex", selected_executable=codex_bin)
+    else:
+        validate_selected_executable(source_repo, codex_bin)
+        env = os.environ.copy()
+    if value := env.get("CODEX_HOME"):
+        normalized = normalize_external_env_path_value(source_repo, "CODEX_HOME", value)
+        if normalized is None:
+            return False
+        env["CODEX_HOME"] = normalized
     try:
         result = subprocess.run(
             [codex_bin, "login", "status"], cwd=cwd,
-            env=(safe_engine_env(source_repo, engine="codex") if UNTRUSTED_SOURCE_ROOTS.get()
-                 else os.environ.copy()),
+            env=env,
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding=SUBPROCESS_TEXT_ENCODING, errors=SUBPROCESS_TEXT_ERRORS,
             timeout=10, check=False,
@@ -6304,7 +7021,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                 )
             auth_config = prepare_codex_inference_config(route, runtime_root)
             auth_config = stage_codex_auth_helper(repo, runtime_root, auth_config)
-            file_auth_linked = not command_auth and prepare_codex_runtime_auth(repo, runtime_codex_home)
+            file_auth_linked = not command_auth and codex_file_auth_source(repo) is not None
             attempts = list(enumerate(models))
             while attempts:
                 index, model = attempts.pop(0)
@@ -6334,27 +7051,34 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                 interrupted_stdout = ""
                 # Retries reuse the frozen prompt, but its captured evidence
                 # must still be admitted before each helper-initiated send.
+                # Check the original auth command as well as the staged wrapper:
+                # its installation may have changed since the preceding attempt.
+                validate_codex_auth_commands(repo, route[0])
                 if before_send := getattr(args, "_verify_review_inputs", None):
                     before_send()
                 try:
-                    result = run_with_heartbeat(
-                        cmd,
-                        review_root,
-                        input_text=prompt,
-                        label="codex",
-                        max_runtime_seconds=getattr(args, "engine_timeout_seconds", None),
-                        stream_output=args.stream_engine_output,
-                        stream_display=CodexStreamDisplay(suppress_diagnostics=command_auth, engine_stage=engine_stage) if args.stream_engine_output else None,
-                        engine_stage=engine_stage,
-                        stop_on_output=CodexAuthFailureStopper(),
-                        env=codex_runtime_env(
-                            repo,
-                            runtime_root,
-                            cmd[0],
-                            file_auth_linked=file_auth_linked,
-                            command_auth=command_auth,
-                        ),
+                    runtime_env = codex_runtime_env(
+                        repo, runtime_root, cmd[0], file_auth_linked=file_auth_linked,
+                        command_auth=command_auth,
                     )
+                    auth_scope = (
+                        contextlib.nullcontext() if command_auth else codex_runtime_auth(
+                            repo, runtime_codex_home, expected_file_auth=file_auth_linked,
+                        )
+                    )
+                    with auth_scope:
+                        result = run_with_heartbeat(
+                            cmd,
+                            review_root,
+                            input_text=prompt,
+                            label="codex",
+                            max_runtime_seconds=getattr(args, "engine_timeout_seconds", None),
+                            stream_output=args.stream_engine_output,
+                            stream_display=CodexStreamDisplay(suppress_diagnostics=command_auth, engine_stage=engine_stage) if args.stream_engine_output else None,
+                            engine_stage=engine_stage,
+                            stop_on_output=CodexAuthFailureStopper(),
+                            env=runtime_env,
+                        )
                 except EngineInterrupted as exc:
                     interrupted_stdout = exc.stdout
                     raise
@@ -6469,6 +7193,7 @@ def run_claude(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                 repo,
                 [Path(cmd[0]).parent],
                 engine="claude",
+                selected_executable=cmd[0],
             ),
         )
     if result.returncode != 0:
@@ -6907,6 +7632,7 @@ def run_amp(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             repo,
             [Path(amp_bin).parent],
             engine="amp",
+            selected_executable=amp_bin,
             extra={
                 "HOME": str(runtime_home),
                 "USERPROFILE": str(runtime_home),
@@ -7068,6 +7794,7 @@ def run_pi(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                 repo,
                 [Path(cmd[0]).parent],
                 engine="pi",
+                selected_executable=cmd[0],
             ),
         )
     if result.returncode != 0:
@@ -8087,12 +8814,11 @@ def openclaw_runtime_env(repo: Path, binary: str, root: Path) -> dict[str, str]:
     env = {key: value for key, value in os.environ.items()
            if key not in path_keys | startup_keys | {"PATH", "TMPDIR", "TMP", "TEMP"}
            and not key.upper().startswith(startup_prefixes)}
-    env.update(safe_engine_env(repo, [Path(binary).parent], engine="openclaw"))
+    env.update(safe_engine_env(repo, [Path(binary).parent], engine="openclaw", selected_executable=binary))
     for key in path_keys:
         env.pop(key, None)
         if value := os.environ.get(key):
-            normalized = normalize_external_env_path_value(
-                repo, "SSL_CERT_DIR" if key == "OPENCLAW_INCLUDE_ROOTS" else key, value)
+            normalized = normalize_external_env_path_value(repo, key, value)
             if normalized:
                 env[key] = normalized
     env.update({
@@ -8522,6 +9248,8 @@ def run_reviewer(
 
     def verify_review_inputs() -> None:
         with PreparationProgress("evidence verification"):
+            # Primary metadata stays bound even without optional source evidence.
+            verify_repository_metadata()
             verify_evidence(repo, evidence or [])
             verify_mixed_sources(repo, mixed)
 
@@ -8652,28 +9380,374 @@ def run_review_passes(
     return chunk_reports
 
 
-def require_output_ready(path: Path, option: str) -> None:
-    try:
+class WindowsOutputParent:
+    """Perform output mutations through retained directory and file handles."""
+
+    def __init__(self, parent: Path, name: str) -> None:
+        self._name(name)
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        self.ctypes = ctypes
+        self.msvcrt = msvcrt
+        self.fd = None
+        self.owned = {}
+        self.ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class UnicodeString(ctypes.Structure):
+            _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT),
+                        ("Buffer", wintypes.LPWSTR)]
+
+        class ObjectAttributes(ctypes.Structure):
+            _fields_ = [("Length", wintypes.ULONG), ("RootDirectory", wintypes.HANDLE),
+                        ("ObjectName", ctypes.POINTER(UnicodeString)),
+                        ("Attributes", wintypes.ULONG), ("SecurityDescriptor", wintypes.LPVOID),
+                        ("SecurityQualityOfService", wintypes.LPVOID)]
+
+        class IoStatus(ctypes.Structure):
+            _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
+
+        class RenameInformation(ctypes.Structure):
+            _fields_ = [("ReplaceIfExists", wintypes.BOOLEAN),
+                        ("RootDirectory", wintypes.HANDLE), ("FileNameLength", wintypes.ULONG),
+                        ("FileName", wintypes.WCHAR * 1)]
+
+        class AttributeTagInformation(ctypes.Structure):
+            _fields_ = [("FileAttributes", wintypes.DWORD), ("ReparseTag", wintypes.DWORD)]
+
+        self.UnicodeString = UnicodeString
+        self.ObjectAttributes = ObjectAttributes
+        self.IoStatus = IoStatus
+        self.RenameInformation = RenameInformation
+        self.AttributeTagInformation = AttributeTagInformation
+        self.kernel32.GetFileInformationByHandleEx.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        self.kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+        self.ntdll.NtCreateFile.argtypes = [
+            ctypes.POINTER(wintypes.HANDLE), wintypes.ULONG, ctypes.POINTER(ObjectAttributes),
+            ctypes.POINTER(IoStatus), ctypes.c_void_p, wintypes.ULONG, wintypes.ULONG,
+            wintypes.ULONG, wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG]
+        self.ntdll.NtCreateFile.restype = wintypes.LONG
+        self.ntdll.NtSetInformationFile.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(IoStatus), ctypes.c_void_p, wintypes.ULONG,
+            wintypes.ULONG]
+        self.ntdll.NtSetInformationFile.restype = wintypes.LONG
+        self.ntdll.RtlNtStatusToDosError.argtypes = [wintypes.LONG]
+        self.ntdll.RtlNtStatusToDosError.restype = wintypes.ULONG
+        self.ntdll.NtClose.argtypes = [wintypes.HANDLE]
+        self.ntdll.NtClose.restype = wintypes.LONG
+
+        # The initial absolute open is read-only. The caller checks its identity
+        # against the admitted path before permitting any mutation.
+        spelling = str(parent)
+        if spelling.startswith("\\\\?\\"):
+            native = "\\??\\" + spelling[4:]
+        elif spelling.startswith("\\\\"):
+            native = "\\??\\UNC\\" + spelling[2:]
+        else:
+            native = "\\??\\" + spelling
         try:
-            metadata = path.lstat()
-        except FileNotFoundError:
-            metadata = None
-        if metadata is not None and not stat.S_ISLNK(metadata.st_mode):
-            if stat.S_ISDIR(metadata.st_mode):
-                raise OSError("output destination is a directory")
-            # Windows cannot replace a read-only entry, even in a writable parent.
-            if getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_READONLY:
-                raise OSError("output destination is read-only")
-        with tempfile.NamedTemporaryFile(
-            dir=path.parent, prefix=".autoreview-output-probe.", delete=False,
-        ) as handle:
-            probe = Path(handle.name)
+            self.fd = self._open(native, 0x1000A0, 1, 0, relative=False)
+            metadata = self._stat_fd(self.fd)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise OSError("output parent is not a directory")
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def _name(name: str) -> None:
+        # Native NT names must retain ordinary Win32 file-entry semantics,
+        # including on Python versions with different is_reserved() rules.
+        stem = name.split(".", 1)[0].rstrip(" ").upper()
+        reserved = stem in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+        reserved = reserved or (len(stem) == 4 and stem[:3] in {"COM", "LPT"}
+                                and stem[3] in "123456789¹²³")
+        if (not name or name[-1:] in {".", " "} or reserved
+                or any(ord(c) < 32 or c in '<>:"/\\|?*' for c in name)):
+            raise OSError("output requires an unambiguous Windows file name")
+
+    def _check_status(self, status: int) -> None:
+        if status < 0:
+            raise self.ctypes.WinError(self.ntdll.RtlNtStatusToDosError(status))
+
+    def _open(self, name: str, access: int, disposition: int, flags: int,
+              *, relative: bool = True, share: int = 3) -> int:
+        from ctypes import wintypes
+
+        if relative:
+            self._name(name)
+        ctypes = self.ctypes
+        text = ctypes.create_unicode_buffer(name)
+        size = len(name.encode("utf-16-le"))
+        if size > 65532:
+            raise OSError("output path is too long")
+        value = self.UnicodeString(size, size + 2, ctypes.cast(text, wintypes.LPWSTR))
+        attributes = self.ObjectAttributes(
+            ctypes.sizeof(self.ObjectAttributes),
+            self.msvcrt.get_osfhandle(self.fd) if relative else None,
+            ctypes.pointer(value), 0x40, None, None)
+        handle = wintypes.HANDLE()
+        io = self.IoStatus()
+        # FILE_OPEN_REPARSE_POINT opens a leaf link itself. RootDirectory binds
+        # the already-open directory; its spelling is never resolved again.
+        self._check_status(self.ntdll.NtCreateFile(
+            ctypes.byref(handle), access, ctypes.byref(attributes), ctypes.byref(io),
+            None, 0x80, share, disposition, flags | 0x200020, None, 0))
         try:
-            # The atomic writer needs only one free inode, even for replacement.
-            probe.unlink()
-            atomic_write_text(probe, "autoreview output preflight\n")
+            return self.msvcrt.open_osfhandle(handle.value, os.O_BINARY | os.O_RDWR)
+        except BaseException:
+            self.ntdll.NtClose(handle)
+            raise
+
+    def _set(self, fd: int, value, kind: int) -> None:
+        io = self.IoStatus()
+        self._check_status(self.ntdll.NtSetInformationFile(
+            self.msvcrt.get_osfhandle(fd), self.ctypes.byref(io), self.ctypes.byref(value),
+            self.ctypes.sizeof(value), kind))
+
+    def close(self) -> None:
+        for fd in self.owned.values():
+            os.close(fd)
+        self.owned.clear()
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def stat(self, name: str) -> os.stat_result:
+        retained = self.owned.get(name)
+        fd = retained if retained is not None else self._open(name, 0x100080, 1, 0)
+        try:
+            return self._stat_fd(fd)
         finally:
-            probe.unlink(missing_ok=True)
+            if retained is None:
+                os.close(fd)
+
+    def _stat_fd(self, fd: int) -> os.stat_result:
+        info = os.fstat(fd)
+        tag = self.AttributeTagInformation()
+        if not self.kernel32.GetFileInformationByHandleEx(
+                self.msvcrt.get_osfhandle(fd), 9, self.ctypes.byref(tag),
+                self.ctypes.sizeof(tag)):
+            raise self.ctypes.WinError(self.ctypes.get_last_error())
+        values = list(info)
+        if tag.ReparseTag & 0x20000000:  # Name-surrogate reparse point.
+            values[0] = stat.S_IFLNK | stat.S_IMODE(info.st_mode)
+        return os.stat_result(values, {"st_file_attributes": tag.FileAttributes,
+                                       "st_reparse_tag": tag.ReparseTag})
+
+    def temporary(self, prefix: str) -> tuple[int, str, os.stat_result]:
+        for _ in range(100):
+            name = prefix + secrets.token_hex(12)
+            try:
+                # Retain DELETE permission but share only reads. The owned
+                # entry cannot be renamed or overwritten while being published.
+                fd = self._open(name, 0x110183, 2, 0x40, share=1)
+            except FileExistsError:
+                continue
+            try:
+                identity = os.fstat(fd)
+                self.owned[name] = os.dup(fd)
+                return fd, name, identity
+            except BaseException:
+                try:
+                    self._delete(fd)
+                finally:
+                    os.close(fd)
+                raise
+        raise FileExistsError("could not allocate an output temporary file")
+
+    def _delete(self, fd: int) -> None:
+        if stat.S_ISDIR(self._stat_fd(fd).st_mode):
+            raise IsADirectoryError("output destination is a directory")
+        self._set(fd, self.ctypes.c_ubyte(1), 13)  # FileDispositionInformation
+
+    def unlink(self, name: str) -> None:
+        fd = self.owned.pop(name, None)
+        if fd is None:
+            fd = self._open(name, 0x110080, 1, 0)
+        try:
+            self._delete(fd)
+        finally:
+            os.close(fd)
+
+    def replace(self, source: str, destination: str) -> None:
+        self._name(destination)
+        fd = self.owned[source]
+        encoded = destination.encode("utf-16-le")
+        ctypes = self.ctypes
+        value = ctypes.create_string_buffer(
+            ctypes.sizeof(self.RenameInformation) + len(encoded))
+        record = self.RenameInformation.from_buffer(value)
+        record.ReplaceIfExists = 1
+        record.RootDirectory = None
+        record.FileNameLength = len(encoded)
+        ctypes.memmove(ctypes.addressof(value) + self.RenameInformation.FileName.offset,
+                       encoded, len(encoded))
+        # Native FileRenameInformation explicitly defines a simple name with
+        # NULL RootDirectory as a rename within this file's existing directory.
+        self._set(fd, value, 10)
+        os.close(self.owned.pop(source))
+
+    def remove_owned(self, name: str, identity: os.stat_result) -> None:
+        fd = self.owned.pop(name, None)
+        if fd is None:
+            try:
+                fd = self._open(name, 0x110080, 1, 0)
+            except FileNotFoundError:
+                return
+        try:
+            current = os.fstat(fd)
+            if ((current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino)
+                    or not stat.S_ISREG(current.st_mode)):
+                raise OSError("temporary entry identity changed")
+            self._delete(fd)
+        finally:
+            os.close(fd)
+
+
+class OutputParent:
+    """Bind mutations to the admitted parent, independently of its pathname."""
+
+    def __init__(self, path: Path, expected: tuple[str, int, int] | None = None) -> None:
+        self.path = path
+        self.parent = path.parent.resolve(strict=True)
+        self.fd = None
+        self.windows = None
+        try:
+            if os.name == "posix":
+                self.fd = os.open(self.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                info = os.fstat(self.fd)
+            elif os.name == "nt":
+                self.windows = WindowsOutputParent(self.parent, path.name)
+                info = os.fstat(self.windows.fd)
+            else:
+                raise OSError("unsupported output filesystem platform")
+            self.identity = (str(self.parent), info.st_dev, info.st_ino)
+            if expected is not None and self.identity != expected:
+                raise SystemExit("output parent changed after admission")
+            self.check()
+        except BaseException:
+            self.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def close(self) -> None:
+        if self.windows is not None:
+            self.windows.close()
+            self.windows = None
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def check(self) -> None:
+        current = self.path.parent.stat()
+        if ((str(self.path.parent.resolve()), current.st_dev, current.st_ino)
+                != self.identity):
+            raise SystemExit("output parent changed after admission")
+        for root in UNTRUSTED_SOURCE_ROOTS.get():
+            require_output_outside_sources(self.path, "output", root)
+
+    def stat(self, name: str) -> os.stat_result:
+        if self.windows is not None:
+            return self.windows.stat(name)
+        return os.stat(name if self.fd is not None else self.parent / name,
+                       dir_fd=self.fd, follow_symlinks=False)
+
+    def unlink(self, name: str) -> None:
+        if self.windows is not None:
+            self.windows.unlink(name)
+            return
+        if self.fd is None:
+            self.check()
+        os.unlink(name if self.fd is not None else self.parent / name, dir_fd=self.fd)
+
+    def replace(self, source: str, destination: str) -> None:
+        self.check()
+        if self.windows is not None:
+            self.windows.replace(source, destination)
+            return
+        if self.fd is not None:
+            os.replace(source, destination, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        else:
+            os.replace(self.parent / source, self.parent / destination)
+
+    def temporary(self, prefix: str) -> tuple[int, str, os.stat_result]:
+        self.check()
+        if self.windows is not None:
+            return self.windows.temporary(prefix)
+        for _ in range(100):
+            name = prefix + secrets.token_hex(12)
+            try:
+                fd = os.open(name if self.fd is not None else self.parent / name,
+                             os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=self.fd)
+            except FileExistsError:
+                continue
+            return fd, name, os.fstat(fd)
+        raise FileExistsError("could not allocate an output temporary file")
+
+    def remove_owned(self, name: str, identity: os.stat_result) -> None:
+        # Metadata refusal must not strand complete prompts/reports. The bound
+        # directory and exact inode, rather than the mutable source, own cleanup.
+        try:
+            if self.windows is not None:
+                self.windows.remove_owned(name, identity)
+                return
+            current = self.stat(name)
+            if ((current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino)
+                    or not stat.S_ISREG(current.st_mode)):
+                raise OSError("temporary entry identity changed")
+            self.unlink(name)
+        except FileNotFoundError:
+            return
+        except (OSError, SystemExit):
+            print("warning: could not safely remove output scratch: "
+                  + display_escape(self.parent / name, 500), file=sys.stderr)
+
+
+def remove_stale_output(path: Path, expected: tuple[str, int, int]) -> None:
+    verify_repository_metadata()
+    with OutputParent(path, expected) as parent:
+        parent.check()
+        try:
+            parent.unlink(path.name)
+        except FileNotFoundError:
+            pass
+
+
+def require_output_ready(path: Path, option: str) -> tuple[str, int, int]:
+    verify_repository_metadata()
+    try:
+        with OutputParent(path) as parent:
+            try:
+                metadata = parent.stat(path.name)
+            except FileNotFoundError:
+                metadata = None
+            if metadata is not None and not stat.S_ISLNK(metadata.st_mode):
+                if stat.S_ISDIR(metadata.st_mode):
+                    raise OSError("output destination is a directory")
+                # Windows cannot replace a read-only entry, even in a writable parent.
+                if getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_READONLY:
+                    raise OSError("output destination is read-only")
+            descriptor, probe, identity = parent.temporary(".autoreview-output-probe.")
+            os.close(descriptor)
+            try:
+                # The atomic writer needs only one free inode, even for replacement.
+                verify_repository_metadata()
+                parent.check()
+                parent.unlink(probe)
+                identity = atomic_write_text(path.parent / probe, "autoreview output preflight\n",
+                                             _parent=parent)
+            finally:
+                parent.remove_owned(probe, identity)
+            return parent.identity
     except OSError:
         raise SystemExit(
             f"{option} output destination is not writable: {display_escape(path, 500)}. "
@@ -8682,7 +9756,7 @@ def require_output_ready(path: Path, option: str) -> None:
 
 
 def require_output_outside_sources(path: Path, option: str, repo: Path) -> None:
-    if not external_env_path(repo, str(path)):
+    if not external_output_path(repo, str(path)):
         raise SystemExit(
             f"{option} must point outside the reviewed repository and external source roots: "
             f"{display_escape(path, 500)}"
@@ -8758,6 +9832,7 @@ def prepare_output_paths(args: argparse.Namespace, repo: Path) -> None:
                     if key[:len(handoff_key)] == handoff_key:
                         raise SystemExit("review outputs must stay outside --native-handoff (removed on exit)")
 
+    args._output_parent_identities = {}
     for option, attribute in (
         ("--json-output", "json_output"),
         ("--output", "output"),
@@ -8765,25 +9840,27 @@ def prepare_output_paths(args: argparse.Namespace, repo: Path) -> None:
         ("--preflight-output", "preflight_output"),
     ):
         if destination := destinations.get(attribute):
-            require_output_ready(Path(destination), option)
+            args._output_parent_identities[attribute] = require_output_ready(Path(destination), option)
 
 
-def atomic_write_text(path: Path, content: str) -> None:
-    # Recheck after review too: output parents can have changed since admission.
-    for root in UNTRUSTED_SOURCE_ROOTS.get():
-        require_output_outside_sources(path, "output", root)
-    parent = path.parent
-    descriptor, temporary = tempfile.mkstemp(
-        dir=parent,
-        prefix=f".{path.name}.",
-    )
-    temporary_path = Path(temporary)
+def atomic_write_text(path: Path, content: str, *,
+                      expected: tuple[str, int, int] | None = None,
+                      _parent: OutputParent | None = None) -> os.stat_result:
+    verify_repository_metadata()
+    if _parent is None:
+        with OutputParent(path, expected) as parent:
+            return atomic_write_text(path, content, _parent=parent)
+    parent = _parent
+    parent.check()
+    descriptor, temporary, identity = parent.temporary(f".{path.name}.")
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(content)
-        os.replace(temporary_path, path)
+        verify_repository_metadata()
+        parent.replace(temporary, path.name)
+        return identity
     finally:
-        temporary_path.unlink(missing_ok=True)
+        parent.remove_owned(temporary, identity)
 
 
 class NativeHandoff:
@@ -8800,6 +9877,8 @@ class NativeHandoff:
     def __init__(self, args: argparse.Namespace, reviewer: argparse.Namespace,
                  prompts: list[str] | list[ReviewPass]) -> None:
         self.root = Path(args.native_handoff)
+        self.metadata_bindings = SOURCE_METADATA_BINDINGS.get()
+        verify_repository_metadata(self.metadata_bindings)
         self.run_id = secrets.token_hex(16)
         self.pass_count = len(prompts)
         self.pass_number = 0
@@ -8811,40 +9890,103 @@ class NativeHandoff:
         # earlier pass can launch, even when a larger prompt budget is explicit.
         for number, prompt in enumerate(prompts, 1):
             self.encode_request(number, prompt.prompt if isinstance(prompt, ReviewPass) else prompt)
-        parent = self.root.parent.stat()
-        if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
-            raise SystemExit("native handoff requires an owned private parent directory")
-        # mkdir's exclusive creation refuses existing paths, including symlinks.
-        try:
-            self.root.mkdir(mode=0o700)
-        except OSError as exc:
-            raise SystemExit(f"cannot create fresh native handoff directory: {exc}") from None
-        self.identity = self.root.stat()
+        self.parent = OutputParent(self.root)
         self.lock_fd = None
+        self.identity = None
+        self.root_fd = None
+        self.created = False
         try:
-            if stat.S_IMODE(self.identity.st_mode) & 0o077:
-                raise SystemExit("native handoff requires a private directory")
-            self.lock_fd = os.open(self.root / ".lock", os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+            parent = os.fstat(self.parent.fd)
+            if parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) & 0o077:
+                raise SystemExit("native handoff requires an owned private parent directory")
+            # Exclusive creation and directory-relative opens retain the same
+            # private exchange even if an outside parent alias is redirected.
+            self.parent.check()
+            try:
+                os.mkdir(self.root.name, mode=0o700, dir_fd=self.parent.fd)
+                self.created = True
+                self.identity = self.parent.stat(self.root.name)
+            except OSError as exc:
+                raise SystemExit(f"cannot create fresh native handoff directory: {exc}") from None
+            descriptor = os.open(self.root.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                 dir_fd=self.parent.fd)
+            try:
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino) != (self.identity.st_dev, self.identity.st_ino):
+                    raise SystemExit("native handoff directory changed during creation")
+                if opened.st_uid != os.getuid() or stat.S_IMODE(opened.st_mode) & 0o077:
+                    raise SystemExit("native handoff requires an owned private directory")
+                if os.listdir(descriptor):
+                    raise SystemExit("native handoff requires a fresh empty directory")
+            except BaseException:
+                os.close(descriptor)
+                raise
+            self.root_fd = descriptor
+            self.lock_fd = os.open(".lock", os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600,
+                                   dir_fd=self.root_fd)
         except BaseException:
             self.close()
             raise
 
+    @staticmethod
+    def remove_contents(directory: int) -> None:
+        # Python 3.10 has no shutil.rmtree(dir_fd=...). Walk only opened
+        # directories, without following links or reopening the exchange path.
+        for name in os.listdir(directory):
+            original = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if stat.S_ISDIR(original.st_mode):
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=directory)
+                try:
+                    opened = os.fstat(child)
+                    if (original.st_dev, original.st_ino) != (opened.st_dev, opened.st_ino):
+                        raise OSError("native scratch directory changed during cleanup")
+                    NativeHandoff.remove_contents(child)
+                    current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    if (original.st_dev, original.st_ino) != (current.st_dev, current.st_ino):
+                        raise OSError("native scratch directory changed during cleanup")
+                    os.rmdir(name, dir_fd=directory)
+                finally:
+                    os.close(child)
+            else:
+                os.unlink(name, dir_fd=directory)
+
     def close(self) -> None:
-        # Never clean up a replacement directory or follow a replaced symlink.
+        # Repository metadata controls publication, not deletion of our own
+        # private exchange. Never follow a replacement parent alias or root.
         import fcntl
         with deferred_owned_process_signals():
             try:
                 if self.lock_fd is not None:
                     fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
-                current = self.root.lstat()
-                if (current.st_dev, current.st_ino) == (self.identity.st_dev, self.identity.st_ino):
-                    shutil.rmtree(self.root)
-            except FileNotFoundError:
-                pass
+                if self.created and self.parent.fd is not None:
+                    if self.identity is None or self.root_fd is None:
+                        raise OSError("native exchange custody was not established")
+                    opened = os.fstat(self.root_fd)
+                    if (opened.st_dev, opened.st_ino) != (self.identity.st_dev, self.identity.st_ino):
+                        raise OSError("native exchange handle identity changed")
+                    self.remove_contents(self.root_fd)
+                    try:
+                        current = self.parent.stat(self.root.name)
+                    except FileNotFoundError:
+                        if os.fstat(self.root_fd).st_nlink:
+                            raise OSError("native exchange moved during cleanup") from None
+                    else:
+                        if ((current.st_dev, current.st_ino) != (self.identity.st_dev, self.identity.st_ino)
+                                or not stat.S_ISDIR(current.st_mode)):
+                            raise OSError("native exchange identity changed")
+                        os.rmdir(self.root.name, dir_fd=self.parent.fd)
+            except (OSError, SystemExit):
+                print("warning: could not safely remove native handoff scratch: "
+                      + display_escape(self.parent.parent / self.root.name, 500), file=sys.stderr)
             finally:
                 if self.lock_fd is not None:
                     os.close(self.lock_fd)
                     self.lock_fd = None
+                if self.root_fd is not None:
+                    os.close(self.root_fd)
+                    self.root_fd = None
+                self.parent.close()
 
     @staticmethod
     def read_file(path: Path | str, limit: int, *, dir_fd: int | None = None) -> bytes:
@@ -8881,7 +10023,9 @@ class NativeHandoff:
         self.pass_number += 1
         number = self.pass_number
         encoded, digest = self.encode_request(number, prompt)
-        atomic_write_text(self.root / f"{number}.request.json", encoded)
+        atomic_write_text(self.root / f"{number}.request.json", encoded,
+                          expected=(str(self.parent.parent / self.root.name),
+                                    self.identity.st_dev, self.identity.st_ino))
         print(f"native pass ready: {number}/{self.pass_count}", flush=True)
         deadline = time.monotonic() + self.timeout if self.timeout is not None else None
         ready_path = self.root / f"{number}.ready"
@@ -9006,7 +10150,8 @@ def write_review_status(args: argparse.Namespace, status: str, exit_code: int,
         envelope["usage"] = usage
     if args.engine == "openclaw" and (models := getattr(args, "openclaw_models", None)):
         envelope["effective_models"] = models
-    atomic_write_text(Path(args.status_output), json.dumps(envelope, indent=2) + "\n")
+    atomic_write_text(Path(args.status_output), json.dumps(envelope, indent=2) + "\n",
+                      expected=getattr(args, "_output_parent_identities", {}).get("status_output"))
 
 
 def preflight_block(args: argparse.Namespace, captured: CapturedBundle,
@@ -9068,6 +10213,7 @@ def main_impl() -> int:
             try:
                 # Source context has unwound by this point. Keep its roots for
                 # this last diagnostic write, including failed admission paths.
+                verify_repository_metadata(getattr(args, "_source_metadata_bindings", ()))
                 for root in getattr(args, "_review_source_roots", ()):
                     require_output_outside_sources(Path(args.engine_stage_dir),
                                                    "--engine-stage-dir", root)
@@ -9078,16 +10224,29 @@ def main_impl() -> int:
 
 
 def main_with_args(args: argparse.Namespace) -> int:
+    # Reject invalid options before repository preparation; construct the
+    # runtime reviewers below after source admission has populated their fields.
+    reviewer_args(args)
     # Discover only by filesystem before Git admission: all declared source roots
     # must already be untrusted when selecting host executables and configuration.
     start = Path.cwd().resolve()
-    root = discover_repo_root(start) or start
+    root = discover_repo_root(start)
+    if root is None:
+        raise SystemExit("autoreview must run inside a git repository")
     args.external_source_manifests = read_external_source_manifests(args, root)
     args._review_source_roots = tuple(
         [root, *(Path(document["root"]) for _, document in args.external_source_manifests)]
     )
+    bindings = tuple(repository_metadata(source) for source in dict.fromkeys(args._review_source_roots))
+    args._source_metadata_bindings = bindings
+    args._review_source_roots = metadata_source_roots(args._review_source_roots, bindings)
     token = UNTRUSTED_SOURCE_ROOTS.set(args._review_source_roots)
+    metadata_token = SOURCE_METADATA_BINDINGS.set(bindings)
+    external_token = EXTERNAL_SOURCE_REVIEW.set(bool(args.external_source_manifests))
+    cleanup_token = None
     try:
+        if os.name == "nt":
+            cleanup_token = WINDOWS_TASKKILL.set(_capture_windows_taskkill(root))
         if args.external_source_manifests:
             # Some platform launch/cleanup code reads these directly from the host
             # environment. Refuse source-owned values before creating any process.
@@ -9097,25 +10256,38 @@ def main_with_args(args: argparse.Namespace) -> int:
                     raise SystemExit(f"{key} must be outside reviewed source roots")
         return main_with_source_boundary(args, root)
     finally:
+        if cleanup_token is not None:
+            WINDOWS_TASKKILL.reset(cleanup_token)
+        EXTERNAL_SOURCE_REVIEW.reset(external_token)
+        SOURCE_METADATA_BINDINGS.reset(metadata_token)
         UNTRUSTED_SOURCE_ROOTS.reset(token)
 
 
 def main_with_source_boundary(args: argparse.Namespace, discovered_root: Path) -> int:
     # Reject input/output collisions before Git/engine probes or stale-output removal.
     validate_output_source_paths(args, discovered_root)
-    args._output_sources_validated = True
     reviewers = reviewer_args(args)
     if not preflight_git():
         return 2
+    for binding in args._source_metadata_bindings:
+        corroborate_repository_metadata(binding)
+    verify_repository_metadata()
+    validate_output_source_paths(args, discovered_root)
+    args._output_sources_validated = True
+    return main_with_output_boundary(args, discovered_root, reviewers)
+
+
+def main_with_output_boundary(args: argparse.Namespace, discovered_root: Path,
+                              reviewers: list[argparse.Namespace]) -> int:
     with PreparationProgress("target selection"):
         repo = repo_root()
         if args.external_source_manifests and repo != discovered_root:
             raise SystemExit("reviewed repository changed after external source admission")
         prepare_output_paths(args, repo)
         if not args.dry_run and getattr(args, "status_output", None):
-            Path(args.status_output).unlink(missing_ok=True)
+            remove_stale_output(Path(args.status_output), args._output_parent_identities["status_output"])
         if getattr(args, "preflight_output", None):
-            Path(args.preflight_output).unlink(missing_ok=True)
+            remove_stale_output(Path(args.preflight_output), args._output_parent_identities["preflight_output"])
         target, target_ref = choose_target(repo, args.mode, args.base)
         if getattr(args, "preflight_output", None) and (target != "branch" or is_dirty(repo)):
             raise SystemExit("preflight export requires a clean committed branch; commit changes and use --mode branch --base <ref>")
@@ -9243,6 +10415,7 @@ def main_with_source_boundary(args: argparse.Namespace, discovered_root: Path) -
         atomic_write_text(
             Path(args.json_output),
             json.dumps(redact_proxy_report(report), indent=2) + "\n",
+            expected=args._output_parent_identities.get("json_output"),
         )
 
     if args.output:
@@ -9255,7 +10428,8 @@ def main_with_source_boundary(args: argparse.Namespace, discovered_root: Path) -
             sys.stdout = original_stdout
         output = rendered.getvalue()
         print(output, end="")
-        atomic_write_text(Path(args.output), output)
+        atomic_write_text(Path(args.output), output,
+                          expected=args._output_parent_identities.get("output"))
     else:
         print_report(report, label=label)
 
@@ -9274,7 +10448,8 @@ def main_with_source_boundary(args: argparse.Namespace, discovered_root: Path) -
             if source_tree_snapshot(repo) != review_source_snapshot or is_dirty(repo):
                 raise ValueError("source changed before preflight export; rerun on the clean branch")
             verify_evidence(repo, evidence.files)
-            atomic_write_text(Path(args.preflight_output), preflight_block(args, captured, report, preflight_version))
+            atomic_write_text(Path(args.preflight_output), preflight_block(args, captured, report, preflight_version),
+                              expected=args._output_parent_identities.get("preflight_output"))
         except (OSError, ValueError, SystemExit) as exc:
             print(f"preflight export failed: {display_escape(exc, 500)}; native review outcome preserved", file=sys.stderr)
     return exit_code

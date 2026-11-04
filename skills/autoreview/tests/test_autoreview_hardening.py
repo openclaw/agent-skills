@@ -1813,12 +1813,12 @@ class AutoreviewHardeningTests(unittest.TestCase):
             absent_commit = git(repo, "rev-parse", "HEAD^^").strip()
             with self.assertRaisesRegex(SystemExit, "absent from the reviewed commit"):
                 capture(repo, "src/token_count.py", absent_commit)
-            original = self.helper["read_git_source"]
+            original = self.helper["committed_source_versions"]
 
             def corrupt(*args):
-                return original(*args)._replace(content="wrong object bytes\n")
+                return {path: source._replace(content="wrong object bytes\n") for path, source in original(*args).items()}
 
-            with mock.patch.dict(capture.__globals__, {"read_git_source": corrupt}):
+            with mock.patch.dict(capture.__globals__, {"committed_source_versions": corrupt}):
                 with self.assertRaisesRegex(SystemExit, "do not match the committed blob"):
                     self.helper["main_impl"]()
             self.assertFalse(sends)
@@ -1838,7 +1838,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     source.write_bytes(original_bytes.replace(b"7", b"8"))
                     os.utime(source, ns=(info.st_atime_ns, info.st_mtime_ns))
 
-                name = {"capture": "read_git_source", "preparation": "prepare_review_prompts"}.get(timing, "run_engine")
+                name = {"capture": "committed_source_versions", "preparation": "prepare_review_prompts"}.get(timing, "run_engine")
                 original = self.helper["main_impl"].__globals__[name]
 
                 def mutation(*args):
@@ -5596,6 +5596,105 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "symlinked"):
                 self.helper["capture_evidence_file"](repo, str(link.resolve().parent / "link.md"), "--prompt-file")
 
+    @unittest.skipIf(os.name == "nt", "uses executable POSIX fixtures and symbolic links")
+    def test_claude_checks_effective_settings_before_probe_and_preserves_trusted_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo, upstream, config = root / "repo", root / "upstream", root / ".claude"
+            for path in (repo, upstream, config):
+                path.mkdir()
+            source_settings = upstream / "settings.json"
+            source_settings.write_text("{}")
+            settings = config / "settings.json"
+            record, calls = root / "record.json", root / "calls.jsonl"
+            fixture = fake_claude_script().replace(
+                "args = sys.argv[1:]", "args = sys.argv[1:]\n"
+                "with open(os.environ['AUTOREVIEW_FAKE_CALLS'], 'a') as out:\n"
+                "    out.write(json.dumps({'argv': args, 'config': os.environ.get('CLAUDE_CONFIG_DIR')}) + '\\n')",
+            )
+            binary = write_executable(root / "claude", fixture)
+            args = argparse.Namespace(claude_bin=str(binary), model=None, tools=False,
+                                      thinking=None, stream_engine_output=False)
+            environment = {"PATH": os.environ.get("PATH", ""), "HOME": str(root),
+                           "USERPROFILE": str(root), "AUTOREVIEW_FAKE_CALLS": str(calls),
+                           "AUTOREVIEW_FAKE_RECORD": str(record)}
+            boundary = self.helper["UNTRUSTED_SOURCE_ROOTS"]
+            for explicit in (False, True):
+                with self.subTest(explicit=explicit), mock.patch.dict(os.environ, environment, clear=True):
+                    if explicit:
+                        os.environ["CLAUDE_CONFIG_DIR"] = str(config)
+                    token = boundary.set((repo, upstream))
+                    try:
+                        # Validation permits absent user settings without creating them.
+                        env = self.helper["safe_engine_env"](repo, engine="claude")
+                        self.assertEqual(env.get("CLAUDE_CONFIG_DIR"), str(config) if explicit else None)
+                        self.assertFalse(settings.exists())
+                        settings.symlink_to(source_settings)
+                        with self.assertRaisesRegex(SystemExit, "Claude configuration.*outside"):
+                            self.helper["run_claude"](args, repo, "fixture review")
+                        self.assertFalse(calls.exists(), "source-owned settings reached the version probe")
+                        settings.unlink()
+                        # Trusted settings preserve the supported user-settings route.
+                        settings.write_text('{"theme":"dark"}')
+                        self.helper["run_claude"](args, repo, "fixture review")
+                        launches = [json.loads(line) for line in calls.read_text().splitlines()]
+                        live = launches[-1]
+                        self.assertIn("--safe-mode", live["argv"])
+                        self.assertEqual(live["argv"][live["argv"].index("--setting-sources") + 1], "user")
+                        self.assertEqual(live["config"], str(config) if explicit else None)
+                        self.assertEqual(settings.read_text(), '{"theme":"dark"}')
+                        calls.unlink()
+                        record.unlink()
+                        settings.unlink()
+                    finally:
+                        boundary.reset(token)
+                        for path in (settings, calls, record):
+                            path.unlink(missing_ok=True)
+            # A trusted HOME does not admit a default config directory owned by a source.
+            token = boundary.set((repo, config))
+            try:
+                with mock.patch.dict(os.environ, environment, clear=True), \
+                        self.assertRaisesRegex(SystemExit, "Claude configuration.*outside"):
+                    self.helper["run_claude"](args, repo, "fixture review")
+                self.assertFalse(calls.exists())
+            finally:
+                boundary.reset(token)
+
+    @unittest.skipIf(os.name == "nt", "uses executable POSIX fixtures and symbolic links")
+    def test_claude_rechecks_settings_after_preflight_before_live_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo, source, config = root / "repo", root / "source", root / "config"
+            for path in (repo, source, config):
+                path.mkdir()
+            settings = config / "settings.json"
+            settings.write_text("{}")
+            source_settings = source / "settings.json"
+            source_settings.write_text("{}")
+            record = root / "live.json"
+            fixture = fake_claude_script().replace(
+                'if "--help" in args or "-h" in args:',
+                'if "--help" in args or "-h" in args:\n'
+                '    settings = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "settings.json"\n'
+                '    settings.unlink()\n'
+                '    settings.symlink_to(os.environ["AUTOREVIEW_FAKE_SETTINGS"])',
+            )
+            binary = write_executable(root / "claude", fixture)
+            args = argparse.Namespace(claude_bin=str(binary), model=None, tools=False,
+                                      thinking=None, stream_engine_output=False)
+            token = self.helper["UNTRUSTED_SOURCE_ROOTS"].set((repo, source))
+            try:
+                with mock.patch.dict(os.environ, {
+                    "PATH": os.environ.get("PATH", ""), "HOME": str(root), "USERPROFILE": str(root),
+                    "CLAUDE_CONFIG_DIR": str(config), "AUTOREVIEW_FAKE_RECORD": str(record),
+                    "AUTOREVIEW_FAKE_SETTINGS": str(source_settings),
+                }, clear=True), self.assertRaisesRegex(SystemExit, "Claude configuration.*outside"):
+                    self.helper["run_claude"](args, repo, "fixture review")
+                self.assertTrue(settings.is_symlink(), "fixture must reach the successful help probe")
+                self.assertFalse(record.exists(), "source-owned settings reached live launch")
+            finally:
+                self.helper["UNTRUSTED_SOURCE_ROOTS"].reset(token)
+
     def test_pi_config_leaves_cannot_come_from_any_reviewed_source(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -6670,6 +6769,79 @@ else:
             finally:
                 boundary.reset(token)
 
+    @unittest.skipIf(os.name == "nt", "uses executable POSIX fixtures and symbolic links")
+    def test_certificate_directory_entries_are_filtered_before_probe_and_live_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo, source, certs, trusted = (root / name for name in ("repo", "source", "certs", "trusted"))
+            for path in (repo, source, certs, trusted):
+                path.mkdir()
+            external = trusted / "certificate.pem"
+            external.write_text("trusted inert certificate fixture")
+            record, calls = root / "record.json", root / "calls.jsonl"
+            fixture = fake_claude_script().replace(
+                "args = sys.argv[1:]", "args = sys.argv[1:]\n"
+                "with open(os.environ['AUTOREVIEW_FAKE_CALLS'], 'a') as out:\n"
+                "    out.write(json.dumps({'argv': args, 'certs': os.environ.get('SSL_CERT_DIR')}) + '\\n')",
+            )
+            binary_dir = root / "bin"
+            binary_dir.mkdir()
+            binary = write_executable(binary_dir / "claude", fixture)
+            args = argparse.Namespace(claude_bin=str(binary), model=None, tools=False,
+                                      thinking=None, stream_engine_output=False)
+            environment = {"PATH": os.environ.get("PATH", ""), "HOME": str(root), "USERPROFILE": str(root),
+                           "SSL_CERT_DIR": os.pathsep.join((str(trusted), str(certs))),
+                           "AUTOREVIEW_FAKE_CALLS": str(calls), "AUTOREVIEW_FAKE_RECORD": str(record)}
+            token = self.helper["UNTRUSTED_SOURCE_ROOTS"].set((repo, source))
+            try:
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    for name in ("012345ab.0", "012345ab.r0", "notes.txt"):
+                        for owner in (repo, source):
+                            with self.subTest(name=name, owner=owner.name):
+                                leaf = owner / "anchor.pem"
+                                leaf.write_text("inert certificate fixture")
+                                entry = certs / name
+                                entry.symlink_to(leaf)
+                                try:
+                                    self.helper["run_claude"](args, repo, "fixture review")
+                                    launches = [json.loads(line) for line in calls.read_text().splitlines()]
+                                    self.assertGreaterEqual(len(launches), 3)
+                                    self.assertTrue(all(launch["certs"] is None for launch in launches))
+                                finally:
+                                    entry.unlink()
+                                    calls.unlink(missing_ok=True)
+                    # Both hashed and arbitrary filenames remain usable when their referents are trusted.
+                    (certs / "012345ab.0").symlink_to(external)
+                    (certs / "notes.txt").symlink_to(external)
+                    self.helper["run_claude"](args, repo, "fixture review")
+                    launches = [json.loads(line) for line in calls.read_text().splitlines()]
+                    self.assertTrue(all(launch["certs"] == environment["SSL_CERT_DIR"] for launch in launches))
+            finally:
+                self.helper["UNTRUSTED_SOURCE_ROOTS"].reset(token)
+
+    def test_certificate_directory_hardlinks_are_inputs_but_include_roots_are_not_cert_stores(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo, source, certs = root / "repo", root / "source", root / "certs"
+            for path in (repo, source, certs):
+                path.mkdir()
+            certificate = source / "certificate.pem"
+            certificate.write_text("inert certificate fixture")
+            os.link(certificate, certs / "arbitrary.pem")
+            token = self.helper["UNTRUSTED_SOURCE_ROOTS"].set((repo, source))
+            try:
+                with mock.patch.dict(os.environ, {
+                    "PATH": os.environ.get("PATH", ""), "HOME": str(root), "USERPROFILE": str(root),
+                    "SSL_CERT_DIR": str(certs),
+                }, clear=True):
+                    self.assertNotIn("SSL_CERT_DIR", self.helper["safe_engine_env"](repo, engine="codex"))
+                    self.assertNotIn("SSL_CERT_DIR", self.helper["safe_git_env"](repo))
+                self.assertEqual(self.helper["normalize_external_env_path_value"](
+                    repo, "OPENCLAW_INCLUDE_ROOTS", os.pathsep.join((str(certs), str(root / "missing")))),
+                    os.pathsep.join((str(certs), str(root / "missing"))))
+            finally:
+                self.helper["UNTRUSTED_SOURCE_ROOTS"].reset(token)
+
     def test_provider_credential_paths_are_forwarded_as_absolute(self) -> None:
         old_env = os.environ.copy()
         old_cwd = Path.cwd()
@@ -6715,16 +6887,16 @@ else:
                 os.environ["SSL_CERT_FILE"] = str(repo / "tls-ca.pem")
                 os.environ["HOME"] = str(repo)
                 os.environ["USERPROFILE"] = str(repo)
-                claude_env = self.helper["safe_engine_env"](repo, engine="claude")
+                with self.assertRaisesRegex(SystemExit, "Claude configuration.*outside"):
+                    self.helper["safe_engine_env"](repo, engine="claude")
                 codex_env = self.helper["safe_engine_env"](repo, engine="codex")
                 with self.assertRaisesRegex(SystemExit, "Pi configuration.*outside"):
                     self.helper["safe_engine_env"](repo, engine="pi")
-                self.assertNotIn("CLAUDE_CONFIG_DIR", claude_env)
                 self.assertNotIn("CODEX_HOME", codex_env)
                 self.assertNotIn("CODEX_CA_CERTIFICATE", codex_env)
                 self.assertNotIn("SSL_CERT_FILE", codex_env)
-                self.assertNotIn("HOME", claude_env)
-                self.assertNotIn("USERPROFILE", claude_env)
+                self.assertNotIn("HOME", codex_env)
+                self.assertNotIn("USERPROFILE", codex_env)
             finally:
                 os.environ.clear()
                 os.environ.update(old)
@@ -6765,32 +6937,128 @@ else:
             )
             try:
                 os.environ["CODEX_HOME"] = str(source_home)
-                linked = self.helper["prepare_codex_runtime_auth"](repo, runtime_home)
-                self.assertTrue(linked)
-                self.assertTrue((runtime_home / "auth.json").is_file())
-                self.assertTrue(
-                    os.path.samefile(source_auth, runtime_home / "auth.json")
-                )
-                self.assertFalse((runtime_home / "config.toml").exists())
                 self.assertIn(
                     'cli_auth_credentials_store="file"',
-                    self.helper["codex_auth_config_flags"](
-                        repo,
-                        force_file=True,
-                    ),
+                    self.helper["codex_auth_config_flags"](repo, force_file=True),
                 )
-
-                (runtime_home / "auth.json").write_text(
-                    '{"token":"test-auth-token"}',
-                    encoding="utf-8",
-                )
+                with self.helper["codex_runtime_auth"](repo, runtime_home, expected_file_auth=True):
+                    self.assertTrue(os.path.samefile(source_auth, runtime_home / "auth.json"))
+                    self.assertFalse((runtime_home / "config.toml").exists())
+                    (runtime_home / "auth.json").write_text(
+                        '{"token":"test-auth-token"}', encoding="utf-8",
+                    )
+                self.assertFalse((runtime_home / "auth.json").exists())
+                self.assertEqual(source_auth.stat().st_nlink, 1)
                 self.assertEqual(
                     json.loads(source_auth.read_text(encoding="utf-8"))["token"],
                     "test-auth-token",
                 )
+                self.assertEqual(self.helper["codex_source_home"](repo), source_home.resolve())
             finally:
                 os.environ.clear()
                 os.environ.update(old)
+
+    def test_codex_auth_scope_preserves_replacements_and_primary_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo, home, runtime = root / "repo", root / "home", root / "runtime"
+            for path in (repo, home, runtime):
+                path.mkdir()
+            (home / "auth.json").write_text('{"fixture":"synthetic"}')
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}):
+                with self.assertRaisesRegex(SystemExit, "changed before reviewer launch"):
+                    with self.helper["codex_runtime_auth"](repo, runtime, expected_file_auth=False):
+                        self.fail("changed eligibility must not reach launch")
+                self.assertFalse((runtime / "auth.json").exists())
+                for primary_error, closed_stderr in ((False, False), (True, False), (True, True)):
+                    with self.subTest(primary_error=primary_error, closed_stderr=closed_stderr):
+                        alias = runtime / "auth.json"
+                        detached = runtime / "detached.json"
+                        expected = RuntimeError if primary_error else SystemExit
+                        message = "original failure" if primary_error else "refusing cleanup"
+                        diagnostics = io.StringIO()
+                        if closed_stderr:
+                            diagnostics.close()
+                        with self.assertRaisesRegex(expected, message), contextlib.redirect_stderr(diagnostics):
+                            with self.helper["codex_runtime_auth"](repo, runtime, expected_file_auth=True):
+                                alias.rename(detached)
+                                alias.write_text("unrelated replacement")
+                                if primary_error:
+                                    raise RuntimeError("original failure")
+                        self.assertEqual(alias.read_text(), "unrelated replacement")
+                        alias.unlink()
+                        detached.unlink()
+
+    def test_codex_auth_scope_removes_created_alias_when_source_changes_during_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo, home, runtime = root / "repo", root / "home", root / "runtime"
+            for path in (repo, home, runtime):
+                path.mkdir()
+            source = home / "auth.json"
+            source.write_text('{"fixture":"original"}')
+            prepare = self.helper["prepare_codex_runtime_auth"]
+
+            def replace_then_prepare(*args):
+                # A concurrent credential replacement occurs before real link creation.
+                source.rename(home / "previous.json")
+                source.write_text('{"fixture":"replacement"}')
+                return prepare(*args)
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}), \
+                    mock.patch.dict(self.helper["codex_runtime_auth"].__wrapped__.__globals__, {
+                        "prepare_codex_runtime_auth": replace_then_prepare,
+                    }), self.assertRaisesRegex(SystemExit, "link changed before reviewer launch"):
+                with self.helper["codex_runtime_auth"](repo, runtime, expected_file_auth=True):
+                    self.fail("a changed source must not reach launch")
+            self.assertFalse((runtime / "auth.json").exists())
+            self.assertEqual(source.stat().st_nlink, 1)
+            self.assertEqual(source.read_text(), '{"fixture":"replacement"}')
+
+    def test_codex_auth_scope_hardlink_fallback_preserves_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo, home, runtime = root / "repo", root / "home", root / "runtime"
+            for path in (repo, home, runtime):
+                path.mkdir()
+            source = home / "auth.json"
+            source.write_text('{"fixture":"synthetic"}')
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}), \
+                    mock.patch.object(Path, "symlink_to", side_effect=OSError("symlink unavailable")):
+                with self.helper["codex_runtime_auth"](repo, runtime, expected_file_auth=True):
+                    alias = runtime / "auth.json"
+                    self.assertFalse(alias.is_symlink())
+                    self.assertTrue(os.path.samefile(source, alias))
+                    self.assertEqual(source.stat().st_nlink, 2)
+                    alias.write_text('{"fixture":"refreshed"}')
+                self.assertFalse(alias.exists())
+                self.assertEqual(source.stat().st_nlink, 1)
+                self.assertEqual(source.read_text(), '{"fixture":"refreshed"}')
+                self.assertEqual(self.helper["codex_source_home"](repo), home)
+
+    def test_codex_auth_symlink_scopes_can_overlap_and_share_refreshes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo, home = root / "repo", root / "home"
+            repo.mkdir()
+            home.mkdir()
+            source = home / "auth.json"
+            source.write_text('{"fixture":"original"}')
+            first, second = root / "first", root / "second"
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}):
+                with self.helper["codex_runtime_auth"](repo, first, expected_file_auth=True):
+                    if os.name == "nt" and not (first / "auth.json").is_symlink():
+                        self.skipTest("native symlink privilege unavailable")
+                    self.assertTrue((first / "auth.json").is_symlink())
+                    with self.helper["codex_runtime_auth"](repo, second, expected_file_auth=True):
+                        self.assertTrue((second / "auth.json").is_symlink())
+                        self.assertEqual(source.stat().st_nlink, 1)
+                        (second / "auth.json").write_text('{"fixture":"refreshed"}')
+                        self.assertEqual((first / "auth.json").read_text(), source.read_text())
+                    self.assertFalse((second / "auth.json").exists())
+                    self.assertEqual(self.helper["codex_source_home"](repo), home)
+                self.assertFalse((first / "auth.json").exists())
+                self.assertEqual(source.read_text(), '{"fixture":"refreshed"}')
 
     def test_codex_runtime_home_does_not_promote_keyring_fallback_file(self) -> None:
         old = os.environ.copy()
