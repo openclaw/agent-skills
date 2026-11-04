@@ -149,7 +149,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.group not in ("all", "core"):
         commands = [unittest_command]
     for command in commands:
-        print("+ " + " ".join(command), flush=True)
+        display = "+ " + " ".join(command)
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(display.encode(encoding, "backslashreplace").decode(encoding), flush=True)
         executable = shutil.which(command[0])
         if executable is None:
             print(f"required executable not found: {command[0]}", file=sys.stderr)

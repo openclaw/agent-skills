@@ -176,7 +176,7 @@ class CheckSkillsTest(unittest.TestCase):
         # Always exercise outer-command output. The default-write-encoding proof
         # additionally needs a real narrow codec, which some hosts do not offer.
         code = r'''
-import locale, runpy, sys, tempfile
+import locale, os, runpy, sys, tempfile
 from pathlib import Path
 if sys.getfilesystemencoding().lower().replace("-", "") != "utf8":
     print("host has no UTF-8 filesystem locale with UTF-8 mode disabled", file=sys.stderr)
@@ -196,12 +196,19 @@ case = runpy.run_path(sys.argv[1])["CheckSkillsTest"]()
 with tempfile.TemporaryDirectory() as temporary:
     parent = Path(temporary) / character
     parent.mkdir()
+    if os.name != "nt":
+        # A real interpreter alias models a checkout-local virtualenv without
+        # requiring virtualenv installation or Windows symlink privileges.
+        interpreter = parent / "python"
+        interpreter.symlink_to(sys.executable)
+        sys.executable = str(interpreter)
     with case.fixture(parent=parent) as (root, foreign, marker, log, environment, groups):
         environment["PYTHONIOENCODING"] = "ascii"
         result = case.invoke(root, foreign, environment, "boundaries", tests_only=False)
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert not marker.exists()
-        assert sorted(log.read_text().splitlines()) == sorted(groups["boundaries"])
+        case.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        case.assertFalse(marker.exists())
+        case.assertCountEqual(log.read_text().splitlines(), groups["boundaries"])
+        case.assertIn(sys.executable.encode("ascii", "backslashreplace").decode("ascii"), result.stdout)
 '''
         for mode in ("outer", "narrow"):
             with self.subTest(proof=mode):
@@ -216,6 +223,18 @@ with tempfile.TemporaryDirectory() as temporary:
                 if mode == "narrow" and result.returncode == 77:
                     self.skipTest(result.stderr.strip())
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_unicode_proof_keeps_failure_checks_when_optimized(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-O", "-S", str(Path(__file__).resolve()),
+             "CheckSkillsTest.test_fixture_source_supports_unicode_paths_under_a_narrow_locale"],
+            env={**os.environ, "PYTHONOPTIMIZE": "1",
+                 "CHECK_FAIL_TEST": "skills.autoreview.tests.test_native_handoff.Cases.test_0"},
+            text=True, capture_output=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FAIL: test_0", result.stderr)
+        self.assertIn("skills.autoreview.tests.test_native_handoff.Cases", result.stderr)
 
     def test_empty_and_broken_discovery_fail_before_running_tests(self) -> None:
         with self.fixture() as (root, foreign, marker, log, environment, groups):
