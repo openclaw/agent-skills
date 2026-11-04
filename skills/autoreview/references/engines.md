@@ -31,7 +31,8 @@ produces no helper-validated machine status or helper isolation guarantees.
   deadline remain unchanged. This flag does not grant model or account access.
 - `--codex-config app_server.max_input_text_chars=3145728` sets a startup
   text-input character limit only when the selected CLI supports that setting.
-  Accepts decimal digits from `1` to `4194304`; the CLI default is `1048576`.
+  Accepts decimal digits from `1` to `4194304`; omission preserves the selected
+  CLI's default.
   This does not change the model context window or output budget. Other
   `app_server` settings remain unsupported.
 - Only Claude accepts `--fallback-model`.

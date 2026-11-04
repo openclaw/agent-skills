@@ -5670,6 +5670,7 @@ def codex_config_overrides(args: argparse.Namespace) -> list[str]:
                 raise SystemExit(
                     "app_server.max_input_text_chars must be a decimal integer from 1 to 4194304"
                 )
+            item = f"{key}={value}"
         overrides.append(item)
     return overrides
 

@@ -3857,8 +3857,13 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_codex_input_text_limit_is_forwarded_as_bounded_startup_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for value in ("1", "1048576", "3145728", "4194304", " 3145728 "):
+            for value, expected in (
+                ("1", "1"), ("1048576", "1048576"), ("3145728", "3145728"),
+                ("4194304", "4194304"), (" 3145728 ", "3145728"),
+                ("\u00a03145728\u00a0", "3145728"), ("\n3145728\n", "3145728"),
+            ):
                 override = f"app_server.max_input_text_chars={value}"
+                canonical = f"app_server.max_input_text_chars={expected}"
                 for source in ("argument", "environment"):
                     with self.subTest(value=value, source=source), mock.patch.dict(
                         os.environ, {"AUTOREVIEW_CODEX_CONFIG": override}, clear=True,
@@ -3871,10 +3876,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
                             args, root, root, root, root / "schema.json", root / "output.json",
                             "fixture-model", auth_config=[],
                         )
-                        index = command.index(override.strip())
+                        self.assertIn(canonical, command)
+                        index = command.index(canonical)
                         self.assertEqual(command[index - 1], "-c")
                         self.assertLess(index, command.index("exec"))
-                        self.assertEqual(command.count(override.strip()), 1)
+                        self.assertEqual(command.count(canonical), 1)
 
     def test_codex_input_text_limit_rejects_invalid_values_from_both_inputs(self) -> None:
         for value in ("0", "-1", "+1", "01", "4194305", "1.5", "1e6", '"3145728"',
