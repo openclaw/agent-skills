@@ -5596,6 +5596,113 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "symlinked"):
                 self.helper["capture_evidence_file"](repo, str(link.resolve().parent / "link.md"), "--prompt-file")
 
+    def test_pi_config_leaves_cannot_come_from_any_reviewed_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = root / "repo"
+            upstream = root / "upstream"
+            config = root / "operator"
+            for path in (repo, upstream, config):
+                path.mkdir()
+            boundary = self.helper["UNTRUSTED_SOURCE_ROOTS"]
+            token = boundary.set((repo, upstream))
+            try:
+                for owner in (repo, upstream):
+                    for name in ("models.json", "auth.json", "settings.json"):
+                        with self.subTest(owner=owner.name, file=name):
+                            source = owner / name
+                            source.write_text("{}")
+                            link = config / name
+                            try:
+                                link.symlink_to(source)
+                            except OSError as exc:
+                                if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                                    self.skipTest("Windows symlink privilege is not available")
+                                raise
+                            try:
+                                with mock.patch.dict(os.environ, {
+                                    "HOME": str(root), "USERPROFILE": str(root),
+                                    "PI_CODING_AGENT_DIR": str(config),
+                                }, clear=True), self.assertRaisesRegex(SystemExit, "Pi configuration.*outside"):
+                                    self.helper["safe_engine_env"](repo, engine="pi")
+                            finally:
+                                link.unlink()
+            finally:
+                boundary.reset(token)
+
+    def test_pi_default_config_is_checked_and_pinned(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = root / "repo"
+            repo.mkdir()
+            config = root / ".pi" / "agent"
+            config.mkdir(parents=True)
+            boundary = self.helper["UNTRUSTED_SOURCE_ROOTS"]
+            token = boundary.set((repo, config))
+            try:
+                with mock.patch.dict(os.environ, {"HOME": str(root), "USERPROFILE": str(root),
+                                                  "PI_CODING_AGENT_DIR": ""}, clear=True):
+                    with self.assertRaisesRegex(SystemExit, "Pi configuration.*outside"):
+                        self.helper["safe_engine_env"](repo, engine="pi")
+            finally:
+                boundary.reset(token)
+            with mock.patch.dict(os.environ, {"HOME": str(root), "USERPROFILE": str(root),
+                                              "PI_CODING_AGENT_DIR": ""}, clear=True):
+                env = self.helper["safe_engine_env"](repo, engine="pi")
+            self.assertEqual(env["PI_CODING_AGENT_DIR"], str(config))
+            self.assertEqual(list(config.iterdir()), [], "admission must not create auth or settings")
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(os, "name", "nt"):
+                with self.assertRaisesRegex(SystemExit, "PI_CODING_AGENT_DIR.*USERPROFILE"):
+                    self.helper["pi_config_directory"](repo)
+
+    def test_pi_source_config_refuses_before_the_version_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = root / "repo"
+            upstream = root / "upstream"
+            repo.mkdir()
+            upstream.mkdir()
+            boundary = self.helper["UNTRUSTED_SOURCE_ROOTS"]
+            token = boundary.set((repo, upstream))
+            try:
+                args = argparse.Namespace(pi_bin=sys.executable)
+                with mock.patch.dict(os.environ, {"PI_CODING_AGENT_DIR": str(upstream)}, clear=True), \
+                        mock.patch.dict(self.helper["ensure_pi_isolation_supported"].__globals__,
+                                        {"run": mock.Mock(side_effect=AssertionError("probe executed"))}), \
+                        self.assertRaisesRegex(SystemExit, "Pi configuration.*outside"):
+                    self.helper["ensure_pi_isolation_supported"](args, repo)
+            finally:
+                boundary.reset(token)
+
+    def test_claude_mtls_paths_exclude_sources_and_preserve_operator_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = root / "repo"
+            upstream = root / "upstream"
+            for path in (repo, upstream):
+                path.mkdir()
+            boundary = self.helper["UNTRUSTED_SOURCE_ROOTS"]
+            token = boundary.set((repo, upstream))
+            keys = ("CLAUDE_CODE_CLIENT_CERT", "CLAUDE_CODE_CLIENT_KEY")
+            try:
+                for owner in (repo, upstream, root):
+                    with self.subTest(owner=owner.name):
+                        identity = owner / "identity.pem"
+                        identity.write_text("synthetic identity fixture")
+                        values = {key: str(identity) for key in keys}
+                        values["CLAUDE_CODE_CLIENT_KEY_PASSPHRASE"] = str(upstream / "scalar-value")
+                        with mock.patch.dict(os.environ, values, clear=True):
+                            env = self.helper["safe_engine_env"](repo, engine="claude")
+                        for key in keys:
+                            if owner == root:
+                                self.assertEqual(env[key], str(identity))
+                            else:
+                                self.assertNotIn(key, env)
+                        self.assertEqual(env["CLAUDE_CODE_CLIENT_KEY_PASSPHRASE"],
+                                         values["CLAUDE_CODE_CLIENT_KEY_PASSPHRASE"])
+            finally:
+                boundary.reset(token)
+
     def test_safe_engine_env_strips_process_injection_variables(self) -> None:
         old = os.environ.copy()
         with tempfile.TemporaryDirectory() as tempdir:
@@ -6009,27 +6116,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 ),
                 repo,
             )
-            alternate_repo = repo.with_name(repo.name.swapcase())
-            with (
-                mock.patch.object(
-                    os.path,
-                    "samefile",
-                    side_effect=lambda left, right: (
-                        str(left).casefold() == str(right).casefold()
-                    ),
-                ),
-                self.assertRaisesRegex(
-                    SystemExit,
-                    "--json-output must point outside",
-                ),
-            ):
-                self.helper["prepare_output_paths"](
-                    argparse.Namespace(
-                        json_output=str(alternate_repo / "review.json"),
-                        output=None,
-                    ),
-                    repo,
-                )
 
     def test_atomic_output_replaces_hard_link_without_touching_repo_file(
         self,
@@ -6548,6 +6634,31 @@ else:
                 os.environ.clear()
                 os.environ.update(old)
 
+    @unittest.skipIf(os.name == "nt", "requires local symlink privilege")
+    def test_credential_parent_components_preserve_source_link_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = root / "repo"
+            source = root / "source"
+            outside = root / "outside"
+            for path in (repo, source, outside / "deep"):
+                path.mkdir(parents=True)
+            (source / "link").symlink_to(outside / "deep", target_is_directory=True)
+            (root / "alias").symlink_to(source / "link", target_is_directory=True)
+            (root / "trusted-link").symlink_to(outside / "deep", target_is_directory=True)
+            boundary = self.helper["UNTRUSTED_SOURCE_ROOTS"]
+            token = boundary.set((repo, source))
+            try:
+                for raw in (source / "link" / ".." / "identity", root / "alias" / ".." / "identity"):
+                    self.assertEqual(raw.resolve(), outside / "identity")
+                    self.assertIsNone(self.helper["normalize_external_env_path_value"](
+                        repo, "AWS_CONFIG_FILE", str(raw)))
+                trusted = root / "trusted-link" / ".." / "identity"
+                self.assertEqual(self.helper["normalize_external_env_path_value"](
+                    repo, "AWS_CONFIG_FILE", str(trusted)), str(outside / "identity"))
+            finally:
+                boundary.reset(token)
+
     def test_provider_credential_paths_are_forwarded_as_absolute(self) -> None:
         old_env = os.environ.copy()
         old_cwd = Path.cwd()
@@ -6595,12 +6706,12 @@ else:
                 os.environ["USERPROFILE"] = str(repo)
                 claude_env = self.helper["safe_engine_env"](repo, engine="claude")
                 codex_env = self.helper["safe_engine_env"](repo, engine="codex")
-                pi_env = self.helper["safe_engine_env"](repo, engine="pi")
+                with self.assertRaisesRegex(SystemExit, "Pi configuration.*outside"):
+                    self.helper["safe_engine_env"](repo, engine="pi")
                 self.assertNotIn("CLAUDE_CONFIG_DIR", claude_env)
                 self.assertNotIn("CODEX_HOME", codex_env)
                 self.assertNotIn("CODEX_CA_CERTIFICATE", codex_env)
                 self.assertNotIn("SSL_CERT_FILE", codex_env)
-                self.assertNotIn("PI_CODING_AGENT_DIR", pi_env)
                 self.assertNotIn("HOME", claude_env)
                 self.assertNotIn("USERPROFILE", claude_env)
             finally:

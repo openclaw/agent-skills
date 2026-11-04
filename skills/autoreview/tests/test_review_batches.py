@@ -9,6 +9,7 @@ import os
 import runpy
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -78,7 +79,7 @@ class ReviewBatchTests(unittest.TestCase):
     def write_manifest(self, repo, manifest):
         (repo / ".review/batches.json").write_bytes(json.dumps(manifest).encode("utf-8"))
 
-    def invoke(self, repo, *options, engine=None, allocated=True, real_engine_probe=False):
+    def invoke(self, repo, *options, engine=None, allocated=True, real_engine_probe=False, codex_transport=None):
         argv = [str(SCRIPT), "--mode", "branch", "--base", "HEAD^", "--engine", "codex",
                 "--max-priority", "P2", "--review-batches", ".review/batches.json",
                 "--source-context-file", "global.md", "--max-prompt-bytes", "80000",
@@ -101,8 +102,17 @@ class ReviewBatchTests(unittest.TestCase):
             return json.dumps(engine(len(sends), report) if engine else report)
 
         output = io.StringIO()
+        # Substitute the CLI transport, keeping capture, dispatch, retry
+        # classification and publication on their supported paths.
+        transport_patches = ({
+            "ensure_codex_isolation_supported": lambda *_: None,
+            "codex_subscription_login_missing": lambda *_: False,
+            "run_with_heartbeat": codex_transport,
+        } if codex_transport is not None else {})
         with mock.patch.dict(self.helper["main_with_args"].__globals__, {
-            "repo_root": lambda: repo, "run_engine": run,
+            **transport_patches,
+            "repo_root": lambda: repo,
+            "run_engine": self.helper["run_engine"] if codex_transport else run,
             "discover_repo_root": lambda _: repo,
             "resolve_engine_binary": (self.helper["resolve_engine_binary"] if real_engine_probe
                                       else lambda *_: (True, None)),
@@ -139,6 +149,270 @@ class ReviewBatchTests(unittest.TestCase):
             (repo / ".review/external.json").write_text(json.dumps(manifest))
             self.write_manifest(repo, self.manifest(repo))
             yield repo, upstream, source, manifest
+
+
+    def test_invalid_external_manifest_cannot_publish_stage_before_output_admission(self):
+        with self.external_fixture() as (repo, upstream, source, _):
+            (repo / ".review/external.json").write_text("{invalid JSON")
+            before = source.read_bytes()
+            argv = [str(SCRIPT), "--mode", "branch", "--base", "HEAD^",
+                    "--external-source-context-file", ".review/external.json",
+                    "--engine-stage-dir", str(upstream), "--stream-engine-output"]
+            persist = mock.Mock(wraps=self.helper["persist_engine_stage"])
+            with mock.patch.object(sys, "argv", argv), mock.patch.dict(
+                self.helper["main_impl"].__globals__, {
+                    "discover_repo_root": lambda _: repo, "persist_engine_stage": persist,
+                },
+            ), self.assertRaisesRegex(SystemExit, "invalid external source manifest JSON"):
+                self.helper["main_impl"]()
+            persist.assert_not_called()
+            self.assertEqual(source.read_bytes(), before)
+            self.assertFalse((upstream / "engine-stage.json").exists())
+            self.assertFalse((upstream / ".engine-stage.partial").exists())
+
+
+    def test_external_sources_cannot_be_output_destinations_before_probes(self):
+        with self.external_fixture() as (repo, upstream, source, manifest):
+            other = repo.parent / "other-source"
+            shutil.copytree(upstream, other)
+            (repo / ".review/other.json").write_text(json.dumps({**manifest, "root": str(other)}))
+            for destination in (source, other / manifest["files"][0]["path"]):
+                before = destination.read_bytes()
+                identity = destination.stat()
+                for option in ("--json-output", "--output", "--status-output", "--preflight-output",
+                               "--engine-stage-dir", "--native-handoff"):
+                    extra = (["--preflight-repo", "example/repository"] if option == "--preflight-output"
+                             else ["--engine", "openclaw"] if option == "--native-handoff" else [])
+                    with self.subTest(destination=destination, option=option):
+                        probe = mock.Mock(side_effect=AssertionError("must reject before any probe"))
+                        with mock.patch.dict(self.helper["main_with_args"].__globals__, {"preflight_git": probe}):
+                            status, sends, _ = self.invoke(
+                                repo, "--external-source-context-file", ".review/external.json",
+                                "--external-source-context-file", ".review/other.json",
+                                option, str(destination), *extra,
+                            )
+                        self.assertIn(option + " must point outside", str(status))
+                        probe.assert_not_called()
+                        self.assertFalse(sends)
+                        self.assertEqual(destination.read_bytes(), before)
+                        self.assertEqual(destination.stat().st_ino, identity.st_ino)
+
+    @unittest.skipIf(os.name == "nt", "requires local symlink privilege")
+    def test_external_output_alias_is_rejected_and_outside_output_is_preserved(self):
+        with self.external_fixture() as (repo, upstream, source, _):
+            alias = repo.parent / "output-alias"
+            alias.symlink_to(source.parent, target_is_directory=True)
+            before = source.read_bytes()
+            status, sends, _ = self.invoke(
+                repo, "--external-source-context-file", ".review/external.json",
+                "--json-output", str(alias / source.name),
+            )
+            self.assertIn("--json-output must point outside", str(status))
+            self.assertFalse(sends)
+            self.assertEqual(source.read_bytes(), before)
+            # A stable operator-owned destination still publishes a complete report.
+            outside = repo.parent / "outside"
+            outside.mkdir()
+            alias.unlink()
+            alias.symlink_to(outside, target_is_directory=True)
+            status, _, output = self.invoke(
+                repo, "--external-source-context-file", ".review/external.json",
+                "--json-output", str(alias / "report.json"),
+            )
+            self.assertEqual(status, 0, output)
+            self.assertEqual(json.loads((outside / "report.json").read_text())["review_status"], "scoped-clean")
+
+    @unittest.skipIf(os.name == "nt", "requires local symlink privilege")
+    def test_output_parent_retargeted_during_review_cannot_replace_external_source(self):
+        with self.external_fixture() as (repo, upstream, source, _):
+            outside = repo.parent / "outside"
+            outside.mkdir()
+            alias = repo.parent / "output-alias"
+            alias.symlink_to(outside, target_is_directory=True)
+            before = source.read_bytes()
+            def retarget(number, report):
+                if number == 2:
+                    alias.unlink()
+                    alias.symlink_to(source.parent, target_is_directory=True)
+                return report
+            status, sends, _ = self.invoke(
+                repo, "--external-source-context-file", ".review/external.json",
+                "--json-output", str(alias / source.name), engine=retarget,
+            )
+            self.assertEqual(len(sends), 2)
+            self.assertIn("output must point outside", str(status))
+            self.assertEqual(source.read_bytes(), before)
+            self.assertEqual(list(outside.iterdir()), [])
+
+    @unittest.skipIf(os.name == "nt", "requires local symlink privilege")
+    def test_ordinary_review_cannot_replace_source_through_retargeted_output_parent(self):
+        with self.fixture() as repo:
+            self.write_manifest(repo, self.manifest(repo))
+            outside = repo.parent / "outside"
+            outside.mkdir()
+            alias = repo.parent / "output-alias"
+            alias.symlink_to(outside, target_is_directory=True)
+            source = repo / "first.py"
+            before = source.read_bytes()
+            def retarget(number, report):
+                if number == 2:
+                    alias.unlink()
+                    alias.symlink_to(repo, target_is_directory=True)
+                return report
+            status, sends, _ = self.invoke(
+                repo, "--json-output", str(alias / source.name), engine=retarget,
+            )
+            self.assertEqual(len(sends), 2)
+            self.assertIn("output must point outside", str(status))
+            self.assertEqual(source.read_bytes(), before)
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertEqual(self.helper["UNTRUSTED_SOURCE_ROOTS"].get(), ())
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows directory junctions")
+    def test_windows_junctions_preserve_all_source_boundaries(self):
+        with self.external_fixture() as (repo, upstream, source, _):
+            trusted = repo.parent / "trusted"
+            trusted.mkdir()
+            cmd = Path(os.environ["SystemRoot"]) / "System32" / "cmd.exe"
+            direct = repo.parent / "source-junction"
+            controlled = upstream / "controlled-junction"
+            indirect = repo.parent / "indirect-junction"
+            safe = repo.parent / "safe-junction"
+            for link, target in ((direct, source.parent), (controlled, trusted),
+                                 (indirect, controlled), (safe, trusted)):
+                subprocess.run([str(cmd), "/d", "/c", "mklink", "/J", str(link), str(target)],
+                               check=True, capture_output=True, text=True)
+                self.assertEqual(link.lstat().st_reparse_tag, stat.IO_REPARSE_TAG_MOUNT_POINT)
+            # The final referent is trusted, but the intermediate source-owned
+            # junction can later change. Exercise real metadata even on Python 3.10.
+            self.assertTrue(os.path.samefile(indirect, trusted))
+            token = self.helper["UNTRUSTED_SOURCE_ROOTS"].set((repo, upstream))
+            try:
+                for path in (direct / source.name, direct / "new-output.json", indirect / "new-output.json"):
+                    with self.subTest(path=path):
+                        self.assertFalse(self.helper["external_env_path"](repo, str(path)))
+                self.assertTrue(self.helper["external_env_path"](repo, str(safe / "new-output.json")))
+            finally:
+                self.helper["UNTRUSTED_SOURCE_ROOTS"].reset(token)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows path normalization")
+    def test_windows_parent_segments_cannot_hide_source_after_a_junction(self):
+        with self.external_fixture() as (repo, upstream, source, _):
+            deep = repo.parent / "trusted" / "deep"
+            deep.mkdir(parents=True)
+            alias = repo.parent / "trusted-junction"
+            cmd = Path(os.environ["SystemRoot"]) / "System32" / "cmd.exe"
+            subprocess.run([str(cmd), "/d", "/c", "mklink", "/J", str(alias), str(deep)],
+                           check=True, capture_output=True, text=True)
+            candidate = alias / ".." / upstream.name / source.relative_to(upstream)
+            # Win32 removes alias/.. before following junctions for this DOS path.
+            self.assertTrue(os.path.samefile(candidate, source))
+            self.assertEqual(candidate.resolve(), source.resolve())
+            token = self.helper["UNTRUSTED_SOURCE_ROOTS"].set((repo, upstream))
+            try:
+                self.assertFalse(self.helper["external_env_path"](repo, str(candidate)))
+            finally:
+                self.helper["UNTRUSTED_SOURCE_ROOTS"].reset(token)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows drive-relative paths")
+    def test_windows_same_drive_relative_path_ignores_drive_letter_case(self):
+        with self.fixture() as repo:
+            if len(repo.drive) != 2 or repo.drive[1] != ":":
+                self.skipTest("requires a drive-letter volume")
+            shared = repo.parent / "shared"
+            shared.mkdir()
+            previous = Path.cwd()
+            try:
+                os.chdir(repo)
+                candidate = repo.drive.swapcase() + "../shared"
+                self.assertEqual(Path(candidate).resolve(), shared.resolve())
+                self.assertTrue(self.helper["external_env_path"](repo, candidate))
+            finally:
+                os.chdir(previous)
+
+    def test_case_aliases_do_not_admit_source_executables_or_overlapping_roots(self):
+        with self.external_fixture() as (repo, upstream, _, manifest):
+            alias = upstream.with_name(upstream.name.upper())
+            if not alias.exists() or not os.path.samefile(alias, upstream):
+                self.skipTest("requires a case-insensitive filesystem")
+            executable = upstream / "reviewer"
+            executable.write_text("#!/bin/sh\nexit 99\n")
+            executable.chmod(0o755)
+            boundary = self.helper["UNTRUSTED_SOURCE_ROOTS"]
+            token = boundary.set((repo, upstream))
+            try:
+                self.assertFalse(self.helper["external_env_path"](repo, str(alias / "reviewer")))
+                self.assertIsNone(self.helper["find_command"](str(alias / "reviewer"), repo))
+                with self.assertRaisesRegex(SystemExit, "must point outside"):
+                    self.helper["require_output_outside_sources"](alias / "new-output.json", "output", repo)
+            finally:
+                boundary.reset(token)
+            # A differently spelled root must not turn the target into its own external source.
+            (repo / ".review/external.json").write_text(json.dumps({**manifest, "root": str(repo.with_name(repo.name.upper()))}))
+            status, sends, _ = self.invoke(repo, "--external-source-context-file", ".review/external.json")
+            self.assertIn("canonical, separate absolute worktree", str(status))
+            self.assertFalse(sends)
+            with self.assertRaisesRegex(SystemExit, "canonical, separate absolute worktree"):
+                self.helper["external_source_binding"](upstream, alias)
+
+    def test_external_evidence_checked_before_codex_retry(self):
+        for retry in ("model", "auth"):
+            for mutation in ("source", "manifest", None):
+                with self.subTest(retry=retry, mutation=mutation), self.external_fixture() as fixture:
+                    repo, _, source, _ = fixture
+                    operator = repo.parent / "operator"
+                    operator.mkdir()
+                    if retry == "auth":
+                        (operator / "config.toml").write_text(
+                            'model_provider = "review_api"\n'
+                            '[model_providers.review_api]\n'
+                            'base_url = "https://api.openai.com/v1"\n'
+                            '[model_providers.review_api.auth]\n'
+                            f'command = {json.dumps(sys.executable)}\n'
+                        )
+                    attempts = []
+                    def transport(command, _cwd, **kwargs):
+                        attempts.append((command, kwargs["input_text"]))
+                        if len(attempts) == 1:
+                            # The first CLI attempt loses access while its captured
+                            # source is changed or the operator withdraws the manifest.
+                            if mutation == "source":
+                                source.write_text("// changed after first send\n")
+                            elif mutation == "manifest":
+                                (repo / ".review/external.json").unlink()
+                            model = command[command.index("--model") + 1]
+                            error = ("401 Unauthorized" if retry == "auth" else
+                                     f"The model {model} does not exist or you do not have access to it.")
+                            return subprocess.CompletedProcess(command, 1, "", error)
+                        report = {
+                            "findings": [], "overall_correctness": "patch is correct",
+                            "overall_explanation": "synthetic CLI reply", "overall_confidence": 0.99,
+                            "review_completion": "complete",
+                        }
+                        Path(command[command.index("--output-last-message") + 1]).write_text(json.dumps(report))
+                        return subprocess.CompletedProcess(command, 0, "", "")
+
+                    with mock.patch.dict(os.environ, {"CODEX_HOME": str(operator)}):
+                        status, _, output = self.invoke(
+                            repo, "--external-source-context-file", ".review/external.json",
+                            "--codex-bin", sys.executable, codex_transport=transport,
+                        )
+                    if mutation:
+                        self.assertEqual(len(attempts), 1, str(status) + output)
+                        self.assertNotEqual(status, 0, output)
+                        self.assertIn("evidence changed", str(status) + output)
+                        self.assertFalse((repo.parent / "result.json").exists(),
+                                         "changed evidence must never publish a clean report")
+                    else:
+                        self.assertEqual(status, 0, output)
+                        self.assertEqual(len(attempts), 3)  # Retry plus the second allocated pass.
+                        self.assertEqual(attempts[0][1], attempts[1][1], "retry must retain the frozen prompt")
+                        first, second = (attempt[0] for attempt in attempts[:2])
+                        if retry == "model":
+                            self.assertNotEqual(first[first.index("--model") + 1], second[second.index("--model") + 1])
+                        else:
+                            self.assertNotIn('model_provider="review_api"', first)
+                            self.assertIn('model_provider="review_api"', second)
 
     def test_external_linked_worktree_sha256_and_executable_blob(self):
         with self.external_fixture(object_format="sha256") as (repo, upstream, source, manifest):
@@ -275,6 +549,31 @@ class ReviewBatchTests(unittest.TestCase):
             finally:
                 boundary.reset(token)
 
+    def test_git_home_cannot_hide_changes_through_source_owned_default_ignores(self):
+        with self.external_fixture() as (repo, upstream, _, _):
+            (repo / "untracked-evidence.txt").write_text("candidate source\n")
+            neutral = repo.parent / "neutral-home"
+            neutral.mkdir()
+            trusted = repo.parent / "trusted-home"
+            for home in (trusted, upstream):
+                directory = home / ".config" / "git"
+                directory.mkdir(parents=True)
+                (directory / "ignore").write_text("untracked-evidence.txt\n")
+            token = self.helper["UNTRUSTED_SOURCE_ROOTS"].set((repo, upstream))
+            try:
+                # Real Git honors trusted defaults; a source tree cannot choose them.
+                for home, expected in ((neutral, "?? untracked-evidence.txt\n"), (trusted, "")):
+                    with self.subTest(home=home), mock.patch.dict(os.environ, {"HOME": str(home)}):
+                        result = self.helper["git_result"](repo, "status", "--porcelain", "--untracked-files=all")
+                        self.assertEqual(result.returncode, 0)
+                        self.assertEqual(result.stdout, expected)
+                for home in (upstream, repo):
+                    with self.subTest(source_home=home), mock.patch.dict(os.environ, {"HOME": str(home)}):
+                        with self.assertRaisesRegex(SystemExit, "Git.*HOME"):
+                            self.helper["safe_git_env"](repo)
+            finally:
+                self.helper["UNTRUSTED_SOURCE_ROOTS"].reset(token)
+
     def test_external_source_platform_environment_is_refused_before_any_process(self):
         with self.external_fixture() as (repo, upstream, _, _):
             for key in ("SystemRoot", "COMSPEC", "SHELL", "TMPDIR"):
@@ -286,6 +585,34 @@ class ReviewBatchTests(unittest.TestCase):
                     self.assertFalse(sends)
                     probe.assert_not_called()
                     self.assertEqual(self.helper["UNTRUSTED_SOURCE_ROOTS"].get(), ())
+
+    @unittest.skipIf(os.name == "nt", "requires local symlink privilege")
+    def test_external_source_platform_paths_reject_source_owned_intermediate_links(self):
+        with self.external_fixture() as (repo, upstream, _, _):
+            trusted = repo.parent / "trusted-system"
+            trusted.mkdir()
+            inside = upstream / "system-link"
+            inside.symlink_to(trusted, target_is_directory=True)
+            outside = repo.parent / "outside-system-link"
+            outside.symlink_to(inside, target_is_directory=True)
+            for key in ("SystemRoot", "COMSPEC", "SHELL", "TMPDIR"):
+                for path in (inside, outside):
+                    with self.subTest(key=key, path=path), mock.patch.dict(os.environ, {key: str(path)}):
+                        probe = mock.Mock(side_effect=AssertionError("process admission must not run"))
+                        with mock.patch.dict(self.helper["main_with_args"].__globals__, {"preflight_git": probe}):
+                            status, sends, _ = self.invoke(repo, "--external-source-context-file", ".review/external.json")
+                        self.assertNotEqual(status, 0)
+                        self.assertFalse(sends)
+                        probe.assert_not_called()
+                        self.assertEqual(self.helper["UNTRUSTED_SOURCE_ROOTS"].get(), ())
+            # A caller-owned alias entirely outside reviewed sources remains valid.
+            outside.unlink()
+            outside.symlink_to(trusted, target_is_directory=True)
+            token = self.helper["UNTRUSTED_SOURCE_ROOTS"].set((repo, upstream))
+            try:
+                self.assertTrue(self.helper["external_env_path"](repo, str(outside)))
+            finally:
+                self.helper["UNTRUSTED_SOURCE_ROOTS"].reset(token)
 
     @unittest.skipIf(os.name == "nt", "uses executable shell wrappers")
     def test_external_sources_exclude_all_source_roots_before_git_admission(self):
@@ -343,7 +670,7 @@ class ReviewBatchTests(unittest.TestCase):
                 self.assertNotIn("dirty external body", prompt)
                 self.assertIn(manifest["commit"], prompt)
                 self.assertIn(manifest["files"][0]["blob"], prompt)
-                self.assertIn(str(upstream), prompt)
+                self.assertIn(f"# External source worktree: {json.dumps(str(upstream))}\n", prompt)
                 self.assertNotIn(source.name, prompt.split("# Change Bundle\n", 1)[1])
             result = json.loads((repo.parent / "result.json").read_text())
             self.assertEqual(len(result["review_allocation"]["units"]), 3)
@@ -425,6 +752,36 @@ class ReviewBatchTests(unittest.TestCase):
                 status, sends, _ = self.invoke(repo, "--external-source-context-file", ".review/external.json")
                 self.assertNotEqual(status, 0)
                 self.assertFalse(sends)
+
+    @unittest.skipIf(os.name == "nt", "requires local symlink privilege")
+    def test_external_source_refuses_symlinks_in_metadata_pointer_targets(self):
+        for pointer in ("gitdir", "commondir"):
+            for alias_kind in ("leaf", "parent"):
+                with self.subTest(pointer=pointer, alias=alias_kind), self.external_fixture() as (repo, upstream, _, manifest):
+                    if pointer == "gitdir":
+                        target = upstream / "metadata"
+                        (upstream / ".git").rename(target)
+                        pointer_file = upstream / ".git"
+                        prefix = "gitdir: "
+                    else:
+                        linked = repo.parent / "linked"
+                        self.git(upstream, "worktree", "add", "--detach", str(linked), "HEAD")
+                        pointer_file = Path(self.git(linked, "rev-parse", "--absolute-git-dir")) / "commondir"
+                        target = upstream / ".git"
+                        upstream = linked
+                        manifest["root"] = str(linked)
+                        prefix = ""
+                    alias = repo.parent / "metadata-alias"
+                    alias.symlink_to(target if alias_kind == "leaf" else target.parent, target_is_directory=True)
+                    redirected = alias if alias_kind == "leaf" else alias / target.name
+                    pointer_file.write_text(prefix + str(redirected) + "\n")
+                    (repo / ".review/external.json").write_text(json.dumps(manifest))
+                    # Real Git accepts these pointers and hides their symlinks in
+                    # its resolved metadata paths. Reject before sending context.
+                    self.assertEqual(self.git(upstream, "rev-parse", "HEAD"), manifest["commit"])
+                    status, sends, _ = self.invoke(repo, "--external-source-context-file", ".review/external.json")
+                    self.assertNotEqual(status, 0)
+                    self.assertFalse(sends)
 
     def test_external_source_never_gains_finding_authority(self):
         with self.external_fixture() as (repo, _, source, manifest):
@@ -664,6 +1021,89 @@ class ReviewBatchTests(unittest.TestCase):
                 payload = json.loads(preflight.read_bytes().split(b"\n")[1])
                 self.assertEqual(payload["completion"], "complete" if complete else "partial")
                 self.assertIn("status scoped-clean" if complete else "status incomplete", payload["summary"])
+
+
+@unittest.skipIf(os.name == "nt", "exercises POSIX env shebang execution")
+class ExecutableSearchPathTests(unittest.TestCase):
+    def setUp(self):
+        self.helper = runpy.run_path(str(SCRIPT))
+        temporary = tempfile.TemporaryDirectory(prefix="autoreview-child-path-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.repo = self.root / "reviewed"
+        self.source = self.root / "external"
+        self.contaminated = self.root / "operator-bin"
+        self.trusted = self.root / "trusted-bin"
+        for directory in (self.repo, self.source, self.contaminated, self.trusted):
+            directory.mkdir()
+        boundary = self.helper["UNTRUSTED_SOURCE_ROOTS"]
+        token = boundary.set((self.source,))
+        self.addCleanup(boundary.reset, token)
+        environment = mock.patch.dict(os.environ, {
+            "PATH": os.pathsep.join(map(str, (self.contaminated, self.trusted))),
+            "HOME": str(self.root),
+        }, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+        defaults = mock.patch.dict(self.helper["safe_engine_path"].__globals__, {"DEFAULT_ENGINE_PATHS": ()})
+        defaults.start()
+        self.addCleanup(defaults.stop)
+
+    def executable(self, path, body):
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+        return path
+
+    def test_trusted_wrapper_child_lookup_stays_outside_sources(self):
+        # Use an arbitrary command name: the boundary must cover future tools,
+        # not an allowlist of known Python/Node interpreter names.
+        command = "autoreview-fixture-interpreter"
+        marker = self.root / "source-interpreter-ran"
+        source_interpreter = self.executable(
+            self.source / command, ": > " + shlex.quote(str(marker)) + "\nprintf 'source-selected\\n'\n",
+        )
+        (self.contaminated / command).symlink_to(source_interpreter)
+        self.executable(self.trusted / command, "printf 'trusted-selected\\n'\n")
+        wrapper_directory = self.root / "wrapper-bin"
+        wrapper_directory.mkdir()
+        wrapper = wrapper_directory / "reviewer"
+        wrapper.write_text("#!/usr/bin/env " + command + "\n")
+        wrapper.chmod(0o755)
+        selected = self.helper["resolve_command"](str(wrapper), self.repo)
+        env = self.helper["safe_engine_env"](self.repo, [wrapper.parent], engine="codex")
+        result = subprocess.run([selected, "--version"], env=env, cwd=self.root,
+                                capture_output=True, text=True, check=False)
+        self.assertFalse(marker.exists(), "source-owned child interpreter executed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "trusted-selected\n")
+        self.assertNotIn(str(self.contaminated), env["PATH"].split(os.pathsep))
+
+    def test_broken_and_nonexecutable_source_entries_exclude_the_whole_directory(self):
+        for owner in (self.repo, self.source):
+            for state in ("missing", "nonexecutable"):
+                with self.subTest(owner=owner.name, state=state):
+                    target = owner / state
+                    if state == "nonexecutable":
+                        target.write_text("not executable yet")
+                        target.chmod(0o644)
+                    link = self.contaminated / "future-command"
+                    link.symlink_to(target)
+                    try:
+                        self.assertEqual(self.helper["safe_engine_path"](
+                            self.repo, [self.contaminated]), str(self.trusted))
+                    finally:
+                        link.unlink()
+
+    def test_later_admission_rechecks_retargeted_link(self):
+        target = self.executable(self.trusted / "tool", "exit 0\n")
+        source_target = self.executable(self.source / "tool", "exit 99\n")
+        link = self.contaminated / "tool"
+        link.symlink_to(target)
+        self.assertEqual(self.helper["safe_engine_path"](self.repo),
+                         os.pathsep.join(map(str, (self.contaminated, self.trusted))))
+        link.unlink()
+        link.symlink_to(source_target)
+        self.assertEqual(self.helper["safe_engine_path"](self.repo), str(self.trusted))
 
 
 if __name__ == "__main__":

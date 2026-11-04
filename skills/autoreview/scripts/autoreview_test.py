@@ -2652,7 +2652,7 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
                         [], returncode, stdout, stderr,
                     )) as probe, contextlib.redirect_stdout(io.StringIO()) as out, \
                     contextlib.redirect_stderr(io.StringIO()) as err:
-                self.assertEqual(AUTOREVIEW.codex_subscription_login_missing("/codex", self.root), expected)
+                self.assertEqual(AUTOREVIEW.codex_subscription_login_missing("/codex", self.root, self.repo), expected)
                 self.assertEqual(out.getvalue() + err.getvalue(), "")
                 self.assertEqual(probe.call_args.args, (["/codex", "login", "status"],))
                 kwargs = probe.call_args.kwargs
@@ -2671,7 +2671,7 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
                     mock.patch.object(AUTOREVIEW.subprocess, "run", side_effect=error), \
                     contextlib.redirect_stdout(io.StringIO()) as out, \
                     contextlib.redirect_stderr(io.StringIO()) as err:
-                self.assertFalse(AUTOREVIEW.codex_subscription_login_missing("/codex", self.root))
+                self.assertFalse(AUTOREVIEW.codex_subscription_login_missing("/codex", self.root, self.repo))
                 self.assertEqual(out.getvalue() + err.getvalue(), "")
 
     def run_codex_attempts(

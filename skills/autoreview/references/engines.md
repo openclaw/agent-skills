@@ -104,6 +104,10 @@ Profile settings remain ignored. Force configured route before subscription atte
 | Amp             | `AMP_API_KEY` for a plugin-free account; local POSIX execution, no custom endpoint or cloud/orb agent |
 | Pi              | CLI 0.79.0+; configured model; no tools or project resources                                          |
 
+- Pi's `PI_CODING_AGENT_DIR` (default `~/.pi/agent`) and its `models.json`,
+  `auth.json` and `settings.json` must stay outside all reviewed source roots;
+  on Windows without `USERPROFILE`, set `PI_CODING_AGENT_DIR` explicitly.
+
 - `--engine kimi`: recognized, refused for reviews + `--dry-run` before any Kimi
   process, configuration read, or authentication setup.
 - Supported Kimi Code prompt mode accepts review content only as command-line

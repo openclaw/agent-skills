@@ -119,7 +119,12 @@ metadata paths are not. Alternate object stores are unsupported. The source root
 cannot contain or be inside the reviewed repository. Before Git preflight, every
 declared source root and the reviewed repository are excluded from host executable
 selection, child `PATH`, authentication and configuration paths. This includes
-reviewer probes and trusted wrappers.
+reviewer probes and trusted wrappers. A trusted `PATH` directory is excluded if
+any entry redirects into a source root. Paths with source-owned intermediate
+symlinks are also rejected, even when their final target is outside the source tree.
+Reports, status files and diagnostic outputs must stay outside every source root.
+Git also rejects source-owned `HOME`, whose default ignore file could hide changes;
+trusted caller exclusions retain their existing behavior.
 
 The helper reads complete UTF-8 regular-file blobs from the declared commit,
 not the source checkout's working bytes. Headers retain the original path,
@@ -129,7 +134,8 @@ relax `--prompt-file` or `--dataset` filename rules. Do not rename or concatenat
 blocked evidence to bypass those rules.
 
 The manifest, source paths, checkout identity, Git metadata/object-store paths
-and captured source fingerprints are revalidated before sends and publication.
+and captured source fingerprints are revalidated before every send, including
+helper-initiated retries, and before publication.
 Changes fail the review rather than silently rebinding a source. Freeze source
 checkouts during the review, including their working files and metadata.
 
