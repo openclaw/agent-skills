@@ -122,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
             result = unittest.TextTestRunner().run(suite)
             return 0 if result.wasSuccessful() else 1
     unittest_command = [python, *(["-S"] if sys.flags.no_site else []),
-                        str(Path(__file__).resolve()), "--group", args.group, "--tests-only"]
+                        "scripts/check-skills", "--group", args.group, "--tests-only"]
     commands = [
         [python, "scripts/validate-skills"],
         ["bash", "-n", "skills/autoreview/scripts/test-review-harness"],

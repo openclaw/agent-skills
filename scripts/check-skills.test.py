@@ -52,7 +52,7 @@ class CheckSkillsTest(unittest.TestCase):
             "scripts/validate-skills", "-n", "-m", "scripts/install-skills.test.py",
             "scripts/validate-skills.test.py", "scripts/check-skills.test.py",
         ])
-        self.assertIn(str(SCRIPT.resolve()), commands[6])
+        self.assertIn("scripts/check-skills", commands[6])
         self.assertEqual(commands[6][-3:], ["--group", "all", "--tests-only"])
         self.assertEqual([command[1] for command in commands[7:]], [
             "--check", "--check", "--check", "run", "--test",
@@ -173,31 +173,49 @@ class CheckSkillsTest(unittest.TestCase):
             self.assertFalse(marker.exists())
 
     def test_fixture_source_supports_unicode_paths_under_a_narrow_locale(self) -> None:
-        # Change the text locale after interpreter startup so the filesystem
-        # retains Unicode support while default text writes use a narrow codec.
+        # Always exercise outer-command output. The default-write-encoding proof
+        # additionally needs a real narrow codec, which some hosts do not offer.
         code = r'''
 import locale, runpy, sys, tempfile
 from pathlib import Path
+if sys.getfilesystemencoding().lower().replace("-", "") != "utf8":
+    print("host has no UTF-8 filesystem locale with UTF-8 mode disabled", file=sys.stderr)
+    sys.exit(77)
+character = "\u674e"
+if sys.argv[2] == "narrow":
+    locale.setlocale(locale.LC_CTYPE, "C")
+    for character in ("\u674e", "\U0001f984"):
+        try:
+            character.encode(locale.getpreferredencoding(False))
+        except UnicodeEncodeError:
+            break
+    else:
+        print("host text codec supports both Unicode filename probes", file=sys.stderr)
+        sys.exit(77)
 case = runpy.run_path(sys.argv[1])["CheckSkillsTest"]()
 with tempfile.TemporaryDirectory() as temporary:
-    parent = Path(temporary) / "\u674e"
+    parent = Path(temporary) / character
     parent.mkdir()
-    locale.setlocale(locale.LC_CTYPE, "C")
-    try:
-        "\u674e".encode(locale.getpreferredencoding(False))
-    except UnicodeEncodeError:
-        pass
-    else:
-        raise AssertionError("fixture must exercise a narrow text locale")
     with case.fixture(parent=parent) as (root, foreign, marker, log, environment, groups):
-        result = case.invoke(root, foreign, environment, "boundaries")
+        environment["PYTHONIOENCODING"] = "ascii"
+        result = case.invoke(root, foreign, environment, "boundaries", tests_only=False)
         assert result.returncode == 0, result.stdout + result.stderr
         assert not marker.exists()
         assert sorted(log.read_text().splitlines()) == sorted(groups["boundaries"])
 '''
-        result = subprocess.run([sys.executable, "-X", "utf8=0", "-S", "-c", code, str(Path(__file__).resolve())],
-                                text=True, capture_output=True, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for mode in ("outer", "narrow"):
+            with self.subTest(proof=mode):
+                command = [sys.executable, "-X", "utf8=1" if mode == "outer" else "utf8=0",
+                           "-S", "-c", code, str(Path(__file__).resolve()), mode]
+                result = subprocess.run(command, text=True, capture_output=True, timeout=30)
+                if mode == "narrow" and result.returncode == 77:
+                    # Try the common POSIX UTF-8 locale when the inherited
+                    # locale cannot establish the required filesystem support.
+                    result = subprocess.run(command, env={**os.environ, "LC_ALL": "C.UTF-8"},
+                                            text=True, capture_output=True, timeout=30)
+                if mode == "narrow" and result.returncode == 77:
+                    self.skipTest(result.stderr.strip())
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_empty_and_broken_discovery_fail_before_running_tests(self) -> None:
         with self.fixture() as (root, foreign, marker, log, environment, groups):
