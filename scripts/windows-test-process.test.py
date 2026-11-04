@@ -578,6 +578,26 @@ class NativeTokenTests(unittest.TestCase):
 
 
 class NativeParentTests(unittest.TestCase):
+    def test_direct_runner_self_test_reduces_before_private_fixture_creation(self):
+        before = HELPER["windows_test_process_status"]()
+        self.assertTrue(before["native"], "this proof requires native Windows")
+        self.assertFalse(before["primary_eligible"],
+                         "this proof needs the original unsuitable primary token")
+        case = "CheckSkillsTest.test_every_group_and_shard_runs_checkout_tests_despite_installed_package"
+        # The self-test's own entrypoint must reduce authority before its real
+        # fixture creates a private checkout and invokes the copied runner.
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-B", "-X", "utf8=1",
+             str(Path(__file__).with_name("check-skills.test.py")), case, "-v"],
+            text=True, encoding="utf-8", capture_output=True, timeout=90,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(case.partition(".")[2], result.stderr)
+        self.assertRegex(result.stderr, r"(?m)^Ran 1 test in ")
+        self.assertNotIn("skipped", result.stderr)
+        self.assertTrue(HELPER["windows_test_process_status"]() == before,
+                        "parent token state changed")
+
     def test_parent_reporting_handles_absent_streams_before_real_child_launch(self):
         self.assertFalse(HELPER["windows_test_process_status"]()["eligible"],
                          "this proof needs the original unsuitable primary token")
@@ -805,9 +825,9 @@ class AuxiliaryConfigurationTests(unittest.TestCase):
             "raise SystemExit(not unittest.TextTestRunner().run(suite).wasSuccessful())\n"
         )
         result = subprocess.run(
-            [sys.executable, "-I", "-S", "-c", code],
+            [sys.executable, "-I", "-S", "-X", "utf8=1", "-c", code],
             env={**os.environ, "PYTHONVERBOSE": "1", "PYTHONINSPECT": "1", "PYTHONWARNINGS": "error"},
-            text=True, capture_output=True, timeout=90,
+            encoding="utf-8", capture_output=True, timeout=90,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

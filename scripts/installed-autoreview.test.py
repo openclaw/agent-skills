@@ -21,6 +21,14 @@ from pathlib import Path, PurePosixPath
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def _source_git(*arguments: str) -> bytes:
+    # Token restriction can remove Git's Administrators ownership exception.
+    # Trust only this script's selected checkout, for this command alone.
+    return subprocess.check_output(
+        ["git", "-c", f"safe.directory={ROOT}", *arguments], cwd=ROOT,
+    )
+
+
 def tree(root: Path) -> dict[str, tuple[str, bytes | str | None]]:
     result = {}
     for path in root.rglob("*"):
@@ -37,9 +45,42 @@ def tree(root: Path) -> dict[str, tuple[str, bytes | str | None]]:
 
 
 class InstalledAutoreviewTests(unittest.TestCase):
+    def test_source_reads_remain_scoped_when_git_rejects_ownership(self) -> None:
+        # Git's own ownership regression facility exercises its real rejection
+        # path without changing checkout ownership or the operator's config.
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.upper().startswith("GIT_")}
+        environment.update(GIT_CONFIG_SYSTEM=os.devnull, GIT_CONFIG_GLOBAL=os.devnull,
+                           GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_COUNT="0",
+                           GIT_TEST_ASSUME_DIFFERENT_OWNER="1", LC_ALL="C", LANG="C")
+        command = ["git", "rev-parse", "HEAD"]
+        rejected = subprocess.run(command, cwd=ROOT, env=environment, capture_output=True)
+        if rejected.returncode == 0:
+            self.skipTest("installed Git lacks the forced ownership rejection facility")
+        self.assertIn(b"dubious ownership", rejected.stderr)
+        probe = (
+            "import runpy, sys\n"
+            "module = runpy.run_path(sys.argv[1])\n"
+            "sys.stdout.buffer.write(module['_source_git'](*sys.argv[2:]))\n"
+        )
+        head = _source_git("rev-parse", "HEAD").decode("ascii").strip()
+        for arguments in (("rev-parse", "HEAD"), ("ls-tree", "-rz", head)):
+            with self.subTest(command=arguments[0]):
+                result = subprocess.run(
+                    [sys.executable, "-I", "-S", "-B", "-c", probe,
+                     str(Path(__file__).resolve()), *arguments],
+                    cwd=ROOT, env=environment, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+                self.assertEqual(result.stdout, _source_git(*arguments))
+        # The two reads must not persist an exception for subsequent commands.
+        rejected = subprocess.run(command, cwd=ROOT, env=environment, capture_output=True)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn(b"dubious ownership", rejected.stderr)
+
     def test_exact_archives_and_installed_entrypoints(self) -> None:
-        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-        entries = subprocess.check_output(["git", "ls-tree", "-rz", head], cwd=ROOT)
+        head = _source_git("rev-parse", "HEAD").decode("ascii").strip()
+        entries = _source_git("ls-tree", "-rz", head)
         expected = {}
         for entry in entries.split(b"\0"):
             if entry:
