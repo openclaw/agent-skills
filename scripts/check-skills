@@ -211,7 +211,7 @@ if __name__ == "__main__":
     bootstrap = runpy.run_path(str(scripts / "windows_test_process.py"))
     status = bootstrap["ensure_windows_test_process"](
         sys.argv[0], sys.argv[1:], parent_check=[
-            sys.executable, "-u", "-I", "-S", "-B",
+            sys.executable, "-u", "-I", "-S", "-B", "-X", "utf8=1",
             str(scripts / "windows-test-process.test.py"), "--native-parent",
         ],
     )

@@ -699,8 +699,9 @@ def ensure_windows_test_process(
     """Continue if suitable, or run the exact test command in a restricted child.
 
     ``argv`` excludes the script name. ``parent_check`` is an optional trusted
-    native regression command that must pass before a parent with unsuitable
-    primary authority starts its restricted child. A returned integer is the
+    native regression command that must emit UTF-8 text and pass before a parent
+    with unsuitable primary authority starts its restricted child. Its decoded
+    output is relayed through the caller's own text encoding. A returned integer is the
     status the caller must exit with; ``None`` means the current process may continue.
     """
     if os.name != "nt":
@@ -728,20 +729,11 @@ def ensure_windows_test_process(
             # requested invocation has NULL handles. These pipes belong only
             # to the proof process; the requested child retains its handles.
             result = subprocess.run(parent_check, check=False, env=parent_environment,
-                                    capture_output=True)
+                                    capture_output=True, encoding="utf-8", errors="replace")
             for stream, output in ((sys.stdout, result.stdout), (sys.stderr, result.stderr)):
                 if stream is not None:
+                    stream.write(output)
                     stream.flush()
-                    binary = getattr(stream, "buffer", None)
-                    if binary is not None:
-                        # Forward the actual proof bytes, independent of either
-                        # interpreter's locale or strict encoding warnings.
-                        binary.write(output)
-                        binary.flush()
-                    else:
-                        encoding = getattr(stream, "encoding", None) or "utf-8"
-                        stream.write(output.decode(encoding, errors="replace"))
-                        stream.flush()
             if result.returncode:
                 return _exit_status(result.returncode)
         script = os.fspath(entrypoint)
