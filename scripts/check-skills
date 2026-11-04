@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import shutil
 import subprocess
 import sys
+import types
 import unittest
 from pathlib import Path
 
@@ -35,51 +37,90 @@ TEST_MODULES = {
 HARDENING_SHARDS = ("hardening-1", "hardening-2")
 
 
-def hardening_test_ids(root: Path) -> list[str]:
-    name, = TEST_MODULES["hardening"]
-    path = root.joinpath(*name.split(".")).with_suffix(".py")
-    # Bind discovery to this checkout: namespace-package imports can otherwise
-    # select an unrelated installed `skills` package, even with root on sys.path.
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    loader = unittest.TestLoader()
-    suite = loader.loadTestsFromModule(module)
-    if loader.errors:
-        raise ValueError("; ".join(loader.errors))
+@contextlib.contextmanager
+def repository_test_modules(root: Path):
+    # Pin sibling imports too: putting a namespace directory on sys.path does
+    # not keep an installed regular `skills` package from taking precedence.
+    def selected(name: str) -> bool:
+        return name == "skills" or name.startswith("skills.")
 
-    def ids(suite: unittest.TestSuite):
+    previous = {name: module for name, module in sys.modules.copy().items() if selected(name)}
+    for name in previous:
+        del sys.modules[name]
+    try:
+        for name in ("skills", "skills.autoreview", "skills.autoreview.scripts", "skills.autoreview.tests"):
+            module = types.ModuleType(name)
+            module.__path__ = [str(root.joinpath(*name.split(".")))]
+            module.__package__ = name
+            module.__spec__ = importlib.util.spec_from_loader(name, loader=None, is_package=True)
+            sys.modules[name] = module
+            if "." in name:
+                parent, _, leaf = name.rpartition(".")
+                setattr(sys.modules[parent], leaf, module)
+        yield
+    finally:
+        for name in tuple(sys.modules):
+            if selected(name):
+                del sys.modules[name]
+        sys.modules.update(previous)
+
+
+def repository_test_suite(root: Path, group: str) -> unittest.TestSuite:
+    if group == "all":
+        groups = TEST_MODULES
+    else:
+        groups = ("hardening",) if group in HARDENING_SHARDS else (group,)
+    loader = unittest.TestLoader()
+    tests = []
+
+    def flatten(suite):
         for test in suite:
             if isinstance(test, unittest.TestSuite):
-                yield from ids(test)
+                yield from flatten(test)
             else:
-                yield test.id()
+                yield test
 
-    names = sorted(ids(suite))
-    if not names or len(names) != len(set(names)):
-        raise ValueError("hardening discovery returned empty or duplicate test IDs")
-    return names
+    for group_name in groups:
+        for entry in TEST_MODULES[group_name]:
+            name = entry.removesuffix(".py").replace("/", ".")
+            path = root.joinpath(*name.split(".")).with_suffix(".py")
+            spec = importlib.util.spec_from_file_location(name, path)
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+            parent, _, leaf = name.rpartition(".")
+            setattr(sys.modules[parent], leaf, module)
+            tests.extend(flatten(loader.loadTestsFromModule(module)))
+    if loader.errors:
+        raise ValueError("; ".join(loader.errors))
+    if not tests or len(tests) != len({test.id() for test in tests}):
+        raise ValueError("test discovery returned empty or duplicate test IDs")
+    if group in HARDENING_SHARDS:
+        tests = sorted(tests, key=lambda test: test.id())[HARDENING_SHARDS.index(group)::2]
+        if not tests:
+            raise ValueError("hardening shard has no test IDs")
+    return unittest.TestSuite(tests)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--group", choices=("all", *TEST_MODULES, *HARDENING_SHARDS), default="all")
+    parser.add_argument("--tests-only", action="store_true", help="run only the selected Python test suite")
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parent.parent
     python = sys.executable
-    if args.group in HARDENING_SHARDS:
-        try:
-            modules = hardening_test_ids(root)[HARDENING_SHARDS.index(args.group)::2]
-            if not modules:
-                raise ValueError("hardening shard has no test IDs")
-        except Exception as exc:
-            print(f"hardening test discovery failed: {exc}", file=sys.stderr)
-            return 1
-    else:
-        groups = TEST_MODULES if args.group == "all" else (args.group,)
-        modules = [module for group in groups for module in TEST_MODULES[group]]
-    unittest_command = [python, "-m", "unittest", *modules]
+    if args.tests_only:
+        with repository_test_modules(root):
+            try:
+                suite = repository_test_suite(root, args.group)
+            except Exception as exc:
+                print(f"test discovery failed: {exc}", file=sys.stderr)
+                return 1
+            result = unittest.TextTestRunner().run(suite)
+            return 0 if result.wasSuccessful() else 1
+    unittest_command = [python, *(["-S"] if sys.flags.no_site else []),
+                        str(Path(__file__).resolve()), "--group", args.group, "--tests-only"]
     commands = [
         [python, "scripts/validate-skills"],
         ["bash", "-n", "skills/autoreview/scripts/test-review-harness"],
