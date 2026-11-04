@@ -1129,8 +1129,8 @@ test("publish distinguishes upload-only receipts while preserving older and staf
     const target = endpoint.replace(/\/api\/v1\/beam\/sessions$/,
       `/beam/upload-flow-${requests.at(-1).beamId.slice(0, 12)}`);
     assert.equal(result.stdout, canView === false
-      ? `Beam upload succeeded: ${target}\nThis link is for authorized Team operators; upload-only access does not let you open it.\n`
-      : `Beamed session: ${target}\n`);
+      ? `Beam upload succeeded: ${target}\nThis link is for authorized Team operators; upload-only access does not let you open it.\nSnapshot is read-only. To continue in Team, its authenticated original publisher must run beam handoff with the same endpoint and source transcript selector.\n`
+      : `Beamed session: ${target}\nSnapshot is read-only. To continue in Team, its authenticated original publisher must run beam handoff with the same endpoint and source transcript selector.\n`);
     assert.equal(requests.at(-1).version, 1);
     assert.equal(Object.hasOwn(requests.at(-1), "canView"), false);
     assert.doesNotMatch(JSON.stringify(requests.at(-1)), /abcdefghijklmnopqrstuvwxyz123456|hidden compact summary|synthetic-personal-access/);

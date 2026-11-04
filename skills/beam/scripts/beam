@@ -509,6 +509,9 @@ async function main() {
     } else {
       console.log(`Beamed session: ${target}`);
     }
+    if (!transferredReceipt(result)) {
+      console.log("Snapshot is read-only. To continue in Team, its authenticated original publisher must run beam handoff with the same endpoint and source transcript selector.");
+    }
   }
 }
 
