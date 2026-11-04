@@ -231,19 +231,30 @@ class GitFixtureIsolationTests(unittest.TestCase):
                               ("attributes", "*.js working-tree-encoding=UTF-16\n*.txt working-tree-encoding=UTF-16\n")):
             config = settings / kind
             config.write_text(content)
-            for owner in ("hardening", "harness", "image"):
-                with self.subTest(owner=owner, kind=kind):
-                    parent = self.root / f"home-{owner}-{kind}"
-                    parent.mkdir()
-                    with mock.patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}):
+            with mock.patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}):
+                os.environ.pop("XDG_CONFIG_HOME", None)
+                # Confirm native Git sees the planted rule using the same
+                # home selectors before the fixture launchers exclude it.
+                selectors = {key: os.environ[key] for key in ("HOME", "USERPROFILE", "XDG_CONFIG_HOME")
+                             if key in os.environ}
+                with mock.patch.dict(self.oracle_env, selectors):
+                    if kind == "ignore":
+                        self.assertEqual(self.native(self.sentinel, "check-ignore", "app.js").strip(), "app.js")
+                    else:
+                        self.assertEqual(self.native(self.sentinel, "check-attr", "working-tree-encoding", "app.js").strip(),
+                                         "app.js: working-tree-encoding: UTF-16")
+                for owner in ("hardening", "harness", "image"):
+                    with self.subTest(owner=owner, kind=kind):
+                        parent = self.root / f"home-{owner}-{kind}"
+                        parent.mkdir()
                         repo = self.fixture(owner, parent)
-                    path, expected = {
-                        "hardening": ("fixture.txt", "fixture\n"),
-                        "harness": ("app.js", self.harness["BENIGN_INITIAL"]),
-                        "image": ("text.txt", "old\n"),
-                    }[owner]
-                    self.assertEqual(self.native(repo, "show", f"HEAD:{path}"), expected)
-                    self.assertEqual(config.read_text(), content)
+                        path, expected = {
+                            "hardening": ("fixture.txt", "fixture\n"),
+                            "harness": ("app.js", self.harness["BENIGN_INITIAL"]),
+                            "image": ("text.txt", "old\n"),
+                        }[owner]
+                        self.assertEqual(self.native(repo, "show", f"HEAD:{path}"), expected)
+                        self.assertEqual(config.read_text(), content)
             config.unlink()
 
     def test_image_fixture_is_independent_of_native_text_newlines(self):

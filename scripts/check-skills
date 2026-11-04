@@ -6,9 +6,11 @@ import argparse
 import contextlib
 import importlib
 import importlib.util
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -36,6 +38,45 @@ TEST_MODULES = {
     ),
 }
 HARDENING_SHARDS = ("hardening-1", "hardening-2")
+
+
+@contextlib.contextmanager
+def fixture_environment():
+    # Fixtures provide their own reviewer configuration and credentials. Keep
+    # only the selected toolchain, Python dependencies, locale and OS plumbing.
+    retained = {
+        "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC",
+        "TEMP", "TMP", "TMPDIR", "DEVELOPER_DIR",
+        "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+        "PYTHONPATH", "PYTHONNOUSERSITE", "PYTHONUTF8", "PYTHONIOENCODING",
+        "PYTHONDONTWRITEBYTECODE", "PYTHONOPTIMIZE",
+    }
+    previous = dict(os.environ)
+    environment = {key: value for key, value in previous.items() if key.upper() in retained}
+    # Stage fixtures need private storage ancestry, which shared /tmp cannot
+    # provide. Use a fresh child of the caller's home without reading its files;
+    # leave the selected OS temporary roots unchanged.
+    with tempfile.TemporaryDirectory(prefix=".check-skills-home.", dir=Path.home().resolve()) as directory:
+        home = Path(directory)
+        environment.update(HOME=directory, USERPROFILE=directory)
+        for key, relative in (
+            ("XDG_CONFIG_HOME", ".config"), ("XDG_CACHE_HOME", ".cache"),
+            ("XDG_DATA_HOME", ".local/share"), ("XDG_STATE_HOME", ".local/state"),
+            ("XDG_RUNTIME_DIR", ".runtime"), ("APPDATA", "AppData/Roaming"),
+            ("LOCALAPPDATA", "AppData/Local"),
+        ):
+            path = home / relative
+            path.mkdir(parents=True)
+            if key == "XDG_RUNTIME_DIR":
+                path.chmod(0o700)
+            environment[key] = str(path)
+        try:
+            os.environ.clear()
+            os.environ.update(environment)
+            yield
+        finally:
+            os.environ.clear()
+            os.environ.update(previous)
 
 
 @contextlib.contextmanager
@@ -113,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(__file__).resolve().parent.parent
     python = sys.executable
     if args.tests_only:
-        with repository_test_modules(root):
+        with fixture_environment(), repository_test_modules(root):
             try:
                 suite = repository_test_suite(root, args.group)
             except Exception as exc:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import runpy
 import shutil
@@ -20,6 +21,8 @@ MAIN = HELPER["main"]
 
 
 class CheckSkillsTest(unittest.TestCase):
+    fixture_failure = None
+
     def test_manifest_covers_checkout_test_files_in_their_groups(self) -> None:
         root = SCRIPT.resolve().parent.parent
         core = "skills/autoreview/scripts/autoreview_test.py"
@@ -88,13 +91,14 @@ class CheckSkillsTest(unittest.TestCase):
         self.assertIn("required executable not found:", error.getvalue())
 
     @contextlib.contextmanager
-    def fixture(self, *, parent=None, forward_import=False):
+    def fixture(self, *, parent=None, forward_import=False, fail_test=None):
         with tempfile.TemporaryDirectory(dir=parent) as directory:
             root = Path(directory) / "repo"
             (root / "scripts").mkdir(parents=True)
             shutil.copy2(SCRIPT, root / "scripts/check-skills")
             for name in ("windows_test_process.py", "windows-test-process.test.py"):
                 shutil.copy2(SCRIPT.with_name(name), root / "scripts" / name)
+            log = Path(directory) / "executed"
             groups = {}
             for group, entries in HELPER["TEST_MODULES"].items():
                 groups[group] = []
@@ -115,8 +119,8 @@ class CheckSkillsTest(unittest.TestCase):
                         label = name + ".Cases.test_" + str(index)
                         groups[group].append(label)
                         body += (f"    def test_{index}(self):\n"
-                                 f"        with Path(os.environ['CHECK_TEST_LOG']).open('a') as stream: stream.write({label!r} + '\\n')\n"
-                                 f"        self.assertNotEqual(os.environ.get('CHECK_FAIL_TEST'), {label!r})\n")
+                                 f"        with Path({str(log)!r}).open('a') as stream: stream.write({label!r} + '\\n')\n"
+                                 f"        self.assertNotEqual({fail_test!r}, {label!r})\n")
                         if forward_import and name.endswith("test_native_handoff"):
                             body += "        self.assertIs(forward, importlib.import_module('skills.autoreview.tests.test_openclaw_exec'))\n"
                     path.write_text(body, encoding="utf-8")
@@ -129,9 +133,7 @@ class CheckSkillsTest(unittest.TestCase):
                 "raise RuntimeError('unrelated installed skills package')\n",
                 encoding="utf-8",
             )
-            log = Path(directory) / "executed"
-            environment = {**os.environ, "PYTHONPATH": str(foreign), "PYTHONNOUSERSITE": "1",
-                           "CHECK_TEST_LOG": str(log)}
+            environment = {**os.environ, "PYTHONPATH": str(foreign), "PYTHONNOUSERSITE": "1"}
             yield root, foreign, marker, log, environment, groups
 
     def invoke(self, root, cwd, environment, group, *, tests_only=True):
@@ -161,8 +163,9 @@ class CheckSkillsTest(unittest.TestCase):
             self.assertFalse(marker.exists())
 
     def test_test_failure_is_not_hidden_by_file_bound_loading(self) -> None:
-        with self.fixture() as (root, foreign, marker, log, environment, groups):
-            environment["CHECK_FAIL_TEST"] = groups["boundaries"][0]
+        with self.fixture(fail_test="skills.autoreview.tests.test_native_handoff.Cases.test_0") as (
+            root, foreign, marker, log, environment, groups,
+        ):
             result = self.invoke(root, foreign, environment, "boundaries", tests_only=False)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("FAILED (failures=1)", result.stderr)
@@ -174,6 +177,104 @@ class CheckSkillsTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertCountEqual(log.read_text().splitlines(), groups["boundaries"])
             self.assertFalse(marker.exists())
+
+    def test_fixture_environment_covers_discovery_children_and_cleanup(self) -> None:
+        with self.fixture() as (root, foreign, marker, log, environment, groups):
+            operator = root.parent / "synthetic-operator"
+            operator.mkdir()
+            (operator / ".codex").mkdir()
+            protected = [operator / ".codex" / name for name in ("config.toml", "auth.json")]
+            for config in protected:
+                config.write_text("synthetic operator state\n", encoding="utf-8")
+            selectors = {
+                "CODEX_HOME", "CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR",
+                "OPENCLAW_CONFIG_PATH", "GH_CONFIG_DIR", "AWS_CONFIG_FILE",
+                "GOOGLE_APPLICATION_CREDENTIALS", "SSL_CERT_FILE",
+                "DBUS_SESSION_BUS_ADDRESS", "AUTOREVIEW_CODEX_CONFIG",
+                "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CUSTOM_TEST_API_KEY",
+            }
+            environment.update({key: str(operator) for key in selectors})
+            environment["CODEX_HOME"] = str(operator / ".codex")
+            environment.update(HOME=str(operator), USERPROFILE=str(operator),
+                               XDG_CONFIG_HOME=str(operator), APPDATA=str(operator))
+            path = root / "skills/autoreview/tests/test_autoreview_hardening.py"
+            driver = '''
+import json, os, runpy, sys
+from pathlib import Path
+protected = set(json.loads(sys.argv[3]))
+def forbid_operator_reads(event, args):
+    if event == "open" and isinstance(args[0], (str, bytes)):
+        if os.path.abspath(os.fsdecode(args[0])) in protected:
+            raise AssertionError("runner accessed synthetic operator configuration")
+sys.addaudithook(forbid_operator_reads)
+before = dict(os.environ)
+result = runpy.run_path(sys.argv[1])["main"](["--group", "hardening", "--tests-only"])
+Path(sys.argv[2]).write_text(json.dumps(dict(os.environ) == before))
+sys.exit(result)
+'''
+            # A real imported test module and its child observe only the fixture
+            # environment. Failure at either stage must still release the home.
+            for failure in ("none", "discovery", "test"):
+                with self.subTest(failure=failure):
+                    receipt = root.parent / f"environment-{failure}.json"
+                    restored = root.parent / f"restored-{failure}.json"
+                    body = f'''
+import json, os, subprocess, sys, unittest
+from pathlib import Path
+selectors = {sorted(selectors)!r}
+receipt = Path({str(receipt)!r})
+home = Path.home()
+observation = {{"home": str(home), "selectors": [key for key in selectors if key in os.environ],
+               "copied_config": (home / ".codex").exists(),
+               "path": os.environ.get("PATH"), "pythonpath": os.environ.get("PYTHONPATH"),
+               "temp": {{key: os.environ.get(key) for key in ("TEMP", "TMP", "TMPDIR")}},
+               "config": os.environ.get("XDG_CONFIG_HOME"), "appdata": os.environ.get("APPDATA"),
+               "runtime_mode": (Path(os.environ["XDG_RUNTIME_DIR"]).stat().st_mode & 0o777
+                                if "XDG_RUNTIME_DIR" in os.environ else None)}}
+receipt.write_text(json.dumps(observation))
+if {failure!r} == "discovery":
+    raise RuntimeError("synthetic discovery failure")
+class Cases(unittest.TestCase):
+    def test_child(self):
+        self.assertEqual(observation["selectors"], [])
+        self.assertNotEqual(home, Path({str(operator)!r}))
+        # Credentials explicitly created by a test remain available to its child.
+        env = {{**os.environ, "OPENAI_API_KEY": "synthetic-fixture"}}
+        code = "import json, os; print(json.dumps([os.environ['OPENAI_API_KEY'], os.environ.get('CODEX_HOME'), os.environ['HOME']]))"
+        child = subprocess.run([sys.executable, "-S", "-c", code], env=env,
+                               text=True, capture_output=True, check=True)
+        observation["child"] = json.loads(child.stdout)
+        receipt.write_text(json.dumps(observation))
+        self.assertNotEqual({failure!r}, "test", "synthetic test failure")
+'''
+                    path.write_text(body, encoding="utf-8")
+                    result = subprocess.run(
+                        [sys.executable, "-S", "-c", driver, str(root / "scripts/check-skills"), str(restored),
+                         json.dumps([str(config.resolve()) for config in protected])],
+                        env=environment, cwd=foreign, text=True, capture_output=True, timeout=30,
+                    )
+                    self.assertEqual(result.returncode, 0 if failure == "none" else 1,
+                                     result.stdout + result.stderr)
+                    if failure != "none":
+                        self.assertIn(f"synthetic {failure} failure", result.stderr)
+                    observed = json.loads(receipt.read_text())
+                    self.assertEqual(observed["selectors"], [])
+                    self.assertEqual(Path(observed["home"]).parent, operator.resolve())
+                    self.assertFalse(observed["copied_config"])
+                    self.assertFalse(Path(observed["home"]).exists())
+                    self.assertTrue(json.loads(restored.read_text()))
+                    self.assertEqual(observed["path"], environment.get("PATH"))
+                    self.assertEqual(observed["pythonpath"], str(foreign))
+                    self.assertEqual(observed["temp"], {key: environment.get(key) for key in ("TEMP", "TMP", "TMPDIR")})
+                    for key in ("config", "appdata"):
+                        self.assertTrue(Path(observed[key]).is_relative_to(observed["home"]))
+                    if os.name != "nt":
+                        self.assertEqual(observed["runtime_mode"], 0o700)
+                    if failure != "discovery":
+                        self.assertEqual(observed["child"], ["synthetic-fixture", None, observed["home"]])
+                    for config in protected:
+                        self.assertEqual(config.read_text(encoding="utf-8"), "synthetic operator state\n")
+                    self.assertFalse(marker.exists())
 
     def test_fixture_source_supports_unicode_paths_under_a_narrow_locale(self) -> None:
         # Always exercise outer-command output. The default-write-encoding proof
@@ -205,7 +306,7 @@ with tempfile.TemporaryDirectory() as temporary:
         interpreter = parent / "python"
         interpreter.symlink_to(sys.executable)
         sys.executable = str(interpreter)
-    with case.fixture(parent=parent) as (root, foreign, marker, log, environment, groups):
+    with case.fixture(parent=parent, fail_test=sys.argv[3] or None) as (root, foreign, marker, log, environment, groups):
         environment["PYTHONIOENCODING"] = "ascii"
         result = case.invoke(root, foreign, environment, "boundaries", tests_only=False)
         case.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -215,7 +316,8 @@ with tempfile.TemporaryDirectory() as temporary:
         for mode in ("outer", "narrow"):
             with self.subTest(proof=mode):
                 command = [sys.executable, "-X", "utf8=1" if mode == "outer" else "utf8=0",
-                           "-S", "-c", code, str(Path(__file__).resolve()), mode]
+                           "-S", "-c", code, str(Path(__file__).resolve()), mode,
+                           self.fixture_failure or ""]
                 result = subprocess.run(command, text=True, capture_output=True, timeout=30)
                 if mode == "narrow" and result.returncode == 77:
                     # Try the common POSIX UTF-8 locale when the inherited
@@ -227,11 +329,17 @@ with tempfile.TemporaryDirectory() as temporary:
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_unicode_proof_keeps_failure_checks_when_optimized(self) -> None:
+        code = '''
+import runpy, sys, unittest
+case = runpy.run_path(sys.argv[1])["CheckSkillsTest"](
+    "test_fixture_source_supports_unicode_paths_under_a_narrow_locale")
+case.fixture_failure = "skills.autoreview.tests.test_native_handoff.Cases.test_0"
+result = unittest.TextTestRunner().run(unittest.TestSuite([case]))
+sys.exit(0 if result.wasSuccessful() else 1)
+'''
         result = subprocess.run(
-            [sys.executable, "-O", "-S", str(Path(__file__).resolve()),
-             "CheckSkillsTest.test_fixture_source_supports_unicode_paths_under_a_narrow_locale"],
-            env={**os.environ, "PYTHONOPTIMIZE": "1",
-                 "CHECK_FAIL_TEST": "skills.autoreview.tests.test_native_handoff.Cases.test_0"},
+            [sys.executable, "-O", "-S", "-c", code, str(Path(__file__).resolve())],
+            env={**os.environ, "PYTHONOPTIMIZE": "1"},
             text=True, capture_output=True, timeout=30,
         )
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)

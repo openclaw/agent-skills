@@ -29,6 +29,12 @@ produces no helper-validated machine status or helper isolation guarantees.
   Failure remains `reviewer_unavailable` with no validated report. Codex-only and
   opt-in; defaults, native recovery within the same provider, and the per-attempt
   deadline remain unchanged. This flag does not grant model or account access.
+- `--codex-config app_server.max_input_text_chars=3145728` sets a startup
+  text-input character limit only when the selected CLI supports that setting.
+  Accepts decimal digits from `1` to `4194304`; omission preserves the selected
+  CLI's default.
+  This does not change the model context window or output budget. Other
+  `app_server` settings remain unsupported.
 - Only Claude accepts `--fallback-model`.
 - Per-engine environment overrides: `AUTOREVIEW_<ENGINE>_*`.
 
