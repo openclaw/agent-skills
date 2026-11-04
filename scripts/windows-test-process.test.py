@@ -142,6 +142,48 @@ def token_default_dacl_sddl(helper, token=None):
             api.kernel.LocalFree(c.cast(text, c.c_void_p))
 
 
+# Object DACL/label are distinct from TokenDefaultDacl and TokenIntegrityLevel.
+# This is read-only, including when recording the original elevated caller.
+def token_object_security_sddl(helper, token=None):
+    api = helper["_windows_api"]()
+    c, w = api.c, api.w
+    query = api.security.GetKernelObjectSecurity
+    query.restype = w.BOOL
+    query.argtypes = [w.HANDLE, w.DWORD, c.c_void_p, w.DWORD, c.POINTER(w.DWORD)]
+    convert = api.security.ConvertSecurityDescriptorToStringSecurityDescriptorW
+    convert.restype = w.BOOL
+    convert.argtypes = [c.c_void_p, w.DWORD, w.DWORD, c.POINTER(w.LPWSTR), c.POINTER(w.DWORD)]
+    selected = token
+    owned = w.HANDLE()
+    if selected is None:
+        if not api.security.OpenProcessToken(api.kernel.GetCurrentProcess(), 0x20008, c.byref(owned)):
+            raise c.WinError(c.get_last_error())
+        selected = owned
+    try:
+        # LABEL_SECURITY_INFORMATION needs READ_CONTROL, not SeSecurityPrivilege.
+        flags = 1 | 4 | 16
+        size = w.DWORD()
+        result = query(selected, flags, None, 0, c.byref(size))
+        if result or c.get_last_error() != 122 or not 0 < size.value <= 1048576:
+            raise RuntimeError("cannot size native token object descriptor")
+        descriptor = c.create_string_buffer(size.value)
+        if not query(selected, flags, descriptor, len(descriptor), c.byref(size)):
+            raise c.WinError(c.get_last_error())
+        if not 0 < size.value <= len(descriptor):
+            raise RuntimeError("invalid native token object descriptor length")
+        text = w.LPWSTR()
+        # The retrieved SACL contains only the mandatory label, never audit ACEs.
+        if not convert(descriptor, 1, 1 | 4 | 8, c.byref(text), None):
+            raise c.WinError(c.get_last_error())
+        try:
+            return text.value
+        finally:
+            api.kernel.LocalFree(c.cast(text, c.c_void_p))
+    finally:
+        if owned:
+            api.kernel.CloseHandle(owned)
+
+
 NATIVE_LAUNCH_DRIVER = r'''
 import json
 import runpy
@@ -406,6 +448,7 @@ class NativeTokenTests(unittest.TestCase):
     def test_reduced_child_owns_and_uses_private_temporary_directory(self):
         before = HELPER["windows_test_process_status"]()
         parent_default_dacl = token_default_dacl_sddl(HELPER)
+        parent_object_security = token_object_security_sddl(HELPER)
         with cross_token_fixture() as (root, original_security):
             default_acl_root = root / "default-acl-parent"
             default_acl_root.mkdir()
@@ -418,9 +461,10 @@ class NativeTokenTests(unittest.TestCase):
                 "status = helper['ensure_windows_test_process'](sys.argv[0], sys.argv[1:])\n"
                 "if status is not None: helper['exit_test_process'](status)\n"
                 "state = helper['windows_test_process_status']()\n"
+                "object_security = proof['token_object_security_sddl'](helper).replace(state['user_sid'], '<current-user>')\n"
                 "dacl = proof['token_default_dacl_sddl'](helper)\n"
                 "dacl = dacl.replace(state['user_sid'], '<current-user>') if dacl else dacl\n"
-                "print(json.dumps(dict(default_dacl=dacl, owner_is_user=state['owner_sid'] == state['user_sid'])), file=sys.stderr, flush=True)\n"
+                "print(json.dumps(dict(default_dacl=dacl, token_object=object_security, owner_is_user=state['owner_sid'] == state['user_sid'])), file=sys.stderr, flush=True)\n"
                 "ordinary = pathlib.Path(sys.argv[1])\n"
                 "direct = ordinary / 'default-file.txt'\n"
                 "direct.write_text('default file', encoding='utf-8')\n"
@@ -447,7 +491,7 @@ class NativeTokenTests(unittest.TestCase):
                 "assert not root.exists()\n"
                 "print(json.dumps(dict(eligible=state['eligible'],\n"
                 "    owner_is_user=state['owner_sid'] == state['user_sid'],\n"
-                "    default_dacl=dacl, ordinary_file=file_security, ordinary_directory=ordinary_security,\n"
+                "    default_dacl=dacl, token_object=object_security, ordinary_file=file_security, ordinary_directory=ordinary_security,\n"
                 "    directory=security, removed=True)))\n",
                 encoding="utf-8",
             )
@@ -462,12 +506,14 @@ class NativeTokenTests(unittest.TestCase):
             self.assertTrue(data["ordinary_directory"]["owner_is_user"])
             self.assertTrue(data["removed"])
             print(json.dumps({"parent_fixture_security": original_security,
+                              "parent_token_object": parent_object_security.replace(before["user_sid"], "<current-user>"),
                               "parent_token_owner_is_user": before["owner_sid"] == before["user_sid"],
                               "parent_default_dacl": (parent_default_dacl.replace(before["user_sid"], "<current-user>")
                                                       if parent_default_dacl else parent_default_dacl),
                               "reduced_child_private_directory": data}), flush=True)
         self.assertEqual(HELPER["windows_test_process_status"](), before)
         self.assertEqual(token_default_dacl_sddl(HELPER), parent_default_dacl)
+        self.assertEqual(token_object_security_sddl(HELPER), parent_object_security)
 
     def test_status_handle_can_query_but_cannot_duplicate_token(self):
         api = HELPER["_windows_api"]()
@@ -724,6 +770,10 @@ class NativeThreadOnlyTests(unittest.TestCase):
                         helper['exit_test_process'](status)
                     assert helper['windows_test_process_status']()['eligible']
                     api = helper['_windows_api']()
+                    proof = runpy.run_path({str(Path(__file__).resolve())!r})
+                    object_security = proof['token_object_security_sddl'](helper)
+                    object_security = object_security.replace(helper['windows_test_process_status']()['user_sid'], '<current-user>')
+                    print(json.dumps(dict(thread_caller_token_object=object_security)), file=sys.stderr, flush=True)
                     duplicate = api.security.DuplicateToken
                     duplicate.restype = api.w.BOOL
                     duplicate.argtypes = [api.w.HANDLE, api.c.c_int, api.c.POINTER(api.w.HANDLE)]

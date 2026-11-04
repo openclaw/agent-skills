@@ -69,6 +69,12 @@ def _windows_api():
     class TokenGroups(c.Structure):
         _fields_ = [("count", w.DWORD), ("groups", SidAndAttributes * 1)]
 
+    class SecurityAttributes(c.Structure):
+        _fields_ = [("length", w.DWORD), ("descriptor", c.c_void_p), ("inherit", w.BOOL)]
+
+    class AclSizeInfo(c.Structure):
+        _fields_ = [("count", w.DWORD), ("used", w.DWORD), ("free", w.DWORD)]
+
     class StartupInfo(c.Structure):
         _fields_ = [
             ("cb", w.DWORD), ("reserved", w.LPWSTR), ("desktop", w.LPWSTR),
@@ -96,6 +102,8 @@ def _windows_api():
     api.LuidAndAttributes = LuidAndAttributes
     api.SidAndAttributes = SidAndAttributes
     api.TokenGroups = TokenGroups
+    api.SecurityAttributes = SecurityAttributes
+    api.AclSizeInfo = AclSizeInfo
     api.StartupInfoEx = StartupInfoEx
     api.ProcessInfo = ProcessInfo
     api.kernel = c.WinDLL("kernel32", use_last_error=True)
@@ -142,6 +150,17 @@ def _windows_api():
     bind(api.security, "CreateRestrictedToken", w.BOOL, w.HANDLE, w.DWORD,
          w.DWORD, c.POINTER(SidAndAttributes), w.DWORD, c.POINTER(LuidAndAttributes),
          w.DWORD, c.POINTER(SidAndAttributes), handle_pointer)
+    bind(api.security, "ConvertStringSecurityDescriptorToSecurityDescriptorW", w.BOOL,
+         w.LPCWSTR, w.DWORD, c.POINTER(c.c_void_p), dword_pointer)
+    bind(api.security, "GetSecurityDescriptorDacl", w.BOOL, c.c_void_p,
+         c.POINTER(w.BOOL), c.POINTER(c.c_void_p), c.POINTER(w.BOOL))
+    bind(api.security, "DuplicateTokenEx", w.BOOL, w.HANDLE, w.DWORD,
+         c.POINTER(SecurityAttributes), c.c_int, c.c_int, handle_pointer)
+    bind(api.security, "GetKernelObjectSecurity", w.BOOL, w.HANDLE,
+         w.DWORD, c.c_void_p, w.DWORD, dword_pointer)
+    bind(api.security, "GetAclInformation", w.BOOL,
+         c.c_void_p, c.c_void_p, w.DWORD, c.c_int)
+    bind(api.security, "GetAce", w.BOOL, c.c_void_p, w.DWORD, c.POINTER(c.c_void_p))
     bind(api.security, "CreateProcessAsUserW", w.BOOL, w.HANDLE,
          w.LPCWSTR, w.LPWSTR, c.c_void_p, c.c_void_p, w.BOOL, w.DWORD,
          c.c_void_p, w.LPCWSTR, c.POINTER(StartupInfo), c.POINTER(ProcessInfo))
@@ -373,6 +392,100 @@ def test_interpreter_flags() -> list[str]:
     return list(original[1:-len(current)])
 
 
+def _descriptor_dacl(api, descriptor):
+    present, defaulted = api.w.BOOL(), api.w.BOOL()
+    acl = api.c.c_void_p()
+    if not api.security.GetSecurityDescriptorDacl(
+        descriptor, api.c.byref(present), api.c.byref(acl), api.c.byref(defaulted),
+    ):
+        raise api.c.WinError(api.c.get_last_error())
+    if not present.value or not acl.value:
+        raise RuntimeError("private token descriptor has no restrictive DACL")
+    return acl
+
+
+def _verify_private_acl(api, acl, user_sid, *, token_object):
+    info = api.AclSizeInfo()
+    if not api.security.GetAclInformation(acl, api.c.byref(info), api.c.sizeof(info), 2):
+        raise api.c.WinError(api.c.get_last_error())  # AclSizeInformation
+    if info.count != 2:
+        raise RuntimeError("private token ACL has unexpected trustees")
+    trustees = set()
+    for index in range(info.count):
+        ace = api.c.c_void_p()
+        if not api.security.GetAce(acl, index, api.c.byref(ace)):
+            raise api.c.WinError(api.c.get_last_error())
+        header = api.c.string_at(ace.value, 4)
+        if header[:2] != b"\x00\x00" or int.from_bytes(header[2:], "little") < 16:
+            raise RuntimeError("private token ACL is not an explicit allow ACL")
+        mask = api.w.DWORD.from_address(ace.value + 4).value
+        # Object creation may map GENERIC_ALL to TOKEN_ALL_ACCESS.
+        if mask != 0x10000000 and not (token_object and mask == 0x000F01FF):
+            raise RuntimeError("private token ACL does not grant the expected full access")
+        trustees.add(_sid_string(api, ace.value + 8))
+    if trustees != {user_sid, "S-1-5-18"}:
+        raise RuntimeError("private token ACL does not belong to its user and SYSTEM")
+
+
+def _verify_private_token_dacls(api, token, user_sid):
+    buffer, length = _token_data(api, token, 6)  # TokenDefaultDacl: future objects
+    if length < api.c.sizeof(api.c.c_void_p):
+        raise RuntimeError("truncated native token default DACL")
+    default_acl = api.c.c_void_p.from_buffer(buffer)
+    if not default_acl.value:
+        raise RuntimeError("private token has a null default DACL")
+    start = api.c.addressof(buffer)
+    if not start + api.c.sizeof(api.c.c_void_p) <= default_acl.value <= start + length - 8:
+        raise RuntimeError("private token default DACL is outside its buffer")
+    acl_size = int.from_bytes(api.c.string_at(default_acl.value + 2, 2), "little")
+    if acl_size < 8 or default_acl.value + acl_size > start + length:
+        raise RuntimeError("truncated private token default ACL")
+    _verify_private_acl(api, default_acl, user_sid, token_object=False)
+    size = api.w.DWORD()
+    result = api.security.GetKernelObjectSecurity(token, 4, None, 0, api.c.byref(size))
+    if result or api.c.get_last_error() != 122 or not 0 < size.value <= 1048576:
+        raise RuntimeError("cannot size private token object descriptor")
+    descriptor = api.c.create_string_buffer(size.value)
+    if not api.security.GetKernelObjectSecurity(token, 4, descriptor, len(descriptor), api.c.byref(size)):
+        raise api.c.WinError(api.c.get_last_error())
+    if not 0 < size.value <= len(descriptor):
+        raise RuntimeError("invalid private token object descriptor length")
+    _verify_private_acl(api, _descriptor_dacl(api, descriptor), user_sid, token_object=True)
+
+
+@contextlib.contextmanager
+def _private_primary(api, restricted, user_sid):
+    # DefaultDacl controls newly created files/objects. The token's own object
+    # DACL separately controls whether its user can reopen/duplicate that token.
+    # Set both only on fresh restricted tokens, never on the original caller.
+    descriptor = api.c.c_void_p()
+    sddl = f"D:(A;;GA;;;SY)(A;;GA;;;{user_sid})"
+    if not api.security.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl, 1, api.c.byref(descriptor), None,
+    ):
+        raise api.c.WinError(api.c.get_last_error())
+    primary = api.w.HANDLE()
+    try:
+        default_acl = _descriptor_dacl(api, descriptor)
+        if not api.security.SetTokenInformation(
+            restricted, 6, api.c.byref(default_acl), api.c.sizeof(default_acl),
+        ):
+            raise api.c.WinError(api.c.get_last_error())
+        attributes = api.SecurityAttributes(api.c.sizeof(api.SecurityAttributes), descriptor, False)
+        # READ_CONTROL is for fresh-object readback. The original caller still
+        # needs only the existing launch rights, not WRITE_DAC or READ_CONTROL.
+        if not api.security.DuplicateTokenEx(
+            restricted, 0x0002008B, api.c.byref(attributes), 2, 1, api.c.byref(primary),
+        ):
+            raise api.c.WinError(api.c.get_last_error())
+        _verify_private_token_dacls(api, primary, user_sid)
+        yield primary
+    finally:
+        if primary:
+            api.kernel.CloseHandle(primary)
+        api.kernel.LocalFree(descriptor)
+
+
 @contextlib.contextmanager
 def _restricted_primary(api, source):
     user_sid, _ = _token_identity(api, source)
@@ -390,16 +503,17 @@ def _restricted_primary(api, source):
     ):
         raise api.c.WinError(api.c.get_last_error())
     try:
-        _set_token_user_owner(api, restricted)
-        _lower_integrity(api, restricted)
-        # Check the created primary token itself before it can launch anything.
-        state = _status(api, restricted)
-        if (not state["primary_token"] or state["nonordinary_privileges"]
-                or state["nonordinary_groups"] or not state["supported_identity"]
-                or state["integrity_level"] > _MEDIUM_INTEGRITY
-                or state["owner_sid"] != state["user_sid"]):
-            raise RuntimeError("native restriction did not remove primary authority")
-        yield restricted
+        with _private_primary(api, restricted, user_sid) as primary:
+            _set_token_user_owner(api, primary)
+            _lower_integrity(api, primary)
+            # Check the final primary itself before it can launch anything.
+            state = _status(api, primary)
+            if (not state["primary_token"] or state["nonordinary_privileges"]
+                    or state["nonordinary_groups"] or not state["supported_identity"]
+                    or state["integrity_level"] > _MEDIUM_INTEGRITY
+                    or state["owner_sid"] != state["user_sid"]):
+                raise RuntimeError("native restriction did not remove primary authority")
+            yield primary
     finally:
         api.kernel.CloseHandle(restricted)
 

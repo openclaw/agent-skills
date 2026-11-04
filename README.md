@@ -226,8 +226,10 @@ and exit status. With a shared console, the child handles Ctrl+C while the paren
 waits for its result. Failure to create or verify that process fails the test command;
 it does not omit tests or change the installed skill's runtime behavior.
 The child must have medium or lower integrity; lowering its integrity leaves the
-original parent token unchanged. New objects default to the child’s user as owner,
-so owner rights on private directories apply to that user.
+original parent token unchanged. New objects default to the child’s user as owner.
+The fresh token grants access to that user and SYSTEM, with matching defaults for
+new objects that do not receive inherited or explicit permissions. Existing source
+permissions are unchanged.
 Local/domain and Entra account identities are
 supported; system and virtual-service identities are not. This does not classify
 how domain accounts are used. The account domain's Domain Users grant is retained;
