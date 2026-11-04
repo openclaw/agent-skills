@@ -3415,7 +3415,7 @@ class WindowsOwnedProcessTransportTests(unittest.TestCase):
     def test_target_closing_stdin_releases_writer_while_job_alive(self):
         with tempfile.TemporaryDirectory(prefix="owned-process-") as directory:
             cwd = Path(directory).resolve()
-            owner_code = r'''import contextlib, ctypes, json, pathlib, runpy, subprocess, sys
+            owner_code = r'''import ctypes, errno, json, pathlib, runpy, subprocess, sys
 from ctypes import wintypes
 helper = runpy.run_path(sys.argv[1])
 target = "import os,time; os.close(0); print(os.getpid(), flush=True); time.sleep(120)"
@@ -3443,10 +3443,14 @@ try:
         if written != len(payload):
             raise RuntimeError('large stdin write was incomplete')
         outcome = 'written'
-    except BrokenPipeError:
-        outcome = 'broken_pipe'
+    except OSError as exc:
+        # Like Popen._stdin_write, accept Windows EINVAL for a closed pipe
+        # even while its child remains alive; unrelated I/O errors still fail.
+        if not isinstance(exc, BrokenPipeError) and exc.errno != errno.EINVAL:
+            raise
+        outcome = 'closed_pipe'
     # Capture both liveness checks before any cleanup can release a retained
-    # read handle and manufacture the BrokenPipe result we are trying to prove.
+    # read handle and manufacture the closed-pipe result we are trying to prove.
     after = [proc.poll() is None, kernel.WaitForSingleObject(handle, 0) == 258]
 finally:
     try:
@@ -3457,8 +3461,11 @@ finally:
         finally:
             if handle:
                 kernel.CloseHandle(handle)
-            with contextlib.suppress(BrokenPipeError):
+            try:
                 proc.stdin.close()
+            except OSError as exc:
+                if not isinstance(exc, BrokenPipeError) and exc.errno != errno.EINVAL:
+                    raise
             proc.stdout.close()
 print(json.dumps([outcome, before, after, not helper['_OWNED_PROCESSES']]))
 '''
@@ -3476,7 +3483,7 @@ print(json.dumps([outcome, before, after, not helper['_OWNED_PROCESSES']]))
                 output, error = owner.communicate(timeout=20)
                 self.assertEqual(owner.returncode, 0, error)
                 outcome, before, after, empty_registry = json.loads(output)
-                self.assertIn(outcome, ("broken_pipe", "written"))
+                self.assertIn(outcome, ("closed_pipe", "written"))
                 self.assertEqual(before, [True, True])
                 self.assertEqual(after, [True, True])
                 self.assertTrue(empty_registry)
