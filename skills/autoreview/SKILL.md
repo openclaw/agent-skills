@@ -98,12 +98,12 @@ never working-copy substitutes. Local mode is unsupported. Before use, read
 
 Files transport is opt-in for Codex branch/commit reviews. It places only selected
 whole Git source blobs in the existing read-only isolated workspace and provides
-a path/commit/blob/mode/digest inventory. The reviewer reads required bodies there;
+a verified `source-inventory.txt` alongside them. The reviewer reads required bodies there;
 it cannot open the original checkout or acquire finding scope from context.
 Source capture and mutation checks still apply. Other engines and local reviews
 use the unchanged inline route; unsupported combinations are refused.
 
-The prompt budget covers the actual instructions, patch and source inventory.
+The prompt budget covers the instructions, patch and inventory pointer (filename, source count and SHA-256).
 Staged bodies remain complete files, not clipped prompt excerpts. This avoids a
 single-input length limit without raising model context capacity or guaranteeing
 a completed review. Missing or unread necessary source still means incomplete.
@@ -230,7 +230,7 @@ and publishing. Text is never truncated or capped by file count/size. Large inli
 are partitioned; by default every change is reviewed against every evidence batch.
 Intact instructions and required inline context must fit per pass, or preparation
 fails. Files transport keeps selected source bodies whole in the isolated workspace;
-instructions, patch and source inventory must fit the same prompt budget.
+instructions, patch and inventory pointer must fit the same prompt budget.
 Each pass must finish its own assessment; a failed pass never yields partial clean.
 
 For a large committed branch with distinct owner contracts, opt in to

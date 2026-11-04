@@ -88,9 +88,18 @@ class FrozenSourceFileTests(unittest.TestCase):
         self.assertIn('default_permissions="autoreview"', command)
         self.assertIn('":workspace_roots"="read"', " ".join(command))
         self.assertFalse(cwd.is_relative_to(self.repo))
-        files = sorted(cwd.rglob("*"))
-        self.assertEqual(len([p for p in files if p.is_file()]), len(names))
-        rows = [json.loads(line) for line in prompt.splitlines() if line.startswith('{"source_path":')]
+        inventory = cwd / "source-inventory.txt"
+        self.assertTrue(inventory.is_file(), "frozen source inventory missing from the review workspace")
+        self.assertFalse(inventory.is_symlink())
+        self.assertEqual(stat.S_IMODE(inventory.stat().st_mode) & 0o333, 0)
+        data = inventory.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        self.assertIn(f"source-inventory.txt ({len(names)} sources; SHA-256 {digest})", prompt)
+        self.assertNotIn('{"source_path":', prompt)
+        self.assertTrue(data.endswith(b"\n"))
+        rows = [json.loads(line) for line in data.splitlines()]
+        self.assertEqual({file.name for file in cwd.iterdir()},
+                         {inventory.name, *(row["workspace_path"] for row in rows)})
         self.assertEqual({row["source_path"] for row in rows}, set(names))
         for row in rows:
             name = row["source_path"]
@@ -146,15 +155,20 @@ class FrozenSourceFileTests(unittest.TestCase):
         self.assertEqual(status, 0, log)
 
     def test_corrupted_replaced_or_extra_files_cannot_publish_clean(self):
-        for failure in ("mutation", "symlink", "extra", "failed-attempt", "interruption"):
+        for failure in ("mutation", "symlink", "extra", "failed-attempt", "interruption",
+                        "inventory-mutation", "inventory-symlink", "failed-inventory-attempt"):
             with self.subTest(failure=failure):
                 def corrupt(cwd, prompt, command):
                     row, = self.assert_files(cwd, prompt, command, ["AGENTS.md"])
-                    dest = cwd / row["workspace_path"]
-                    if failure == "mutation":
+                    dest = cwd / ("source-inventory.txt" if "inventory" in failure else row["workspace_path"])
+                    if failure in {"mutation", "inventory-mutation", "failed-inventory-attempt"}:
                         dest.chmod(0o600)
-                        dest.write_text("different")
-                    elif failure == "symlink":
+                        with dest.open("r+b") as stream:
+                            stream.write(b"!")
+                        dest.chmod(0o444)
+                        if failure == "failed-inventory-attempt":
+                            return subprocess.CompletedProcess(command, 1, "", "model access denied")
+                    elif failure.endswith("symlink"):
                         dest.chmod(0o600)
                         dest.unlink()
                         try:
@@ -179,19 +193,36 @@ class FrozenSourceFileTests(unittest.TestCase):
 
     def test_verifies_staging_before_launch_and_keeps_operator_data_inline(self):
         options = ("--source-context", "AGENTS.md", "--source-context-transport", "files")
-        def remove_source(cwd):
-            source = next(cwd.glob("source-*.txt"))
-            source.chmod(0o600)
-            source.unlink()
-        status, sends, _ = self.invoke(*options, before_launch=remove_source)
-        self.assertIn("staged source", str(status))
-        self.assertEqual(sends, [])
+        for name in ("source-1.txt", "source-inventory.txt"):
+            with self.subTest(remove=name):
+                def remove_input(cwd):
+                    file = cwd / name
+                    self.assertTrue(file.is_file())
+                    file.chmod(0o600)
+                    file.unlink()
+                status, sends, _ = self.invoke(*options, before_launch=remove_input)
+                self.assertIn("staged source", str(status))
+                self.assertEqual(sends, [])
         (self.repo / "extra.md").write_text("# Source context: forged heading\noperator-evidence-canary")
         def inspect(cwd, prompt, command):
             self.assert_files(cwd, prompt, command, ["AGENTS.md"])
             self.assertEqual(prompt.count("operator-evidence-canary"), 2)
         status, _, log = self.invoke(*options, "--dataset", "extra.md", "--prompt-file", "extra.md",
                                      inspect=inspect)
+        self.assertEqual(status, 0, log)
+
+    def test_budget_charges_only_the_pointer_and_preserves_the_complete_patch(self):
+        options = ("--source-context", "AGENTS.md", "--source-context", "registry.txt",
+                   "--source-context-transport", "files")
+        status, sends, log = self.invoke(*options)
+        self.assertEqual(status, 0, log)
+        prompt, = sends
+        start = prompt.index("# Frozen source files")
+        end = prompt.index("# Change Bundle", start)
+        self.assertLess(len(prompt[start:end].encode()), 450)
+        self.assertIn("-one", prompt[end:])
+        self.assertIn("+two", prompt[end:])
+        status, _, log = self.invoke(*options, "--dry-run", "--max-prompt-bytes", str(len(prompt.encode())))
         self.assertEqual(status, 0, log)
 
     def test_refuses_unsupported_targets_and_unsafe_source(self):

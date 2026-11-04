@@ -101,9 +101,11 @@ branch/commit source context. It supports both source-context flags and the exac
 contexts selected by a branch allocation. Ordinary prompt files and datasets
 retain their existing inline behavior. The default is `inline`.
 
-The helper stages only the selected captured Git blobs under neutral numbered
-filenames in its existing isolated read-only workspace. The inventory binds each
-file to the original repository path, commit, blob, mode, byte count and digest.
+The helper stages the selected captured Git blobs under neutral numbered filenames
+and a read-only `source-inventory.txt` in the same isolated workspace. Each JSON
+line binds one staged file to its original repository path, commit, blob, mode,
+byte count and SHA-256. The prompt names the inventory and binds its bytes by
+SHA-256 alongside the source count.
 Original checkout files, Git metadata, user configuration and credentials are
 not staged. Existing source classification, path/topology and mutation checks
 remain mandatory; the helper also verifies staged inputs before and after use.
@@ -115,8 +117,8 @@ Missing source, invalid reports and incomplete assignments retain their existing
 failure semantics.
 
 Dry runs and live runs plan the same source inventory. Prompt-byte limits still
-cover the actual instructions, change framing and inventory, while whole staged
-source bodies do not occupy the initial prompt. Model context capacity and
+cover the actual instructions, change framing and inventory pointer, while the
+staged inventory and source bodies do not occupy the initial prompt. Model context capacity and
 review completeness remain independent limits.
 
 ```bash
@@ -147,7 +149,7 @@ review completeness remain independent limits.
   explicit pass budget still applies.
 - Terminal fallbacks preserve feasible complete-evidence plan when batch framing cannot fit.
 - Intact instructions, inline source-context files and required mixed source context
-  must fit the per-pass prompt budget. Files transport budgets the source inventory
+  must fit the per-pass prompt budget. Files transport budgets the inventory pointer
   while preserving whole selected source bodies in the isolated workspace. Failed
   or incomplete passes never produce a partial clean verdict.
 - `--max-prompt-bytes N` selects that UTF-8 byte budget for dry-run and live review
