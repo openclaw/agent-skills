@@ -90,7 +90,8 @@ class NativeProductCustodyTests(unittest.TestCase):
                 # The same reduced token must really satisfy the product's
                 # ACL/ownership contract when it becomes a child's primary.
                 # This is a native process, not a mocked AccessCheck result.
-                command = [sys.executable, "-u", "-I", "-S", "-B", str(Path(__file__).resolve()),
+                command = [sys.executable, "-u", "-I", "-S", "-B", "-X", "utf8=1",
+                           str(Path(__file__).resolve()),
                            "--reduced-child", str(self.library)]
                 code = BOOTSTRAP["_launch"](
                     api, restricted, command, BOOTSTRAP["_native_environment_block"](api),

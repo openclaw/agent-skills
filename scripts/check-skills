@@ -165,16 +165,17 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if result.wasSuccessful() else 1
     unittest_command = [python, *(["-S"] if sys.flags.no_site else []),
                         "scripts/check-skills", "--group", args.group, "--tests-only"]
+    compile_command = [python, "-m", "py_compile",
+                       "scripts/install-skills", "scripts/install-skills.test.py",
+                       "scripts/validate-skills", "scripts/validate-skills.test.py",
+                       "scripts/check-skills", "scripts/check-skills.test.py",
+                       "skills/autoreview/scripts/autoreview",
+                       "skills/autoreview/scripts/test-review-harness.py",
+                       "skills/autoreview/scripts/autoreview_test.py"]
     commands = [
         [python, "scripts/validate-skills"],
         ["bash", "-n", "skills/autoreview/scripts/test-review-harness"],
-        [python, "-m", "py_compile",
-         "scripts/install-skills", "scripts/install-skills.test.py",
-         "scripts/validate-skills", "scripts/validate-skills.test.py",
-         "scripts/check-skills", "scripts/check-skills.test.py",
-         "skills/autoreview/scripts/autoreview",
-         "skills/autoreview/scripts/test-review-harness.py",
-         "skills/autoreview/scripts/autoreview_test.py"],
+        compile_command,
         [python, "scripts/install-skills.test.py"],
         [python, "scripts/validate-skills.test.py"],
         [python, "scripts/check-skills.test.py"],
@@ -192,16 +193,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.group not in ("all", "core"):
         commands = [unittest_command]
     for command in commands:
-        display = "+ " + " ".join(command)
-        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-        print(display.encode(encoding, "backslashreplace").decode(encoding), flush=True)
-        executable = shutil.which(command[0])
-        if executable is None:
-            print(f"required executable not found: {command[0]}", file=sys.stderr)
-            return 1
-        result = subprocess.run([executable, *command[1:]], cwd=root)
-        if result.returncode:
-            return result.returncode
+        with contextlib.ExitStack() as cleanup:
+            if command is compile_command:
+                # Restricted Windows users may only read the original checkout.
+                cache = cleanup.enter_context(tempfile.TemporaryDirectory(prefix="check-skills-pycache."))
+                command = [python, "-X", f"pycache_prefix={cache}", *command[1:]]
+            display = "+ " + " ".join(command)
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(display.encode(encoding, "backslashreplace").decode(encoding), flush=True)
+            executable = shutil.which(command[0])
+            if executable is None:
+                print(f"required executable not found: {command[0]}", file=sys.stderr)
+                return 1
+            result = subprocess.run([executable, *command[1:]], cwd=root)
+            if result.returncode:
+                return result.returncode
     return 0
 
 
@@ -212,7 +218,7 @@ if __name__ == "__main__":
     bootstrap = runpy.run_path(str(scripts / "windows_test_process.py"))
     status = bootstrap["ensure_windows_test_process"](
         sys.argv[0], sys.argv[1:], parent_check=[
-            sys.executable, "-u", "-I", "-S", "-B",
+            sys.executable, "-u", "-I", "-S", "-B", "-X", "utf8=1",
             str(scripts / "windows-test-process.test.py"), "--native-parent",
         ],
     )

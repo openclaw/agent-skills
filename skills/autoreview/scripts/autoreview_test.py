@@ -12,6 +12,7 @@ import itertools
 import json
 import os
 import runpy
+import shutil
 import stat
 import subprocess
 import sys
@@ -30,6 +31,16 @@ SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 assert SPEC is not None
 AUTOREVIEW = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(AUTOREVIEW)
+
+
+@contextlib.contextmanager
+def private_engine_executable(name: str):
+    # Process transport is mocked, but selected-path admission inspects a real
+    # independent executable and its installation directory.
+    with tempfile.TemporaryDirectory(prefix="autoreview-test-bin.") as directory:
+        binary = Path(directory) / (name + (".exe" if os.name == "nt" else ""))
+        shutil.copy2(sys.executable, binary)
+        yield str(binary)
 
 
 FINAL_REPORT = {
@@ -1218,13 +1229,13 @@ class AutoreviewAmpTests(unittest.TestCase):
             "PYTHONPATH": "/tmp/attack",
             "PLUGINS": "inherited-plugins",
         }
-        with tempfile.TemporaryDirectory(prefix="autoreview-amp-run-test.") as tmpdir:
+        with tempfile.TemporaryDirectory(prefix="autoreview-amp-run-test.") as tmpdir, private_engine_executable("amp") as engine_bin:
             repo = Path(tmpdir) / "repo"
             repo.mkdir()
             with mock.patch.dict(os.environ, inherited, clear=False), mock.patch.object(
                 AUTOREVIEW,
                 "ensure_amp_isolation_supported",
-                return_value="/usr/bin/amp",
+                return_value=engine_bin,
             ), mock.patch.object(
                 AUTOREVIEW,
                 "run",
@@ -1448,13 +1459,13 @@ class AutoreviewAmpTests(unittest.TestCase):
                 "amp engine timed out after 0.01s",
             )
 
-        with tempfile.TemporaryDirectory(prefix="autoreview-amp-timeout-test.") as tmpdir:
+        with tempfile.TemporaryDirectory(prefix="autoreview-amp-timeout-test.") as tmpdir, private_engine_executable("amp") as engine_bin:
             repo = Path(tmpdir) / "repo"
             repo.mkdir()
             with mock.patch.object(
                 AUTOREVIEW,
                 "ensure_amp_isolation_supported",
-                return_value="/usr/bin/amp",
+                return_value=engine_bin,
             ), mock.patch.object(
                 AUTOREVIEW,
                 "run",
@@ -1566,13 +1577,13 @@ class AutoreviewAmpTests(unittest.TestCase):
                 "",
             )
 
-        with tempfile.TemporaryDirectory(prefix="autoreview-amp-error-test.") as tmpdir:
+        with tempfile.TemporaryDirectory(prefix="autoreview-amp-error-test.") as tmpdir, private_engine_executable("amp") as engine_bin:
             repo = Path(tmpdir) / "repo"
             repo.mkdir()
             with mock.patch.object(
                 AUTOREVIEW,
                 "ensure_amp_isolation_supported",
-                return_value="/usr/bin/amp",
+                return_value=engine_bin,
             ), mock.patch.object(
                 AUTOREVIEW,
                 "run",
@@ -2098,7 +2109,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         ):
             args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
         prompt = "complete retry pack: unicode \u03c0\r\n-deleted line\n unchanged context\n"
-        with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir:
+        with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, private_engine_executable("codex") as engine_bin:
             events = []
 
             def fake_run(command, _cwd, **kwargs):
@@ -2116,8 +2127,8 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                 output_path.write_text(json.dumps({**FINAL_REPORT, "review_completion": "complete"}))
                 return subprocess.CompletedProcess(command, 0, AutoreviewEfficiencyTests.usage_event(2), "")
 
-            with mock.patch.object(AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex"), \
-                    mock.patch.object(AUTOREVIEW, "ensure_codex_isolation_supported", return_value="/usr/bin/codex"), \
+            with mock.patch.object(AUTOREVIEW, "resolve_command", return_value=engine_bin), \
+                    mock.patch.object(AUTOREVIEW, "ensure_codex_isolation_supported", return_value=engine_bin), \
                     mock.patch.object(AUTOREVIEW, "codex_auth_config_flags", return_value=[]), \
                     mock.patch.object(AUTOREVIEW, "prepare_codex_runtime_auth", return_value=None), \
                     mock.patch.object(AUTOREVIEW, "find_command", side_effect=AssertionError("unexpected scanner lookup")), \
@@ -2153,9 +2164,9 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                     event = {"type": "error", "message": message.format(model=model)}
                     return subprocess.CompletedProcess(command, 1, json.dumps(event), "")
 
-                with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, \
-                        mock.patch.object(AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex"), \
-                        mock.patch.object(AUTOREVIEW, "ensure_codex_isolation_supported", return_value="/usr/bin/codex"), \
+                with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, private_engine_executable("codex") as engine_bin, \
+                        mock.patch.object(AUTOREVIEW, "resolve_command", return_value=engine_bin), \
+                        mock.patch.object(AUTOREVIEW, "ensure_codex_isolation_supported", return_value=engine_bin), \
                         mock.patch.object(AUTOREVIEW, "codex_auth_config_flags", return_value=[]), \
                         mock.patch.object(AUTOREVIEW, "prepare_codex_runtime_auth", return_value=None), \
                         mock.patch.object(AUTOREVIEW, "run_with_heartbeat", side_effect=fake_run):
@@ -2193,7 +2204,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             output_path.write_text(json.dumps(FINAL_REPORT))
             return subprocess.CompletedProcess(command, 0, "", "")
 
-        with tempfile.TemporaryDirectory(prefix="autoreview-codex-workspace-test.") as tmpdir:
+        with tempfile.TemporaryDirectory(prefix="autoreview-codex-workspace-test.") as tmpdir, private_engine_executable("codex") as engine_bin:
             repo = Path(tmpdir)
             (repo / ".env").write_text("ignored environment fixture\n")
             with mock.patch.dict(
@@ -2203,11 +2214,11 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             ), mock.patch.object(
                 AUTOREVIEW,
                 "resolve_command",
-                return_value="/usr/bin/codex",
+                return_value=engine_bin,
             ), mock.patch.object(
                 AUTOREVIEW,
                 "ensure_codex_isolation_supported",
-                return_value="/usr/bin/codex",
+                return_value=engine_bin,
             ), mock.patch.object(
                 AUTOREVIEW,
                 "codex_auth_config_flags",
@@ -2271,14 +2282,14 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             models.append(command[command.index("--model") + 1])
             return subprocess.CompletedProcess(command, 1, "", "network timeout")
 
-        with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, mock.patch.object(
+        with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, private_engine_executable("codex") as engine_bin, mock.patch.object(
             AUTOREVIEW,
             "resolve_command",
-            return_value="/usr/bin/codex",
+            return_value=engine_bin,
         ), mock.patch.object(
             AUTOREVIEW,
             "ensure_codex_isolation_supported",
-            return_value="/usr/bin/codex",
+            return_value=engine_bin,
         ), mock.patch.object(AUTOREVIEW, "codex_auth_config_flags", return_value=[]), mock.patch.object(
             AUTOREVIEW,
             "prepare_codex_runtime_auth",
@@ -2316,14 +2327,14 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                 "model_not_available: gpt-6-sol is temporarily unavailable due to capacity",
             )
 
-        with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, mock.patch.object(
+        with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, private_engine_executable("codex") as engine_bin, mock.patch.object(
             AUTOREVIEW,
             "resolve_command",
-            return_value="/usr/bin/codex",
+            return_value=engine_bin,
         ), mock.patch.object(
             AUTOREVIEW,
             "ensure_codex_isolation_supported",
-            return_value="/usr/bin/codex",
+            return_value=engine_bin,
         ), mock.patch.object(AUTOREVIEW, "codex_auth_config_flags", return_value=[]), mock.patch.object(
             AUTOREVIEW,
             "prepare_codex_runtime_auth",

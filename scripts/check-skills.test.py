@@ -46,15 +46,22 @@ class CheckSkillsTest(unittest.TestCase):
             self.assertEqual(MAIN(args), 0)
         for call in run.call_args_list:
             self.assertEqual(call.kwargs, {"cwd": SCRIPT.resolve().parent.parent})
-        return [call.args[0] for call in run.call_args_list]
+        commands = [list(call.args[0]) for call in run.call_args_list]
+        for command in commands:
+            if command[1:2] == ["-X"]:
+                self.assertTrue(command[2].startswith("pycache_prefix="))
+                self.assertFalse(Path(command[2].removeprefix("pycache_prefix=")).exists())
+                command[2] = "pycache_prefix=<temporary>"
+        return commands
 
     def test_default_preserves_full_command_order(self) -> None:
         commands = self.commands([])
         self.assertEqual(commands, self.commands(["--group", "all"]))
         self.assertEqual([command[1] for command in commands[:6]], [
-            "scripts/validate-skills", "-n", "-m", "scripts/install-skills.test.py",
+            "scripts/validate-skills", "-n", "-X", "scripts/install-skills.test.py",
             "scripts/validate-skills.test.py", "scripts/check-skills.test.py",
         ])
+        self.assertEqual(commands[2][1:5], ["-X", "pycache_prefix=<temporary>", "-m", "py_compile"])
         self.assertEqual(commands[6][1], "scripts/windows-test-process.test.py")
         self.assertIn("scripts/check-skills", commands[7])
         self.assertEqual(commands[7][-3:], ["--group", "all", "--tests-only"])
@@ -89,6 +96,64 @@ class CheckSkillsTest(unittest.TestCase):
             self.assertEqual(MAIN(["--group", "boundaries"]), 1)
         run.assert_not_called()
         self.assertIn("required executable not found:", error.getvalue())
+
+    def test_main_compiles_outside_checkout_and_cleans_cache_on_success_and_failure(self) -> None:
+        real_run = subprocess.run
+        source_root = SCRIPT.resolve().parent.parent
+        sources = (
+            "scripts/install-skills", "scripts/install-skills.test.py",
+            "scripts/validate-skills", "scripts/validate-skills.test.py",
+            "scripts/check-skills", "scripts/check-skills.test.py",
+            "skills/autoreview/scripts/autoreview",
+            "skills/autoreview/scripts/test-review-harness.py",
+            "skills/autoreview/scripts/autoreview_test.py",
+        )
+        for invalid in (False, True):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "repo"
+                for source in sources:
+                    target = root / source
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_root / source, target)
+                if invalid:
+                    (root / "scripts/install-skills.test.py").write_text("def broken(:\n", encoding="utf-8")
+                before = {source: (root / source).read_bytes() for source in sources}
+                main = runpy.run_path(str(root / "scripts/check-skills"))["main"]
+                executed = []
+                caches = []
+                compiled = []
+
+                def run(command, **kwargs):
+                    executed.append(command)
+                    # Delegate the compiler unchanged; unrelated toolchains and
+                    # test suites are outside this cache-placement regression.
+                    if "py_compile" not in command:
+                        return subprocess.CompletedProcess(command, 0)
+                    result = real_run(command, **kwargs, capture_output=True, text=True)
+                    compiled.append(result)
+                    self.assertEqual(command[1], "-X")
+                    cache = Path(command[2].removeprefix("pycache_prefix="))
+                    caches.append(cache)
+                    self.assertTrue(any(cache.rglob("*.pyc")))
+                    self.assertFalse(list(root.rglob("__pycache__")))
+                    return result
+
+                with mock.patch("shutil.which", side_effect=lambda name: name), \
+                        mock.patch("subprocess.run", side_effect=run), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    status = main(["--group", "core"])
+                self.assertEqual(len(compiled), 1)
+                self.assertEqual(status, compiled[0].returncode)
+                if invalid:
+                    self.assertNotEqual(status, 0)
+                    self.assertIn("SyntaxError", compiled[0].stderr)
+                    self.assertEqual(len(executed), 3)
+                else:
+                    self.assertEqual(status, 0, compiled[0].stderr)
+                    self.assertEqual(len(executed), 13)
+                self.assertFalse(any(cache.exists() for cache in caches))
+                self.assertFalse(list(root.rglob("__pycache__")))
+                self.assertEqual(before, {source: (root / source).read_bytes() for source in sources})
 
     @contextlib.contextmanager
     def fixture(self, *, parent=None, forward_import=False, fail_test=None):
@@ -144,6 +209,10 @@ class CheckSkillsTest(unittest.TestCase):
         )
 
     def test_every_group_and_shard_runs_checkout_tests_despite_installed_package(self) -> None:
+        if os.name == "nt":
+            bootstrap = runpy.run_path(str(SCRIPT.with_name("windows_test_process.py")))
+            self.assertTrue(bootstrap["windows_test_process_status"]()["eligible"],
+                            "runner fixtures must be created by the admitted test process")
         with self.fixture() as (root, foreign, marker, log, environment, groups):
             expected = {**groups, "all": sum(groups.values(), []),
                         "hardening-1": sorted(groups["hardening"])[::2],
@@ -386,4 +455,10 @@ sys.exit(0 if result.wasSuccessful() else 1)
 
 
 if __name__ == "__main__":
+    # Admit the test process before it creates private fixture checkouts.
+    # The runner entrypoint, not this caller test, owns the native parent proof.
+    bootstrap = runpy.run_path(str(SCRIPT.with_name("windows_test_process.py")))
+    status = bootstrap["ensure_windows_test_process"](sys.argv[0], sys.argv[1:])
+    if status is not None:
+        bootstrap["exit_test_process"](status)
     unittest.main()

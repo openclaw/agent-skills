@@ -902,19 +902,21 @@ class ReviewBatchTests(unittest.TestCase):
             self.assertNotEqual(status, 0)
             self.assertFalse(sends)
             self.assertFalse(marker.exists(), "source-owned reviewer executed during preflight")
-            trusted = repo.parent / "trusted-codex"
+            (repo.parent / "bin").mkdir()
+            trusted = repo.parent / "bin" / "trusted-codex"
             shutil.copy2(binary, trusted)
             config = repo.parent / "operator-config"
             config.mkdir()
             (upstream / "config.toml").write_text('cli_auth_credentials_store="keyring"\n')
             (config / "config.toml").symlink_to(upstream / "config.toml")
             with mock.patch.dict(os.environ, {"CODEX_HOME": str(config)}):
-                status, sends, _ = self.invoke(
+                status, sends, output = self.invoke(
                     repo, "--external-source-context-file", ".review/external.json",
                     "--codex-bin", str(trusted), "--dry-run", real_engine_probe=True,
                 )
             self.assertNotEqual(status, 0)
             self.assertFalse(sends)
+            self.assertIn("Codex configuration and authentication must be outside reviewed source roots", output)
             self.assertFalse(marker.exists(), "reviewer probe admitted source-owned configuration")
 
     @unittest.skipIf(os.name == "nt", "uses executable shell wrappers")
@@ -1198,7 +1200,8 @@ class ReviewBatchTests(unittest.TestCase):
                 candidate = directory / "git"
                 candidate.write_text("#!/bin/sh\ntouch " + shlex.quote(str(marker)) + "\nexit 99\n")
                 candidate.chmod(0o755)
-            wrapper = repo.parent / "trusted-git-wrapper"
+            (repo.parent / "trusted-bin").mkdir()
+            wrapper = repo.parent / "trusted-bin" / "trusted-git-wrapper"
             wrapper.write_text("#!/bin/sh\n" + "\n".join(
                 'case ":$PATH:" in *' + shlex.quote(":" + str(directory) + ":")
                 + '*) touch ' + shlex.quote(str(marker)) + '; exit 98;; esac'

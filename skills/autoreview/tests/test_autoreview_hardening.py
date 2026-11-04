@@ -3667,6 +3667,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_cli_status_for_launched_codex_and_claude_failures(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             git(repo, "commit", "-q", "--allow-empty", "-m", "base")
             (repo / "source.txt").write_text("review me\n")
@@ -3677,7 +3678,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     with self.subTest(engine=engine, timeout=timeout):
                         # Help/version preflights succeed; only the launched review fails.
                         injected = "import time; sys.stdin.read(); time.sleep(30)" if timeout else "print('DIAGNOSTIC_SENTINEL\\x1b[31m', file=sys.stderr); raise SystemExit(17)"
-                        executable = write_executable(root / engine, source.replace('record = os.environ["AUTOREVIEW_FAKE_RECORD"]', injected + '\nrecord = os.environ["AUTOREVIEW_FAKE_RECORD"]'))
+                        executable = write_executable(root / "bin" / engine, source.replace('record = os.environ["AUTOREVIEW_FAKE_RECORD"]', injected + '\nrecord = os.environ["AUTOREVIEW_FAKE_RECORD"]'))
                         sidecar = root / "status.json"
                         report = root / "result.json"
                         argv = [sys.executable, str(SCRIPT), "--mode", "local", "--engine", engine,
@@ -3701,6 +3702,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_cli_codex_model_fallback_opt_out_preserves_failed_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             git(repo, "commit", "-q", "--allow-empty", "-m", "base")
             (repo / "source.txt").write_text("review me\n")
@@ -3717,7 +3719,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     'f"The model {model} does not exist or you do not have access to it."}))\n'
                     '    raise SystemExit(17)\n'
                 )
-                executable = write_executable(root / "codex", fake_codex_script().replace(
+                executable = write_executable(root / "bin" / "codex", fake_codex_script().replace(
                     'print("fake codex ok")', failure + 'print("fake codex ok")',
                 ))
                 for disabled in (True, False):
@@ -5541,13 +5543,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_git_preflight_failures_stop_before_target_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             for body, diagnostic, minimum in (
                 ("exit 7", "exit 7", 0),
                 ("exec sleep 60", "timed out after 10s", 9),
             ):
                 with self.subTest(diagnostic=diagnostic):
-                    binary = write_executable(root / f"git-stub-{minimum}", f"#!/bin/sh\n{body}\n")
+                    binary = write_executable(root / "bin" / f"git-stub-{minimum}", f"#!/bin/sh\n{body}\n")
                     started = time.monotonic()
                     result = subprocess.run(
                         [sys.executable, str(SCRIPT), "--mode", "local", "--dry-run"],
@@ -5568,8 +5571,9 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_git_override_uses_trusted_resolution_and_preserves_git_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
-            binary = write_executable(root / "git-stub", "#!/bin/sh\nexit 0\n")
+            binary = write_executable(root / "bin" / "git-stub", "#!/bin/sh\nexit 0\n")
             developer = str(root / "Xcode.app/Contents/Developer")
             with mock.patch.dict(os.environ, {"AUTOREVIEW_GIT": str(binary), "DEVELOPER_DIR": developer,
                                                "GIT_DIR": "untrusted", "DYLD_INSERT_LIBRARIES": "untrusted"}):
@@ -5643,6 +5647,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_claude_checks_effective_settings_before_probe_and_preserves_trusted_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
+            (root / "bin").mkdir()
             repo, upstream, config = root / "repo", root / "upstream", root / ".claude"
             for path in (repo, upstream, config):
                 path.mkdir()
@@ -5655,7 +5660,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 "with open(os.environ['AUTOREVIEW_FAKE_CALLS'], 'a') as out:\n"
                 "    out.write(json.dumps({'argv': args, 'config': os.environ.get('CLAUDE_CONFIG_DIR')}) + '\\n')",
             )
-            binary = write_executable(root / "claude", fixture)
+            binary = write_executable(root / "bin" / "claude", fixture)
             args = argparse.Namespace(claude_bin=str(binary), model=None, tools=False,
                                       thinking=None, stream_engine_output=False)
             environment = {"PATH": os.environ.get("PATH", ""), "HOME": str(root),
@@ -5707,6 +5712,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_claude_rechecks_settings_after_preflight_before_live_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
+            (root / "bin").mkdir()
             repo, source, config = root / "repo", root / "source", root / "config"
             for path in (repo, source, config):
                 path.mkdir()
@@ -5722,7 +5728,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 '    settings.unlink()\n'
                 '    settings.symlink_to(os.environ["AUTOREVIEW_FAKE_SETTINGS"])',
             )
-            binary = write_executable(root / "claude", fixture)
+            binary = write_executable(root / "bin" / "claude", fixture)
             args = argparse.Namespace(claude_bin=str(binary), model=None, tools=False,
                                       thinking=None, stream_engine_output=False)
             token = self.helper["UNTRUSTED_SOURCE_ROOTS"].set((repo, source))
@@ -6313,6 +6319,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_cli_detects_source_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             source = repo / "source.txt"
             source.write_text("before\n", encoding="utf-8")
@@ -6320,7 +6327,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             git(repo, "commit", "-qm", "initial")
             source.write_text("review me\n", encoding="utf-8")
             codex_bin = write_executable(
-                root / "codex",
+                root / "bin" / "codex",
                 fake_codex_script(),
             )
             record_path = root / "record.json"
@@ -6533,8 +6540,9 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_claude_probe_captures_help_from_pipe_sensitive_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
-            cli = write_executable(root / "claude", r'''#!/usr/bin/env python3
+            cli = write_executable(root / "bin" / "claude", r'''#!/usr/bin/env python3
 import os
 import stat
 import sys
@@ -8346,12 +8354,13 @@ os.execv(target, [str(target), *sys.argv[1:]])
     def test_dry_run_flag_exits_zero_when_bundle_and_engine_resolve(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             source = repo / "source.txt"
             source.write_text("staged\n", encoding="utf-8")
             git(repo, "add", "source.txt")
             codex_bin = write_executable(
-                root / "codex",
+                root / "bin" / "codex",
                 fake_codex_script(),
             )
             env = {**os.environ, "CODEX_HOME": str(root)}
@@ -8556,13 +8565,14 @@ os.execv(target, [str(target), *sys.argv[1:]])
     def test_dry_run_flag_exits_zero_for_plain_commit_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             source = repo / "source.txt"
             source.write_text("staged\n", encoding="utf-8")
             git(repo, "add", "source.txt")
             git(repo, "commit", "-q", "-m", "seed")
             codex_bin = write_executable(
-                root / "codex",
+                root / "bin" / "codex",
                 fake_codex_script(),
             )
             env = {**os.environ, "CODEX_HOME": str(root)}
@@ -8601,9 +8611,10 @@ os.execv(target, [str(target), *sys.argv[1:]])
         # the binary resolves on PATH.
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             pi_bin = write_executable(
-                root / "pi",
+                root / "bin" / "pi",
                 fake_pi_script(),
             )
             env = os.environ.copy()
@@ -8636,12 +8647,13 @@ os.execv(target, [str(target), *sys.argv[1:]])
     def test_dry_run_flag_exits_zero_when_pi_version_supported(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             source = repo / "source.txt"
             source.write_text("staged\n", encoding="utf-8")
             git(repo, "add", "source.txt")
             pi_bin = write_executable(
-                root / "pi",
+                root / "bin" / "pi",
                 fake_pi_script(),
             )
             env = os.environ.copy()
@@ -8679,12 +8691,13 @@ os.execv(target, [str(target), *sys.argv[1:]])
         # flags resolved.
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             source = repo / "source.txt"
             source.write_text("staged\n", encoding="utf-8")
             git(repo, "add", "source.txt")
             claude_bin = write_executable(
-                root / "claude",
+                root / "bin" / "claude",
                 fake_claude_script(),
             )
             env = os.environ.copy()
@@ -8741,12 +8754,13 @@ os.execv(target, [str(target), *sys.argv[1:]])
         # would fail before an engine starts.
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             source = repo / "source.txt"
             source.write_text("staged\n", encoding="utf-8")
             git(repo, "add", "source.txt")
             codex_bin = write_executable(
-                root / "codex",
+                root / "bin" / "codex",
                 fake_codex_script(),
             )
             env = {**os.environ, "CODEX_HOME": str(root)}
@@ -8783,6 +8797,7 @@ os.execv(target, [str(target), *sys.argv[1:]])
     def test_dry_run_flag_exits_zero_when_prompt_file_valid(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             source = repo / "source.txt"
             source.write_text("staged\n", encoding="utf-8")
@@ -8790,7 +8805,7 @@ os.execv(target, [str(target), *sys.argv[1:]])
             prompt_file = repo / "prompt.md"
             prompt_file.write_text("Focus on error handling.\n", encoding="utf-8")
             codex_bin = write_executable(
-                root / "codex",
+                root / "bin" / "codex",
                 fake_codex_script(),
             )
             env = {**os.environ, "CODEX_HOME": str(root)}
@@ -8825,12 +8840,13 @@ os.execv(target, [str(target), *sys.argv[1:]])
         # get the same pre-engine existence check as prompt files.
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             source = repo / "source.txt"
             source.write_text("staged\n", encoding="utf-8")
             git(repo, "add", "source.txt")
             codex_bin = write_executable(
-                root / "codex",
+                root / "bin" / "codex",
                 fake_codex_script(),
             )
             env = os.environ.copy()
@@ -9034,7 +9050,9 @@ class AuthenticatedProxyTests(unittest.TestCase):
             git(repo, "add", ".")
             git(repo, "commit", "-qm", "fixture")
             (repo / "source.txt").write_text("after\n")
-            fake = root / "codex-fixture"
+            installation = root / "bin"
+            installation.mkdir()
+            fake = installation / "codex-fixture"
             fake.write_text(f"#!{sys.executable}\n" + '''import json, os, sys
 from pathlib import Path
 if "--version" in sys.argv:

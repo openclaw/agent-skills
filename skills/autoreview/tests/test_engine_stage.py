@@ -741,7 +741,8 @@ class StageTests(unittest.TestCase):
             (repo / 'source.txt').write_text('synthetic change\n')
             subprocess.run(['git', *args], cwd=repo, env=env, check=True,
                            capture_output=True, timeout=5)
-        producer = self.root / 'synthetic-producer'
+        (self.root / 'bin').mkdir()
+        producer = self.root / 'bin' / 'synthetic-producer'
         # The only engine executable is this owned local fixture. Its Python
         # interpreter disables site loading, inherited paths and bytecode writes.
         producer.write_text('#!/bin/sh\n'

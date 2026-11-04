@@ -280,7 +280,7 @@ if mode == "parent-streams-subject":
              f"raise SystemExit({int(options[1])})")
     status = helper["ensure_windows_test_process"](
         sys.argv[0], sys.argv[1:],
-        parent_check=[sys.executable, "-I", "-S", "-B", "-c", proof],
+        parent_check=[sys.executable, "-I", "-S", "-B", "-X", "utf8=1", "-c", proof],
     )
     if status is not None:
         helper["exit_test_process"](status)
@@ -458,9 +458,28 @@ class NativeTokenTests(unittest.TestCase):
                 "import json, pathlib, runpy, sys, tempfile\n"
                 f"proof = runpy.run_path({str(Path(__file__).resolve())!r})\n"
                 "helper = proof['HELPER']\n"
-                "status = helper['ensure_windows_test_process'](sys.argv[0], sys.argv[1:])\n"
-                "if status is not None: helper['exit_test_process'](status)\n"
+                # Manufacture the token even when the calling account already
+                # passes admission; its ambient DACL is not what this proves.
+                "if len(sys.argv) == 2:\n"
+                "    caller = helper['windows_test_process_status']()\n"
+                "    caller_dacl = proof['token_default_dacl_sddl'](helper)\n"
+                "    caller_object = proof['token_object_security_sddl'](helper)\n"
+                "    api = helper['_windows_api']()\n"
+                "    with helper['_process_token'](api, for_launch=True) as source:\n"
+                "        with helper['_restricted_primary'](api, source) as restricted:\n"
+                "            fresh = helper['_status'](api, restricted)['primary_token_id']\n"
+                "            assert fresh != caller['primary_token_id']\n"
+                "            command = [sys.executable, '-I', '-S', '-B', '-X', 'utf8=1',\n"
+                "                       *sys.argv, json.dumps(caller['primary_token_id'])]\n"
+                "            status = helper['_launch'](api, restricted, command,\n"
+                "                                      helper['_native_environment_block'](api))\n"
+                "    assert helper['windows_test_process_status']() == caller\n"
+                "    assert proof['token_default_dacl_sddl'](helper) == caller_dacl\n"
+                "    assert proof['token_object_security_sddl'](helper) == caller_object\n"
+                "    raise SystemExit(status)\n"
                 "state = helper['windows_test_process_status']()\n"
+                "fresh_primary = state['primary_token_id'] != json.loads(sys.argv[2])\n"
+                "assert fresh_primary\n"
                 "ordinary = pathlib.Path(sys.argv[1])\n"
                 "direct = ordinary / 'default-file.txt'\n"
                 "direct.write_text('default file', encoding='utf-8')\n"
@@ -486,17 +505,21 @@ class NativeTokenTests(unittest.TestCase):
                 "    item.unlink()\n"
                 "assert not root.exists()\n"
                 "print(json.dumps(dict(eligible=state['eligible'],\n"
+                "    fresh_primary=fresh_primary,\n"
                 "    owner_is_user=state['owner_sid'] == state['user_sid'],\n"
                 "    ordinary_file=file_security, ordinary_directory=ordinary_security,\n"
                 "    directory=security, removed=True)))\n",
                 encoding="utf-8",
             )
-            result = subprocess.run([sys.executable, "-I", "-S", "-B", str(script), str(default_acl_root)],
-                                    capture_output=True, text=True, timeout=60)
+            result = subprocess.run(
+                [sys.executable, "-I", "-S", "-B", "-X", "utf8=1", str(script), str(default_acl_root)],
+                capture_output=True, text=True, encoding="utf-8", timeout=60,
+            )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stderr, "", "successful native proof must not emit host diagnostics")
             data = json.loads(result.stdout)
             self.assertTrue(data["eligible"])
+            self.assertTrue(data["fresh_primary"])
             self.assertTrue(data["owner_is_user"])
             self.assertTrue(data["directory"])
             self.assertTrue(data["ordinary_file"])
@@ -555,26 +578,39 @@ class NativeTokenTests(unittest.TestCase):
 
 
 class NativeParentTests(unittest.TestCase):
+    def test_direct_runner_self_test_reduces_before_private_fixture_creation(self):
+        before = HELPER["windows_test_process_status"]()
+        self.assertTrue(before["native"], "this proof requires native Windows")
+        self.assertFalse(before["primary_eligible"],
+                         "this proof needs the original unsuitable primary token")
+        case = "CheckSkillsTest.test_every_group_and_shard_runs_checkout_tests_despite_installed_package"
+        # The self-test's own entrypoint must reduce authority before its real
+        # fixture creates a private checkout and invokes the copied runner.
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-B", "-X", "utf8=1",
+             str(Path(__file__).with_name("check-skills.test.py")), case, "-v"],
+            text=True, encoding="utf-8", capture_output=True, timeout=90,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(case.partition(".")[2], result.stderr)
+        self.assertRegex(result.stderr, r"(?m)^Ran 1 test in ")
+        self.assertNotIn("skipped", result.stderr)
+        self.assertTrue(HELPER["windows_test_process_status"]() == before,
+                        "parent token state changed")
+
     def test_autoreview_product_custody_before_primary_restriction(self):
         proof = (Path(__file__).resolve().parent.parent / "skills" / "autoreview"
                  / "tests" / "test_windows_primary_custody.py")
         result = subprocess.run(
-            [sys.executable, "-u", "-I", "-S", "-B", str(proof)],
-            capture_output=True, timeout=60,
+            [sys.executable, "-u", "-I", "-S", "-B", "-X", "utf8=1", str(proof)],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=60,
         )
         # Keep native CI evidence explicit: an inapplicable local negative is
         # reported as skipped, while the real reduced-child control still runs.
         for stream, output in ((sys.stdout, result.stdout), (sys.stderr, result.stderr)):
             if stream is not None:
+                stream.write(output)
                 stream.flush()
-                binary = getattr(stream, "buffer", None)
-                if binary is not None:
-                    binary.write(output)
-                    binary.flush()
-                else:
-                    encoding = getattr(stream, "encoding", None) or "utf-8"
-                    stream.write(output.decode(encoding, errors="replace"))
-                    stream.flush()
         self.assertEqual(result.returncode, 0, "native product custody proof failed; see output")
 
     def test_parent_reporting_handles_absent_streams_before_real_child_launch(self):
@@ -648,7 +684,7 @@ class NativeParentTests(unittest.TestCase):
             "import runpy, sys\n"
             f"helper = runpy.run_path({str(HELPER_PATH)!r})\n"
             "status = helper['ensure_windows_test_process'](sys.argv[1], [], "
-            "parent_check=[sys.executable, '-I', '-c', 'raise SystemExit(23)'])\n"
+            "parent_check=[sys.executable, '-I', '-X', 'utf8=1', '-c', 'raise SystemExit(23)'])\n"
             "raise SystemExit(status if status is not None else 99)\n"
         )
         command = [sys.executable, "-I", "-S", "-c", code, str(Path(__file__).resolve())]
@@ -663,6 +699,41 @@ class NativeParentTests(unittest.TestCase):
 
 
 class WindowsTestProcessTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "requires native parent-proof execution")
+    def test_auxiliary_utf8_text_uses_the_callers_utf16_streams(self):
+        # The isolated proof and requested suite deliberately use different
+        # encodings. Both must remain decodable in each redirected caller log.
+        with cross_token_fixture() as (root, _):
+            script = root / "different-stream-encodings.py"
+            script.write_text(
+                "import os, runpy, sys\n"
+                f"helper = runpy.run_path({str(HELPER_PATH)!r})\n"
+                "proof = [sys.executable, '-I', '-S', '-X', 'utf8=1', '-c',\n"
+                "         \"import sys; print('proof 雪'); print('proof Ω', file=sys.stderr)\"]\n"
+                "status = helper['ensure_windows_test_process'](sys.argv[0], sys.argv[1:], parent_check=proof)\n"
+                "if status is not None: helper['exit_test_process'](status)\n"
+                "assert os.environ['PYTHONIOENCODING'] == 'utf-16-le'\n"
+                "assert sys.flags.warn_default_encoding == 1\n"
+                "assert 'error::EncodingWarning' in sys.warnoptions\n"
+                "print('caller 雪')\n"
+                "print('caller Ω', file=sys.stderr)\n",
+                encoding="utf-8",
+            )
+            environment = {key: value for key, value in os.environ.items()
+                           if not key.upper().startswith("PYTHON")}
+            environment["PYTHONIOENCODING"] = "utf-16-le"
+            result = subprocess.run(
+                [sys.executable, "-u", "-S", "-B", "-X", "warn_default_encoding",
+                 "-W", "error::EncodingWarning", str(script)],
+                env=environment, capture_output=True, timeout=60,
+            )
+            stdout = result.stdout.decode("utf-16-le").replace("\r\n", "\n")
+            stderr = result.stderr.decode("utf-16-le").replace("\r\n", "\n")
+            self.assertEqual(result.returncode, 0, stdout + stderr)
+            needs_proof = not HELPER["windows_test_process_status"]()["primary_eligible"]
+            self.assertEqual(stdout, ("proof 雪\n" if needs_proof else "") + "caller 雪\n")
+            self.assertEqual(stderr, ("proof Ω\n" if needs_proof else "") + "caller Ω\n")
+
     def test_waiting_wrapper_exits_without_an_inspect_prompt(self):
         with tempfile.TemporaryDirectory() as directory:
             script = Path(directory) / "waiting-wrapper.py"
@@ -695,13 +766,13 @@ class WindowsTestProcessTests(unittest.TestCase):
     def test_invocation_preserves_interpreter_arguments_streams_and_exit(self):
         # This is a real second process. On Windows it also has to pass native
         # admission, so argument preservation is proved across the actual path.
-        with cross_token_fixture() as (root, original_security):
+        with cross_token_fixture() as (root, _):
             script = root / "invocation witness.py"
             script.write_text(
                 "import json, os, runpy, sys\n"
                 "from pathlib import Path\n"
                 f"helper = runpy.run_path({str(HELPER_PATH)!r})\n"
-                "proof = [sys.executable, '-I', '-S', '-X', 'utf8', '-c',\n"
+                "proof = [sys.executable, '-I', '-S', '-X', 'utf8=1', '-c',\n"
                 "         \"import sys; sys.stdout.write('auxiliary 雪' + chr(10)); sys.stderr.write('auxiliary Ω' + chr(10))\"]\n"
                 "status = helper['ensure_windows_test_process'](sys.argv[0], sys.argv[1:], parent_check=proof)\n"
                 "if status is not None: helper['exit_test_process'](status)\n"
@@ -728,7 +799,7 @@ class WindowsTestProcessTests(unittest.TestCase):
                 cwd=root, env={**os.environ, "INVOCATION_WITNESS": "preserved"},
                 input="stdin witness", encoding="utf-8", capture_output=True, timeout=60,
             )
-            self.assertEqual(result.returncode, 17, result.stdout + result.stderr + str(original_security))
+            self.assertEqual(result.returncode, 17, result.stdout + result.stderr)
             needs_proof = os.name == "nt" and not HELPER["windows_test_process_status"]()["primary_eligible"]
             self.assertEqual(result.stdout, ("auxiliary 雪\n" if needs_proof else "") + "stdout witness\n")
             self.assertEqual(result.stderr, ("auxiliary Ω\n" if needs_proof else "") + "stderr witness\n")
@@ -769,9 +840,9 @@ class AuxiliaryConfigurationTests(unittest.TestCase):
             "raise SystemExit(not unittest.TextTestRunner().run(suite).wasSuccessful())\n"
         )
         result = subprocess.run(
-            [sys.executable, "-I", "-S", "-c", code],
+            [sys.executable, "-I", "-S", "-X", "utf8=1", "-c", code],
             env={**os.environ, "PYTHONVERBOSE": "1", "PYTHONINSPECT": "1", "PYTHONWARNINGS": "error"},
-            text=True, capture_output=True, timeout=90,
+            encoding="utf-8", capture_output=True, timeout=90,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -813,7 +884,7 @@ class NativeThreadOnlyTests(unittest.TestCase):
                         os.environ['AGENT_SKILLS_TEST_THREAD_STAGE'] = '1'
                         status = helper['ensure_windows_test_process'](
                             sys.argv[0], sys.argv[1:],
-                            parent_check=[sys.executable, '-I', '-c', 'raise SystemExit(47)'])
+                            parent_check=[sys.executable, '-I', '-X', 'utf8=1', '-c', 'raise SystemExit(47)'])
                     finally:
                         try:
                             if installed and not install(None, None):
@@ -849,7 +920,7 @@ class NativeParentExitTests(unittest.TestCase):
             "import runpy, sys\n"
             f"helper = runpy.run_path({str(HELPER_PATH)!r})\n"
             "status = helper['ensure_windows_test_process'](sys.argv[0], sys.argv[1:], "
-            f"parent_check=[sys.executable, '-I', '-S', '-c', {exit_code!r}])\n"
+            f"parent_check=[sys.executable, '-I', '-S', '-X', 'utf8=1', '-c', {exit_code!r}])\n"
             "helper['exit_test_process'](status if status is not None else 99)\n"
         )
         result = subprocess.run([sys.executable, "-I", "-S", "-c", code],
@@ -1064,7 +1135,7 @@ if __name__ == "__main__":
             raise SystemExit(not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful())
         status = HELPER["ensure_windows_test_process"](
             sys.argv[0], sys.argv[1:], parent_check=[
-                sys.executable, "-u", "-I", "-S", "-B",
+                sys.executable, "-u", "-I", "-S", "-B", "-X", "utf8=1",
                 str(Path(__file__).resolve()), "--native-parent",
             ],
         )

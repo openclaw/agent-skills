@@ -421,12 +421,13 @@ print("maintenance")
             root = Path(temporary).resolve()
             repo = init_repo(root)
             helper = load_helper()
-            selected = root / "selected-git"
+            (root / "bin").mkdir()
+            selected = root / "bin" / "selected-git"
             # A distinct trusted executable cannot be substituted by PATH Git.
             selected.write_text("#!/bin/sh\nexit 97\n")
             selected.chmod(0o755)
             with mock.patch.dict(os.environ, {"AUTOREVIEW_GIT": str(selected)}):
-                with self.assertRaisesRegex(SystemExit, "pass --base explicitly"):
+                with self.assertRaisesRegex(SystemExit, "cannot select the approved Git; pass --base explicitly"):
                     helper["safe_gh_env"](repo)
 
     def test_empty_optional_environment_keeps_default_discovery(self):
