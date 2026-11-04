@@ -19,6 +19,28 @@ from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parent.parent
+_GIT_REPOSITORY_ENV = frozenset({
+    # Git's local_repo_env inventory, plus namespace/discovery overrides.
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+    "GIT_SHALLOW_FILE", "GIT_COMMON_DIR", "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+})
+
+
+def _source_git(*arguments: str) -> bytes:
+    # Token restriction can remove Git's Administrators ownership exception.
+    # Trust only this script's selected checkout, for this command alone.
+    environment = {key: value for key, value in os.environ.items()
+                   if key.upper() not in _GIT_REPOSITORY_ENV
+                   and not key.upper().startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))}
+    # Archive identity must describe the named commit's actual objects.
+    return subprocess.check_output(
+        ["git", "--no-replace-objects", "-c", f"safe.directory={ROOT}", *arguments],
+        cwd=ROOT, env=environment,
+    )
 
 
 def tree(root: Path) -> dict[str, tuple[str, bytes | str | None]]:
@@ -37,9 +59,154 @@ def tree(root: Path) -> dict[str, tuple[str, bytes | str | None]]:
 
 
 class InstalledAutoreviewTests(unittest.TestCase):
+    def test_source_commit_identity_keeps_its_raw_tree_with_replacement_refs(self) -> None:
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.upper().startswith("GIT_")}
+        environment.update(GIT_CONFIG_SYSTEM=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                           GIT_CONFIG_GLOBAL=os.devnull, LC_ALL="C", LANG="C")
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "replacement source"
+            repository.mkdir()
+
+            def git(*arguments: str) -> bytes:
+                return subprocess.check_output(["git", *arguments], cwd=repository,
+                                               env=environment, stderr=subprocess.PIPE)
+
+            git("init", "--quiet")
+            source = repository / "source.txt"
+            for content in ("original source\n", "replacement source\n"):
+                source.write_text(content, encoding="utf-8")
+                git("add", "source.txt")
+                git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                    "commit", "--quiet", "--no-gpg-sign", "--no-verify", "-m", content.strip())
+                if content == "original source\n":
+                    original = git("rev-parse", "HEAD").decode("ascii").strip()
+                    original_tree = git("ls-tree", "-rz", original)
+            replacement = git("rev-parse", "HEAD").decode("ascii").strip()
+            replacement_tree = git("ls-tree", "-rz", replacement)
+            self.assertNotEqual(original_tree, replacement_tree)
+            git("update-ref", "HEAD", original)
+            git("replace", original, replacement)
+            # Replacements change object lookup, while HEAD still names A.
+            self.assertEqual(git("rev-parse", "HEAD").decode("ascii").strip(), original)
+            self.assertEqual(git("ls-tree", "-rz", original), replacement_tree)
+            scripts = repository / "scripts"
+            scripts.mkdir()
+            copied = scripts / Path(__file__).name
+            shutil.copyfile(__file__, copied)
+            probe = (
+                "import json, runpy, sys\n"
+                "module = runpy.run_path(sys.argv[1])\n"
+                "head = module['_source_git']('rev-parse', 'HEAD').decode('ascii').strip()\n"
+                "entries = module['_source_git']('ls-tree', '-rz', head)\n"
+                "print(json.dumps(dict(head=head, tree=entries.hex())))\n"
+            )
+            for inherited in ({}, {"GIT_NO_REPLACE_OBJECTS": "1"}):
+                with self.subTest(caller_disables_replacement=bool(inherited)):
+                    result = subprocess.run(
+                        [sys.executable, "-I", "-S", "-B", "-X", "utf8=1", "-c", probe, str(copied)],
+                        cwd=directory, env={**environment, **inherited},
+                        capture_output=True, encoding="utf-8",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    observed = json.loads(result.stdout)
+                    self.assertEqual(observed["head"], original)
+                    self.assertEqual(bytes.fromhex(observed["tree"]), original_tree)
+            self.assertEqual(git("rev-parse", f"refs/replace/{original}").decode("ascii").strip(), replacement)
+
+    def test_source_reads_ignore_another_repositorys_environment(self) -> None:
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.upper().startswith("GIT_")}
+        environment.update(GIT_CONFIG_SYSTEM=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                           GIT_CONFIG_GLOBAL=os.devnull, LC_ALL="C", LANG="C")
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            other = scratch / "other repository"
+            other.mkdir()
+            config = scratch / "external.gitconfig"
+            config.write_text("[fixture]\n\tmarker = unchanged\n", encoding="utf-8")
+            environment["GIT_CONFIG_GLOBAL"] = str(config)
+
+            def git(*arguments: str) -> bytes:
+                return subprocess.check_output(["git", *arguments], cwd=other, env=environment,
+                                               stderr=subprocess.PIPE)
+
+            git("init", "--quiet")
+            (other / "foreign.txt").write_text("other source\n", encoding="utf-8")
+            git("add", "foreign.txt")
+            git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                "commit", "--quiet", "--no-gpg-sign", "--no-verify", "-m", "foreign source")
+            foreign_head = git("rev-parse", "HEAD")
+            config_before = config.read_bytes()
+            repo_config_before = (other / ".git/config").read_bytes()
+            selected = ["git", "--no-replace-objects", "-c", f"safe.directory={ROOT}"]
+            head = subprocess.check_output([*selected, "rev-parse", "HEAD"], cwd=ROOT,
+                                           env=environment)
+            self.assertNotEqual(head, foreign_head)
+            probe = (
+                "import runpy, sys\n"
+                "module = runpy.run_path(sys.argv[1])\n"
+                "sys.stdout.buffer.write(module['_source_git'](*sys.argv[2:]))\n"
+            )
+            conflicting = {**environment, "GIT_DIR": str(other / ".git"),
+                           "GIT_WORK_TREE": str(other), "GIT_COMMON_DIR": str(other / ".git"),
+                           "GIT_OBJECT_DIRECTORY": str(other / ".git/objects"),
+                           "GIT_INDEX_FILE": str(other / ".git/index")}
+            # Establish that the inherited overrides really select the foreign
+            # source before checking the two supported metadata reads.
+            self.assertEqual(subprocess.check_output(["git", "rev-parse", "HEAD"],
+                                                     cwd=ROOT, env=conflicting), foreign_head)
+            for arguments in (("rev-parse", "HEAD"), ("ls-tree", "-rz", head.decode("ascii").strip())):
+                with self.subTest(command=arguments[0]):
+                    expected = subprocess.check_output([*selected, *arguments], cwd=ROOT,
+                                                       env=environment)
+                    result = subprocess.run(
+                        [sys.executable, "-I", "-S", "-B", "-c", probe,
+                         str(Path(__file__).resolve()), *arguments],
+                        cwd=other, env=conflicting, capture_output=True,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+                    self.assertEqual(result.stdout, expected)
+            self.assertEqual(config.read_bytes(), config_before)
+            self.assertEqual((other / ".git/config").read_bytes(), repo_config_before)
+            self.assertEqual(git("rev-parse", "HEAD"), foreign_head)
+
+    def test_source_reads_remain_scoped_when_git_rejects_ownership(self) -> None:
+        # Git's own ownership regression facility exercises its real rejection
+        # path without changing checkout ownership or the operator's config.
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.upper().startswith("GIT_")}
+        environment.update(GIT_CONFIG_SYSTEM=os.devnull, GIT_CONFIG_GLOBAL=os.devnull,
+                           GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_COUNT="0",
+                           GIT_TEST_ASSUME_DIFFERENT_OWNER="1", LC_ALL="C", LANG="C")
+        command = ["git", "rev-parse", "HEAD"]
+        rejected = subprocess.run(command, cwd=ROOT, env=environment, capture_output=True)
+        if rejected.returncode == 0:
+            self.skipTest("installed Git lacks the forced ownership rejection facility")
+        self.assertIn(b"dubious ownership", rejected.stderr)
+        probe = (
+            "import runpy, sys\n"
+            "module = runpy.run_path(sys.argv[1])\n"
+            "sys.stdout.buffer.write(module['_source_git'](*sys.argv[2:]))\n"
+        )
+        head = _source_git("rev-parse", "HEAD").decode("ascii").strip()
+        for arguments in (("rev-parse", "HEAD"), ("ls-tree", "-rz", head)):
+            with self.subTest(command=arguments[0]):
+                result = subprocess.run(
+                    [sys.executable, "-I", "-S", "-B", "-c", probe,
+                     str(Path(__file__).resolve()), *arguments],
+                    cwd=ROOT, env=environment, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+                self.assertEqual(result.stdout, _source_git(*arguments))
+        # The two reads must not persist an exception for subsequent commands.
+        rejected = subprocess.run(command, cwd=ROOT, env=environment, capture_output=True)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn(b"dubious ownership", rejected.stderr)
+
     def test_exact_archives_and_installed_entrypoints(self) -> None:
-        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-        entries = subprocess.check_output(["git", "ls-tree", "-rz", head], cwd=ROOT)
+        head = _source_git("rev-parse", "HEAD").decode("ascii").strip()
+        entries = _source_git("ls-tree", "-rz", head)
         expected = {}
         for entry in entries.split(b"\0"):
             if entry:
@@ -198,6 +365,18 @@ print(json.dumps({"parser": parser, "image": image}))
 
 
 if __name__ == "__main__":
+    import runpy
+
+    scripts = Path(__file__).resolve().parent
+    bootstrap = runpy.run_path(str(scripts / "windows_test_process.py"))
+    status = bootstrap["ensure_windows_test_process"](
+        sys.argv[0], sys.argv[1:], parent_check=[
+            sys.executable, "-u", "-I", "-S", "-B", "-X", "utf8=1",
+            str(scripts / "windows-test-process.test.py"), "--native-parent",
+        ],
+    )
+    if status is not None:
+        bootstrap["exit_test_process"](status)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archives", type=Path, required=True)
     parser.add_argument("--extras", choices=("absent", "present"), required=True)
