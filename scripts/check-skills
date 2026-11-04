@@ -136,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         [python, "scripts/install-skills.test.py"],
         [python, "scripts/validate-skills.test.py"],
         [python, "scripts/check-skills.test.py"],
+        [python, "scripts/windows-test-process.test.py"],
         unittest_command,
         ["node", "--check", "skills/agent-transcript/scripts/agent-transcript"],
         ["node", "--check", "skills/beam/scripts/beam"],
@@ -163,4 +164,16 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    import runpy
+
+    scripts = Path(__file__).resolve().parent
+    bootstrap = runpy.run_path(str(scripts / "windows_test_process.py"))
+    status = bootstrap["ensure_windows_test_process"](
+        sys.argv[0], sys.argv[1:], parent_check=[
+            sys.executable, "-u", "-I", "-S", "-B",
+            str(scripts / "windows-test-process.test.py"), "--native-parent",
+        ],
+    )
+    if status is not None:
+        bootstrap["exit_test_process"](status)
     raise SystemExit(main())

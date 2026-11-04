@@ -52,9 +52,10 @@ class CheckSkillsTest(unittest.TestCase):
             "scripts/validate-skills", "-n", "-m", "scripts/install-skills.test.py",
             "scripts/validate-skills.test.py", "scripts/check-skills.test.py",
         ])
-        self.assertIn("scripts/check-skills", commands[6])
-        self.assertEqual(commands[6][-3:], ["--group", "all", "--tests-only"])
-        self.assertEqual([command[1] for command in commands[7:]], [
+        self.assertEqual(commands[6][1], "scripts/windows-test-process.test.py")
+        self.assertIn("scripts/check-skills", commands[7])
+        self.assertEqual(commands[7][-3:], ["--group", "all", "--tests-only"])
+        self.assertEqual([command[1] for command in commands[8:]], [
             "--check", "--check", "--check", "run", "--test",
         ])
 
@@ -67,7 +68,7 @@ class CheckSkillsTest(unittest.TestCase):
                 self.assertEqual(len(suites), 1)
                 self.assertEqual(suites[0][-3:], ["--group", group, "--tests-only"])
                 other = [command for command in commands if command not in suites]
-                self.assertEqual(other, full[:6] + full[7:] if group == "core" else [])
+                self.assertEqual(other, full[:7] + full[8:] if group == "core" else [])
 
     def test_first_failure_stops_and_preserves_exit_status(self) -> None:
         for group in ("all", *HELPER["TEST_MODULES"], *HELPER["HARDENING_SHARDS"]):
@@ -92,6 +93,8 @@ class CheckSkillsTest(unittest.TestCase):
             root = Path(directory) / "repo"
             (root / "scripts").mkdir(parents=True)
             shutil.copy2(SCRIPT, root / "scripts/check-skills")
+            for name in ("windows_test_process.py", "windows-test-process.test.py"):
+                shutil.copy2(SCRIPT.with_name(name), root / "scripts" / name)
             groups = {}
             for group, entries in HELPER["TEST_MODULES"].items():
                 groups[group] = []

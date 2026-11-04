@@ -216,6 +216,32 @@ are development-only; installed skills do not need `npm install`. The separate
 macOS CI job uses the `xcode-27` Apple Silicon runner and installs a pinned Codex CLI to exercise native sandbox access
 controls without a reviewer account or provider request.
 
+On Windows, `scripts/check-skills` and `scripts/installed-autoreview.test.py`
+prepare a restricted primary process when the original token has elevated
+integrity, privileges, or group grants beyond the ordinary test profile. Invoke these files directly with
+Python; module (`-m`), command (`-c`), or mutated argument forms are unsupported.
+They retain the selected Python interpreter, flags, arguments, working
+directory, environment, standard streams,
+and exit status. Failure to create or verify that process fails the test command;
+it does not omit tests or change the installed skill's runtime behavior.
+The child must have medium or lower integrity; lowering its integrity leaves the
+original parent token unchanged. Local/domain and Entra account identities are
+supported; system and virtual-service identities are not. This does not classify
+how domain accounts are used. The account domain's Domain Users grant is retained;
+other custom group grants may be removed by the restricted test profile.
+
+Before the restricted launch, the original Windows process runs native bootstrap
+proofs: a restricted thread cannot hide its original primary authority, a marker
+cannot bypass admission, a failed parent check stops execution, and a real child
+preserves invocation details. These auxiliary checks run noninteractively; an
+interactive flag still applies to the requested child, without a second prompt
+in the waiting parent. The restricted child runs the requested suites and
+the regular invocation check. These checks establish the test process boundary;
+they do not by themselves establish a skill's filesystem custody policy. The
+bootstrap retains user identity grants and does not provision accounts or
+rewrite file or desktop permissions. Hosts that require removed administrative
+grants for their interpreter or checkout must fix that access before testing.
+
 For a quick frontmatter-only check, run `scripts/validate-skills`. It checks
 every `skills/*/SKILL.md` for YAML frontmatter plus required `name` and
 `description` strings. Frontmatter must be a mapping enclosed by standalone

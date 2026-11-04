@@ -198,6 +198,18 @@ print(json.dumps({"parser": parser, "image": image}))
 
 
 if __name__ == "__main__":
+    import runpy
+
+    scripts = Path(__file__).resolve().parent
+    bootstrap = runpy.run_path(str(scripts / "windows_test_process.py"))
+    status = bootstrap["ensure_windows_test_process"](
+        sys.argv[0], sys.argv[1:], parent_check=[
+            sys.executable, "-u", "-I", "-S", "-B",
+            str(scripts / "windows-test-process.test.py"), "--native-parent",
+        ],
+    )
+    if status is not None:
+        bootstrap["exit_test_process"](status)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archives", type=Path, required=True)
     parser.add_argument("--extras", choices=("absent", "present"), required=True)
