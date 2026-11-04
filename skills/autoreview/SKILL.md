@@ -37,6 +37,10 @@ The default links to this source. Honor custom `--target` paths; here use
 See `--help` for flags/env overrides. Keep `codex exec`: native `codex review`
 cannot combine explicit Git targets and custom instructions.
 
+On Windows, the default selects a trusted `codex.exe` from PATH before a wrapper.
+Explicit `--codex-bin` and `CODEX_BIN` choices take precedence. The isolation probe
+prints the selected executable and version.
+
 `python3 "$AUTOREVIEW" --version` prints `autoreview source-sha256:<64 hex digits>`
 for the executing helper's bytes, including copy-mode installations. It exits
 without Git, configuration, engine probes or report writes. This identifies the
@@ -56,6 +60,10 @@ Choose the target explicitly when ambiguous:
 | Local candidate against a base | `--mode local --base <ref>` | Pinned base → index → working tree, including untracked files |
 | Committed branch/PR | `--mode branch --base <ref>` | Merge-base → HEAD; excludes dirty work |
 | One commit | `--mode commit --commit <ref>` | Raw parent → commit; root compares against empty tree |
+
+To review a subset, repeat `--path <file-or-directory>`. Paths are literal and
+start at the repository root. Reports identify this as a partial review. See
+[path selection](references/git-and-context.md#path-selection) for limits.
 
 Gitlink bumps include full old/new IDs and selected `.gitmodules` URLs as pin
 metadata; upstream contents are not automatically fetched or reviewed. See

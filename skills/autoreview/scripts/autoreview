@@ -192,6 +192,7 @@ class CapturedBundle(NamedTuple):
     branch_patch: str = ""
     branch_header: str = ""
     omitted_paths: tuple[str, ...] = ()
+    selected_paths: tuple[str, ...] = ()
 
 
 class UntrackedSources(NamedTuple):
@@ -2135,6 +2136,15 @@ def resolve_command(name: str, repo: Path) -> str:
     raise SystemExit(f"executable not found: {name}. Install it or pass an explicit trusted path when supported.")
 
 
+def select_codex_binary(args: argparse.Namespace, repo: Path) -> str:
+    # A wrapper can depend on CODEX_HOME, which the isolated runtime replaces.
+    # Keep explicit operator choices; only the Windows default prefers native.
+    if os.name == "nt" and not getattr(args, "codex_bin_explicit", True):
+        if native := find_command("codex.exe", repo):
+            return native
+    return resolve_command(args.codex_bin, repo)
+
+
 def resolve_git(repo: Path) -> str:
     return resolve_command(os.environ.get("AUTOREVIEW_GIT", "git"), repo)
 
@@ -2979,6 +2989,7 @@ def linked_worktree_boundary(
 
 def untracked_sources(
     repo: Path, claimed_paths: list[str] | tuple[str, ...] = (),
+    pathspec: tuple[str, ...] = (),
 ) -> UntrackedSources:
     files = git_path_list(
         repo,
@@ -2987,6 +2998,7 @@ def untracked_sources(
         "--others",
         "--exclude-standard",
         "-z",
+        *pathspec,
     )
     directories = [
         rel for rel in files
@@ -3021,8 +3033,9 @@ def untracked_sources(
 def collect_untracked_file_snapshots(
     repo: Path,
     claimed_paths: list[str] | tuple[str, ...] = (),
+    pathspec: tuple[str, ...] = (),
 ) -> tuple[list[tuple[str, str]], int]:
-    files = untracked_sources(repo, claimed_paths).files
+    files = untracked_sources(repo, claimed_paths, pathspec).files
     omitted = 0
     included: list[tuple[str, str]] = []
     for rel in files:
@@ -3242,12 +3255,12 @@ def local_diff_capture(repo: Path, *args: str) -> tuple[str, str, str, list[str]
     return patch, "\0".join(records[:index]) + "\0", "\0".join(records[index:]) + "\0", paths
 
 
-def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
+def local_bundle(repo: Path, base_ref: str | None = None, pathspec: tuple[str, ...] = ()) -> CapturedBundle:
     if base_ref is not None:
         base_ref = validate_git_ref(repo, base_ref, "base", pin=True)
     staged_base = ("--end-of-options", base_ref) if base_ref is not None else ()
-    staged_patch, staged_raw, staged_numstat, staged_paths = local_diff_capture(repo, "--cached", *staged_base)
-    unstaged_patch, unstaged_raw, unstaged_numstat, unstaged_paths = local_diff_capture(repo)
+    staged_patch, staged_raw, staged_numstat, staged_paths = local_diff_capture(repo, "--cached", *staged_base, *pathspec)
+    unstaged_patch, unstaged_raw, unstaged_numstat, unstaged_paths = local_diff_capture(repo, *pathspec)
     require_no_binary_diff("local staged diff", staged_numstat, staged_raw)
     require_no_binary_diff("local unstaged diff", unstaged_numstat, unstaged_raw)
     unstaged_link_paths = {record[0] for record in gitlink_records(unstaged_raw)}
@@ -3265,7 +3278,7 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
     staged_links = gitlink_manifest(repo, staged_raw, local_base, None, "base -> index")
     unstaged_links = gitlink_manifest(repo, unstaged_raw, None, "working_tree", "index -> working_tree")
     untracked_snapshots, omitted_untracked = collect_untracked_file_snapshots(
-        repo, staged_paths + unstaged_paths,
+        repo, staged_paths + unstaged_paths, pathspec,
     )
     untracked = [rel for rel, _content in untracked_snapshots]
     omitted_tracked = len(
@@ -3278,7 +3291,7 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
         and not omitted_tracked
         and not omitted_untracked
     )
-    if empty_scope and base_ref is None:
+    if empty_scope and (base_ref is None or pathspec):
         raise SystemExit("no local changes to review")
     staged_blocked_paths = tracked_sensitive_paths(staged_paths)
     unstaged_blocked_paths = tracked_sensitive_paths(unstaged_paths)
@@ -3312,14 +3325,14 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
         (
             REVIEW_SECURITY_OMISSION
             if tracked_sensitive_paths(staged_paths)
-            else git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--stat", *staged_base)
+            else git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--stat", *staged_base, *pathspec)
         ),
         staged_patch,
         "# Unstaged Diff",
         (
             REVIEW_SECURITY_OMISSION
             if tracked_sensitive_paths(unstaged_paths)
-            else git(repo, "diff", *SAFE_DIFF_FLAGS, "--stat")
+            else git(repo, "diff", *SAFE_DIFF_FLAGS, "--stat", *pathspec)
         ),
         unstaged_patch,
     ]
@@ -3531,7 +3544,7 @@ def source_tree_snapshot(
     return head, index_entries, tuple(sorted(fingerprints))
 
 
-def branch_bundle(repo: Path, base_ref: str) -> CapturedBundle:
+def branch_bundle(repo: Path, base_ref: str, pathspec: tuple[str, ...] = ()) -> CapturedBundle:
     base_label = base_ref
     base_ref = validate_git_ref(repo, base_ref, "base", pin=True)
     head_ref = validate_git_ref(repo, "HEAD", "commit", pin=True)
@@ -3543,20 +3556,20 @@ def branch_bundle(repo: Path, base_ref: str) -> CapturedBundle:
         "--name-only",
         "-z",
         "--end-of-options",
-        merge_base, head_ref,
+        merge_base, head_ref, *pathspec,
     )
     branch_numstat = git(
         repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--numstat", "-z",
-        "--end-of-options", merge_base, head_ref,
+        "--end-of-options", merge_base, head_ref, *pathspec,
     )
     branch_raw = git(
         repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--raw", "--no-abbrev", "-z",
-        "--end-of-options", merge_base, head_ref,
+        "--end-of-options", merge_base, head_ref, *pathspec,
     )
     links = gitlink_manifest(repo, branch_raw, merge_base, head_ref, "merge-base -> HEAD")
     images = capture_added_branch_images(repo, branch_raw, branch_numstat)
     branch_patch = git(
-        repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--patch", "--end-of-options", merge_base, head_ref,
+        repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--patch", "--end-of-options", merge_base, head_ref, *pathspec,
     )
     omitted_paths = tracked_sensitive_paths(branch_paths)
     original_patch = branch_patch
@@ -3577,7 +3590,7 @@ def branch_bundle(repo: Path, base_ref: str) -> CapturedBundle:
                     *COMMIT_DIFF_FLAGS,
                     "--stat",
                     "--end-of-options",
-                    merge_base, head_ref,
+                    merge_base, head_ref, *pathspec,
                 )
             ),
         ]
@@ -3618,14 +3631,14 @@ def commit_diff_refs(repo: Path, commit_ref: str) -> tuple[str, ...]:
     return (*parents, commit_ref)
 
 
-def commit_bundle(repo: Path, commit_ref: str) -> CapturedBundle:
+def commit_bundle(repo: Path, commit_ref: str, pathspec: tuple[str, ...] = ()) -> CapturedBundle:
     refs = commit_diff_refs(repo, commit_ref)
-    commit_patch = git(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--patch", *refs)
-    commit_paths = git_path_list(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--name-only", "-z", *refs)
-    commit_raw = git(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--raw", "-z", *refs)
+    commit_patch = git(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--patch", *refs, *pathspec)
+    commit_paths = git_path_list(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--name-only", "-z", *refs, *pathspec)
+    commit_raw = git(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--raw", "-z", *refs, *pathspec)
     require_no_binary_diff(
         "commit diff",
-        git(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--numstat", "-z", *refs),
+        git(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--numstat", "-z", *refs, *pathspec),
         commit_raw,
     )
     links = gitlink_manifest(repo, commit_raw, refs[0] if len(refs) == 2 else "absent",
@@ -3635,7 +3648,7 @@ def commit_bundle(repo: Path, commit_ref: str) -> CapturedBundle:
     commit_summary = REVIEW_SECURITY_OMISSION
     if not blocked_paths:
         commit_summary = git(repo, "log", "-1", "--no-patch", "--format=fuller", refs[-1])
-        commit_summary += git(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--stat", *refs)
+        commit_summary += git(repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--stat", *refs, *pathspec)
     parent_header = f"parent: {refs[0]}" if len(refs) == 2 else "parent: none (verified raw root)"
     text = "\n\n".join(
         [
@@ -3650,13 +3663,42 @@ def commit_bundle(repo: Path, commit_ref: str) -> CapturedBundle:
     return CapturedBundle(text, paths, commit=refs[-1])
 
 
-def build_bundle(repo: Path, target: str, target_ref: str | None, commit_ref: str) -> CapturedBundle:
+def selected_review_paths(repo: Path, paths: Sequence[str]) -> tuple[str, ...]:
+    root = repo.resolve()
+    selected = []
+    for raw in paths:
+        path = Path(raw)
+        if not raw or "\0" in raw or ".." in path.parts or (not path.is_absolute() and path.drive):
+            raise SystemExit("--path requires a literal path inside the reviewed repository")
+        if path.is_absolute():
+            try:
+                path = path.relative_to(root)
+            except ValueError:
+                raise SystemExit("--path must stay inside the reviewed repository") from None
+        if not is_within((root / path).resolve(), root):
+            raise SystemExit("--path must stay inside the reviewed repository")
+        rel = path.as_posix()
+        if rel not in selected:
+            selected.append(rel)
+    return tuple(selected)
+
+
+def build_bundle(
+    repo: Path, target: str, target_ref: str | None, commit_ref: str,
+    paths: Sequence[str] = (),
+) -> CapturedBundle:
+    selected = selected_review_paths(repo, paths)
+    pathspec = ("--", *(f":(top,literal){'' if path == '.' else path}" for path in selected)) if selected else ()
     if target == "local":
-        return local_bundle(repo, target_ref)
-    if target == "branch":
+        captured = local_bundle(repo, target_ref, pathspec)
+    elif target == "branch":
         assert target_ref
-        return branch_bundle(repo, target_ref)
-    return commit_bundle(repo, commit_ref)
+        captured = branch_bundle(repo, target_ref, pathspec)
+    else:
+        captured = commit_bundle(repo, commit_ref, pathspec)
+    if selected and not captured.paths and REVIEW_SECURITY_OMISSION not in captured.text:
+        raise SystemExit("no changes to review in the selected --path scope")
+    return captured._replace(selected_paths=selected)
 
 
 def relative_evidence_path(repo: Path, raw_path: str, label: str) -> Path:
@@ -4906,6 +4948,11 @@ def prepare_selected_review(
     captured: CapturedBundle, evidence: EvidenceInputs,
 ) -> tuple[EvidenceInputs, list[str] | list[ReviewPass]]:
     evidence = capture_source_context_inputs(args, repo, captured, evidence)
+    if captured.selected_paths:
+        evidence = evidence._replace(prompt=(
+            "Review only the selected literal paths: " + json.dumps(captured.selected_paths)
+            + ". This is a partial review, not a whole-branch verdict.\n\n" + evidence.prompt
+        ))
     if getattr(args, "review_batches", None):
         return prepare_batch_review(args, repo, target, target_ref, captured, evidence)
     return evidence, prepare_review_prompts(
@@ -5402,7 +5449,7 @@ def ensure_codex_isolation_supported(
     repo: Path,
 ) -> str:
     selected_bin = args.codex_bin
-    codex_bin = resolve_command(selected_bin, repo)
+    codex_bin = select_codex_binary(args, repo)
     temp_root = safe_temp_root(repo, engine="codex")
     with tempfile.TemporaryDirectory(
         prefix="autoreview-codex-probe-workspace.",
@@ -5437,6 +5484,9 @@ def ensure_codex_isolation_supported(
             "Use an absolute --codex-bin path, set CODEX_BIN, or correct PATH. "
             "CODEX_HOME-dependent launchers are incompatible with autoreview isolation."
         )
+    args.codex_bin = codex_bin
+    print(f"codex executable: {display_escape(codex_bin, 1000)}", flush=True)
+    print(f"codex version: {display_escape(result.stdout.strip(), 500)}", flush=True)
     return codex_bin
 
 
@@ -7434,6 +7484,8 @@ def print_report(report: dict[str, Any], *, label: str = "autoreview") -> None:
     findings = report["findings"]
     display_label = display_escape(label, 200)
     status = report["review_status"]
+    if report.get("selected_paths"):
+        print("literal path scope (partial review): " + display_escape(json.dumps(report["selected_paths"]), 4000))
     if status == "incomplete":
         print(f"{display_label} incomplete: selected scope could not be certified")
     elif status == "filtered":
@@ -7518,6 +7570,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["auto", "local", "uncommitted", "branch", "commit"], default="auto")
     parser.add_argument("--base", help="Branch base, or explicit commit to compare with the index in local mode.")
     parser.add_argument("--commit", default="HEAD")
+    parser.add_argument("--path", action="append", help="Review only this literal repository file or directory. Repeatable; relative paths start at the repo root. A partial review, incompatible with review batches and PR preflight export.")
     parser.add_argument("--engine", choices=ENGINES, default=os.environ.get("AUTOREVIEW_ENGINE", "codex"))
     parser.add_argument("--native-handoff", help="Fresh private directory outside the repo for bound OpenClaw execution. Requires --engine openclaw; see references/openclaw.md.")
     parser.add_argument("--native-submit", action=NativeSubmitAction, nargs=2, metavar=("HANDOFF", "RESPONSE"), help="Commit a complete native response to an existing live exchange, remove its spool, and exit. No Git or reviewer startup.")
@@ -7552,7 +7605,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--openclaw-bin", default=os.environ.get("OPENCLAW_BIN", "openclaw"), help="Trusted host OpenClaw executable; never selected by a sandbox request.")
     parser.add_argument("--openclaw-config", help="Optional external operator config for direct OpenClaw execution. Omit to inherit normal native configuration and authentication.")
-    parser.add_argument("--codex-bin", default=os.environ.get("CODEX_BIN", "codex"))
+    parser.add_argument("--codex-bin", default=os.environ.get("CODEX_BIN"))
     parser.add_argument(
         "--codex-no-fallback",
         action="store_true",
@@ -7609,6 +7662,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expect-findings", action="store_true", help="Treat findings as success; for harness acceptance tests.")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    args.codex_bin_explicit = args.codex_bin is not None
+    if args.codex_bin is None:
+        args.codex_bin = "codex"
+    if args.path and (args.review_batches or args.preflight_output):
+        parser.error("--path is a partial review; use full scope for --review-batches or --preflight-output")
     if args.engine == "openclaw" and not args.native_handoff and args.openclaw_config is None:
         args.openclaw_config = os.environ.get("AUTOREVIEW_OPENCLAW_CONFIG")
     if args.engine not in ENGINES:
@@ -8037,6 +8095,11 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
     bin_name = bin_by_engine.get(engine)
     if bin_name is None:
         return False, f"unsupported engine: {engine}"
+    if engine == "codex":
+        try:
+            bin_name = select_codex_binary(reviewer, repo)
+        except SystemExit as exc:
+            return False, str(exc.code)
     if find_command(bin_name, repo) is None:
         return False, f"executable not found: {bin_name}"
     probe = ENGINE_ISOLATION_PROBES.get(engine)
@@ -8133,7 +8196,8 @@ def dry_run_preflight(
     bundle_ok = True
     try:
         with PreparationProgress("bundle preparation"):
-            captured = build_bundle(repo, target, target_ref, args.commit)
+            captured = build_bundle(repo, target, target_ref, args.commit,
+                                    **({"paths": args.path} if getattr(args, "path", None) else {}))
             for reviewer in reviewers:
                 require_image_engine(reviewer.engine, captured.images)
         if target == "commit":
@@ -8796,7 +8860,8 @@ def main_with_args(args: argparse.Namespace) -> int:
     if getattr(args, "preflight_output", None) and is_dirty(repo):
         raise SystemExit("source became dirty before preflight capture; commit changes and rerun")
     with PreparationProgress("bundle/evidence preparation"):
-        captured = build_bundle(repo, target, target_ref, args.commit)
+        captured = build_bundle(repo, target, target_ref, args.commit,
+                                **({"paths": args.path} if getattr(args, "path", None) else {}))
         if getattr(args, "preflight_output", None):
             if (not captured.paths or captured.commit != review_source_snapshot[0]
                     or not captured.base or not captured.commit
@@ -8848,6 +8913,8 @@ def main_with_args(args: argparse.Namespace) -> int:
         report = merge_chunk_reports(chunk_reports)
     if usage := review_usage_summary(args):
         report["usage"] = usage
+    if captured.selected_paths:
+        report["selected_paths"] = list(captured.selected_paths)
     missing = missing_required_findings(report, args.require_finding)
     if missing:
         report["missing_required_findings"] = missing

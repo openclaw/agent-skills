@@ -36,6 +36,7 @@ TEST_MODULES = {
         "skills.autoreview.tests.test_review_harness",
         "skills.autoreview.tests.test_prompt_budget",
         "skills.autoreview.tests.test_review_batches",
+        "skills.autoreview.tests.test_path_scope",
     ),
 }
 HARDENING_SHARDS = ("hardening-1", "hardening-2")

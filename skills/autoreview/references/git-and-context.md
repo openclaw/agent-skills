@@ -44,6 +44,23 @@
 - Differently named `AUTOREVIEW_GIT` override child cannot also select as `git`:
   explicit `--base` required. Rejected GitHub configuration paths: same requirement.
 
+## Path selection
+
+`--path` limits local, branch and commit capture to named files or directories.
+Repeat it to select a union. Git wildcard and exclusion syntax are literal names.
+Relative paths start at the repository root; `.` selects the root. Absolute paths
+must stay inside that root. Deleted paths are valid; traversal and symlink escapes
+are refused. Native path spelling is preserved, including literal POSIX backslashes.
+
+The same scope applies to staged, unstaged and untracked inputs, diff metadata,
+and finding authority. Selected sensitive inputs retain the existing omission
+rules. An empty selected delta fails before reviewer startup, including with an
+explicit local base. Without `--path`, existing empty-scope behavior is unchanged.
+
+Prompts and reports label the partial scope. Whole-repository mutation checks
+remain active. Extra evidence adds context, not finding authority. `--review-batches`
+and `--preflight-output` require full scope and cannot be combined with `--path`.
+
 ## Submodule pins
 
 Gitlink changes (mode `160000`) include full old/new commit IDs and the path's
