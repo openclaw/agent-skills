@@ -166,10 +166,35 @@ Handled interrupts attempt termination for every registered process even if one
 attempt fails. The first signal retains its exit status through buffered and
 streaming cleanup; later handled signals do not restart the sweep. Cleanup
 failures are reported by exception type, without changing cancellation into a
-retryable launch failure. Nested startup deferrals retain the first observed
-signal until the outer critical section finishes registration. Each direct
-helper launch has independent signal state, so catching one interrupt cannot
-disable cancellation of a later launch.
+retryable launch failure. Nested startup deferrals delay the batch sweep until
+the outer critical section finishes registration. The first signal records a
+durable cancellation request. Later Windows GO decisions reject it; a decision
+already holding the shared guard may finish authorizing the target. The callback
+waits for that guard before sweeping. The guard never spans pipe I/O or cleanup.
+Each invocation keeps one signal callback; direct helper launches have independent
+signal state, so catching one interrupt cannot disable cancellation of a later launch.
+The state remains visible through scope recovery: entering workers inherit its
+cancellation. One invocation-owned evidence collection retains cleanup failures
+and prior outcomes. For CLI-managed processes, each new cancellation delivery
+has its own exception, cause, traceback, and partial output.
+An exception already unwinding through its owning context is preserved. A new
+operation started from an earlier error handler reports its own cleanup failures.
+An interrupted sweep retains its process snapshot and completed phase attempts.
+Scope finalization makes one bounded recovery attempt, revisiting interrupted
+force-kill operations without repeating completed attempts or the shared grace wait.
+Handler restoration makes at most two passes, including recovery from an interrupt
+between handlers, and changes only dispositions still observed to be owned by that
+invocation. An owned signal takes priority over routine help or validation exits,
+while retaining the prior exit as diagnostic evidence. Ordinary exit and launch
+observations are retained separately from actual cleanup failures. Repeated
+interruptions or native cleanup errors remain reported failures; these bounds do
+not guarantee completed teardown or exactly-once operating-system effects.
+Handler-restoration failures retain an uncertain launch outcome. When cancellation
+supersedes that outcome, including interruption after a successful STARTED
+acknowledgement, direct launch callers receive this launch's exact known failure
+as the safe exception cause, preserving its protocol error chain. If no precise
+failure was observed, the cause records that the target may have started.
+The CLI retains this evidence internally and exits with the signal's status.
 
 Normalized `PATH`, `SSL_CERT_DIR` and `OPENCLAW_INCLUDE_ROOTS` entries must
 survive path-list serialization unchanged.

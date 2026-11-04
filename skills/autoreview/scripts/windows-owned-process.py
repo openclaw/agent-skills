@@ -4,6 +4,7 @@ The caller admits the interpreter and this file, registers Startup.process and
 Startup.job before finish(), and closes the job when unregistering the process.
 """
 
+import contextlib
 import ctypes
 from ctypes import wintypes
 import errno
@@ -247,8 +248,10 @@ class Startup:
                     cleanup()
                 except BaseException as error:
                     if not isinstance(error, Exception) and isinstance(failure, Exception):
-                        error.startup_failure = failure
-                        error.__cause__ = None
+                        error.prior_outcomes = (*getattr(error, "prior_outcomes", ()), failure)
+                        error.cleanup_errors = (*getattr(error, "cleanup_errors", ()),
+                                                *getattr(failure, "cleanup_errors", ()))
+                        error.__dict__.setdefault("startup_failure", failure)
                         error.__suppress_context__ = True
                         failure = error
                     else:
@@ -265,10 +268,13 @@ class Startup:
             # Cancellation and GO share one decision: a pre-GO timeout cannot
             # subsequently release the target from this worker.
             with self.state_lock:
-                if self.cancelled or time.monotonic() >= self.deadline:
-                    raise TimeoutError("Windows startup expired before GO")
-                # Even a partial GO write is conservatively potentially launched.
-                self.go_sent = True
+                decision = self.launch_decision() if self.launch_decision is not None else contextlib.nullcontext(True)
+                with decision as allowed:
+                    if not allowed or self.cancelled or time.monotonic() >= self.deadline:
+                        raise TimeoutError("Windows startup expired before GO")
+                    # Commit authorization under the shared cancellation guard.
+                    # No signal callback waits on the pipe write below.
+                    self.go_sent = True
             write_frame(self.writer, self.frame)
             result = read_frame(self.reader)
             if (result.get("operation") == "error"
@@ -290,13 +296,14 @@ class Startup:
             self._close_control()
             self.done.set()
 
-    def finish(self, deadline):
+    def finish(self, deadline, *, launch_decision=None):
         if self.worker is not None:
             raise RuntimeError("Windows startup can only be awaited once")
         with self.state_lock:
             if self.cancelled:
                 raise RuntimeError("Windows startup was already aborted")
             self.deadline = deadline
+            self.launch_decision = launch_decision
         allowance = max(0, deadline - time.monotonic())
         # The worker owns its raw endpoints until I/O ends, but a broken peer
         # must not turn bounded startup cleanup into an unbounded interpreter exit.

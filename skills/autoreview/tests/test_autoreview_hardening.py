@@ -37,6 +37,17 @@ PRIVATE_KEY_BEGIN_TEXT = "BEGIN " + "PRIVATE KEY"
 RSA_PRIVATE_KEY_BEGIN_TEXT = "BEGIN RSA " + "PRIVATE KEY"
 
 
+@contextlib.contextmanager
+def working_directory(repo: Path):
+    # Main discovers its source boundary from cwd before invoking Git.
+    previous = Path.cwd()
+    try:
+        os.chdir(repo)
+        yield
+    finally:
+        os.chdir(previous)
+
+
 def write_executable(path: Path, text: str) -> Path:
     path.write_text(text, encoding="utf-8")
     path.chmod(0o755)
@@ -1162,8 +1173,7 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                         if expect:
                             argv.append("--expect-findings")
                         text = io.StringIO()
-                        with mock.patch.dict(self.helper["main_impl"].__globals__, {
-                            "repo_root": lambda: repo,
+                        with working_directory(repo), mock.patch.dict(self.helper["main_impl"].__globals__, {
                             "prepare_review_prompts": lambda *args: original_prepare(*args) * count,
                             "run_engine": lambda *_: json.dumps({**provider, "review_completion": "complete"}),
                         }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(text), \
@@ -2857,8 +2867,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 return json.dumps({**report, "review_completion": "complete"})
 
             main = self.helper["main_impl"]
-            with mock.patch.dict(main.__globals__, {
-                "repo_root": lambda: repo,
+            with working_directory(repo), mock.patch.dict(main.__globals__, {
                 "run_engine": run_engine,
                 "resolve_engine_binary": lambda _reviewer, _repo: (True, None),
             }):
@@ -2998,8 +3007,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             argv = [str(SCRIPT), "--engine", "codex", "--mode", "local", "--base", "review-base",
                     *datasets, "--json-output", str(root / "report.json"),
                     "--status-output", str(root / "status.json")]
-            with self.without_reviewer_defaults(), mock.patch.dict(main.__globals__, {
-                "repo_root": lambda: repo, "run_engine": engine,
+            with working_directory(repo), self.without_reviewer_defaults(), mock.patch.dict(main.__globals__, {
+                "run_engine": engine,
                 "resolve_engine_binary": lambda _reviewer, _repo: (True, None),
             }):
                 output = io.StringIO()
@@ -3141,8 +3150,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
                             "--base", base if mode == "local" else head,
                             "--json-output", str(outputs / "report.json"),
                             "--status-output", str(outputs / "status.json")]
-                    with self.without_reviewer_defaults(), mock.patch.dict(self.helper["main_impl"].__globals__, {
-                        "repo_root": lambda: repo, "run_engine": engine,
+                    with working_directory(repo), self.without_reviewer_defaults(), mock.patch.dict(self.helper["main_impl"].__globals__, {
+                        "run_engine": engine,
                     }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                         if exit_code is None:
                             with self.assertRaises(self.helper["ReviewerUnavailable"]):
@@ -3334,8 +3343,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                             argv.extend(["--require-finding", needle])
                         if expect:
                             argv.append("--expect-findings")
-                        with self.without_reviewer_defaults(), mock.patch.dict(self.helper["main_impl"].__globals__, {
-                            "repo_root": lambda: repo,
+                        with working_directory(repo), self.without_reviewer_defaults(), mock.patch.dict(self.helper["main_impl"].__globals__, {
                             "build_review_prompts": lambda *_args: ["synthetic pack"] * count,
                             "run_engine": lambda *_args: json.dumps({**provider, "review_completion": "complete"}),
                         }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -3470,8 +3478,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     engine = mock.Mock(side_effect=reply)
                     stdout, stderr = io.StringIO(), io.StringIO()
                     main = self.helper["main_impl"]
-                    with mock.patch.dict(main.__globals__, {
-                        "repo_root": lambda: repo,
+                    with working_directory(repo), mock.patch.dict(main.__globals__, {
                         "resolve_engine_binary": lambda *_args: (True, None),
                         "run_engine": engine,
                     }), mock.patch.object(sys, "argv", argv), \
@@ -3561,8 +3568,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                                 expected_exit = 2 if not complete else int(not has_finding) if expect else int(has_finding)
                                 finalized = mock.Mock(wraps=status_fn)
                                 text = io.StringIO()
-                                with mock.patch.dict(self.helper["main_impl"].__globals__, {
-                                    "repo_root": lambda: repo,
+                                with working_directory(repo), mock.patch.dict(self.helper["main_impl"].__globals__, {
                                     "build_review_prompts": lambda *_: ["synthetic pack"] * len(completions),
                                     "run_engine": engine, "review_status": finalized,
                                 }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(text), \
@@ -3635,8 +3641,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                                 "--output", str(human)]
                         engine = mock.Mock(side_effect=[clean] * (count - 1) + [failure])
                         stdout = io.StringIO()
-                        with mock.patch.dict(self.helper["main_impl"].__globals__, {
-                            "repo_root": lambda: repo,
+                        with working_directory(repo), mock.patch.dict(self.helper["main_impl"].__globals__, {
                             "build_review_prompts": lambda *_args: ["synthetic pack"] * count,
                             "run_engine": engine,
                         }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
@@ -5795,6 +5800,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             repo = root / "repo"
             upstream = root / "upstream"
             config = root / "operator"
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
             for path in (repo, upstream, config):
                 path.mkdir()
             boundary = self.helper["UNTRUSTED_SOURCE_ROOTS"]
@@ -5814,7 +5821,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                                 raise
                             try:
                                 with mock.patch.dict(os.environ, {
-                                    "HOME": str(root), "USERPROFILE": str(root),
+                                    "PATH": str(bin_dir), "HOME": str(root), "USERPROFILE": str(root),
                                     "PI_CODING_AGENT_DIR": str(config),
                                 }, clear=True), self.assertRaisesRegex(SystemExit, "Pi configuration.*outside"):
                                     self.helper["safe_engine_env"](repo, engine="pi")
@@ -6067,6 +6074,512 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 kernel.CloseHandle(handle)
 
     @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_outer_deferral_cancels_registration_and_ready_before_go(self) -> None:
+        module = self.helper["_load_windows_process_module"](
+            str(SCRIPT.with_name("windows-owned-process.py")))
+        namespace = self.helper["start_owned_process"].__globals__
+        real_spawn = module.spawn
+        real_read = module.read_frame
+        real_write = module.write_frame
+        real_register = self.helper["register_owned_process"]
+        real_sweep = self.helper["terminate_owned_processes"]
+        interrupted = self.helper["EngineInterrupted"]
+        for phase in ("registration", "ready", "ready-close-error"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as handles:
+                cwd = Path(temp).resolve()
+                witness = cwd / "must-not-run"
+                startups = []
+                supervisor_waits = []
+                events = []
+                writes = []
+                finishes = []
+                interruptions = []
+                close_failures = []
+                close_error = OSError("private-control-close-detail")
+                ready = threading.Event()
+                release_ready = threading.Event()
+
+                def cancel():
+                    # The outer deferral owns delivery, but cannot authorize GO.
+                    signal.raise_signal(signal.SIGTERM)
+                    signal.raise_signal(signal.SIGINT)
+
+                def observe_spawn(*args, **kwargs):
+                    startup = real_spawn(*args, **kwargs)
+                    startups.append(startup)
+                    supervisor_waits.append(handles.enter_context(
+                        self.windows_process_handle(startup.process.pid)))
+                    finish = startup.finish
+
+                    def observe_finish(*finish_args, **finish_kwargs):
+                        finishes.append(True)
+                        return finish(*finish_args, **finish_kwargs)
+
+                    startup.finish = observe_finish
+                    if phase == "ready-close-error":
+                        close = module.os.close
+                        reader = startup.reader
+
+                        def fail_after_close(descriptor):
+                            close(descriptor)
+                            if descriptor == reader and not close_failures:
+                                close_failures.append(True)
+                                raise close_error
+
+                        handles.enter_context(mock.patch.object(module.os, "close", fail_after_close))
+                    if phase.startswith("ready"):
+                        wait = startup.done.wait
+
+                        def signal_during_ready(timeout):
+                            self.assertTrue(ready.wait(10), "supervisor did not send READY")
+                            cancel()
+                            release_ready.set()
+                            return wait(timeout)
+
+                        startup.done.wait = signal_during_ready
+                    return startup
+
+                def register_then_cancel(proc, job=None):
+                    real_register(proc, job)
+                    if phase == "registration":
+                        cancel()
+
+                def hold_ready(descriptor):
+                    frame = real_read(descriptor)
+                    if phase.startswith("ready") and frame.get("operation") == "ready":
+                        # Consume a real READY, then let the main thread's actual
+                        # signal handler run before the worker decides about GO.
+                        ready.set()
+                        if not release_ready.wait(10):
+                            raise TimeoutError("test did not release the READY gate")
+                    return frame
+
+                def observe_write(descriptor, frame):
+                    writes.append(frame)
+                    return real_write(descriptor, frame)
+
+                def observe_sweep(*args, **kwargs):
+                    events.append("sweep")
+                    return real_sweep(*args, **kwargs)
+
+                def invocation():
+                    with self.helper["deferred_owned_process_signals"]():
+                        with self.assertRaises(interrupted) as raised:
+                            self.helper["start_owned_process"](
+                                [sys.executable, "-I", "-S", "-c",
+                                 "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(witness)],
+                                cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True,
+                            )
+                        interruptions.append(raised.exception)
+                        self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                        self.assertEqual(events, [])
+                        self.assertEqual(namespace["_OWNED_PROCESSES"], {})
+                        self.assertEqual(supervisor_waits[0](5000), 0)
+                        events.append("local cleanup")
+                    self.fail("outermost deferral did not deliver cancellation")
+
+                try:
+                    with mock.patch.object(module, "spawn", observe_spawn), \
+                            mock.patch.object(module, "read_frame", hold_ready), \
+                            mock.patch.object(module, "write_frame", observe_write), \
+                            mock.patch.dict(namespace, {
+                                "register_owned_process": register_then_cancel,
+                                "terminate_owned_processes": observe_sweep,
+                                "main_impl": invocation,
+                            }):
+                        self.assertEqual(self.helper["main"](), 128 + signal.SIGTERM)
+                    self.assertEqual(events, ["local cleanup", "sweep"])
+                    self.assertEqual(finishes, [] if phase == "registration" else [True])
+                    if phase == "ready-close-error":
+                        self.assertEqual(close_failures, [True])
+                        self.assertIn(close_error, interruptions[0].cleanup_errors)
+                        self.assertIsInstance(interruptions[0].startup_failure, subprocess.TimeoutExpired)
+                    self.assertEqual(writes, [])
+                    self.assertFalse(witness.exists())
+                    self.assertEqual(len(startups), 1)
+                    startup = startups[0]
+                    self.assertFalse(startup.go_sent)
+                    self.assertIsNone(startup.reader)
+                    self.assertIsNone(startup.writer)
+                    self.assertTrue(startup.process.stdout.closed)
+                    self.assertTrue(startup.process.stderr.closed)
+                finally:
+                    release_ready.set()
+                    for startup in startups:
+                        if startup.process.pid in namespace["_OWNED_PROCESSES"]:
+                            self.helper["finish_owned_process"](
+                                startup.process, startup.abort, startup.close)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_restoration_recovers_cancel_before_worker_go(self) -> None:
+        module = self.helper["_load_windows_process_module"](
+            str(SCRIPT.with_name("windows-owned-process.py")))
+        namespace = self.helper["start_owned_process"].__globals__
+        real_spawn, real_read, real_write = module.spawn, module.read_frame, module.write_frame
+        real_signal = signal.signal
+        ready, release = threading.Event(), threading.Event()
+        startups, waits, descriptors, writes, outcomes, injected = [], [], [], [], [], []
+        worker = None
+        decisions_before_deadline = []
+        with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as handles:
+            cwd = Path(temp).resolve()
+            witness = cwd / "must-not-run"
+            for number in self.helper["_handled_signal_numbers"]():
+                handles.callback(real_signal, number, signal.getsignal(number))
+            # Give restored SIGINT an explicit prior disposition instead of
+            # depending on an ambient ignored signal or returning callback.
+            real_signal(signal.SIGINT, signal.default_int_handler)
+
+            def observe_spawn(*args, **kwargs):
+                startup = real_spawn(*args, **kwargs)
+                startups.append(startup)
+                descriptors.extend((startup.reader, startup.writer))
+                waits.append(handles.enter_context(self.windows_process_handle(startup.process.pid)))
+                return startup
+
+            def hold_ready(descriptor):
+                frame = real_read(descriptor)
+                if frame.get("operation") == "ready":
+                    ready.set()
+                    if not release.wait(15):
+                        raise TimeoutError("test did not release READY after restoration")
+                return frame
+
+            def observe_write(descriptor, frame):
+                writes.append(frame)
+                return real_write(descriptor, frame)
+
+            def launch_worker():
+                try:
+                    proc = self.helper["start_owned_process"](
+                        [sys.executable, "-I", "-S", "-c",
+                         "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(witness)],
+                        cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True,
+                    )
+                    outcomes.append(proc)
+                except BaseException as error:
+                    outcomes.append(error)
+
+            try:
+                with mock.patch.object(module, "spawn", observe_spawn), \
+                        mock.patch.object(module, "read_frame", hold_ready), \
+                        mock.patch.object(module, "write_frame", observe_write):
+                    with self.assertRaises(self.helper["EngineInterrupted"]) as raised:
+                        with self.helper["OwnedProcessSignalHandlers"]() as scope:
+                            state = scope.state
+                            decision_lock = state.decision_lock
+
+                            class InterruptedLockEntry:
+                                def __enter__(self):
+                                    decision_lock.acquire()
+                                    try:
+                                        if (threading.current_thread() is threading.main_thread()
+                                                and state.signals and not injected):
+                                            injected.append(state.signals["first"])
+                                            # The first callback recorded SIGTERM but
+                                            # has not finished its guarded transition.
+                                            signal.raise_signal(signal.SIGINT)
+                                    except BaseException:
+                                        # The fault belongs to callback entry, not a
+                                        # leaked fixture lock that blocks the worker.
+                                        decision_lock.release()
+                                        raise
+                                    if threading.current_thread() is not threading.main_thread():
+                                        decisions_before_deadline.append(
+                                            time.monotonic() < startups[0].deadline)
+                                    return self
+
+                                def __exit__(self, *exc_info):
+                                    decision_lock.release()
+
+                            def restore_then_interrupt(number, handler):
+                                result = real_signal(number, handler)
+                                if (number == signal.SIGINT and handler is signal.default_int_handler
+                                        and ready.is_set() and not injected):
+                                    signal.raise_signal(signal.SIGTERM)
+                                return result
+
+                            # Keep both hooks live through the owning scope exit.
+                            handles.enter_context(mock.patch.object(state, "decision_lock", InterruptedLockEntry()))
+                            handles.enter_context(mock.patch.object(signal, "signal", restore_then_interrupt))
+                            worker = threading.Thread(target=launch_worker, daemon=True)
+                            worker.start()
+                            self.assertTrue(ready.wait(10), "worker did not consume native READY")
+                            self.assertIn(startups[0].process.pid, namespace["_OWNED_PROCESSES"])
+                    self.assertEqual(injected, [signal.SIGTERM])
+                    self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                    # Scope recovery must leave durable cancellation for a worker
+                    # that retained the state but has not made its GO decision.
+                    self.assertTrue(worker.is_alive())
+                    self.assertFalse(startups[0].cancelled)
+                    release.set()
+                    worker.join(timeout=10)
+                    self.assertFalse(worker.is_alive())
+                    self.assertEqual(len(outcomes), 1)
+                    self.assertIsNot(outcomes[0], raised.exception)
+                    self.assertEqual(outcomes[0].code, raised.exception.code)
+                    self.assertEqual(decisions_before_deadline, [True])
+                    self.assertEqual(writes, [])
+                    self.assertFalse(witness.exists())
+                    self.assertEqual(len(startups), 1)
+                    startup = startups[0]
+                    self.assertFalse(startup.go_sent)
+                    self.assertEqual(waits[0](5000), 0)
+                    self.assertEqual(namespace["_OWNED_PROCESSES"], {})
+                    self.assertIsNone(startup.reader)
+                    self.assertIsNone(startup.writer)
+                    for descriptor in descriptors:
+                        with self.assertRaises(OSError):
+                            os.fstat(descriptor)
+                    self.assertTrue(startup.process.stdout.closed)
+                    self.assertTrue(startup.process.stderr.closed)
+            finally:
+                release.set()
+                if worker is not None:
+                    worker.join(timeout=10)
+                for startup in startups:
+                    if startup.process.pid in namespace["_OWNED_PROCESSES"]:
+                        self.helper["finish_owned_process"](
+                            startup.process, startup.abort, startup.close)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_go_wins_signal_overlap_retains_launch_outcome(self) -> None:
+        module = self.helper["_load_windows_process_module"](
+            str(SCRIPT.with_name("windows-owned-process.py")))
+        namespace = self.helper["start_owned_process"].__globals__
+        real_spawn = module.spawn
+        real_write = module.write_frame
+        real_sweep = self.helper["terminate_owned_processes"]
+        startups, native_waits, records, sweeps, interruptions = [], [], [], [], []
+        control_descriptors = []
+        entered = threading.Event()
+        release = threading.Event()
+        observer = None
+        with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as handles:
+            cwd = Path(temp).resolve()
+            witness = cwd / "target.pid"
+            with self.helper["OwnedProcessSignalHandlers"]() as scope:
+                state = scope.state
+                real_decision = state.launch_decision
+
+                @contextlib.contextmanager
+                def hold_authorized_decision():
+                    with real_decision() as allowed:
+                        # Authorization acquired the real shared guard first.
+                        # Pause before GO commits so the signal must arbitrate.
+                        entered.set()
+                        if not release.wait(10):
+                            raise TimeoutError("test did not release GO arbitration")
+                        yield allowed
+
+                def release_after_signal_recorded():
+                    try:
+                        deadline = time.monotonic() + 5
+                        while time.monotonic() < deadline:
+                            if state.signals:
+                                records.append((state.signals["first"], startups[0].go_sent))
+                                return
+                            time.sleep(0.001)
+                    finally:
+                        release.set()
+
+                def observe_spawn(*args, **kwargs):
+                    startup = real_spawn(*args, **kwargs)
+                    startups.append(startup)
+                    control_descriptors.extend((startup.reader, startup.writer))
+                    native_waits.append(handles.enter_context(
+                        self.windows_process_handle(startup.process.pid)))
+                    wait = startup.done.wait
+
+                    def interrupt_while_guard_held(timeout):
+                        nonlocal observer
+                        self.assertTrue(entered.wait(10), "worker did not acquire GO guard")
+                        observer = threading.Thread(target=release_after_signal_recorded)
+                        observer.start()
+                        # This actual main-thread handler records SIGTERM, then
+                        # waits for the worker's already-owned decision guard.
+                        signal.raise_signal(signal.SIGTERM)
+                        return wait(timeout)
+
+                    startup.done.wait = interrupt_while_guard_held
+                    return startup
+
+                def observe_go(descriptor, frame):
+                    real_write(descriptor, frame)
+                    # The real target executes before outer deferral permits a
+                    # sweep. Retain its exact native identity for the exit check.
+                    pid = int(self.wait_for_process_witness(witness))
+                    wait = handles.enter_context(self.windows_process_handle(pid))
+                    native_waits.append(wait)
+                    self.assertEqual(wait(0), 258)
+
+                def observe_sweep(*args, **kwargs):
+                    sweeps.append(True)
+                    real_sweep(*args, **kwargs)
+
+                try:
+                    with mock.patch.object(state, "launch_decision", hold_authorized_decision), \
+                            mock.patch.object(module, "spawn", observe_spawn), \
+                            mock.patch.object(module, "write_frame", observe_go), \
+                            mock.patch.dict(namespace, {"terminate_owned_processes": observe_sweep}):
+                        with self.assertRaises(self.helper["EngineInterrupted"]) as raised:
+                            with self.helper["deferred_owned_process_signals"]():
+                                try:
+                                    self.helper["start_owned_process"](
+                                        [sys.executable, "-I", "-S", "-c",
+                                         "import os,pathlib,sys,time; "
+                                         "p=pathlib.Path(sys.argv[1]); q=p.with_suffix('.pending'); "
+                                         "q.write_text(str(os.getpid())); q.replace(p); time.sleep(120)",
+                                         str(witness)], cwd, stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                    )
+                                except self.helper["EngineInterrupted"] as interrupted:
+                                    interruptions.append(interrupted)
+                                    self.assertEqual(sweeps, [])
+                                    self.assertEqual(namespace["_OWNED_PROCESSES"], {})
+                                    raise
+                        self.assertEqual(sweeps, [True])
+                    self.assertEqual(records, [(signal.SIGTERM, False)])
+                    self.assertEqual(len(interruptions), 1)
+                    self.assertIs(raised.exception, interruptions[0])
+                    self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                    self.assertIsInstance(raised.exception.__cause__, module.LaunchIndeterminate)
+                    self.assertIs(raised.exception.startup_failure, raised.exception.__cause__)
+                    self.assertIsNone(raised.exception.__cause__.__cause__)
+                    self.assertNotIn(str(witness), str(raised.exception.__cause__))
+                    self.assertEqual(len(native_waits), 2)
+                    for wait in native_waits:
+                        self.assertEqual(wait(5000), 0)
+                    startup = startups[0]
+                    self.assertTrue(startup.go_sent)
+                    self.assertFalse(startup.worker.is_alive())
+                    self.assertIsNone(startup.reader)
+                    self.assertIsNone(startup.writer)
+                    for descriptor in control_descriptors:
+                        with self.assertRaises(OSError):
+                            os.fstat(descriptor)
+                    self.assertTrue(startup.process.stdout.closed)
+                    self.assertTrue(startup.process.stderr.closed)
+                finally:
+                    release.set()
+                    if observer is not None:
+                        observer.join(timeout=10)
+                        self.assertFalse(observer.is_alive())
+                    for startup in startups:
+                        if startup.process.pid in namespace["_OWNED_PROCESSES"]:
+                            self.helper["finish_owned_process"](
+                                startup.process, startup.abort, startup.close)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_successful_start_restore_failure_is_indeterminate(self) -> None:
+        self.assert_successful_start_restore_outcome("error")
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_successful_start_restore_cancellation_retains_outcome(self) -> None:
+        for fault in ("owned-signal", "restored-signal"):
+            with self.subTest(fault=fault):
+                self.assert_successful_start_restore_outcome(fault)
+
+    def assert_successful_start_restore_outcome(self, fault: str) -> None:
+        module = self.helper["_load_windows_process_module"](
+            str(SCRIPT.with_name("windows-owned-process.py")))
+        real_spawn = module.spawn
+        real_signal = signal.signal
+        restore_error = OSError("private-handler-restore-detail")
+        startups = []
+        target_waits = []
+        successful = []
+        faults = []
+        cancellations = []
+        with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as handles:
+            cwd = Path(temp).resolve()
+            witness = cwd / "target.pid"
+            # A restored SIGINT must raise independently of the test runner's
+            # ambient disposition (which may be SIG_IGN or a returning callback).
+            ambient_int = signal.getsignal(signal.SIGINT)
+            handles.callback(real_signal, signal.SIGINT, ambient_int)
+            real_signal(signal.SIGINT, signal.default_int_handler)
+            previous = {number: signal.getsignal(number)
+                        for number in self.helper["_handled_signal_numbers"]()}
+            for number, handler in previous.items():
+                handles.callback(real_signal, number, handler)
+
+            def observe_spawn(*args, **kwargs):
+                startup = real_spawn(*args, **kwargs)
+                startups.append(startup)
+                finish = startup.finish
+
+                def observe_finish(*finish_args, **finish_kwargs):
+                    result = finish(*finish_args, **finish_kwargs)
+                    # STARTED was received; independently prove the target has
+                    # executed and is still alive before failure at handoff.
+                    pid = int(self.wait_for_process_witness(witness))
+                    wait = handles.enter_context(self.windows_process_handle(pid))
+                    target_waits.append(wait)
+                    self.assertEqual(wait(0), 258)
+                    successful.append(True)
+                    return result
+
+                startup.finish = observe_finish
+                return startup
+
+            def restore_then_fail(number, handler):
+                result = real_signal(number, handler)
+                if (successful and not faults and number == signal.SIGINT
+                        and handler is previous[number]):
+                    faults.append(True)
+                    if fault == "error":
+                        raise restore_error
+                    # SIGINT has just been restored; SIGTERM is still owned by
+                    # the invocation. Both can interrupt the successful handoff.
+                    try:
+                        signal.raise_signal(signal.SIGTERM if fault == "owned-signal" else signal.SIGINT)
+                    except BaseException as cancellation:
+                        cancellations.append(cancellation)
+                        raise
+                return result
+
+            with mock.patch.object(module, "spawn", observe_spawn), \
+                    mock.patch.object(signal, "signal", restore_then_fail):
+                expected = (module.LaunchIndeterminate if fault == "error" else
+                            self.helper["EngineInterrupted"] if fault == "owned-signal" else KeyboardInterrupt)
+                with self.assertRaises(expected) as raised:
+                    self.helper["start_owned_process"](
+                        [sys.executable, "-I", "-S", "-c",
+                         "import os,pathlib,sys,time; "
+                         "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(120)",
+                         str(witness)], cwd, stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    )
+            self.assertEqual(successful, [True])
+            self.assertEqual(faults, [True])
+            if fault == "error":
+                outcome = raised.exception
+                self.assertIn(restore_error, outcome.cleanup_errors)
+            else:
+                self.assertEqual(len(cancellations), 1)
+                self.assertIs(raised.exception, cancellations[0])
+                if fault == "owned-signal":
+                    self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                outcome = raised.exception.__cause__
+                self.assertIsInstance(outcome, module.LaunchIndeterminate)
+                self.assertIs(raised.exception.startup_failure, outcome)
+            self.assertIsNone(outcome.__cause__)
+            self.assertIn("Windows target may have started", str(outcome))
+            self.assertNotIn("private-handler-restore-detail", str(outcome))
+            self.assertNotIn(str(witness), str(outcome))
+            self.assertEqual(target_waits[0](5000), 0)
+            startup = startups[0]
+            startup.process.wait(timeout=5)
+            self.assertEqual(self.helper["_OWNED_PROCESSES"], {})
+            self.assertIsNone(startup.reader)
+            self.assertIsNone(startup.writer)
+            self.assertTrue(startup.process.stdout.closed)
+            self.assertTrue(startup.process.stderr.closed)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
     def test_windows_lost_start_acknowledgement_terminates_owned_target(self) -> None:
         self.assert_lost_acknowledgement_cleanup(abort_fails=False)
 
@@ -6086,9 +6599,18 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_windows_cleanup_cancellation_retains_post_go_uncertainty(self) -> None:
         self.assert_lost_acknowledgement_cleanup(abort_fails=True, cancelled=True)
 
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_lost_acknowledgement_survives_handler_restore_failure(self) -> None:
+        self.assert_lost_acknowledgement_cleanup(abort_fails=False, restore_fault="error")
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_restore_signal_retains_lost_acknowledgement(self) -> None:
+        self.assert_lost_acknowledgement_cleanup(abort_fails=False, restore_fault="signal")
+
     def assert_lost_acknowledgement_cleanup(self, *, abort_fails: bool,
                                            control_close_fails: bool = False,
-                                           stalled: bool = False, cancelled: bool = False) -> None:
+                                           stalled: bool = False, cancelled: bool = False,
+                                           restore_fault: str | None = None) -> None:
         supervisor = str(SCRIPT.with_name("windows-owned-process.py"))
         module = self.helper["_load_windows_process_module"](supervisor)
         real_spawn = module.spawn
@@ -6098,6 +6620,12 @@ class AutoreviewHardeningTests(unittest.TestCase):
         cleanup_error = (self.helper["EngineInterrupted"](130) if cancelled
                          else subprocess.TimeoutExpired("private-target-argument", 2))
         control_error = OSError("private-control-detail")
+        restore_error = OSError("private-handler-restore-detail")
+        launch_failures = []
+        restore_faults = []
+        real_signal = signal.signal
+        previous = {number: signal.getsignal(number)
+                    for number in self.helper["_handled_signal_numbers"]()}
         control_descriptors = []
         control_faults = []
         target_waits = []
@@ -6123,6 +6651,16 @@ class AutoreviewHardeningTests(unittest.TestCase):
             def observe_spawn(*args, **kwargs):
                 startup = real_spawn(*args, **kwargs)
                 startups.append(startup)
+                finish = startup.finish
+
+                def observe_finish(*finish_args, **finish_kwargs):
+                    try:
+                        return finish(*finish_args, **finish_kwargs)
+                    except module.LaunchIndeterminate as failure:
+                        launch_failures.append(failure)
+                        raise
+
+                startup.finish = observe_finish
                 supervisor_waits.append(startup.process.wait)
                 control_descriptors.extend((startup.reader, startup.writer))
                 if control_close_fails:
@@ -6157,18 +6695,48 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 os.dup2(eof_reader, startup.reader, inheritable=False)
                 injected.append(True)
 
+            def restore_then_fault(number, handler):
+                result = real_signal(number, handler)
+                if (restore_fault and launch_failures and not restore_faults
+                        and number == signal.SIGINT and handler is previous[number]):
+                    restore_faults.append(True)
+                    if restore_fault == "signal":
+                        # Keep a generic restoration error active when the real
+                        # handler observes SIGTERM. The root owner must retain
+                        # this launch's exact lost-STARTED outcome over that metadata.
+                        try:
+                            raise restore_error
+                        except OSError:
+                            signal.raise_signal(signal.SIGTERM)
+                    else:
+                        raise restore_error
+                return result
+
+            for number, handler in previous.items():
+                handles.callback(real_signal, number, handler)
             with mock.patch.object(module, "spawn", observe_spawn), mock.patch.object(
                 module, "write_frame", lose_acknowledgement,
-            ):
-                expected = self.helper["EngineInterrupted"] if cancelled else module.LaunchIndeterminate
+            ), mock.patch.object(signal, "signal", restore_then_fault):
+                expected = (self.helper["EngineInterrupted"]
+                            if cancelled or restore_fault == "signal" else module.LaunchIndeterminate)
                 with self.assertRaises(expected) as raised:
                     self.helper["run_with_heartbeat"](
                         [sys.executable, "-I", "-S", "-c", target_code, str(witness)],
                         cwd, label="lost-start-acknowledgement", max_runtime_seconds=5 if stalled else 20,
                     )
 
-            launch_failure = raised.exception.__cause__ if cancelled else raised.exception
+            launch_failure = (raised.exception.__cause__
+                              if cancelled or restore_fault == "signal" else raised.exception)
             self.assertIsInstance(launch_failure, module.LaunchIndeterminate)
+            self.assertEqual(len(launch_failures), 1)
+            self.assertIs(launch_failure, launch_failures[0])
+            if restore_fault:
+                self.assertEqual(restore_faults, [True])
+                if restore_fault == "signal":
+                    self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                else:
+                    self.assertIn(restore_error, launch_failure.cleanup_errors)
+                    self.assertNotIn("private-handler-restore-detail", str(launch_failure))
             if stalled:
                 self.assertIn("acknowledgement timed out", str(launch_failure))
             else:

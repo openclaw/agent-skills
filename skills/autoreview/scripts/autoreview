@@ -32,7 +32,7 @@ import time
 import unicodedata
 import urllib.parse
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, NamedTuple
 
@@ -1915,20 +1915,51 @@ def safe_engine_env(
     return env
 
 
+class _CancellationEvidence:
+    """Invocation-owned observations shared by independent signal deliveries."""
+
+    def __init__(self) -> None:
+        self.cleanup_errors: dict[int, BaseException] = {}
+        self.prior_outcomes: dict[int, BaseException] = {}
+
+    def retain(self, target: dict[int, BaseException], errors: Iterable[BaseException]) -> None:
+        for error in errors:
+            # Another delivery of this cancellation is control flow, not a new
+            # failure. Retaining it would also make the evidence refer to itself.
+            if isinstance(error, EngineInterrupted) and error._evidence is self:
+                continue
+            target.setdefault(id(error), error)
+
+
 class EngineInterrupted(BaseException):
-    """Raised after in-flight engine process groups have been terminated.
+    """One cancellation delivery, with private cause, traceback and output.
 
     Subclasses BaseException directly (not SystemExit): internal
-    ``except SystemExit`` guards scattered through this script (secret
-    handling and file-read status helpers)
-    would otherwise catch and swallow the interrupt, letting the run
-    continue instead of unwinding.
+    ``except SystemExit`` guards must not swallow cancellation. Diagnostic
+    evidence is shared by the invocation; exception propagation is not.
     """
 
-    def __init__(self, code: int) -> None:
+    def __init__(self, code: int, *, evidence: _CancellationEvidence | None = None) -> None:
         super().__init__(code)
         self.code = code
         self.stdout = ""
+        self._evidence = evidence if evidence is not None else _CancellationEvidence()
+
+    @property
+    def cleanup_errors(self) -> tuple[BaseException, ...]:
+        return tuple(self._evidence.cleanup_errors.values())
+
+    @cleanup_errors.setter
+    def cleanup_errors(self, errors: Iterable[BaseException]) -> None:
+        self._evidence.retain(self._evidence.cleanup_errors, errors)
+
+    @property
+    def prior_outcomes(self) -> tuple[BaseException, ...]:
+        return tuple(self._evidence.prior_outcomes.values())
+
+    @prior_outcomes.setter
+    def prior_outcomes(self, outcomes: Iterable[BaseException]) -> None:
+        self._evidence.retain(self._evidence.prior_outcomes, outcomes)
 
 
 class OwnedProcess(NamedTuple):
@@ -1939,8 +1970,75 @@ class OwnedProcess(NamedTuple):
 class _OwnedProcessSignalState:
     def __init__(self) -> None:
         self.signals: dict[str, int] = {}
+        self.decision_lock = threading.RLock()
         self.deferrals = 0
-        self.dispatched = False
+        self.sweeping = False
+        self.sweep = _OwnedProcessSweep()
+        self.evidence = _CancellationEvidence()
+
+    def __call__(self, signum: int, _frame: Any) -> None:
+        # The installed callback already owns its state. Claim the signal
+        # before any context lookup, exception construction, or other helper.
+        self.signals.setdefault("first", signum)
+        self.wait_for_launch_decision()
+        self.dispatch()
+
+    def wait_for_launch_decision(self) -> None:
+        # Nested callbacks may record another signal while this RLock is held.
+        # Defer their sweep until the outer callback releases arbitration too.
+        self.deferrals += 1
+        try:
+            with self.decision_lock:
+                pass
+        finally:
+            self.deferrals -= 1
+
+    @contextlib.contextmanager
+    def launch_decision(self):
+        # The caller commits GO under this guard, then releases it before I/O.
+        # Cancellation and authorization have one winner, even across threads.
+        with self.decision_lock:
+            yield not self.signals
+
+    def cancellation(self) -> EngineInterrupted | None:
+        if not self.signals:
+            return None
+        return EngineInterrupted(128 + self.signals["first"], evidence=self.evidence)
+
+    def check_launch(self) -> None:
+        if interrupted := self.cancellation():
+            # Deferral postpones the batch sweep, never permission to launch.
+            raise interrupted from interrupted.__cause__
+
+    def dispatch(self, unwinding: BaseException | None = None) -> None:
+        if not self.signals or self.deferrals or self.sweeping:
+            return
+        # Recovery may arrive after a restored handler interrupted the callback.
+        # The durable request already blocks later GO decisions; wait out any
+        # decision that acquired the guard before the request before sweeping.
+        self.wait_for_launch_decision()
+        self.retain_cleanup_errors(self.sweep.errors)
+        if self.sweep.completed:
+            return
+        # Only an explicit current unwind may reuse its delivery. A caller can
+        # start another operation while handling an earlier cancellation.
+        interrupted = (unwinding if isinstance(unwinding, EngineInterrupted)
+                       and unwinding._evidence is self.evidence else self.cancellation())
+        if unwinding is not None and unwinding is not interrupted:
+            interrupted.prior_outcomes = (unwinding,)
+            interrupted.cleanup_errors = getattr(unwinding, "cleanup_errors", ())
+            interrupted.__dict__.setdefault("startup_failure", unwinding)
+        try:
+            self.sweeping = True
+            terminate_owned_processes(self.sweep)
+        except BaseException as error:
+            self.retain_cleanup_errors((error, *getattr(error, "cleanup_errors", ()), *self.sweep.errors))
+        finally:
+            self.sweeping = False
+        raise interrupted from interrupted.__cause__
+
+    def retain_cleanup_errors(self, errors: Iterable[BaseException]) -> None:
+        self.evidence.retain(self.evidence.cleanup_errors, errors)
 
 
 _OWNED_PROCESS_SIGNAL_STATE: _OwnedProcessSignalState | None = None
@@ -1978,9 +2076,10 @@ def unregister_owned_process(proc: subprocess.Popen[str]) -> None:
 
 
 def finish_owned_process(proc: subprocess.Popen[str], terminate: Callable[[], None] | None = None,
-                         finalize: Callable[[], None] | None = None, *, close_streams: bool = True) -> None:
-    """Release owned resources without replacing an active cancellation."""
-    active = sys.exc_info()[1]
+                         finalize: Callable[[], None] | None = None, *, close_streams: bool = True,
+                         unwinding: BaseException | None = None) -> None:
+    """Release resources while preserving only this operation's cancellation."""
+    active = unwinding
     errors: list[BaseException] = []
     try:
         if terminate is not None:
@@ -2045,6 +2144,7 @@ def start_owned_process(
     """Register the lifetime owner before permitting a Windows target to start."""
     startup = None
     proc = None
+    launch_failure = None
     finalized = False
 
     def cleanup(failure: BaseException) -> None:
@@ -2056,16 +2156,20 @@ def start_owned_process(
                 try:
                     finish_owned_process(proc, startup.abort if startup is not None
                                          else lambda: terminate_process_group(proc),
-                                         startup.close if startup is not None else None)
+                                         startup.close if startup is not None else None,
+                                         unwinding=failure)
                 except BaseException as cleanup_error:
                     if not isinstance(cleanup_error, Exception) and isinstance(failure, Exception):
                         # Cancellation exits the invocation. Retain post-GO knowledge
                         # as its safe cause, never as permission to retry. Other
                         # startup errors may format private argv in a traceback.
-                        cleanup_error.startup_failure = failure
+                        cleanup_error.prior_outcomes = (*getattr(cleanup_error, "prior_outcomes", ()), failure)
+                        cleanup_error.cleanup_errors = (*getattr(cleanup_error, "cleanup_errors", ()),
+                                                        *getattr(failure, "cleanup_errors", ()))
+                        cleanup_error.__dict__.setdefault("startup_failure", failure)
                         if startup is not None and isinstance(failure, module.LaunchIndeterminate):
                             raise cleanup_error from failure
-                        raise cleanup_error from None
+                        raise cleanup_error from cleanup_error.__cause__
                     # An abort timeout cannot downgrade post-GO uncertainty. Retain
                     # the original protocol cause and all secondary cleanup errors.
                     failure.cleanup_errors = (*getattr(failure, "cleanup_errors", ()), cleanup_error)
@@ -2073,8 +2177,10 @@ def start_owned_process(
             finalized = True
 
     try:
-        with OwnedProcessSignalHandlers():
+        with OwnedProcessSignalHandlers() as signal_scope:
             try:
+                if signal_scope.state is not None:
+                    signal_scope.state.check_launch()
                 if os.name == "nt":
                     supervisor = Path(__file__).absolute().with_name("windows-owned-process.py")
                     # A Windows venv executable redirects through a waiting parent that
@@ -2093,63 +2199,129 @@ def start_owned_process(
                         startup = module.spawn(str(interpreter), str(supervisor), args, cwd=cwd, **kwargs)
                         proc = startup.process
                         register_owned_process(proc, startup.job)
-                    startup.finish(min(time.monotonic() + 10, deadline) if deadline is not None
-                                   else time.monotonic() + 10)
+                    if signal_scope.state is not None:
+                        signal_scope.state.check_launch()
+                    try:
+                        startup.finish(
+                            min(time.monotonic() + 10, deadline) if deadline is not None
+                            else time.monotonic() + 10,
+                            launch_decision=signal_scope.state.launch_decision
+                            if signal_scope.state is not None else None,
+                        )
+                    except subprocess.TimeoutExpired as failure:
+                        interrupted = (signal_scope.state.cancellation()
+                                       if signal_scope.state is not None else None)
+                        if interrupted is not None:
+                            interrupted.prior_outcomes = (*getattr(interrupted, "prior_outcomes", ()), failure)
+                            interrupted.cleanup_errors = (*getattr(interrupted, "cleanup_errors", ()),
+                                                          *getattr(failure, "cleanup_errors", ()))
+                            interrupted.__dict__.setdefault("startup_failure", failure)
+                            raise interrupted from interrupted.__cause__
+                        raise
                 else:
                     with deferred_owned_process_signals():
                         proc = subprocess.Popen(args, cwd=cwd, **kwargs, **process_group_popen_kwargs())
                         register_owned_process(proc)
+                if signal_scope.state is not None:
+                    signal_scope.state.check_launch()
                 return proc
             except BaseException as failure:
+                # This belongs to the current launch. Shared cancellation
+                # metadata may describe a different owner or a restore failure.
+                if startup is not None and isinstance(failure, module.LaunchIndeterminate):
+                    launch_failure = failure
                 cleanup(failure)
                 raise
     except BaseException as failure:
         # Scope restoration can fail after startup succeeded but before the
-        # caller receives the process. That failed handoff still owns cleanup.
+        # caller receives the process. Preserve that launch knowledge before
+        # cleanup, since cleanup may itself be interrupted.
+        if startup is not None and startup.go_sent and not startup.reported_error:
+            if not isinstance(failure, Exception):
+                prior = launch_failure
+                if prior is None:
+                    prior = module.LaunchIndeterminate(
+                        "Windows target may have started; launch finalization was interrupted")
+                # Keep observations from every owner, but select this launch's
+                # exact cause, including its original protocol failure chain.
+                failure.prior_outcomes = (*getattr(failure, "prior_outcomes", ()), prior)
+                failure.cleanup_errors = (*getattr(failure, "cleanup_errors", ()),
+                                          *getattr(prior, "cleanup_errors", ()))
+                failure.startup_failure = prior
+                cleanup(failure)
+                raise failure from prior
+            if not isinstance(failure, module.LaunchIndeterminate):
+                uncertain = module.LaunchIndeterminate("Windows target may have started; launch finalization failed")
+                uncertain.cleanup_errors = (failure, *getattr(failure, "cleanup_errors", ()))
+                cleanup(uncertain)
+                raise uncertain from None
         cleanup(failure)
         raise
 
 
-def terminate_owned_processes() -> None:
-    with _OWNED_PROCESS_LOCK:
-        owned = list(_OWNED_PROCESSES.values())
-    processes = [entry.process for entry in owned]
-    # Keep the exact job references even if another worker unregisters while
-    # this cancellation sweep runs. Closing a job is synchronized and idempotent.
-    jobs = {entry.process: entry.job for entry in owned} if os.name == "nt" else {}
-    # Phase 1: signal every owned group up front. Phase 2/3 then pay one
-    # shared grace window for the whole batch instead of one grace window
-    # per registered engine process, which used to make interrupt handling
-    # take grace_seconds * len(processes).
-    errors: list[BaseException] = []
-    survivors = []
-    for proc in processes:
+class _OwnedProcessSweep:
+    """Retain completed attempts when a restored handler interrupts a sweep."""
+
+    def __init__(self) -> None:
+        self.owned: tuple[OwnedProcess, ...] | None = None
+        self.signaled: dict[OwnedProcess, bool] = {}
+        self.waited = False
+        self.enforced: set[OwnedProcess] = set()
+        self.errors: list[BaseException] = []
+        self.completed = False
+
+
+def terminate_owned_processes(sweep: _OwnedProcessSweep | None = None) -> None:
+    sweep = sweep if sweep is not None else _OwnedProcessSweep()
+    if sweep.owned is None:
+        with _OWNED_PROCESS_LOCK:
+            sweep.owned = tuple(_OWNED_PROCESSES.values())
+    # Retain exact process/job identities even if another thread unregisters.
+    # Finish phase 1 for every entry before spending one shared grace window.
+    for entry in sweep.owned:
+        if entry in sweep.signaled:
+            continue
+        needs_enforcement = True
         try:
-            if (_signal_owned_process_group(proc, job=jobs[proc]) if jobs
-                    else _signal_owned_process_group(proc)):
-                survivors.append(proc)
+            needs_enforcement = (_signal_owned_process_group(entry.process, job=entry.job)
+                                 if entry.job is not None else _signal_owned_process_group(entry.process))
         except BaseException as error:
-            errors.append(error)
-            # A failed first signal still needs enforcement, and must not stop
-            # cancellation from reaching the other registered processes.
-            survivors.append(proc)
-    if survivors:
+            sweep.errors.append(error)
+        finally:
+            # An interrupted/failed signal still gets enforcement, but a resumed
+            # logical sweep does not repeat its completed phase-1 attempt.
+            sweep.signaled[entry] = needs_enforcement
+    survivors = [entry for entry in sweep.owned if sweep.signaled[entry]]
+    if survivors and not sweep.waited:
         try:
-            _await_owned_process_groups(survivors, _OWNED_PROCESS_GRACE_SECONDS)
+            _await_owned_process_groups([entry.process for entry in survivors], _OWNED_PROCESS_GRACE_SECONDS)
         except BaseException as error:
-            errors.append(error)
-        for proc in survivors:
-            try:
-                if jobs:
-                    _enforce_owned_process_group(proc, _OWNED_PROCESS_GRACE_SECONDS, job=jobs[proc])
-                else:
-                    _enforce_owned_process_group(proc, _OWNED_PROCESS_GRACE_SECONDS)
-            except BaseException as error:
-                errors.append(error)
-    if errors:
-        primary = next((error for error in errors if not isinstance(error, Exception)), errors[0])
+            sweep.errors.append(error)
+        finally:
+            # Recovery does not restart a partially spent grace period.
+            sweep.waited = True
+    for entry in survivors:
+        if entry in sweep.enforced:
+            continue
+        try:
+            if entry.job is not None:
+                _enforce_owned_process_group(entry.process, _OWNED_PROCESS_GRACE_SECONDS, job=entry.job)
+            else:
+                _enforce_owned_process_group(entry.process, _OWNED_PROCESS_GRACE_SECONDS)
+        except BaseException as error:
+            sweep.errors.append(error)
+            # Ordinary native failures are completed attempts. An asynchronous
+            # interruption can precede the actual kill, so leave that entry for
+            # the invocation's one recovery pass.
+            if isinstance(error, Exception):
+                sweep.enforced.add(entry)
+        else:
+            sweep.enforced.add(entry)
+    sweep.completed = all(entry in sweep.enforced for entry in survivors)
+    if sweep.errors:
+        primary = next((error for error in sweep.errors if not isinstance(error, Exception)), sweep.errors[0])
         primary.cleanup_errors = (*getattr(primary, "cleanup_errors", ()),
-                                  *(error for error in errors if error is not primary))
+                                  *(error for error in sweep.errors if error is not primary))
         raise primary
 
 
@@ -2242,25 +2414,6 @@ def terminate_process_group(
     _enforce_owned_process_group(proc, grace_seconds)
 
 
-def engine_signal_handler(signum: int, _frame: Any) -> None:
-    with OwnedProcessSignalHandlers() as scope:
-        state = scope.state
-        # Claim the observed signal before constructing an exception or doing
-        # anything that can be interrupted by another delivered signal.
-        first_signal = state.signals.setdefault("first", signum)
-        if state.deferrals or state.dispatched:
-            return
-        state.dispatched = True
-        interrupted = EngineInterrupted(128 + first_signal)
-        try:
-            terminate_owned_processes()
-        except BaseException as error:
-            interrupted.cleanup_errors = (error, *getattr(error, "cleanup_errors", ()))
-        # A failing cancellation sweep cannot turn this signal into a timeout or
-        # a retryable launch failure. Never render raw cleanup exception text.
-        raise interrupted from None
-
-
 def _handled_signal_numbers() -> list[int]:
     handled_signals = [signal.SIGINT, signal.SIGTERM]
     if hasattr(signal, "SIGHUP"):
@@ -2285,7 +2438,7 @@ class OwnedProcessSignalHandlers:
         self.owns_state = True
         try:
             for signum in self.previous:
-                signal.signal(signum, engine_signal_handler)
+                signal.signal(signum, self.state)
         except BaseException:
             self.__exit__(*sys.exc_info())
             raise
@@ -2296,39 +2449,71 @@ class OwnedProcessSignalHandlers:
         if not self.owns_state:
             return
         errors: list[BaseException] = []
+        cancellation = None
+
+        def retain(error: BaseException) -> None:
+            nonlocal cancellation
+            errors.append(error)
+            if cancellation is None and isinstance(error, (EngineInterrupted, KeyboardInterrupt)):
+                # Preserve the signal observed at this catch boundary, rather
+                # than a different signal received during a later restoration.
+                cancellation = (error if isinstance(error, EngineInterrupted)
+                                and error._evidence is self.state.evidence
+                                else self.state.cancellation() or error)
+
+        def restore() -> None:
+            try:
+                for signum, handler in self.previous.items():
+                    try:
+                        if signal.getsignal(signum) is self.state:
+                            signal.signal(signum, handler)
+                    except BaseException as error:
+                        retain(error)
+            except BaseException as error:
+                # Iterator advancement is also interruptible. The complete
+                # mapping remains available to the one recovery pass.
+                retain(error)
+
         try:
-            for signum, handler in self.previous.items():
-                try:
-                    signal.signal(signum, handler)
-                except BaseException as error:
-                    errors.append(error)
+            try:
+                restore()
+            finally:
+                # Retry only dispositions still observed to be ours. This also
+                # covers an interruption between two restoration operations.
+                restore()
+            try:
+                self.state.dispatch(cancellation or _exc)
+            except BaseException as error:
+                retain(error)
+            if errors:
+                if _exc is not None and (isinstance(_exc, (EngineInterrupted, KeyboardInterrupt))
+                                         or cancellation is None):
+                    _exc.cleanup_errors = (*getattr(_exc, "cleanup_errors", ()), *errors)
+                    return
+                primary = cancellation or errors[0]
+                primary.cleanup_errors = (*getattr(primary, "cleanup_errors", ()),
+                                          *(error for error in errors if error is not primary))
+                if _exc is not None:
+                    # The startup owner can promote its known safe post-GO
+                    # outcome; generic restoration must not overwrite it.
+                    primary.prior_outcomes = (*getattr(primary, "prior_outcomes", ()), _exc)
+                    primary.cleanup_errors = (*getattr(primary, "cleanup_errors", ()),
+                                              *getattr(_exc, "cleanup_errors", ()))
+                    primary.__dict__.setdefault("startup_failure", _exc)
+                raise primary from primary.__cause__
         finally:
+            # Entering workers inherit cancellation throughout restoration and
+            # recovery, including after the sweep captured its owned snapshot.
             _OWNED_PROCESS_SIGNAL_STATE = None
-        if errors:
-            if isinstance(_exc, (EngineInterrupted, KeyboardInterrupt)):
-                _exc.cleanup_errors = (*getattr(_exc, "cleanup_errors", ()), *errors)
-                return
-            primary = next((error for error in errors if not isinstance(error, Exception)), errors[0])
-            primary.cleanup_errors = (*getattr(primary, "cleanup_errors", ()),
-                                      *(error for error in errors if error is not primary))
-            raise primary from None
 
 
 @contextlib.contextmanager
 def deferred_owned_process_signals():
-    """Defer handled-signal delivery across a spawn+register critical section.
+    """Postpone the batch sweep until the outer registration section exits.
 
-    A signal arriving between Popen() and register_owned_process() would
-    orphan the just-spawned group: the signal handler cannot terminate a
-    process it does not know about yet. For the duration of the wrapped
-    critical section, swap the handled signals (the same set
-    OwnedProcessSignalHandlers installs) to a collector that just records
-    the signal number. On exit, restore the previous handlers and, if a
-    signal was collected, run the real handler logic -- by then the
-    child is registered, so cleanup includes it.
-
-    Main-thread spawns keep the explicit signal deferral below so a handler
-    cannot interrupt the same thread before registration.
+    The invocation keeps one installed callback. Nested deferrals only change
+    depth; they never swap handlers or authorize a cancelled Windows target.
+    Worker spawns retain the registry lock instead of installing signal handlers.
     """
     if threading.current_thread() is not threading.main_thread():
         with _OWNED_PROCESS_LOCK:
@@ -2338,24 +2523,15 @@ def deferred_owned_process_signals():
     with OwnedProcessSignalHandlers() as scope:
         state = scope.state
         state.deferrals += 1
-
-        def _collect(signum: int, frame: Any) -> None:
-            # Record into the invocation before any handler can be restored.
-            engine_signal_handler(signum, frame)
-
-        previous = {signum: signal.getsignal(signum) for signum in _handled_signal_numbers()}
+        unwinding = None
         try:
-            for signum in previous:
-                signal.signal(signum, _collect)
             yield
+        except BaseException as error:
+            unwinding = error
+            raise
         finally:
-            try:
-                for signum, handler in previous.items():
-                    signal.signal(signum, handler)
-            finally:
-                state.deferrals -= 1
-                if state.signals and not state.deferrals:
-                    engine_signal_handler(state.signals["first"], None)
+            state.deferrals -= 1
+            state.dispatch(unwinding)
 
 
 def emit_heartbeat(
@@ -2644,6 +2820,7 @@ def run_with_heartbeat(
         if deadline.expired():
             return deadline.completed_process(args, "", "", cleanup_errors=getattr(failure, "cleanup_errors", ()))
         raise
+    unwinding = None
     try:
         first_communicate = True
         while True:
@@ -2669,6 +2846,7 @@ def run_with_heartbeat(
                     return deadline.completed_process(args, stdout, stderr)
                 emit_heartbeat(label, started, proc)
     except EngineInterrupted as exc:
+        unwinding = exc
         try:
             exc.stdout, _stderr = proc.communicate(timeout=_TIMED_OUT_STREAM_DRAIN_SECONDS)
         except subprocess.TimeoutExpired as drain_timeout:
@@ -2676,8 +2854,12 @@ def run_with_heartbeat(
         except BaseException as error:
             exc.cleanup_errors = (*getattr(exc, "cleanup_errors", ()), error)
         raise
+    except KeyboardInterrupt as exc:
+        unwinding = exc
+        raise
     finally:
-        finish_owned_process(proc, None if deadline.terminated else lambda: terminate_process_group(proc))
+        finish_owned_process(proc, None if deadline.terminated else lambda: terminate_process_group(proc),
+                             unwinding=unwinding)
 
 
 def run_with_stream(
@@ -2711,6 +2893,7 @@ def run_with_stream(
                 return deadline.completed_process(args, "", "", cleanup_errors=getattr(failure, "cleanup_errors", ()))
             raise
         collection_entered = False
+        unwinding = None
         try:
             if engine_stage is not None:
                 try:
@@ -2732,15 +2915,17 @@ def run_with_stream(
             )
             terminal = "engine_timeout" if isinstance(result, TimedOutEngineProcess) else "returned"
             return result
-        except EngineInterrupted as exc:
-            exc.stdout = "".join(stdout_parts)
+        except (EngineInterrupted, KeyboardInterrupt) as exc:
+            unwinding = exc
+            if isinstance(exc, EngineInterrupted):
+                exc.stdout = "".join(stdout_parts)
             raise
         finally:
             # Collector workers own their streams once entered; otherwise this
             # finalizer owns them. In both cases release the registered lifetime.
             finish_owned_process(
                 proc, None if deadline.terminated else lambda: terminate_process_group(proc),
-                close_streams=not collection_entered,
+                close_streams=not collection_entered, unwinding=unwinding,
             )
     except (EngineInterrupted, KeyboardInterrupt):
         terminal = "interrupted"
@@ -3056,6 +3241,7 @@ def preflight_git() -> bool:
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            unwinding = None
             try:
                 code = proc.wait(timeout=max(0, expires_at - time.monotonic()))
                 if code == 0:
@@ -3063,8 +3249,12 @@ def preflight_git() -> bool:
                 reason = f"exit {code}"
             except subprocess.TimeoutExpired:
                 reason = "timed out after 10s"
+            except (EngineInterrupted, KeyboardInterrupt) as exc:
+                unwinding = exc
+                raise
             finally:
-                finish_owned_process(proc, lambda: terminate_process_group(proc, grace_seconds=0.1))
+                finish_owned_process(proc, lambda: terminate_process_group(proc, grace_seconds=0.1),
+                                     unwinding=unwinding)
         except subprocess.TimeoutExpired as failure:
             reason = "timed out after 10s"
             if errors := getattr(failure, "cleanup_errors", ()):
