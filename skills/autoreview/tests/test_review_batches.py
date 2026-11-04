@@ -1890,6 +1890,96 @@ class ExecutableSearchPathTests(unittest.TestCase):
                 self.helper["safe_engine_path"](self.repo)
         self.assertEqual(self.helper["safe_engine_path"](self.repo), str(self.trusted))
 
+    def test_admission_rechecks_component_topology_with_unchanged_referents(self):
+        for mutation in ("prefix", "symlink", "missing"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory(dir=self.root) as temporary:
+                root = Path(temporary)
+                dependencies = root / "dependencies"
+                dependencies.mkdir()
+                target = self.executable(dependencies / "tool", "exit 0\n")
+                link = self.contaminated / "tool"
+                future = root / "future"
+                alias = self.source / mutation
+                link.symlink_to(future / "tool" if mutation == "missing" else target)
+                original_scandir = os.scandir
+
+                def change_after_component_capture(path):
+                    children = original_scandir(path)
+                    if Path(path) == self.trusted:
+                        # Followed identities remain unchanged, but a source-owned
+                        # component now controls the already inspected lookup.
+                        if mutation == "prefix":
+                            displaced = root / "displaced"
+                            dependencies.rename(displaced)
+                            alias.symlink_to(displaced, target_is_directory=True)
+                            dependencies.symlink_to(alias, target_is_directory=True)
+                        elif mutation == "symlink":
+                            alias.symlink_to(target)
+                            link.unlink()
+                            link.symlink_to(alias)
+                        else:
+                            # Both followed observations still report missing.
+                            future.symlink_to(alias, target_is_directory=True)
+                    return children
+
+                try:
+                    with mock.patch("os.scandir", side_effect=change_after_component_capture):
+                        with self.assertRaisesRegex(SystemExit, "filesystem paths changed"):
+                            self.helper["safe_engine_path"](self.repo)
+                    self.assertFalse(self.helper["external_env_path"](self.repo, str(link)))
+                finally:
+                    link.unlink()
+                    alias.unlink(missing_ok=True)
+
+    def test_admission_rechecks_custody_metadata_after_component_capture(self):
+        for mutation in ("mode", "hardlink"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory(dir=self.root) as temporary:
+                target = self.executable(Path(temporary) / "tool", "exit 0\n")
+                link = self.contaminated / "tool"
+                link.symlink_to(target)
+                shared = self.source / "shared-tool"
+                original_scandir = os.scandir
+
+                def change_after_component_capture(path):
+                    children = original_scandir(path)
+                    if Path(path) == self.trusted:
+                        # The inode is stable while metadata used by admission
+                        # changes; a new source hardlink also removes custody.
+                        if mutation == "mode":
+                            target.chmod(0o555)
+                        else:
+                            os.link(target, shared)
+                    return children
+
+                try:
+                    with mock.patch("os.scandir", side_effect=change_after_component_capture):
+                        with self.assertRaisesRegex(SystemExit, "filesystem paths changed"):
+                            self.helper["safe_engine_path"](self.repo)
+                    if mutation == "hardlink":
+                        self.assertFalse(self.helper["independent_file_custody"](target))
+                finally:
+                    link.unlink()
+                    shared.unlink(missing_ok=True)
+
+    def test_admission_allows_unrelated_sibling_changes(self):
+        target = self.executable(self.root / "tool", "exit 0\n")
+        (self.contaminated / "tool").symlink_to(target)
+        original_scandir = os.scandir
+
+        def create_sibling_after_component_capture(path):
+            children = original_scandir(path)
+            if Path(path) == self.trusted:
+                # Shared ancestors can change their child inventory while all
+                # consumed lookup entries and custody remain unchanged.
+                sibling = self.root / "unrelated-directory"
+                sibling.mkdir()
+                (sibling / "note").write_text("unrelated activity\n")
+            return children
+
+        with mock.patch("os.scandir", side_effect=create_sibling_after_component_capture):
+            self.assertEqual(self.helper["safe_engine_path"](self.repo),
+                             os.pathsep.join(map(str, (self.contaminated, self.trusted))))
+
 
 @unittest.skipIf(os.name == "nt", "POSIX executable and symlink fixtures")
 class GitConsumerPathTests(unittest.TestCase):

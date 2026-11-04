@@ -1592,7 +1592,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
     @contextlib.contextmanager
     def preparation_fixture(self, *options):
         with tempfile.TemporaryDirectory() as tempdir:
-            repo = init_repo(Path(tempdir))
+            repo = init_repo(Path(tempdir)).resolve()
             # Protected review reads ignore host Git config, including Windows autocrlf.
             git(repo, "config", "core.autocrlf", "false")
             for index in range(24):
@@ -1618,12 +1618,16 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 })
 
             with self.without_reviewer_defaults(), mock.patch.dict(self.helper["main_impl"].__globals__, {
-                "repo_root": lambda: repo,
                 "run_engine": engine,
                 "resolve_engine_binary": lambda *_args: (True, None),
             }), mock.patch.object(sys, "argv", [str(SCRIPT), "--engine", "codex", "--mode", "local", *options]), \
                     contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                yield repo, sends, stdout, stderr
+                previous_cwd = Path.cwd()
+                try:
+                    os.chdir(repo)
+                    yield repo, sends, stdout, stderr
+                finally:
+                    os.chdir(previous_cwd)
 
     @contextlib.contextmanager
     def committed_context_fixture(self, *options, path="src/token_count.py", role="--source-context",
@@ -2156,7 +2160,15 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 # Explicit evidence has its own initial capture and three fresh
                 # checks; finding membership never adds another content read.
                 self.assertEqual(read.call_count, 5 if explicit else 1)
-                self.assertEqual(fingerprint.call_count, 3 * 27)
+                # Metadata custody also fingerprints .git records; these checks
+                # count each reviewed working file in the three full snapshots.
+                working_files = [repo / name for name in (".gitignore", "source.md", "note.md")]
+                working_files.extend(repo / f"unchanged-{index}.txt" for index in range(24))
+                self.assertCountEqual(
+                    [call.args[0] for call in fingerprint.call_args_list
+                     if not call.args[0].is_relative_to(repo / ".git")],
+                    working_files * 3,
+                )
                 for index in range(24):
                     self.assertEqual(sum(call.args[0] == repo / f"unchanged-{index}.txt"
                                          for call in fingerprint.call_args_list), 3)
@@ -5488,6 +5500,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             repo = init_repo(root)
+            selected_git = self.helper["resolve_git"](repo)
             repo_bin = repo / "bin"
             trusted_bin = root / "trusted-bin"
             repo_bin.mkdir()
@@ -5502,7 +5515,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 },
                 clear=False,
             ):
-                env = self.helper["safe_git_env"](repo)
+                env = self.helper["safe_git_env"](repo, selected_git=selected_git)
 
         self.assertNotIn(str(repo_bin.resolve()), env["PATH"].split(os.pathsep))
         self.assertIn(str(trusted_bin.resolve()), env["PATH"].split(os.pathsep))

@@ -919,6 +919,10 @@ def independent_file_custody(path: str | Path) -> bool:
         return True
     except (OSError, ValueError):
         return False
+    return _independent_file_custody(path, metadata)
+
+
+def _independent_file_custody(path: str | Path, metadata: os.stat_result) -> bool:
     try:
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink <= 1:
             return True
@@ -955,7 +959,7 @@ def admit_executable_directories(
         boundary = capture_external_env_boundary(repo)
     except (OSError, RuntimeError, ValueError) as exc:
         raise SystemExit("cannot inspect source roots for executable PATH admission") from exc
-    admission = ExternalEnvAdmission(boundary, {}, {})
+    admission = ExternalEnvAdmission(boundary, {}, {}, {}, {})
     entries: list[str] = []
     admitted: set[Path] = set()
 
@@ -974,7 +978,12 @@ def admit_executable_directories(
             # a launcher might import. Redirectors also need source-path checks.
             with os.scandir(resolved) as children:
                 for child in children:
-                    if not independent_file_custody(child.path):
+                    try:
+                        # Windows DirEntry.stat omits the hardlink count.
+                        metadata = os.stat(child.path) if os.name == "nt" else child.stat()
+                    except (FileNotFoundError, NotADirectoryError):
+                        metadata = None
+                    if metadata is not None and not _independent_file_custody(child.path, metadata):
                         return None
                     needs_check = not child.is_file(follow_symlinks=False)
                     if os.name == "nt":
@@ -1027,6 +1036,10 @@ def admit_executable_directories(
     try:
         unchanged_paths = all(path_identity(path) == identity
                               for path, identity in admission.observed.items())
+        unchanged_paths = unchanged_paths and all(
+            capture_path_entry(path).identity == observation.identity
+            for path, observation in admission.entries.items()
+        )
     except (OSError, RuntimeError, ValueError):
         unchanged_paths = False
     if not unchanged_paths:
@@ -1072,10 +1085,52 @@ class ExternalEnvBoundary(NamedTuple):
     identities: frozenset[tuple[int, int]]
 
 
+class PathEntryObservation(NamedTuple):
+    state: str
+    signature: tuple[int, ...]
+    target: str | None
+    metadata: os.stat_result | None
+
+    @property
+    def identity(self) -> tuple[str, tuple[int, ...], str | None]:
+        return self.state, self.signature, self.target
+
+
 class ExternalEnvAdmission(NamedTuple):
     boundary: ExternalEnvBoundary
     observed: dict[Path, tuple[str, int, int]]
     owned: dict[Path, bool]
+    entries: dict[Path, PathEntryObservation]
+    children: dict[tuple[Path, str], Path]
+
+
+def capture_path_entry(path: Path) -> PathEntryObservation:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return PathEntryObservation("missing", (), None, None)
+    except NotADirectoryError:
+        return PathEntryObservation("not_directory", (), None, None)
+
+    def signature(info: os.stat_result) -> tuple[int, ...]:
+        # Reading a link can update atime without changing its lookup or custody.
+        identity = (info.st_dev, info.st_ino, info.st_mode,
+                    info.st_uid, info.st_gid, info.st_rdev)
+        # Directory child inventory may change without changing this component.
+        # Each consumed child has its own observation instead.
+        if stat.S_ISDIR(info.st_mode):
+            return identity
+        return (*identity, info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    identity = signature(metadata)
+    target = None
+    if stat.S_ISLNK(metadata.st_mode):
+        target = os.readlink(path)
+        # Disappearance or a type change after the first lstat invalidates the
+        # capture; it must never turn into a reusable missing-path observation.
+        if signature(path.lstat()) != identity:
+            raise OSError("filesystem entry changed during executable PATH admission")
+    return PathEntryObservation("present", identity, target, metadata)
 
 
 def path_identity(path: Path) -> tuple[str, int, int]:
@@ -1131,22 +1186,40 @@ def _external_path_allowed(
         roots, identities = boundary
 
         def owned(path: Path) -> bool:
-            if admission is not None and path in admission.owned:
+            if admission is not None:
+                # A source-owned parent owns every descendant. Otherwise inspect each
+                # new ancestor once; the admission fence rechecks observations.
+                pending = []
+                current = path
+                while current not in admission.owned:
+                    pending.append(current)
+                    if current in roots:
+                        result = True
+                        break
+                    parent = current.parent
+                    if parent == current:
+                        result = False
+                        break
+                    current = parent
+                else:
+                    result = admission.owned[current]
+                for current in reversed(pending):
+                    if not result:
+                        identity = admission.observed.get(current)
+                        if identity is None:
+                            identity = path_identity(current)
+                            admission.observed[current] = identity
+                        result = identity[0] == "present" and identity[1:] in identities
+                    admission.owned[current] = result
                 return admission.owned[path]
             ancestors = (path, *path.parents)
             result = not roots.isdisjoint(ancestors)
             if not result:
                 for ancestor in ancestors:
-                    identity = admission.observed.get(ancestor) if admission is not None else None
-                    if identity is None:
-                        identity = path_identity(ancestor)
-                        if admission is not None:
-                            admission.observed[ancestor] = identity
+                    identity = path_identity(ancestor)
                     if identity[0] == "present" and identity[1:] in identities:
                         result = True
                         break
-            if admission is not None:
-                admission.owned[path] = result
             return result
 
         candidate = Path(value).expanduser()
@@ -1168,13 +1241,26 @@ def _external_path_allowed(
             if component == "..":
                 current = current.parent
                 continue
-            entry = current / component
+            observation = None
+            if admission is not None and os.name != "nt":
+                key = (current, component)
+                entry = admission.children.get(key)
+                if entry is None:
+                    entry = current / component
+                    admission.children[key] = entry
+                observation = admission.entries.get(entry)
+                if observation is None:
+                    observation = capture_path_entry(entry)
+                    admission.entries[entry] = observation
+                metadata = observation.metadata
+            else:
+                entry = current / component
+                try:
+                    metadata = entry.lstat()
+                except (FileNotFoundError, NotADirectoryError):
+                    metadata = None
             # Inspect before collapsing later '..': source-owned links can
             # resolve outside now and be retargeted before a child consumes them.
-            try:
-                metadata = entry.lstat()
-            except (FileNotFoundError, NotADirectoryError):
-                metadata = None
             # Path.is_junction is unavailable on supported Python 3.10/3.11.
             junction = (os.name == "nt" and getattr(metadata, "st_reparse_tag", 0)
                         == stat.IO_REPARSE_TAG_MOUNT_POINT)
@@ -1192,7 +1278,7 @@ def _external_path_allowed(
                 links += 1
                 if links > 40:
                     return False
-                target = Path(os.readlink(entry))
+                target = Path(observation.target if observation is not None else os.readlink(entry))
                 if target.is_absolute():
                     current = Path(target.anchor)
                     pending.extend(reversed(target.parts[1:]))

@@ -114,7 +114,7 @@ class CheckSkillsTest(unittest.TestCase):
                 for source in sources:
                     target = root / source
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source_root / source, target)
+                    shutil.copyfile(source_root / source, target)
                 if invalid:
                     (root / "scripts/install-skills.test.py").write_text("def broken(:\n", encoding="utf-8")
                 before = {source: (root / source).read_bytes() for source in sources}
@@ -129,7 +129,10 @@ class CheckSkillsTest(unittest.TestCase):
                     # test suites are outside this cache-placement regression.
                     if "py_compile" not in command:
                         return subprocess.CompletedProcess(command, 0)
-                    result = real_run(command, **kwargs, capture_output=True, text=True)
+                    result = real_run(
+                        command, **kwargs, env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                        capture_output=True, text=True, encoding="utf-8",
+                    )
                     compiled.append(result)
                     self.assertEqual(command[1], "-X")
                     cache = Path(command[2].removeprefix("pycache_prefix="))
@@ -201,11 +204,12 @@ class CheckSkillsTest(unittest.TestCase):
             environment = {**os.environ, "PYTHONPATH": str(foreign), "PYTHONNOUSERSITE": "1"}
             yield root, foreign, marker, log, environment, groups
 
-    def invoke(self, root, cwd, environment, group, *, tests_only=True):
+    def invoke(self, root, cwd, environment, group, *, tests_only=True, output_encoding="utf-8"):
         return subprocess.run(
-            [sys.executable, "-S", str(root / "scripts/check-skills"), "--group", group,
+            [sys.executable, "-S", "-X", "utf8=1", str(root / "scripts/check-skills"), "--group", group,
              *(["--tests-only"] if tests_only else [])],
-            cwd=cwd, env=environment, text=True, capture_output=True, timeout=30,
+            cwd=cwd, env={**environment, "PYTHONIOENCODING": output_encoding},
+            text=True, encoding=output_encoding, capture_output=True, timeout=30,
         )
 
     def test_every_group_and_shard_runs_checkout_tests_despite_installed_package(self) -> None:
@@ -239,6 +243,23 @@ class CheckSkillsTest(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("FAILED (failures=1)", result.stderr)
             self.assertFalse(marker.exists())
+
+    def test_fixture_invocation_uses_utf8_with_inherited_legacy_stream_encoding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory) / "caf\u00e9"
+            parent.mkdir()
+            # A real failing test emits its non-ASCII source path. cp1252 can
+            # encode this character, so implicit UTF-8 capture would misdecode
+            # it rather than receiving an ASCII backslash escape.
+            with self.fixture(
+                parent=parent, fail_test="skills.autoreview.tests.test_native_handoff.Cases.test_0",
+            ) as (root, foreign, marker, log, environment, groups):
+                environment["PYTHONIOENCODING"] = "cp1252"
+                result = self.invoke(root, foreign, environment, "boundaries")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(str(parent.resolve()), result.stderr)
+                self.assertIn("FAILED (failures=1)", result.stderr)
+                self.assertFalse(marker.exists())
 
     def test_forward_sibling_import_preserves_module_identity(self) -> None:
         with self.fixture(forward_import=True) as (root, foreign, marker, log, environment, groups):
@@ -308,19 +329,21 @@ class Cases(unittest.TestCase):
         self.assertEqual(observation["selectors"], [])
         self.assertNotEqual(home, Path({str(operator)!r}))
         # Credentials explicitly created by a test remain available to its child.
-        env = {{**os.environ, "OPENAI_API_KEY": "synthetic-fixture"}}
+        env = {{**os.environ, "OPENAI_API_KEY": "synthetic-fixture", "PYTHONIOENCODING": "utf-8"}}
         code = "import json, os; print(json.dumps([os.environ['OPENAI_API_KEY'], os.environ.get('CODEX_HOME'), os.environ['HOME']]))"
-        child = subprocess.run([sys.executable, "-S", "-c", code], env=env,
-                               text=True, capture_output=True, check=True)
+        child = subprocess.run([sys.executable, "-S", "-X", "utf8=1", "-c", code], env=env,
+                               text=True, encoding="utf-8", capture_output=True, check=True)
         observation["child"] = json.loads(child.stdout)
         receipt.write_text(json.dumps(observation))
         self.assertNotEqual({failure!r}, "test", "synthetic test failure")
 '''
                     path.write_text(body, encoding="utf-8")
                     result = subprocess.run(
-                        [sys.executable, "-S", "-c", driver, str(root / "scripts/check-skills"), str(restored),
+                        [sys.executable, "-S", "-X", "utf8=1", "-c", driver,
+                         str(root / "scripts/check-skills"), str(restored),
                          json.dumps([str(config.resolve()) for config in protected])],
-                        env=environment, cwd=foreign, text=True, capture_output=True, timeout=30,
+                        env={**environment, "PYTHONIOENCODING": "utf-8"}, cwd=foreign,
+                        text=True, encoding="utf-8", capture_output=True, timeout=30,
                     )
                     self.assertEqual(result.returncode, 0 if failure == "none" else 1,
                                      result.stdout + result.stderr)
@@ -376,8 +399,8 @@ with tempfile.TemporaryDirectory() as temporary:
         interpreter.symlink_to(sys.executable)
         sys.executable = str(interpreter)
     with case.fixture(parent=parent, fail_test=sys.argv[3] or None) as (root, foreign, marker, log, environment, groups):
-        environment["PYTHONIOENCODING"] = "ascii"
-        result = case.invoke(root, foreign, environment, "boundaries", tests_only=False)
+        result = case.invoke(root, foreign, environment, "boundaries", tests_only=False,
+                             output_encoding="ascii")
         case.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         case.assertFalse(marker.exists())
         case.assertCountEqual(log.read_text().splitlines(), groups["boundaries"])
@@ -387,12 +410,14 @@ with tempfile.TemporaryDirectory() as temporary:
                 command = [sys.executable, "-X", "utf8=1" if mode == "outer" else "utf8=0",
                            "-S", "-c", code, str(Path(__file__).resolve()), mode,
                            self.fixture_failure or ""]
-                result = subprocess.run(command, text=True, capture_output=True, timeout=30)
+                environment = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+                result = subprocess.run(command, env=environment, text=True, encoding="utf-8",
+                                        capture_output=True, timeout=30)
                 if mode == "narrow" and result.returncode == 77:
                     # Try the common POSIX UTF-8 locale when the inherited
                     # locale cannot establish the required filesystem support.
-                    result = subprocess.run(command, env={**os.environ, "LC_ALL": "C.UTF-8"},
-                                            text=True, capture_output=True, timeout=30)
+                    result = subprocess.run(command, env={**environment, "LC_ALL": "C.UTF-8"},
+                                            text=True, encoding="utf-8", capture_output=True, timeout=30)
                 if mode == "narrow" and result.returncode == 77:
                     self.skipTest(result.stderr.strip())
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -407,9 +432,9 @@ result = unittest.TextTestRunner().run(unittest.TestSuite([case]))
 sys.exit(0 if result.wasSuccessful() else 1)
 '''
         result = subprocess.run(
-            [sys.executable, "-O", "-S", "-c", code, str(Path(__file__).resolve())],
-            env={**os.environ, "PYTHONOPTIMIZE": "1"},
-            text=True, capture_output=True, timeout=30,
+            [sys.executable, "-O", "-S", "-X", "utf8=1", "-c", code, str(Path(__file__).resolve())],
+            env={**os.environ, "PYTHONOPTIMIZE": "1", "PYTHONIOENCODING": "utf-8"},
+            text=True, encoding="utf-8", capture_output=True, timeout=30,
         )
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("FAIL: test_0", result.stderr)
