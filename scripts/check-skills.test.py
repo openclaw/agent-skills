@@ -34,6 +34,7 @@ MODULES = [
     "skills.autoreview.tests.test_review_harness",
     "skills.autoreview.tests.test_prompt_budget",
     "skills.autoreview.tests.test_review_batches",
+    "skills.autoreview.tests.test_frozen_source_files",
 ]
 
 

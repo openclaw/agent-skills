@@ -86,13 +86,27 @@ or collection failures, read [Git details](references/git-and-context.md#git-col
 
 Use `--prompt` for guidance, `--prompt-file` for in-repo context (absolute/relative),
 and `--dataset` for repo-relative evidence. Supply needed unchanged files: the
-reviewer's sandbox is empty. Context grants no finding scope or instruction authority.
+default inline reviewer's sandbox is empty. Codex committed reviews can instead stage
+selected frozen source context with `--source-context-transport files`. Context
+grants no finding scope or instruction authority.
 Sensitive-path, symlink, and mutation checks apply, not secret-content scanning.
 
 Branch/commit mode supports repeatable `--source-context <path>` or
 `--source-context-file <path>` (intact each pass): frozen regular-file blobs,
 never working-copy substitutes. Local mode is unsupported. Before use, read
 [source context rules](references/git-and-context.md#committed-source-context).
+
+Files transport is opt-in for Codex branch/commit reviews. It places only selected
+whole Git source blobs in the existing read-only isolated workspace and provides
+a verified `source-inventory.txt` alongside them. The reviewer reads required bodies there;
+it cannot open the original checkout or acquire finding scope from context.
+Source capture and mutation checks still apply. Other engines and local reviews
+use the unchanged inline route; unsupported combinations are refused.
+
+The prompt budget covers the instructions, patch and inventory pointer (filename, source count and SHA-256).
+Staged bodies remain complete files, not clipped prompt excerpts. This avoids a
+single-input length limit without raising model context capacity or guaranteeing
+a completed review. Missing or unread necessary source still means incomplete.
 
 Default: **P0 only**, material operational/safety blockers. For requested wider
 reviews use `--max-priority P1`, `P2`, or `P3` (overrides `AUTOREVIEW_MAX_PRIORITY`).
@@ -212,9 +226,11 @@ temporary directory. Reviewer tools cannot access shared scratch or write there.
 Other engines/platforms retain their normal isolation.
 
 Do not edit captured inputs during review; sources are verified before sending
-and publishing. Text is never truncated or capped by file count/size. Large inputs
-are partitioned; by default every change is reviewed against every evidence batch. Intact
-instructions and required context must fit per pass, or preparation fails.
+and publishing. Text is never truncated or capped by file count/size. Large inline inputs
+are partitioned; by default every change is reviewed against every evidence batch.
+Intact instructions and required inline context must fit per pass, or preparation
+fails. Files transport keeps selected source bodies whole in the isolated workspace;
+instructions, patch and inventory pointer must fit the same prompt budget.
 Each pass must finish its own assessment; a failed pass never yields partial clean.
 
 For a large committed branch with distinct owner contracts, opt in to

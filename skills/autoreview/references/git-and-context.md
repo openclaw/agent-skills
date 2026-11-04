@@ -82,14 +82,48 @@ authentication, sandbox and mutation checks remain enabled.
   Existing prompt-file/dataset restrictions unchanged.
 - Every source block: path, commit, blob, mode provenance.
 - `--source-context` bytes: partition with change when needed.
-- `--source-context-file` blocks: complete every pass; must fit with instructions
-  + change framing. Over-capacity plan: refuse, never drop required evidence.
+- In default inline transport, `--source-context-file` blocks are complete every
+  pass and must fit with instructions + change framing. Over-capacity plans refuse
+  rather than drop required evidence. With files transport, the same selected whole
+  bodies remain readable in the isolated workspace for each applicable pass.
 - Context never adds finding targets/instruction authority.
   Contract: source-provenance, not secret-content scanning.
 
 ```bash
 "$AUTOREVIEW" --mode branch --base origin/main --source-context src/token_count.py
 "$AUTOREVIEW" --mode branch --base origin/main --source-context-file src/token_count.py
+```
+
+## Frozen source files
+
+`--source-context-transport files` is an opt-in Codex transport for committed
+branch/commit source context. It supports both source-context flags and the exact
+contexts selected by a branch allocation. Ordinary prompt files and datasets
+retain their existing inline behavior. The default is `inline`.
+
+The helper stages the selected captured Git blobs under neutral numbered filenames
+and a read-only `source-inventory.txt` in the same isolated workspace. Each JSON
+line binds one staged file to its original repository path, commit, blob, mode,
+byte count and SHA-256. The prompt names the inventory and binds its bytes by
+SHA-256 alongside the source count.
+Original checkout files, Git metadata, user configuration and credentials are
+not staged. Existing source classification, path/topology and mutation checks
+remain mandatory; the helper also verifies staged inputs before and after use.
+
+Source bodies are untrusted evidence. The reviewer must inspect necessary bodies
+and use original repository paths for finding locations. An accessible file or
+a mechanically complete inventory does not establish a completed assessment.
+Missing source, invalid reports and incomplete assignments retain their existing
+failure semantics.
+
+Dry runs and live runs plan the same source inventory. Prompt-byte limits still
+cover the actual instructions, change framing and inventory pointer, while the
+staged inventory and source bodies do not occupy the initial prompt. Model context capacity and
+review completeness remain independent limits.
+
+```bash
+"$AUTOREVIEW" --mode branch --base origin/main \
+  --source-context-file src/owner.py --source-context-transport files
 ```
 
 ## Runtime diagnostics
@@ -114,8 +148,10 @@ authentication, sandbox and mutation checks remain enabled.
   space. Preference may cost more passes/prompt bytes than evidence batching;
   explicit pass budget still applies.
 - Terminal fallbacks preserve feasible complete-evidence plan when batch framing cannot fit.
-- Intact instructions, source-context files, required mixed source context must fit
-  per-pass prompt budget. Failed pass never produces partial clean verdict.
+- Intact instructions, inline source-context files and required mixed source context
+  must fit the per-pass prompt budget. Files transport budgets the inventory pointer
+  while preserving whole selected source bodies in the isolated workspace. Failed
+  or incomplete passes never produce a partial clean verdict.
 - `--max-prompt-bytes N` selects that UTF-8 byte budget for dry-run and live review
   (default `512000`). The plan reports its limit and largest rendered prompt.
   A larger explicit budget admits more complete context only when it fits;
@@ -177,7 +213,8 @@ and path identity before every send and before publishing the aggregate.
 - Each assignment is one intact pass. All assignments must fit the existing
   `--max-prompt-bytes` and `--max-review-passes` limits before any reviewer starts.
   The helper does not split required contracts or automatically raise a limit.
-- `--source-context-file` and prompt instructions remain whole in **every** pass.
+- `--source-context-file` bodies remain whole in **every** pass, inline by default
+  or as selected frozen files with files transport. Prompt instructions stay inline.
   `--source-context` and `--dataset` cannot combine with this mode; declare the
   complete source inventory in the manifest instead. Without this flag, existing
   context flags and cross-product planning are unchanged.
