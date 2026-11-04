@@ -166,7 +166,10 @@ Handled interrupts attempt termination for every registered process even if one
 attempt fails. The first signal retains its exit status through buffered and
 streaming cleanup; later handled signals do not restart the sweep. Cleanup
 failures are reported by exception type, without changing cancellation into a
-retryable launch failure.
+retryable launch failure. Nested startup deferrals retain the first observed
+signal until the outer critical section finishes registration. Each direct
+helper launch has independent signal state, so catching one interrupt cannot
+disable cancellation of a later launch.
 
 Normalized `PATH`, `SSL_CERT_DIR` and `OPENCLAW_INCLUDE_ROOTS` entries must
 survive path-list serialization unchanged.

@@ -1936,7 +1936,14 @@ class OwnedProcess(NamedTuple):
     job: Any = None
 
 
-_ACTIVE_ENGINE_INTERRUPT: EngineInterrupted | None = None
+class _OwnedProcessSignalState:
+    def __init__(self) -> None:
+        self.signals: dict[str, int] = {}
+        self.deferrals = 0
+        self.dispatched = False
+
+
+_OWNED_PROCESS_SIGNAL_STATE: _OwnedProcessSignalState | None = None
 _OWNED_PROCESS_LOCK = threading.RLock()
 _OWNED_PROCESSES: dict[int, OwnedProcess] = {}
 _OWNED_PROCESS_GRACE_SECONDS = 2.0
@@ -2038,50 +2045,68 @@ def start_owned_process(
     """Register the lifetime owner before permitting a Windows target to start."""
     startup = None
     proc = None
+    finalized = False
+
+    def cleanup(failure: BaseException) -> None:
+        nonlocal finalized
+        if finalized:
+            return
+        try:
+            if proc is not None:
+                try:
+                    finish_owned_process(proc, startup.abort if startup is not None
+                                         else lambda: terminate_process_group(proc),
+                                         startup.close if startup is not None else None)
+                except BaseException as cleanup_error:
+                    if not isinstance(cleanup_error, Exception) and isinstance(failure, Exception):
+                        # Cancellation exits the invocation. Retain post-GO knowledge
+                        # as its safe cause, never as permission to retry. Other
+                        # startup errors may format private argv in a traceback.
+                        cleanup_error.startup_failure = failure
+                        if startup is not None and isinstance(failure, module.LaunchIndeterminate):
+                            raise cleanup_error from failure
+                        raise cleanup_error from None
+                    # An abort timeout cannot downgrade post-GO uncertainty. Retain
+                    # the original protocol cause and all secondary cleanup errors.
+                    failure.cleanup_errors = (*getattr(failure, "cleanup_errors", ()), cleanup_error)
+        finally:
+            finalized = True
+
     try:
-        if os.name == "nt":
-            supervisor = Path(__file__).absolute().with_name("windows-owned-process.py")
-            # A Windows venv executable redirects through a waiting parent that
-            # would retain inherited job and pipe handles outside the owned job.
-            # This private stdlib-only supervisor must run in the direct base
-            # interpreter; the requested target argv and environment stay intact.
-            interpreter = Path(sys._base_executable).absolute()
-            # Both the parent-loaded support code and child interpreter obey the
-            # same source boundary as other selected executable installations.
-            admit_executable_directories(
-                cwd, selected_executables=[str(interpreter), str(supervisor)],
-                include_search_path=False,
-            )
-            module = _load_windows_process_module(str(supervisor))
-            with deferred_owned_process_signals():
-                startup = module.spawn(str(interpreter), str(supervisor), args, cwd=cwd, **kwargs)
-                proc = startup.process
-                register_owned_process(proc, startup.job)
-            startup.finish(min(time.monotonic() + 10, deadline) if deadline is not None
-                           else time.monotonic() + 10)
-        else:
-            with deferred_owned_process_signals():
-                proc = subprocess.Popen(args, cwd=cwd, **kwargs, **process_group_popen_kwargs())
-                register_owned_process(proc)
-        return proc
-    except BaseException as failure:
-        if proc is not None:
+        with OwnedProcessSignalHandlers():
             try:
-                finish_owned_process(proc, startup.abort if startup is not None
-                                     else lambda: terminate_process_group(proc),
-                                     startup.close if startup is not None else None)
-            except BaseException as cleanup_error:
-                if not isinstance(cleanup_error, Exception) and isinstance(failure, Exception):
-                    # Cancellation exits the invocation. Retain post-GO knowledge
-                    # as its safe cause, never as permission to retry. Other
-                    # startup errors may format private argv in a traceback.
-                    cleanup_error.startup_failure = failure
-                    if startup is not None and isinstance(failure, module.LaunchIndeterminate):
-                        raise cleanup_error from failure
-                    raise cleanup_error from None
-                # An abort timeout cannot downgrade post-GO uncertainty. Retain
-                # the original protocol cause and all secondary cleanup errors.
-                failure.cleanup_errors = (*getattr(failure, "cleanup_errors", ()), cleanup_error)
+                if os.name == "nt":
+                    supervisor = Path(__file__).absolute().with_name("windows-owned-process.py")
+                    # A Windows venv executable redirects through a waiting parent that
+                    # would retain inherited job and pipe handles outside the owned job.
+                    # This private stdlib-only supervisor must run in the direct base
+                    # interpreter; the requested target argv and environment stay intact.
+                    interpreter = Path(sys._base_executable).absolute()
+                    # Both the parent-loaded support code and child interpreter obey the
+                    # same source boundary as other selected executable installations.
+                    admit_executable_directories(
+                        cwd, selected_executables=[str(interpreter), str(supervisor)],
+                        include_search_path=False,
+                    )
+                    module = _load_windows_process_module(str(supervisor))
+                    with deferred_owned_process_signals():
+                        startup = module.spawn(str(interpreter), str(supervisor), args, cwd=cwd, **kwargs)
+                        proc = startup.process
+                        register_owned_process(proc, startup.job)
+                    startup.finish(min(time.monotonic() + 10, deadline) if deadline is not None
+                                   else time.monotonic() + 10)
+                else:
+                    with deferred_owned_process_signals():
+                        proc = subprocess.Popen(args, cwd=cwd, **kwargs, **process_group_popen_kwargs())
+                        register_owned_process(proc)
+                return proc
+            except BaseException as failure:
+                cleanup(failure)
+                raise
+    except BaseException as failure:
+        # Scope restoration can fail after startup succeeded but before the
+        # caller receives the process. That failed handoff still owns cleanup.
+        cleanup(failure)
         raise
 
 
@@ -2218,17 +2243,22 @@ def terminate_process_group(
 
 
 def engine_signal_handler(signum: int, _frame: Any) -> None:
-    global _ACTIVE_ENGINE_INTERRUPT
-    if _ACTIVE_ENGINE_INTERRUPT is not None:
-        return  # The first signal owns the sweep and subsequent unwind.
-    interrupted = _ACTIVE_ENGINE_INTERRUPT = EngineInterrupted(128 + signum)
-    try:
-        terminate_owned_processes()
-    except BaseException as error:
-        interrupted.cleanup_errors = (error, *getattr(error, "cleanup_errors", ()))
-    # A failing cancellation sweep cannot turn this signal into a timeout or a
-    # retryable launch failure. Keep raw cleanup diagnostics out of tracebacks.
-    raise interrupted from None
+    with OwnedProcessSignalHandlers() as scope:
+        state = scope.state
+        # Claim the observed signal before constructing an exception or doing
+        # anything that can be interrupted by another delivered signal.
+        first_signal = state.signals.setdefault("first", signum)
+        if state.deferrals or state.dispatched:
+            return
+        state.dispatched = True
+        interrupted = EngineInterrupted(128 + first_signal)
+        try:
+            terminate_owned_processes()
+        except BaseException as error:
+            interrupted.cleanup_errors = (error, *getattr(error, "cleanup_errors", ()))
+        # A failing cancellation sweep cannot turn this signal into a timeout or
+        # a retryable launch failure. Never render raw cleanup exception text.
+        raise interrupted from None
 
 
 def _handled_signal_numbers() -> list[int]:
@@ -2239,22 +2269,49 @@ def _handled_signal_numbers() -> list[int]:
 
 
 class OwnedProcessSignalHandlers:
-    """Install process-wide handlers so interrupts clean up owned engine groups."""
+    """Share first-signal ownership through one invocation and its cleanup."""
 
     def __enter__(self) -> "OwnedProcessSignalHandlers":
-        global _ACTIVE_ENGINE_INTERRUPT
-        self.previous_interrupt = _ACTIVE_ENGINE_INTERRUPT
-        _ACTIVE_ENGINE_INTERRUPT = None
+        global _OWNED_PROCESS_SIGNAL_STATE
+        self.owns_state = False
+        self.state = _OWNED_PROCESS_SIGNAL_STATE
+        if threading.current_thread() is not threading.main_thread():
+            return self
+        if self.state is not None:
+            return self
+        self.state = _OwnedProcessSignalState()
         self.previous = {signum: signal.getsignal(signum) for signum in _handled_signal_numbers()}
-        for signum in self.previous:
-            signal.signal(signum, engine_signal_handler)
+        _OWNED_PROCESS_SIGNAL_STATE = self.state
+        self.owns_state = True
+        try:
+            for signum in self.previous:
+                signal.signal(signum, engine_signal_handler)
+        except BaseException:
+            self.__exit__(*sys.exc_info())
+            raise
         return self
 
     def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
-        global _ACTIVE_ENGINE_INTERRUPT
-        for signum, handler in self.previous.items():
-            signal.signal(signum, handler)
-        _ACTIVE_ENGINE_INTERRUPT = self.previous_interrupt
+        global _OWNED_PROCESS_SIGNAL_STATE
+        if not self.owns_state:
+            return
+        errors: list[BaseException] = []
+        try:
+            for signum, handler in self.previous.items():
+                try:
+                    signal.signal(signum, handler)
+                except BaseException as error:
+                    errors.append(error)
+        finally:
+            _OWNED_PROCESS_SIGNAL_STATE = None
+        if errors:
+            if isinstance(_exc, (EngineInterrupted, KeyboardInterrupt)):
+                _exc.cleanup_errors = (*getattr(_exc, "cleanup_errors", ()), *errors)
+                return
+            primary = next((error for error in errors if not isinstance(error, Exception)), errors[0])
+            primary.cleanup_errors = (*getattr(primary, "cleanup_errors", ()),
+                                      *(error for error in errors if error is not primary))
+            raise primary from None
 
 
 @contextlib.contextmanager
@@ -2278,21 +2335,27 @@ def deferred_owned_process_signals():
             yield
         return
 
-    collected: list[int] = []
+    with OwnedProcessSignalHandlers() as scope:
+        state = scope.state
+        state.deferrals += 1
 
-    def _collect(signum: int, _frame: Any) -> None:
-        collected.append(signum)
+        def _collect(signum: int, frame: Any) -> None:
+            # Record into the invocation before any handler can be restored.
+            engine_signal_handler(signum, frame)
 
-    previous = {signum: signal.getsignal(signum) for signum in _handled_signal_numbers()}
-    for signum in previous:
-        signal.signal(signum, _collect)
-    try:
-        yield
-    finally:
-        for signum, handler in previous.items():
-            signal.signal(signum, handler)
-        if collected:
-            engine_signal_handler(collected[0], None)
+        previous = {signum: signal.getsignal(signum) for signum in _handled_signal_numbers()}
+        try:
+            for signum in previous:
+                signal.signal(signum, _collect)
+            yield
+        finally:
+            try:
+                for signum, handler in previous.items():
+                    signal.signal(signum, handler)
+            finally:
+                state.deferrals -= 1
+                if state.signals and not state.deferrals:
+                    engine_signal_handler(state.signals["first"], None)
 
 
 def emit_heartbeat(
@@ -10499,18 +10562,17 @@ def preflight_block(args: argparse.Namespace, captured: CapturedBundle,
 
 
 def main() -> int:
-    with OwnedProcessSignalHandlers():
-        try:
+    try:
+        with OwnedProcessSignalHandlers():
             return main_impl()
-        except EngineInterrupted as exc:
-            # No longer a SystemExit subclass (see EngineInterrupted), so it
-            # is not caught by internal `except SystemExit` guards on the
-            # way up -- convert it to a plain exit code here instead.
-            if errors := getattr(exc, "cleanup_errors", ()):
-                with contextlib.suppress(Exception):
-                    print("autoreview interrupted; process cleanup failed: "
-                          + ", ".join(type(error).__name__ for error in errors), file=sys.stderr)
-            return exc.code
+    except EngineInterrupted as exc:
+        # Scope acquisition/restoration may also be interrupted. Convert only
+        # after the invocation has restored its handlers and signal state.
+        if errors := getattr(exc, "cleanup_errors", ()):
+            with contextlib.suppress(Exception):
+                print("autoreview interrupted; process cleanup failed: "
+                      + ", ".join(type(error).__name__ for error in errors), file=sys.stderr)
+        return exc.code
 
 
 def main_impl() -> int:
