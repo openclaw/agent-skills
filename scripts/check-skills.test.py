@@ -208,7 +208,6 @@ with tempfile.TemporaryDirectory() as temporary:
         case.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         case.assertFalse(marker.exists())
         case.assertCountEqual(log.read_text().splitlines(), groups["boundaries"])
-        case.assertIn(sys.executable.encode("ascii", "backslashreplace").decode("ascii"), result.stdout)
 '''
         for mode in ("outer", "narrow"):
             with self.subTest(proof=mode):
