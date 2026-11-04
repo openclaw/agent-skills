@@ -4,6 +4,7 @@ import contextlib
 import io
 import os
 import runpy
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,28 +17,25 @@ from unittest import mock
 SCRIPT = Path(__file__).with_name("check-skills")
 HELPER = runpy.run_path(str(SCRIPT))
 MAIN = HELPER["main"]
-MODULES = [
-    "skills/autoreview/scripts/autoreview_test.py",
-    "skills.autoreview.tests.test_autoreview_hardening",
-    "skills.autoreview.tests.test_native_handoff",
-    "skills.autoreview.tests.test_openclaw_exec",
-    "skills.autoreview.tests.test_codex_sandbox",
-    "skills.autoreview.tests.test_codex_inference_route",
-    "skills.autoreview.tests.test_git_line_endings",
-    "skills.autoreview.tests.test_git_boundary",
-    "skills.autoreview.tests.test_gitlinks",
-    "skills.autoreview.tests.test_git_filter_collection",
-    "skills.autoreview.tests.test_engine_stage",
-    "skills.autoreview.tests.test_terminal_report_authority",
-    "skills.autoreview.tests.test_output_path_interpretation",
-    "skills.autoreview.tests.test_output_readiness",
-    "skills.autoreview.tests.test_review_harness",
-    "skills.autoreview.tests.test_prompt_budget",
-    "skills.autoreview.tests.test_review_batches",
-]
 
 
 class CheckSkillsTest(unittest.TestCase):
+    def test_manifest_covers_checkout_test_files_in_their_groups(self) -> None:
+        root = SCRIPT.resolve().parent.parent
+        core = "skills/autoreview/scripts/autoreview_test.py"
+        hardening = "skills/autoreview/tests/test_autoreview_hardening.py"
+        discovered = {path.relative_to(root).as_posix()
+                      for path in (root / "skills/autoreview/tests").glob("test_*.py")}
+        self.assertTrue((root / core).is_file())
+        self.assertIn(hardening, discovered)
+        expected = {"core": {core}, "hardening": {hardening},
+                    "boundaries": discovered - {hardening}}
+        self.assertEqual(set(HELPER["TEST_MODULES"]), set(expected))
+        for group, paths in expected.items():
+            actual = [entry if entry.endswith(".py") else entry.replace(".", "/") + ".py"
+                      for entry in HELPER["TEST_MODULES"][group]]
+            self.assertCountEqual(actual, paths, group)
+
     def commands(self, args: list[str]) -> list[list[str]]:
         with mock.patch("shutil.which", side_effect=lambda name: name), \
                 mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run, \
@@ -47,36 +45,33 @@ class CheckSkillsTest(unittest.TestCase):
             self.assertEqual(call.kwargs, {"cwd": SCRIPT.resolve().parent.parent})
         return [call.args[0] for call in run.call_args_list]
 
-    def test_default_preserves_full_command_order_and_combined_modules(self) -> None:
+    def test_default_preserves_full_command_order(self) -> None:
         commands = self.commands([])
         self.assertEqual(commands, self.commands(["--group", "all"]))
-        self.assertEqual([command[1] for command in commands], [
+        self.assertEqual([command[1] for command in commands[:6]], [
             "scripts/validate-skills", "-n", "-m", "scripts/install-skills.test.py",
-            "scripts/validate-skills.test.py", "scripts/check-skills.test.py", "-m",
+            "scripts/validate-skills.test.py", "scripts/check-skills.test.py",
+        ])
+        self.assertIn("scripts/check-skills", commands[6])
+        self.assertEqual(commands[6][-3:], ["--group", "all", "--tests-only"])
+        self.assertEqual([command[1] for command in commands[7:]], [
             "--check", "--check", "--check", "run", "--test",
         ])
-        self.assertEqual(commands[6], [sys.executable, "-m", "unittest", *MODULES])
 
-    def test_groups_cover_each_module_once_and_only_core_runs_other_checks(self) -> None:
+    def test_only_core_runs_other_checks(self) -> None:
         full = self.commands([])
-        grouped_modules = []
-        for group, expected in (("core", MODULES[:1]), ("hardening", MODULES[1:2]),
-                                ("boundaries", MODULES[2:])):
+        for group in (*HELPER["TEST_MODULES"], *HELPER["HARDENING_SHARDS"]):
             with self.subTest(group=group):
                 commands = self.commands(["--group", group])
-                suites = [command for command in commands if command[1:3] == ["-m", "unittest"]]
-                self.assertEqual(suites, [[sys.executable, "-m", "unittest", *expected]])
-                grouped_modules.extend(suites[0][3:])
+                suites = [command for command in commands if "--tests-only" in command]
+                self.assertEqual(len(suites), 1)
+                self.assertEqual(suites[0][-3:], ["--group", group, "--tests-only"])
                 other = [command for command in commands if command not in suites]
-                self.assertEqual(other, [command for command in full if command[1:3] != ["-m", "unittest"]]
-                                 if group == "core" else [])
-        self.assertEqual(grouped_modules, MODULES)
-        self.assertEqual(len(grouped_modules), len(set(grouped_modules)))
+                self.assertEqual(other, full[:6] + full[7:] if group == "core" else [])
 
     def test_first_failure_stops_and_preserves_exit_status(self) -> None:
-        for group in ("all", "core", "hardening", "boundaries", "hardening-1", "hardening-2"):
+        for group in ("all", *HELPER["TEST_MODULES"], *HELPER["HARDENING_SHARDS"]):
             with self.subTest(group=group), \
-                    mock.patch.dict(MAIN.__globals__, {"hardening_test_ids": lambda _root: ["first", "second"]}), \
                     mock.patch("shutil.which", return_value="resolved-executable"), \
                     mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 17)) as run, \
                     contextlib.redirect_stdout(io.StringIO()):
@@ -85,91 +80,188 @@ class CheckSkillsTest(unittest.TestCase):
                 self.assertEqual(run.call_args.args[0][0], "resolved-executable")
 
     def test_missing_executable_stops_before_execution(self) -> None:
-        for group in ("boundaries", "hardening-1", "hardening-2"):
-            with self.subTest(group=group), \
-                    mock.patch.dict(MAIN.__globals__, {"hardening_test_ids": lambda _root: ["first", "second"]}), \
-                    mock.patch("shutil.which", return_value=None), mock.patch("subprocess.run") as run, \
-                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as error:
-                self.assertEqual(MAIN(["--group", group]), 1)
-            run.assert_not_called()
-            self.assertIn("required executable not found:", error.getvalue())
+        with mock.patch("shutil.which", return_value=None), mock.patch("subprocess.run") as run, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(MAIN(["--group", "boundaries"]), 1)
+        run.assert_not_called()
+        self.assertIn("required executable not found:", error.getvalue())
 
-    def test_hardening_shards_cover_native_loader_ids_once(self) -> None:
-        root = SCRIPT.resolve().parent.parent
-        loader = unittest.TestLoader()
-        with mock.patch.object(sys, "path", [str(root), *sys.path]):
-            pending = list(loader.loadTestsFromNames(MODULES[1:2]))
-        self.assertFalse(loader.errors)
-        expected = []
-        while pending:
-            test = pending.pop()
-            if isinstance(test, unittest.TestSuite):
-                pending.extend(test)
-            else:
-                expected.append(test.id())
-        expected.sort()
-        self.assertTrue(expected)
-        self.assertEqual(len(expected), len(set(expected)))
-        shards = []
-        for index, group in enumerate(("hardening-1", "hardening-2")):
-            command, = self.commands(["--group", group])
-            self.assertEqual(command[:3], [sys.executable, "-m", "unittest"])
-            self.assertEqual(command[3:], expected[index::2])
-            self.assertTrue(command[3:])
-            self.assertEqual([command], self.commands(["--group", group]))
-            shards.append(command[3:])
-        self.assertFalse(set(shards[0]) & set(shards[1]))
-        self.assertEqual(sorted(shards[0] + shards[1]), expected)
+    @contextlib.contextmanager
+    def fixture(self, *, parent=None, forward_import=False):
+        with tempfile.TemporaryDirectory(dir=parent) as directory:
+            root = Path(directory) / "repo"
+            (root / "scripts").mkdir(parents=True)
+            shutil.copy2(SCRIPT, root / "scripts/check-skills")
+            groups = {}
+            for group, entries in HELPER["TEST_MODULES"].items():
+                groups[group] = []
+                for entry in entries:
+                    name = entry.removesuffix(".py").replace("/", ".")
+                    path = root.joinpath(*name.split(".")).with_suffix(".py")
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    body = "import importlib, os, unittest\nfrom pathlib import Path\nSENTINEL = 'local checkout'\n"
+                    if forward_import and name.endswith("test_native_handoff"):
+                        body += "from skills.autoreview.tests import test_openclaw_exec as forward\n"
+                    # Exercise the same sibling-import forms as the real suite.
+                    if name.endswith("test_openclaw_exec"):
+                        body += "from skills.autoreview.tests import test_native_handoff as native\nassert native.SENTINEL == SENTINEL\n"
+                    if name.endswith("test_gitlinks"):
+                        body += "from skills.autoreview.tests.test_autoreview_hardening import SENTINEL as sibling\nassert sibling == SENTINEL\n"
+                    body += "class Cases(unittest.TestCase):\n"
+                    for index in range(5 if group == "hardening" else 1):
+                        label = name + ".Cases.test_" + str(index)
+                        groups[group].append(label)
+                        body += (f"    def test_{index}(self):\n"
+                                 f"        with Path(os.environ['CHECK_TEST_LOG']).open('a') as stream: stream.write({label!r} + '\\n')\n"
+                                 f"        self.assertNotEqual(os.environ.get('CHECK_FAIL_TEST'), {label!r})\n")
+                        if forward_import and name.endswith("test_native_handoff"):
+                            body += "        self.assertIs(forward, importlib.import_module('skills.autoreview.tests.test_openclaw_exec'))\n"
+                    path.write_text(body, encoding="utf-8")
+            foreign = Path(directory) / "installed"
+            (foreign / "skills").mkdir(parents=True)
+            marker = foreign / "imported"
+            (foreign / "skills/__init__.py").write_text(
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('unrelated package imported')\n"
+                "raise RuntimeError('unrelated installed skills package')\n",
+                encoding="utf-8",
+            )
+            log = Path(directory) / "executed"
+            environment = {**os.environ, "PYTHONPATH": str(foreign), "PYTHONNOUSERSITE": "1",
+                           "CHECK_TEST_LOG": str(log)}
+            yield root, foreign, marker, log, environment, groups
 
-    def test_discovery_is_bound_to_script_root_from_foreign_cwd(self) -> None:
-        root = SCRIPT.resolve().parent.parent
-        expected = HELPER["hardening_test_ids"](root)
-        with tempfile.TemporaryDirectory() as tempdir:
-            foreign = Path(tempdir)
-            (foreign / "skills").mkdir()
-            (foreign / "skills/__init__.py").write_text("raise AssertionError('alien skills imported')\n")
-            alien = types.ModuleType("skills")
-            alien.__path__ = [str(foreign / "skills")]
-            cwd = Path.cwd()
-            try:
-                os.chdir(foreign)
-                with mock.patch.object(sys, "path", [str(foreign), *sys.path]), \
-                        mock.patch.dict(sys.modules, {"skills": alien}):
-                    before_path, before_modules = list(sys.path), dict(sys.modules)
-                    first, = self.commands(["--group", "hardening-1"])
-                    second, = self.commands(["--group", "hardening-2"])
-                    self.assertEqual(sorted(first[3:] + second[3:]), expected)
-                    self.assertEqual(sys.path, before_path)
-                    self.assertEqual(sys.modules, before_modules)
-            finally:
-                os.chdir(cwd)
+    def invoke(self, root, cwd, environment, group, *, tests_only=True):
+        return subprocess.run(
+            [sys.executable, "-S", str(root / "scripts/check-skills"), "--group", group,
+             *(["--tests-only"] if tests_only else [])],
+            cwd=cwd, env=environment, text=True, capture_output=True, timeout=30,
+        )
 
-    def test_shards_handle_odd_counts_and_reject_discovery_failures(self) -> None:
-        def suite(names):
-            tests = []
-            for name in names:
-                test = mock.Mock(spec=unittest.TestCase)
-                test.id.return_value = name
-                tests.append(test)
-            return unittest.TestSuite([unittest.TestSuite(tests)])
+    def test_every_group_and_shard_runs_checkout_tests_despite_installed_package(self) -> None:
+        with self.fixture() as (root, foreign, marker, log, environment, groups):
+            expected = {**groups, "all": sum(groups.values(), []),
+                        "hardening-1": sorted(groups["hardening"])[::2],
+                        "hardening-2": sorted(groups["hardening"])[1::2]}
+            for group, labels in expected.items():
+                with self.subTest(group=group):
+                    log.unlink(missing_ok=True)
+                    result = self.invoke(root, foreign, environment, group)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(sorted(log.read_text().splitlines()), sorted(labels))
+                    self.assertFalse(marker.exists())
+            # Also exercise the outer command runner and its real child process.
+            log.unlink()
+            result = self.invoke(root, foreign, environment, "boundaries", tests_only=False)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(sorted(log.read_text().splitlines()), sorted(groups["boundaries"]))
+            self.assertFalse(marker.exists())
 
-        loader = mock.Mock(errors=[], loadTestsFromModule=mock.Mock(return_value=suite(["e", "b", "d", "a", "c"])))
-        with mock.patch("unittest.TestLoader", return_value=loader):
-            first, = self.commands(["--group", "hardening-1"])
-            second, = self.commands(["--group", "hardening-2"])
-        self.assertEqual(first[3:], ["a", "c", "e"])
-        self.assertEqual(second[3:], ["b", "d"])
-        for names, errors, diagnostic in (([], [], "empty or duplicate"),
-                                         (["a", "a"], [], "empty or duplicate"),
-                                         (["a"], ["loader error"], "loader error"),
-                                         (["a"], [], "shard has no test IDs")):
-            loader = mock.Mock(errors=errors, loadTestsFromModule=mock.Mock(return_value=suite(names)))
-            with self.subTest(names=names, errors=errors), \
-                    mock.patch("unittest.TestLoader", return_value=loader), mock.patch("subprocess.run") as run, \
-                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as error:
-                self.assertEqual(MAIN(["--group", "hardening-2"]), 1)
-            run.assert_not_called()
-            self.assertIn(diagnostic, error.getvalue())
+    def test_test_failure_is_not_hidden_by_file_bound_loading(self) -> None:
+        with self.fixture() as (root, foreign, marker, log, environment, groups):
+            environment["CHECK_FAIL_TEST"] = groups["boundaries"][0]
+            result = self.invoke(root, foreign, environment, "boundaries", tests_only=False)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("FAILED (failures=1)", result.stderr)
+            self.assertFalse(marker.exists())
+
+    def test_forward_sibling_import_preserves_module_identity(self) -> None:
+        with self.fixture(forward_import=True) as (root, foreign, marker, log, environment, groups):
+            result = self.invoke(root, foreign, environment, "boundaries", tests_only=False)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertCountEqual(log.read_text().splitlines(), groups["boundaries"])
+            self.assertFalse(marker.exists())
+
+    def test_fixture_source_supports_unicode_paths_under_a_narrow_locale(self) -> None:
+        # Always exercise outer-command output. The default-write-encoding proof
+        # additionally needs a real narrow codec, which some hosts do not offer.
+        code = r'''
+import locale, os, runpy, sys, tempfile
+from pathlib import Path
+if sys.getfilesystemencoding().lower().replace("-", "") != "utf8":
+    print("host has no UTF-8 filesystem locale with UTF-8 mode disabled", file=sys.stderr)
+    sys.exit(77)
+character = "\u674e"
+if sys.argv[2] == "narrow":
+    locale.setlocale(locale.LC_CTYPE, "C")
+    for character in ("\u674e", "\U0001f984"):
+        try:
+            character.encode(locale.getpreferredencoding(False))
+        except UnicodeEncodeError:
+            break
+    else:
+        print("host text codec supports both Unicode filename probes", file=sys.stderr)
+        sys.exit(77)
+case = runpy.run_path(sys.argv[1])["CheckSkillsTest"]()
+with tempfile.TemporaryDirectory() as temporary:
+    parent = Path(temporary) / character
+    parent.mkdir()
+    if os.name != "nt":
+        # A real interpreter alias models a checkout-local virtualenv without
+        # requiring virtualenv installation or Windows symlink privileges.
+        interpreter = parent / "python"
+        interpreter.symlink_to(sys.executable)
+        sys.executable = str(interpreter)
+    with case.fixture(parent=parent) as (root, foreign, marker, log, environment, groups):
+        environment["PYTHONIOENCODING"] = "ascii"
+        result = case.invoke(root, foreign, environment, "boundaries", tests_only=False)
+        case.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        case.assertFalse(marker.exists())
+        case.assertCountEqual(log.read_text().splitlines(), groups["boundaries"])
+'''
+        for mode in ("outer", "narrow"):
+            with self.subTest(proof=mode):
+                command = [sys.executable, "-X", "utf8=1" if mode == "outer" else "utf8=0",
+                           "-S", "-c", code, str(Path(__file__).resolve()), mode]
+                result = subprocess.run(command, text=True, capture_output=True, timeout=30)
+                if mode == "narrow" and result.returncode == 77:
+                    # Try the common POSIX UTF-8 locale when the inherited
+                    # locale cannot establish the required filesystem support.
+                    result = subprocess.run(command, env={**os.environ, "LC_ALL": "C.UTF-8"},
+                                            text=True, capture_output=True, timeout=30)
+                if mode == "narrow" and result.returncode == 77:
+                    self.skipTest(result.stderr.strip())
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_unicode_proof_keeps_failure_checks_when_optimized(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-O", "-S", str(Path(__file__).resolve()),
+             "CheckSkillsTest.test_fixture_source_supports_unicode_paths_under_a_narrow_locale"],
+            env={**os.environ, "PYTHONOPTIMIZE": "1",
+                 "CHECK_FAIL_TEST": "skills.autoreview.tests.test_native_handoff.Cases.test_0"},
+            text=True, capture_output=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("FAIL: test_0", result.stderr)
+        self.assertIn("skills.autoreview.tests.test_native_handoff.Cases", result.stderr)
+
+    def test_empty_and_broken_discovery_fail_before_running_tests(self) -> None:
+        with self.fixture() as (root, foreign, marker, log, environment, groups):
+            path = root / "skills/autoreview/tests/test_autoreview_hardening.py"
+            for content, group, diagnostic in (
+                ("", "hardening", "empty or duplicate"),
+                ("syntax error!", "hardening-1", "test discovery failed"),
+                ("import unittest\nclass One(unittest.TestCase):\n def test_one(self): pass\n",
+                 "hardening-2", "shard has no test IDs"),
+            ):
+                with self.subTest(group=group, diagnostic=diagnostic):
+                    path.write_text(content, encoding="utf-8")
+                    result = self.invoke(root, foreign, environment, group)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn(diagnostic, result.stderr)
+                    self.assertFalse(log.exists())
+                    self.assertFalse(marker.exists())
+
+    def test_module_binding_restores_existing_packages(self) -> None:
+        alien = types.ModuleType("skills")
+        with mock.patch.dict(sys.modules, {"skills": alien}):
+            before = {name: value for name, value in sys.modules.items()
+                      if name == "skills" or name.startswith("skills.")}
+            with HELPER["repository_test_modules"](SCRIPT.resolve().parent.parent):
+                self.assertIsNot(sys.modules["skills"], alien)
+            after = {name: value for name, value in sys.modules.items()
+                     if name == "skills" or name.startswith("skills.")}
+            self.assertEqual(before, after)
 
     def test_invalid_selector_is_rejected_before_any_command(self) -> None:
         for args in (["--group", "unknown"], ["--group"]):
