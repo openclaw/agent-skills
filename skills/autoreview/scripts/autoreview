@@ -7870,6 +7870,11 @@ def run_amp(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         attest_amp_plugin_inventory(preflight.stdout, plugin_path, review_root)
         print("amp isolation: complete plugin inventory contains only the generated adapter")
 
+        # Evidence may have changed while the CLI probes were running. Refuse
+        # before making the frozen prompt available to the adapter.
+        if before_send := getattr(args, "_verify_review_inputs", None):
+            before_send()
+
         # Do not materialize the private prompt until the authenticated complete
         # plugin inventory has proved that Amp loaded only the generated adapter.
         # Users with personal or workspace plugins must use a dedicated Amp API

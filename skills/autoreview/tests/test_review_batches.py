@@ -848,6 +848,75 @@ class ReviewBatchTests(unittest.TestCase):
                             self.assertNotIn('model_provider="review_api"', first)
                             self.assertIn('model_provider="review_api"', second)
 
+    @unittest.skipUnless(os.name == "posix", "Amp requires a POSIX runtime")
+    def test_amp_rechecks_external_evidence_after_plugin_preflight(self):
+        for mutation in ("source", "manifest", None):
+            with self.subTest(mutation=mutation), self.external_fixture() as fixture:
+                repo, _, source, _ = fixture
+                trusted = repo.parent / "trusted-bin"
+                trusted.mkdir()
+                probe_record = repo.parent / "plugin-probe.json"
+                executed = repo.parent / "executed.json"
+                program = trusted / "amp-fixture.py"
+                # A real child implements only Amp's CLI handshake. It changes
+                # captured evidence during the last probe, after initial admission.
+                # The control stops at --execute; this is not model execution proof.
+                program.write_text(
+                    "import json, os, sys\nfrom pathlib import Path\n"
+                    f"mutation = {mutation!r}\nsource = Path({str(source)!r})\n"
+                    f"manifest = Path({str(repo / '.review/external.json')!r})\n"
+                    f"probe_record = Path({str(probe_record)!r})\n"
+                    f"executed = Path({str(executed)!r})\n"
+                    "args = sys.argv[1:]\n"
+                    "if '--help' in args:\n"
+                    "    print('--execute --stream-json --stream-json-input --plugin-ready-timeout --settings-file --no-ide')\n"
+                    "elif args[-2:] == ['tools', 'list']:\n"
+                    "    probe = next((Path(os.environ['HOME']) / '.config/agents/skills').iterdir())\n"
+                    "    print(f'error connecting to {probe.name}: MCP server is not allowed by MCP permissions', file=sys.stderr)\n"
+                    "elif args[-2:] == ['plugins', 'list']:\n"
+                    "    plugin = next((Path(os.environ['XDG_CONFIG_HOME']) / 'amp/plugins').iterdir())\n"
+                    "    prompt = Path(args[args.index('--settings-file') + 1]).parent / 'review-prompt.txt'\n"
+                    "    probe_record.write_text(json.dumps({'prompt_exists': prompt.exists()}))\n"
+                    "    if mutation == 'source':\n"
+                    "        source.write_text('// changed during plugin preflight\\n')\n"
+                    "    elif mutation == 'manifest':\n"
+                    "        manifest.unlink()\n"
+                    "    print(f'✓ {plugin} active\\ntool: autoreview_generate\\nagent: autoreview-adapter\\nagent mode: autoreview')\n"
+                    "elif '--execute' in args:\n"
+                    "    prompt = Path(args[args.index('--settings-file') + 1]).parent / 'review-prompt.txt'\n"
+                    "    executed.write_text(json.dumps({'external_contract_received': '// full external contract' in prompt.read_text()}))\n"
+                    "    sys.exit(17)\n"
+                    "else:\n"
+                    "    raise SystemExit('unexpected fixture arguments')\n"
+                )
+                wrapper = trusted / "amp"
+                wrapper.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable)
+                                   + " -S " + shlex.quote(str(program)) + ' "$@"\n')
+                wrapper.chmod(0o700)
+                result = subprocess.run(
+                    [sys.executable, "-S", str(SCRIPT), "--mode", "branch", "--base", "HEAD^",
+                     "--engine", "amp", "--amp-bin", str(wrapper),
+                     "--external-source-context-file", ".review/external.json",
+                     "--json-output", str(repo.parent / "result.json")],
+                    cwd=repo, env={**os.environ, "AMP_API_KEY": "synthetic-cli-handshake"},
+                    capture_output=True, text=True, timeout=90,
+                )
+                output = result.stdout + result.stderr
+                self.assertTrue(probe_record.exists(), output)
+                self.assertEqual(json.loads(probe_record.read_text()), {"prompt_exists": False})
+                self.assertNotEqual(result.returncode, 0, output)
+                self.assertFalse((repo.parent / "result.json").exists(), output)
+                if mutation:
+                    self.assertFalse(executed.exists(), "changed evidence reached the reviewer")
+                    self.assertIn("evidence changed", output)
+                    if mutation == "source":
+                        self.assertEqual(source.read_text(), "// changed during plugin preflight\n")
+                    else:
+                        self.assertFalse((repo / ".review/external.json").exists())
+                else:
+                    self.assertTrue(executed.exists(), output)
+                    self.assertEqual(json.loads(executed.read_text()), {"external_contract_received": True})
+
     def test_external_linked_worktree_sha256_and_executable_blob(self):
         with self.external_fixture(object_format="sha256") as (repo, upstream, source, manifest):
             self.git(upstream, "update-index", "--chmod=+x", manifest["files"][0]["path"])
