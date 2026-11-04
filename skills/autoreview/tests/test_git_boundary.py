@@ -333,6 +333,31 @@ class GitFixtureIsolationTests(unittest.TestCase):
             os.chdir(original_cwd)
 
 
+class GitGlobalExcludesTests(unittest.TestCase):
+    def test_new_global_config_is_observed_after_absence_with_default_ignore(self):
+        for relative in (".gitconfig", ".config/git/config"):
+            with self.subTest(config=relative), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                repo = init_repo(root)
+                home = root / "home"
+                config_dir = home / ".config/git"
+                config_dir.mkdir(parents=True)
+                (config_dir / "ignore").write_text("default.tmp\n")
+                for name in ("default.tmp", "later.tmp", "visible.txt"):
+                    (repo / name).write_text("reviewable content\n")
+                helper = load_helper()
+                with mock.patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}):
+                    # Missing config must leave Git's default ignore effective.
+                    self.assertEqual(set(helper["untracked_sources"](repo).files),
+                                     {"later.tmp", "visible.txt"})
+                    excludes = home / "excludes"
+                    excludes.write_text("default.tmp\nlater.tmp\n")
+                    git(repo, "config", "--file", str(home / relative),
+                        "core.excludesFile", str(excludes))
+                    # Absence is a per-call observation, never a cached policy.
+                    self.assertEqual(helper["untracked_sources"](repo).files, ["visible.txt"])
+
+
 @unittest.skipIf(os.name == "nt", "POSIX executable and symlink fixtures")
 class GhGitBoundaryTests(unittest.TestCase):
     def test_nested_git_uses_trusted_executable_and_scoped_environment(self):

@@ -713,9 +713,22 @@ def global_excludes_file(repo: Path) -> Path | None:
     home = Path(env["HOME"]).expanduser()
     # This query restores global configuration deliberately. Validate the
     # effective leaves before Git follows their links, not only their HOME.
-    for config in (home / ".gitconfig", home / ".config" / "git" / "config"):
+    configs = (home / ".gitconfig", home / ".config" / "git" / "config")
+    for config in configs:
         if not external_env_path(repo, str(config)):
             raise SystemExit("Git requires global configuration outside reviewed source roots")
+    # This sanitized environment has no XDG override, and --global reads only
+    # these two files. Keep uncertain or present leaves on Git's normal path.
+    missing = 0
+    for config in configs:
+        try:
+            config.lstat()
+        except FileNotFoundError:
+            missing += 1
+        except OSError:
+            pass
+    if missing == len(configs):
+        return None
     env.pop("GIT_CONFIG_GLOBAL", None)
     result = git_result(
         repo,
@@ -2723,13 +2736,12 @@ def is_dirty(repo: Path) -> bool:
 
 def choose_target(repo: Path, mode: str, base_ref: str | None) -> tuple[str, str | None]:
     mode = "local" if mode == "uncommitted" else mode
-    branch = current_branch(repo)
     if mode == "local" or (mode == "auto" and is_dirty(repo)):
         # Pin an explicit base once; later queries must not follow a moving branch.
         return "local", validate_git_ref(repo, base_ref, "base", pin=True) if base_ref is not None else None
     if mode == "commit":
         return "commit", None
-    if mode == "branch" or (mode == "auto" and branch != "main"):
+    if mode == "branch" or (mode == "auto" and current_branch(repo) != "main"):
         return "branch", base_ref or detect_pr_base(repo) or "origin/main"
     raise SystemExit("no review target: clean main checkout and no forced mode")
 
@@ -3689,6 +3701,12 @@ def untracked_sources(
         "--exclude-standard",
         "-z",
     )
+    return _classify_untracked_sources(repo, files, claimed_paths)
+
+
+def _classify_untracked_sources(
+    repo: Path, files: list[str], claimed_paths: list[str] | tuple[str, ...],
+) -> UntrackedSources:
     directories = [
         rel for rel in files
         if rel.endswith("/") and not any(
@@ -3960,7 +3978,7 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
         raise SystemExit("uncommitted submodule contents are not bundled; commit them or use branch mode")
     unstaged_raw = working_gitlink_diff(unstaged_raw, unstaged_patch, unstaged_paths)
     local_base = base_ref
-    if local_base is None:
+    if local_base is None and gitlink_records(staged_raw):
         head = git_result(repo, "rev-parse", "--verify", "HEAD", check=False)
         local_base = head.stdout.strip() if head.returncode == 0 else "absent"
     staged_links = gitlink_manifest(repo, staged_raw, local_base, None, "base -> index")
@@ -4204,20 +4222,42 @@ def source_tree_snapshot(
         if ref_result.returncode != 1:
             raise SystemExit("unable to verify unborn HEAD for source snapshot")
         head = f"unborn:{symbolic_head}"
-    index_entries = git(
+    listing = git(
         repo,
+        *global_excludes_git_args(repo),
         "ls-files",
+        "--cached",
+        "--others",
         "--stage",
+        "--exclude-standard",
+        "-t",
         "-z",
     )
-    tracked = git_path_list(repo, "ls-files", "-z")
-    index_modes = {
-        rel: metadata.split(" ", 1)[0]
-        for record in index_entries.split("\0")
-        if record and "\t" in record
-        for metadata, rel in (record.split("\t", 1),)
-    }
-    untracked = untracked_sources(repo, tracked)
+    records = listing.split("\0")
+    if records[-1]:
+        raise SystemExit("invalid source snapshot file listing")
+    index_records = []
+    tracked = []
+    untracked_files = []
+    index_modes = {}
+    for record in records[:-1]:
+        # Tags distinguish raw untracked names from stage-looking filenames.
+        # Keep all conflict stages and strip only the tag from index records.
+        tag, entry = record[:2], record[2:]
+        if tag == "? " and entry:
+            untracked_files.append(entry)
+        elif tag in {"H ", "S ", "M "}:
+            metadata, separator, rel = entry.partition("\t")
+            mode = re.fullmatch(r"([0-7]{6}) (?:[0-9a-f]{40}|[0-9a-f]{64}) [0-3]", metadata)
+            if not separator or not rel or mode is None:
+                raise SystemExit("invalid source snapshot index entry")
+            index_records.append(entry + "\0")
+            tracked.append(rel)
+            index_modes[rel] = mode[1]
+        else:
+            raise SystemExit("invalid source snapshot file tag")
+    index_entries = "".join(index_records)
+    untracked = _classify_untracked_sources(repo, untracked_files, tracked)
     fingerprints = list(untracked.worktrees)
     for rel in sorted(set(tracked + untracked.files)):
         fingerprints.append((
@@ -4706,13 +4746,17 @@ def repository_metadata_scope(roots: tuple[Path, ...]):
 def corroborate_repository_metadata(expected: RepositoryMetadata) -> None:
     root = expected.root
     verify_repository_metadata((expected,))
-    if Path(git(root, "rev-parse", "--show-toplevel").removesuffix("\n")).resolve() != root:
+    options = (("--show-toplevel",), ("--absolute-git-dir",),
+               ("--git-common-dir",), ("--git-path", "objects"))
+    output = git(root, "rev-parse", *(argument for group in options for argument in group))
+    paths = output.removesuffix("\n").split("\n")
+    if len(paths) != len(options):
+        # These flags terminate each path with LF. Embedded newlines require
+        # separate queries so aliases and unusual names retain their meaning.
+        paths = [git(root, "rev-parse", *group).removesuffix("\n") for group in options]
+    if Path(paths[0]).resolve() != root:
         raise SystemExit("source root must be a Git worktree root")
-    for options, (path, _) in zip(
-        (("--absolute-git-dir",), ("--git-common-dir",), ("--git-path", "objects")),
-        expected.paths[2:],
-    ):
-        actual = Path(git(root, "rev-parse", *options).removesuffix("\n"))
+    for actual, (path, _) in zip(paths[1:], expected.paths[2:]):
         if (root / actual).resolve() != Path(path).resolve():
             raise SystemExit("external source metadata does not match its raw pointers")
     verify_repository_metadata((expected,))

@@ -502,6 +502,20 @@ class ReviewBatchTests(unittest.TestCase):
                         repo, upstream, manifest["files"][0]["path"], manifest["commit"],
                     )
 
+    def test_metadata_corroboration_rejects_mutation_after_git_returns(self):
+        with self.external_fixture() as (_, upstream, _, _):
+            expected = self.helper["repository_metadata"](upstream)
+            original = self.helper["git"]
+            def read(*args, **kwargs):
+                result = original(*args, **kwargs)
+                # Git saw the admitted store, but its raw metadata changed
+                # before the caller can accept the corroborating path output.
+                (upstream / ".git/objects/info/alternates").write_text("")
+                return result
+            with mock.patch.dict(self.helper["corroborate_repository_metadata"].__globals__, {"git": read}):
+                with self.assertRaisesRegex(SystemExit, "metadata changed after admission"):
+                    self.helper["corroborate_repository_metadata"](expected)
+
 
     def test_invalid_external_manifest_cannot_publish_stage_before_output_admission(self):
         with self.external_fixture() as (repo, upstream, source, _):
@@ -1390,10 +1404,10 @@ class ReviewBatchTests(unittest.TestCase):
                 self.assertFalse(sends)
                 self.assertFalse((repo.parent / "result.json").exists())
 
-    @unittest.skipIf(os.name == "nt", "requires POSIX trailing-space/tab directory names")
+    @unittest.skipIf(os.name == "nt", "requires POSIX whitespace directory names")
     def test_external_metadata_pointer_whitespace_matches_stock_git(self):
         for pointer in ("gitdir", "commondir"):
-            for suffix in (" ", "\t"):
+            for suffix in (" ", "\t", "\ninside"):
                 with self.subTest(pointer=pointer, suffix=repr(suffix)), self.linked_external_fixture() as fixture:
                     repo, linked, git_dir, common, manifest = fixture
                     # Detach the admin directory from the common store so either
