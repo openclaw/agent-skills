@@ -379,7 +379,7 @@ class StageTests(unittest.TestCase):
     def main_fixture(self, *, unavailable=False, fail_persistence=False):
         args=self.parse(['--engine-stage-dir',str(self.output),'--stream-engine-output','--status-output',str(self.root/'status.json'),'--json-output',str(self.root/'report.json')])
         report={'findings':[],'overall_correctness':'patch is correct','overall_explanation':'synthetic','overall_confidence':1.0}
-        captured=types.SimpleNamespace(mixed=(),text='synthetic',images=())
+        captured=M.CapturedBundle(text='synthetic', paths=set())
         evidence=types.SimpleNamespace(prompt='',datasets=[],files=[])
         seen=[]
         def passes(args,reviewers,*remaining):
@@ -661,7 +661,7 @@ class StageTests(unittest.TestCase):
                     '--json-output', str(directory / 'report.json'),
                     '--status-output', str(directory / 'status.json')])
                 evidence = types.SimpleNamespace(prompt='', datasets=[], files=[])
-                captured = types.SimpleNamespace(mixed=(), text='synthetic', images=())
+                captured = M.CapturedBundle(text='synthetic', paths=set())
                 calls = []
                 report = {'findings': [], 'overall_correctness': 'patch is correct',
                           'overall_explanation': 'synthetic', 'overall_confidence': 1.0}
