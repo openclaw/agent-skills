@@ -292,6 +292,36 @@ if mode == "parent-streams-subject":
     raise SystemExit(29)
 
 
+if mode == "watchdog-owner-loss":
+    import os
+    import tempfile
+    import time
+
+    create = api.kernel.CreateProcessW
+
+    def pause_after_creation(*arguments):
+        result = create(*arguments)
+        if result:
+            process = api.c.cast(arguments[-1], api.c.POINTER(api.ProcessInfo)).contents
+            receipt = Path(receipt_path)
+            temporary = receipt.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"owner": os.getpid(), "child": process.process_id}),
+                                 encoding="utf-8")
+            os.replace(temporary, receipt)
+            # Delay only returning to Python's launch implementation. The real
+            # API has already created the child with the supplied attributes.
+            time.sleep(30)
+        return result
+
+    api.kernel.CreateProcessW = pause_after_creation
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        helper["run_windows_test_proof"](
+            [sys.executable, "-I", "-S", "-c", "import time; time.sleep(30)"],
+            stdout=stdout_file, stderr=stderr_file,
+        )
+    raise AssertionError("owner-loss witness unexpectedly returned")
+
+
 if mode == "deadline-parent":
     import subprocess
     command = [sys.executable, "-u", "-I", "-S", "-B", "-X", "utf8=1",
@@ -402,6 +432,54 @@ class NativeLaunchProofs(unittest.TestCase):
         result_path = Path(str(receipt) + receipt_suffix)
         return result, json.loads(result_path.read_text(encoding="utf-8")), receipt
 
+    @unittest.skipUnless(os.name == "nt", "requires creation-time native Windows job ownership")
+    def test_watchdog_owner_death_immediately_after_native_creation_reaps_child(self):
+        api = HELPER["_windows_api"]()
+        open_process = api.kernel.OpenProcess
+        open_process.argtypes = [api.w.DWORD, api.w.BOOL, api.w.DWORD]
+        open_process.restype = api.w.HANDLE
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "owner-loss-driver.py"
+            script.write_text(textwrap.dedent(NATIVE_LAUNCH_DRIVER), encoding="utf-8")
+            receipt = root / "created.json"
+            handles = {}
+            with tempfile.TemporaryFile() as output:
+                owner = subprocess.Popen(
+                    [sys.executable, "-I", "-S", "-B", "-X", "utf8=1", str(script),
+                     str(HELPER_PATH), "watchdog-owner-loss", str(receipt)],
+                    stdout=output, stderr=output,
+                )
+                try:
+                    deadline = time.monotonic() + 10
+                    while not receipt.is_file() and owner.poll() is None and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(receipt.is_file(), "real native creation must finish before owner death")
+                    pids = json.loads(receipt.read_text(encoding="utf-8"))
+                    for name in ("owner", "child"):
+                        handle = open_process(0x00100001, False, pids[name])  # SYNCHRONIZE | TERMINATE
+                        self.assertTrue(handle, "retain the actual live process before owner death")
+                        handles[name] = handle
+                        self.assertEqual(api.kernel.WaitForSingleObject(handle, 0), 258)
+                    # Terminate the actual Python owner, including when the
+                    # Popen process is a venv redirector waiting for that owner.
+                    self.assertTrue(api.kernel.TerminateProcess(handles["owner"], 130))
+                    self.assertEqual(api.kernel.WaitForSingleObject(handles["owner"], 5000), 0)
+                    self.assertEqual(api.kernel.WaitForSingleObject(handles["child"], 5000), 0,
+                                     "creation-time job ownership must reap the child before cleanup")
+                    self.assertNotEqual(owner.wait(timeout=5), 0)
+                finally:
+                    # On the old create-then-assign path this explicitly reaps
+                    # the orphan only after the observable ownership assertion.
+                    for handle in handles.values():
+                        if api.kernel.WaitForSingleObject(handle, 0) == 258:
+                            api.kernel.TerminateProcess(handle, 130)
+                            api.kernel.WaitForSingleObject(handle, 5000)
+                        api.kernel.CloseHandle(handle)
+                    if owner.poll() is None:
+                        owner.kill()
+                    owner.wait(timeout=5)
+
     @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
     def test_outer_watchdog_stops_proof_before_reduced_launch_and_owns_descendants(self):
         api = HELPER["_windows_api"]()
@@ -455,7 +533,9 @@ class NativeLaunchProofs(unittest.TestCase):
                         self.assertFalse(worker.is_alive(), "outer watchdog did not return")
                         self.assertLess(time.monotonic() - started, 20)
                         self.assertEqual(len(errors), 1)
-                        self.assertIsInstance(errors[0], subprocess.TimeoutExpired)
+                        if not isinstance(errors[0], subprocess.TimeoutExpired):
+                            # Preserve the native API traceback on CI failures.
+                            raise errors[0]
                         for handle in handles:
                             self.assertEqual(api.kernel.WaitForSingleObject(handle, 0), 0,
                                              "proof and descendants must exit before emergency cleanup")

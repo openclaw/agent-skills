@@ -269,9 +269,10 @@ sets a 30-second deadline where the reduced process handle is owned and attempts
 to terminate the child on timeout. Failed termination or a cleanup wait exceeding
 five seconds fails the proof. A separate 60-second watchdog covers the entire
 proof interpreter, including token preparation and native launch. Its owned job
-contains the interpreter before it runs and terminates the whole process tree on
-timeout; teardown waits are bounded. File-backed output capture lets the caller
-report failures even if a process still holds its output handles. Missing native
+associates the interpreter at process creation, including before the launch call
+returns, and terminates the whole process tree on timeout; teardown waits are
+bounded. This proof requires Windows 10 or Windows Server 2016 or newer.
+File-backed output capture lets the caller report failures even if a process still holds its output handles. Missing native
 fixtures or failed operations also fail the proof. The bootstrap retains user
 identity grants and does not provision accounts or rewrite file or desktop permissions. Hosts that require removed administrative
 grants for their interpreter or checkout must fix that access before testing.
