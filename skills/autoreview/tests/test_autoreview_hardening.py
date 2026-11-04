@@ -1368,7 +1368,16 @@ class AutoreviewBinaryDeletionTests(unittest.TestCase):
                         self.assert_deletion(repo, captured, asset.name, "local", ref)
                         self.assertEqual(captured.mixed, ())
                         heading = "# Staged Diff" if staged else "# Unstaged Diff"
-                        self.assertIn("Binary files ", captured.text.split(heading, 1)[1])
+                        section = captured.text.split(heading, 1)[1].split("# Unstaged Diff", 1)[0]
+                        self.assertIn("Binary files ", section)
+                        # Skipping an empty side's stat must not suppress the
+                        # nonempty opposite side, including binary deletions.
+                        stat_args = ("--cached",) if staged else ()
+                        if staged and ref:
+                            stat_args += ("--end-of-options", ref)
+                        expected_stat = git(repo, "diff", *self.helper["SAFE_DIFF_FLAGS"], "--stat", *stat_args)
+                        self.assertTrue(expected_stat)
+                        self.assertIn(expected_stat, section)
 
     def test_committed_deletion_is_reviewable_from_pinned_base_commit_and_branch(self):
         with self.asset_repo() as (repo, asset, base):

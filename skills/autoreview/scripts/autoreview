@@ -4096,6 +4096,16 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
     unstaged_units = local_patch_ownership(unstaged_patch, unstaged_paths) if mixed_paths else []
     staged_patch = validate_review_patch(staged_paths, staged_patch)
     unstaged_patch = validate_review_patch(unstaged_paths, unstaged_patch)
+    # An empty captured diff has no presentation stat. Keep its empty result
+    # instead of launching another diff (and filter discovery) for that side.
+    staged_stat = ""
+    if staged_paths:
+        staged_stat = (REVIEW_SECURITY_OMISSION if staged_blocked_paths
+                       else git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--stat", *staged_base))
+    unstaged_stat = ""
+    if unstaged_paths:
+        unstaged_stat = (REVIEW_SECURITY_OMISSION if unstaged_blocked_paths
+                         else git(repo, "diff", *SAFE_DIFF_FLAGS, "--stat"))
     parts = [
         "# Git Status",
         local_status(
@@ -4105,18 +4115,10 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
             redact=bool(omitted_tracked or omitted_untracked),
         ),
         "# Staged Diff" if base_ref is None else f"# Staged Diff\nbase: {base_ref}",
-        (
-            REVIEW_SECURITY_OMISSION
-            if tracked_sensitive_paths(staged_paths)
-            else git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--stat", *staged_base)
-        ),
+        staged_stat,
         staged_patch,
         "# Unstaged Diff",
-        (
-            REVIEW_SECURITY_OMISSION
-            if tracked_sensitive_paths(unstaged_paths)
-            else git(repo, "diff", *SAFE_DIFF_FLAGS, "--stat")
-        ),
+        unstaged_stat,
         unstaged_patch,
     ]
     owned_parts = {4: (staged_units, "index"), 7: (unstaged_units, "working_tree")}
