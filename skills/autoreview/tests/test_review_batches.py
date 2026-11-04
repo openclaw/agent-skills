@@ -2586,8 +2586,18 @@ class SelectedExecutableDirectoryTests(unittest.TestCase):
                     os.link(self.payload, sibling)
                 try:
                     with mock.patch.dict(os.environ, {"AUTOREVIEW_GIT": str(executable)}), \
-                            self.in_repo(), contextlib.redirect_stderr(io.StringIO()):
+                            self.in_repo(), contextlib.redirect_stderr(io.StringIO()) as stderr:
+                        with self.assertRaises(SystemExit) as rejected:
+                            self.helper["safe_git_env"](self.repo)
+                        message = str(rejected.exception)
+                        self.assertIn(str(executable), message)
+                        self.assertIn(str(sibling), message)
+                        reason = "independent file custody required" if kind == "hardlink" else "path admission refused"
+                        self.assertIn(reason, message)
                         self.assertFalse(self.helper["preflight_git"]())
+                        self.assertIn(str(executable), stderr.getvalue())
+                        self.assertIn(str(sibling), stderr.getvalue())
+                        self.assertIn(reason, stderr.getvalue())
                     self.assertFalse(self.marker.exists(), "Git probe executed a source-owned sibling")
                 finally:
                     sibling.unlink()

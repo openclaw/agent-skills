@@ -975,13 +975,22 @@ def admit_executable_directories(
     admission = ExternalEnvAdmission(boundary, {}, {}, {}, {})
     entries: list[str] = []
     admitted: set[Path] = set()
+    rejection: tuple[str | Path, str] | None = None
+
+    def reject(path: str | Path, reason: str) -> None:
+        nonlocal rejection
+        if rejection is None:
+            rejection = (path, reason)
 
     def inspect(path: str | Path) -> Path | None:
         candidate = Path(path).expanduser()
+        inspected = candidate
         try:
             if not candidate.is_absolute() or not candidate.is_dir():
+                reject(candidate, "absolute directory required")
                 return None
             if not external_env_path(repo, str(candidate), admission=admission):
+                reject(candidate, "path admission refused")
                 return None
             resolved = candidate.resolve()
             if resolved in admitted:
@@ -991,20 +1000,24 @@ def admit_executable_directories(
             # a launcher might import. Redirectors also need source-path checks.
             with os.scandir(resolved) as children:
                 for child in children:
+                    inspected = child.path
                     try:
                         # Windows DirEntry.stat omits the hardlink count.
                         metadata = os.stat(child.path) if os.name == "nt" else child.stat()
                     except (FileNotFoundError, NotADirectoryError):
                         metadata = None
                     if metadata is not None and not _independent_file_custody(child.path, metadata):
+                        reject(inspected, "independent file custody required")
                         return None
                     needs_check = not child.is_file(follow_symlinks=False)
                     if os.name == "nt":
                         needs_check |= bool(child.stat(follow_symlinks=False).st_file_attributes
                                             & stat.FILE_ATTRIBUTE_REPARSE_POINT)
                     if needs_check and not external_env_path(repo, child.path, admission=admission):
+                        reject(inspected, "path admission refused")
                         return None
         except (OSError, RuntimeError):
+            reject(inspected, "filesystem inspection unavailable")
             return None
         admitted.add(resolved)
         return resolved
@@ -1013,6 +1026,9 @@ def admit_executable_directories(
     # invoked spelling and resolved target's directory, even if neither is
     # representable in PATH. This checks direct entries, not dependency trees.
     for executable in selected_executables or []:
+        # Report only this executable's first rejected path, never a previous
+        # selection or a PATH entry inspected for another purpose.
+        rejection = None
         candidate = Path(executable)
         try:
             trusted = candidate.is_absolute() and external_env_path(repo, str(candidate), admission=admission)
@@ -1021,9 +1037,14 @@ def admit_executable_directories(
                        and inspect(candidate.parent) is not None
                        and inspect(target.parent) is not None)
         except (OSError, RuntimeError):
+            reject(candidate, "filesystem inspection unavailable")
             trusted = False
         if not trusted:
-            raise SystemExit("selected executable requires trusted installation directories outside reviewed source roots")
+            rejected_path, reason = rejection or (candidate, "absolute admitted regular executable required")
+            raise SystemExit(
+                "selected executable requires trusted installation directories outside reviewed source roots; "
+                f"selected {str(candidate)!r}; rejected {str(rejected_path)!r}: {reason}"
+            )
 
     def add(path: str | Path) -> None:
         candidate = Path(path).expanduser()
@@ -2839,8 +2860,11 @@ def preflight_git() -> bool:
     try:
         selected = resolve_git(repo)
         git_env = safe_git_env(repo, selected_git=selected)
-    except SystemExit:
-        reason = "executable or environment missing or untrusted"
+    except SystemExit as exc:
+        detail = str(exc)
+        reason = (display_escape(detail, 1000)
+                  if detail.startswith("selected executable requires trusted installation directories outside reviewed source roots")
+                  else "executable or environment missing or untrusted")
     else:
         try:
             with deferred_owned_process_signals():
