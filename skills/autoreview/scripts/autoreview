@@ -1969,7 +1969,8 @@ def unregister_owned_process(proc: subprocess.Popen[str]) -> None:
 
 
 
-def finish_owned_process(proc: subprocess.Popen[str], terminate: Callable[[], None] | None = None) -> None:
+def finish_owned_process(proc: subprocess.Popen[str], terminate: Callable[[], None] | None = None,
+                         finalize: Callable[[], None] | None = None) -> None:
     """Release all owned resources even when explicit termination fails."""
     errors: list[BaseException] = []
     try:
@@ -1985,15 +1986,23 @@ def finish_owned_process(proc: subprocess.Popen[str], terminate: Callable[[], No
         except BaseException as exc:
             errors.append(exc)
         finally:
-            for stream in (proc.stdin, proc.stdout, proc.stderr):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except BaseException as exc:
-                        errors.append(exc)
+            try:
+                if finalize is not None:
+                    finalize()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except BaseException as exc:
+                            errors.append(exc)
     if errors:
-        primary = errors[0]
-        primary.cleanup_errors = (*getattr(primary, "cleanup_errors", ()), *errors[1:])
+        # Cancellation must survive an earlier cleanup failure.
+        primary = next((error for error in errors if not isinstance(error, Exception)), errors[0])
+        primary.cleanup_errors = (*getattr(primary, "cleanup_errors", ()),
+                                  *(error for error in errors if error is not primary))
         raise primary
 
 
@@ -2054,10 +2063,19 @@ def start_owned_process(
         if proc is not None:
             try:
                 finish_owned_process(proc, startup.abort if startup is not None
-                                     else lambda: terminate_process_group(proc))
+                                     else lambda: terminate_process_group(proc),
+                                     startup.close if startup is not None else None)
             except BaseException as cleanup_error:
-                # A cleanup timeout must never replace post-GO uncertainty with
-                # a retryable pre-start timeout. Retain the original cause too.
+                if not isinstance(cleanup_error, Exception) and isinstance(failure, Exception):
+                    # Cancellation exits the invocation. Retain post-GO knowledge
+                    # as its safe cause, never as permission to retry. Other
+                    # startup errors may format private argv in a traceback.
+                    cleanup_error.startup_failure = failure
+                    if startup is not None and isinstance(failure, module.LaunchIndeterminate):
+                        raise cleanup_error from failure
+                    raise cleanup_error from None
+                # An abort timeout cannot downgrade post-GO uncertainty. Retain
+                # the original protocol cause and all secondary cleanup errors.
                 failure.cleanup_errors = (*getattr(failure, "cleanup_errors", ()), cleanup_error)
         raise
 
@@ -2309,15 +2327,22 @@ class EngineRuntimeDeadline:
         args: list[str],
         stdout: str,
         stderr: str,
+        *, cleanup_errors: tuple[BaseException, ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         assert self.max_runtime_seconds is not None
         detail = f"{self.label} engine timed out after {self.max_runtime_seconds:g}s"
-        return TimedOutEngineProcess(
+        if cleanup_errors:
+            # Cleanup exceptions may contain private target argv. Report only
+            # their kinds, retaining the objects for programmatic inspection.
+            detail += "\nstartup cleanup failed: " + ", ".join(type(error).__name__ for error in cleanup_errors)
+        result = TimedOutEngineProcess(
             args,
             124,
             stdout,
             f"{stderr.rstrip()}\n{detail}".lstrip(),
         )
+        result.cleanup_errors = cleanup_errors
+        return result
 
 
 def timeout_output_text(value: str | bytes | None) -> str:
@@ -2515,9 +2540,9 @@ def run_with_heartbeat(
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             encoding=SUBPROCESS_TEXT_ENCODING, errors=SUBPROCESS_TEXT_ERRORS, env=env,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as failure:
         if deadline.expired():
-            return deadline.completed_process(args, "", "")
+            return deadline.completed_process(args, "", "", cleanup_errors=getattr(failure, "cleanup_errors", ()))
         raise
     try:
         first_communicate = True
@@ -2579,10 +2604,10 @@ def run_with_stream(
                 encoding=SUBPROCESS_TEXT_ENCODING, errors=SUBPROCESS_TEXT_ERRORS,
                 bufsize=1, env=env,
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as failure:
             if deadline.expired():
                 terminal = "engine_timeout"
-                return deadline.completed_process(args, "", "")
+                return deadline.completed_process(args, "", "", cleanup_errors=getattr(failure, "cleanup_errors", ()))
             raise
         collection_entered = False
         try:

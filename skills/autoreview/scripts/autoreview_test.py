@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -3271,6 +3272,118 @@ class AutoreviewPreflightTests(unittest.TestCase):
 
 
 class OwnedProcessCleanupTests(unittest.TestCase):
+    def test_startup_timeout_preserves_cleanup_cancellation_and_details(self):
+        for streamed, outcome in itertools.product((False, True), ("error", "engine", "keyboard")):
+            with self.subTest(streamed=streamed, outcome=outcome), \
+                    tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as patches:
+                processes = []
+                startup_failure = subprocess.TimeoutExpired("private-startup-argument", 0.001)
+                if outcome == "engine":
+                    cleanup_failure = AUTOREVIEW.EngineInterrupted(130)
+                elif outcome == "keyboard":
+                    cleanup_failure = KeyboardInterrupt()
+                else:
+                    cleanup_failure = RuntimeError("private-cleanup-detail")
+                register = AUTOREVIEW.register_owned_process
+                terminate = AUTOREVIEW.terminate_process_group
+
+                def fail_after_termination(proc, *args, **kwargs):
+                    terminate(proc, *args, **kwargs)
+                    raise cleanup_failure
+
+                def expire_after_registration(proc, job=None):
+                    register(proc, job)
+                    processes.append(proc)
+                    if job is not None:
+                        terminate_job = job.terminate
+
+                        def interrupt_job():
+                            terminate_job()
+                            raise cleanup_failure
+
+                        patches.enter_context(mock.patch.object(job, "terminate", interrupt_job))
+                    # The actual process is registered; only startup completion
+                    # is made to fail after the caller's deadline has elapsed.
+                    time.sleep(0.02)
+                    raise startup_failure
+
+                patches.enter_context(mock.patch.object(AUTOREVIEW, "register_owned_process", expire_after_registration))
+                patches.enter_context(mock.patch.object(AUTOREVIEW, "terminate_process_group", fail_after_termination))
+                try:
+                    def run():
+                        return AUTOREVIEW.run_with_heartbeat(
+                            [sys.executable, "-I", "-S", "-c", "import time; time.sleep(5)"],
+                            Path(directory).resolve(), label="startup-cleanup", stream_output=streamed,
+                            max_runtime_seconds=0.001,
+                        )
+
+                    if outcome != "error":
+                        with self.assertRaises(type(cleanup_failure)) as raised:
+                            run()
+                        self.assertIs(raised.exception, cleanup_failure)
+                        self.assertIs(raised.exception.startup_failure, startup_failure)
+                        self.assertIsNone(raised.exception.__cause__)
+                        diagnostic = "".join(traceback.format_exception(raised.exception))
+                        self.assertNotIn("private-startup-argument", diagnostic)
+                        if outcome == "engine":
+                            self.assertEqual(raised.exception.code, 130)
+                    else:
+                        result = run()
+                        self.assertIsInstance(result, AUTOREVIEW.TimedOutEngineProcess)
+                        self.assertEqual(result.returncode, 124)
+                        self.assertIn("startup cleanup failed: RuntimeError", result.stderr)
+                        self.assertNotIn("private-cleanup-detail", result.stderr)
+                        self.assertNotIn("private-startup-argument", result.stderr)
+                        self.assertEqual(result.cleanup_errors, (cleanup_failure,))
+                    self.assertEqual(len(processes), 1)
+                    self.assertNotIn(processes[0].pid, AUTOREVIEW._OWNED_PROCESSES)
+                    for stream in (processes[0].stdin, processes[0].stdout, processes[0].stderr):
+                        if stream is not None:
+                            self.assertTrue(stream.closed)
+                finally:
+                    patches.close()
+                    for proc in processes:
+                        if proc.poll() is None:
+                            proc.kill()
+                        proc.wait(timeout=5)
+                        AUTOREVIEW.unregister_owned_process(proc)
+                        for stream in (proc.stdin, proc.stdout, proc.stderr):
+                            if stream is not None:
+                                stream.close()
+
+    def test_startup_control_close_attempts_both_real_descriptors(self):
+        module = AUTOREVIEW._load_windows_process_module(str(SCRIPT_PATH.with_name("windows-owned-process.py")))
+        startup = object.__new__(module.Startup)
+        startup.reader, startup.writer = os.pipe()
+        startup.control_errors = []
+        descriptors = (startup.reader, startup.writer)
+        close = os.close
+        failure = OSError("injected control close failure")
+
+        def close_then_fail(descriptor):
+            close(descriptor)
+            if descriptor == descriptors[0]:
+                raise failure
+
+        try:
+            # This unit covers the raw descriptor owner, without pretending to
+            # construct a Windows job or exercise the native launch protocol.
+            with mock.patch.object(module.os, "close", close_then_fail):
+                startup._close_control()
+            self.assertEqual(startup.control_errors, [failure])
+            self.assertIsNone(startup.reader)
+            self.assertIsNone(startup.writer)
+            for descriptor in descriptors:
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+        finally:
+            for name in ("reader", "writer"):
+                descriptor = getattr(startup, name)
+                if descriptor is not None:
+                    with contextlib.suppress(OSError):
+                        close(descriptor)
+                    setattr(startup, name, None)
+
     def test_buffered_cleanup_releases_streams_and_owner_after_termination_failure(self):
         for close_fails in (False, True):
             with self.subTest(close_fails=close_fails), tempfile.TemporaryDirectory() as directory:

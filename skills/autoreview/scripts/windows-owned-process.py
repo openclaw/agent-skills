@@ -205,6 +205,7 @@ class Startup:
         self.go_sent = False
         self.reported_error = False
         self.error = None
+        self.control_errors = []
         child_reader = child_writer = assignment = None
         try:
             try:
@@ -238,15 +239,27 @@ class Startup:
                     close_error = exc
                 if close_error is not None:
                     raise close_error
-        except BaseException:
-            try:
-                self.abort()
-            finally:
-                self.job.close()
-            raise
+        except BaseException as failure:
+            # No exchange worker exists during construction. Attempt all three
+            # releases even when a previous native operation failed.
+            for cleanup in (self.abort, self.job.close, self.close):
+                try:
+                    cleanup()
+                except BaseException as error:
+                    if not isinstance(error, Exception) and isinstance(failure, Exception):
+                        error.startup_failure = failure
+                        error.__cause__ = None
+                        error.__suppress_context__ = True
+                        failure = error
+                    else:
+                        failure.cleanup_errors = (*getattr(failure, "cleanup_errors", ()), error)
+            raise failure
 
     def _exchange(self):
         try:
+            with self.state_lock:
+                if self.cancelled:
+                    raise TimeoutError("Windows startup aborted before readiness")
             if read_frame(self.reader) != {"version": 1, "operation": "ready"}:
                 raise ValueError("invalid Windows supervisor readiness")
             # Cancellation and GO share one decision: a pre-GO timeout cannot
@@ -271,6 +284,10 @@ class Startup:
         except BaseException as exc:
             self.error = exc
         finally:
+            # Once started, this worker alone closes the raw endpoints, after
+            # its last I/O. Even failed aborts cannot orphan or recycle them
+            # underneath a live reader.
+            self._close_control()
             self.done.set()
 
     def finish(self, deadline):
@@ -291,15 +308,24 @@ class Startup:
                 raise LaunchIndeterminate("Windows target may have started; acknowledgement timed out")
             raise subprocess.TimeoutExpired(self.argv, allowance)
         self.worker.join()
-        self._close_control()
+        failure = None
         if self.error is not None:
             if self.reported_error:
-                raise self.error
-            if self.go_sent:
-                raise LaunchIndeterminate("Windows target may have started; acknowledgement lost") from self.error
-            if isinstance(self.error, TimeoutError):
-                raise subprocess.TimeoutExpired(self.argv, allowance) from self.error
-            raise OSError(errno.EIO, "Windows supervisor failed before target startup") from self.error
+                failure = self.error
+            elif self.go_sent:
+                failure = LaunchIndeterminate("Windows target may have started; acknowledgement lost")
+            elif isinstance(self.error, TimeoutError):
+                failure = subprocess.TimeoutExpired(self.argv, allowance)
+            else:
+                failure = OSError(errno.EIO, "Windows supervisor failed before target startup")
+        elif self.control_errors:
+            failure = LaunchIndeterminate("Windows target started; control cleanup failed")
+        if failure is not None:
+            failure.cleanup_errors = (*getattr(failure, "cleanup_errors", ()), *self.control_errors)
+            self.control_errors.clear()
+            if failure is self.error:
+                raise failure
+            raise failure from self.error
         return self.process
 
     def _close_control(self):
@@ -307,7 +333,32 @@ class Startup:
             descriptor = getattr(self, name)
             setattr(self, name, None)
             if descriptor is not None:
-                os.close(descriptor)
+                try:
+                    os.close(descriptor)
+                except BaseException as error:
+                    self.control_errors.append(error)
+
+    def close(self):
+        """Finalize protocol I/O after the caller releases the native job."""
+        with self.state_lock:
+            self.cancelled = True
+            unstarted = self.worker is None or self.worker.ident is None
+            if unstarted:
+                # A delayed worker must see cancellation before any I/O. Holding
+                # its entry lock makes closing unstarted endpoints safe too.
+                self._close_control()
+        if not unstarted:
+            self.worker.join(timeout=SETTLE_SECONDS)
+            if self.worker.is_alive():
+                # The worker still owns both endpoints and will close them when
+                # its I/O ends; never close a descriptor beneath that operation.
+                raise TimeoutError("Windows startup I/O did not settle")
+        if self.control_errors:
+            errors, self.control_errors = self.control_errors, []
+            primary = next((error for error in errors if not isinstance(error, Exception)), errors[0])
+            primary.cleanup_errors = (*getattr(primary, "cleanup_errors", ()),
+                                      *(error for error in errors if error is not primary))
+            raise primary
 
     def abort(self):
         # The child cannot retain a control endpoint after it and its job settle.
@@ -328,11 +379,6 @@ class Startup:
             if time.monotonic() >= deadline:
                 raise TimeoutError("Windows owned job did not settle")
             time.sleep(0.01)
-        if self.worker is not None and self.worker.ident is not None:
-            self.worker.join(timeout=max(0, deadline - time.monotonic()))
-            if self.worker.is_alive():
-                raise TimeoutError("Windows startup I/O did not settle")
-        self._close_control()
         if termination_error is not None:
             raise termination_error
 

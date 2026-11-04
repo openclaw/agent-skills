@@ -6074,13 +6074,32 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_windows_lost_acknowledgement_survives_abort_timeout(self) -> None:
         self.assert_lost_acknowledgement_cleanup(abort_fails=True)
 
-    def assert_lost_acknowledgement_cleanup(self, *, abort_fails: bool) -> None:
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_lost_acknowledgement_survives_control_close_failure(self) -> None:
+        self.assert_lost_acknowledgement_cleanup(abort_fails=False, control_close_fails=True)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_stalled_exchange_closes_after_abort_failure(self) -> None:
+        self.assert_lost_acknowledgement_cleanup(abort_fails=True, stalled=True)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_cleanup_cancellation_retains_post_go_uncertainty(self) -> None:
+        self.assert_lost_acknowledgement_cleanup(abort_fails=True, cancelled=True)
+
+    def assert_lost_acknowledgement_cleanup(self, *, abort_fails: bool,
+                                           control_close_fails: bool = False,
+                                           stalled: bool = False, cancelled: bool = False) -> None:
         supervisor = str(SCRIPT.with_name("windows-owned-process.py"))
         module = self.helper["_load_windows_process_module"](supervisor)
         real_spawn = module.spawn
         real_write_frame = module.write_frame
         startups = []
-        cleanup_error = subprocess.TimeoutExpired("private-target-argument", 2)
+        supervisor_waits = []
+        cleanup_error = (self.helper["EngineInterrupted"](130) if cancelled
+                         else subprocess.TimeoutExpired("private-target-argument", 2))
+        control_error = OSError("private-control-detail")
+        control_descriptors = []
+        control_faults = []
         target_waits = []
         injected = []
         target_code = (
@@ -6096,12 +6115,27 @@ class AutoreviewHardeningTests(unittest.TestCase):
             # Keep an actual EOF endpoint available without allocating descriptors
             # after closing the owned response pipe. Only its contents change.
             eof_reader, eof_writer = os.pipe()
-            os.close(eof_writer)
+            held_writer = handles.enter_context(os.fdopen(eof_writer, "wb", buffering=0))
+            if not stalled:
+                held_writer.close()
             handles.callback(os.close, eof_reader)
 
             def observe_spawn(*args, **kwargs):
                 startup = real_spawn(*args, **kwargs)
                 startups.append(startup)
+                supervisor_waits.append(startup.process.wait)
+                control_descriptors.extend((startup.reader, startup.writer))
+                if control_close_fails:
+                    close = os.close
+                    reader = startup.reader
+
+                    def close_then_fail(descriptor):
+                        close(descriptor)
+                        if descriptor == reader and not control_faults:
+                            control_faults.append(True)
+                            raise control_error
+
+                    handles.enter_context(mock.patch.object(module.os, "close", close_then_fail))
                 if abort_fails:
                     # The native target really starts; inject only a failed wait
                     # during abort, after native job termination was requested.
@@ -6117,33 +6151,57 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 wait = handles.enter_context(self.windows_process_handle(pid))
                 target_waits.append(wait)
                 self.assertEqual(wait(0), 258)
-                # GO has reached the real supervisor and the real target is live.
-                # This worker has not begun its next read: replace its response
-                # endpoint with real EOF, discarding even an already buffered
-                # STARTED while preserving the fd for ordinary owner cleanup.
+                # GO reached the real supervisor and the target is live. Replace
+                # the response with EOF, or a held-open pipe for a real timeout,
+                # before this worker can consume even a buffered STARTED.
                 os.dup2(eof_reader, startup.reader, inheritable=False)
                 injected.append(True)
 
             with mock.patch.object(module, "spawn", observe_spawn), mock.patch.object(
                 module, "write_frame", lose_acknowledgement,
             ):
-                with self.assertRaises(module.LaunchIndeterminate) as raised:
+                expected = self.helper["EngineInterrupted"] if cancelled else module.LaunchIndeterminate
+                with self.assertRaises(expected) as raised:
                     self.helper["run_with_heartbeat"](
                         [sys.executable, "-I", "-S", "-c", target_code, str(witness)],
-                        cwd, label="lost-start-acknowledgement", max_runtime_seconds=20,
+                        cwd, label="lost-start-acknowledgement", max_runtime_seconds=5 if stalled else 20,
                     )
 
-            self.assertIsInstance(raised.exception.__cause__, EOFError)
-            if abort_fails:
-                self.assertEqual(raised.exception.cleanup_errors, (cleanup_error,))
-                self.assertIn("cleanup also failed: TimeoutExpired", str(raised.exception))
-                self.assertNotIn("private-target-argument", str(raised.exception))
+            launch_failure = raised.exception.__cause__ if cancelled else raised.exception
+            self.assertIsInstance(launch_failure, module.LaunchIndeterminate)
+            if stalled:
+                self.assertIn("acknowledgement timed out", str(launch_failure))
+            else:
+                self.assertIsInstance(launch_failure.__cause__, EOFError)
+            if cancelled:
+                self.assertIs(raised.exception, cleanup_error)
+                self.assertEqual(raised.exception.code, 130)
+            elif abort_fails:
+                self.assertEqual(launch_failure.cleanup_errors, (cleanup_error,))
+                self.assertIn("cleanup also failed: TimeoutExpired", str(launch_failure))
+                self.assertNotIn("private-target-argument", str(launch_failure))
+            if control_close_fails:
+                self.assertEqual(control_faults, [True])
+                self.assertEqual(launch_failure.cleanup_errors, (control_error,))
+                self.assertNotIn("private-control-detail", str(launch_failure))
+            # If even post-job finalization timed out, release the test-held pipe
+            # and observe the worker independently. Its finally must own both fds.
+            held_writer.close()
+            startups[0].close()
+            self.assertIsNone(startups[0].reader)
+            self.assertIsNone(startups[0].writer)
+            for descriptor in control_descriptors:
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
             self.assertEqual(injected, [True])
             self.assertEqual(len(startups), 1)
             self.assertEqual(len(target_waits), 1)
             # Check real cleanup before the observation handle's emergency
             # teardown could terminate a process and conceal an ownership bug.
             self.assertEqual(target_waits[0](5000), 0)
+            # Target and supervisor shutdown are independent observations. The
+            # injected abort wait cannot substitute for either process witness.
+            supervisor_waits[0](timeout=5)
             self.assertIsNotNone(startups[0].process.poll())
             self.assertEqual(self.helper["_OWNED_PROCESSES"], {})
 
