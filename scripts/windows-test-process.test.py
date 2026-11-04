@@ -449,7 +449,7 @@ class NativeTokenTests(unittest.TestCase):
         before = HELPER["windows_test_process_status"]()
         parent_default_dacl = token_default_dacl_sddl(HELPER)
         parent_object_security = token_object_security_sddl(HELPER)
-        with cross_token_fixture() as (root, original_security):
+        with cross_token_fixture() as (root, _):
             default_acl_root = root / "default-acl-parent"
             default_acl_root.mkdir()
             grant_new_fixture_user_access(default_acl_root, inherit=False)
@@ -461,19 +461,15 @@ class NativeTokenTests(unittest.TestCase):
                 "status = helper['ensure_windows_test_process'](sys.argv[0], sys.argv[1:])\n"
                 "if status is not None: helper['exit_test_process'](status)\n"
                 "state = helper['windows_test_process_status']()\n"
-                "object_security = proof['token_object_security_sddl'](helper).replace(state['user_sid'], '<current-user>')\n"
-                "dacl = proof['token_default_dacl_sddl'](helper)\n"
-                "dacl = dacl.replace(state['user_sid'], '<current-user>') if dacl else dacl\n"
-                "print(json.dumps(dict(default_dacl=dacl, token_object=object_security, owner_is_user=state['owner_sid'] == state['user_sid'])), file=sys.stderr, flush=True)\n"
                 "ordinary = pathlib.Path(sys.argv[1])\n"
                 "direct = ordinary / 'default-file.txt'\n"
                 "direct.write_text('default file', encoding='utf-8')\n"
                 "assert direct.read_text(encoding='utf-8') == 'default file'\n"
-                "file_security = proof['native_directory_security'](direct)\n"
+                "file_security = proof['native_directory_security'](direct)['owner_is_user']\n"
                 "direct.unlink()\n"
                 "nested = ordinary / 'default-directory'\n"
                 "nested.mkdir()\n"
-                "ordinary_security = proof['native_directory_security'](nested)\n"
+                "ordinary_security = proof['native_directory_security'](nested)['owner_is_user']\n"
                 "direct = nested / 'child.txt'\n"
                 "direct.write_text('nested file', encoding='utf-8')\n"
                 "assert direct.read_text(encoding='utf-8') == 'nested file'\n"
@@ -481,7 +477,7 @@ class NativeTokenTests(unittest.TestCase):
                 "nested.rmdir()\n"
                 "with tempfile.TemporaryDirectory() as directory:\n"
                 "    root = pathlib.Path(directory)\n"
-                "    security = proof['native_directory_security'](root)\n"
+                "    security = proof['native_directory_security'](root)['owner_is_user']\n"
                 "    item = root / 'ordinary-file.txt'\n"
                 "    item.write_text('created', encoding='utf-8')\n"
                 "    assert item.read_text(encoding='utf-8') == 'created'\n"
@@ -491,29 +487,24 @@ class NativeTokenTests(unittest.TestCase):
                 "assert not root.exists()\n"
                 "print(json.dumps(dict(eligible=state['eligible'],\n"
                 "    owner_is_user=state['owner_sid'] == state['user_sid'],\n"
-                "    default_dacl=dacl, token_object=object_security, ordinary_file=file_security, ordinary_directory=ordinary_security,\n"
+                "    ordinary_file=file_security, ordinary_directory=ordinary_security,\n"
                 "    directory=security, removed=True)))\n",
                 encoding="utf-8",
             )
             result = subprocess.run([sys.executable, "-I", "-S", "-B", str(script), str(default_acl_root)],
                                     capture_output=True, text=True, timeout=60)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr + str(original_security))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "", "successful native proof must not emit host diagnostics")
             data = json.loads(result.stdout)
             self.assertTrue(data["eligible"])
             self.assertTrue(data["owner_is_user"])
-            self.assertTrue(data["directory"]["owner_is_user"])
-            self.assertTrue(data["ordinary_file"]["owner_is_user"])
-            self.assertTrue(data["ordinary_directory"]["owner_is_user"])
+            self.assertTrue(data["directory"])
+            self.assertTrue(data["ordinary_file"])
+            self.assertTrue(data["ordinary_directory"])
             self.assertTrue(data["removed"])
-            print(json.dumps({"parent_fixture_security": original_security,
-                              "parent_token_object": parent_object_security.replace(before["user_sid"], "<current-user>"),
-                              "parent_token_owner_is_user": before["owner_sid"] == before["user_sid"],
-                              "parent_default_dacl": (parent_default_dacl.replace(before["user_sid"], "<current-user>")
-                                                      if parent_default_dacl else parent_default_dacl),
-                              "reduced_child_private_directory": data}), flush=True)
-        self.assertEqual(HELPER["windows_test_process_status"](), before)
-        self.assertEqual(token_default_dacl_sddl(HELPER), parent_default_dacl)
-        self.assertEqual(token_object_security_sddl(HELPER), parent_object_security)
+        self.assertTrue(HELPER["windows_test_process_status"]() == before, "parent token state changed")
+        self.assertTrue(token_default_dacl_sddl(HELPER) == parent_default_dacl, "parent default DACL changed")
+        self.assertTrue(token_object_security_sddl(HELPER) == parent_object_security, "parent token descriptor changed")
 
     def test_status_handle_can_query_but_cannot_duplicate_token(self):
         api = HELPER["_windows_api"]()
@@ -688,7 +679,9 @@ class WindowsTestProcessTests(unittest.TestCase):
                 "import json, os, runpy, sys\n"
                 "from pathlib import Path\n"
                 f"helper = runpy.run_path({str(HELPER_PATH)!r})\n"
-                "status = helper['ensure_windows_test_process'](sys.argv[0], sys.argv[1:])\n"
+                "proof = [sys.executable, '-I', '-S', '-X', 'utf8', '-c',\n"
+                "         \"import sys; sys.stdout.write('auxiliary 雪' + chr(10)); sys.stderr.write('auxiliary Ω' + chr(10))\"]\n"
+                "status = helper['ensure_windows_test_process'](sys.argv[0], sys.argv[1:], parent_check=proof)\n"
                 "if status is not None: helper['exit_test_process'](status)\n"
                 "print('stdout witness', flush=True)\n"
                 "print('stderr witness', file=sys.stderr, flush=True)\n"
@@ -698,6 +691,7 @@ class WindowsTestProcessTests(unittest.TestCase):
                 "            no_site=sys.flags.no_site, optimize=sys.flags.optimize,\n"
                 "            dont_write_bytecode=sys.flags.dont_write_bytecode,\n"
                 "            utf8_mode=sys.flags.utf8_mode, warnings=sys.warnoptions,\n"
+                "            warn_default_encoding=sys.flags.warn_default_encoding,\n"
                 "            write_through=sys.stdout.write_through,\n"
                 "            stdin=sys.stdin.read(), status=helper['windows_test_process_status']())\n"
                 "Path(sys.argv[1]).write_text(json.dumps(data), encoding='utf-8')\n"
@@ -707,13 +701,15 @@ class WindowsTestProcessTests(unittest.TestCase):
             output = root / "result.json"
             arguments = [str(output), "space argument", "雪", 'quoted "argument"', "trailing\\", "$literal`value"]
             result = subprocess.run(
-                [sys.executable, "-I", "-u", "-S", "-B", "-O", "-X", "utf8", "-W", "error", script.name, *arguments],
+                [sys.executable, "-I", "-u", "-S", "-B", "-O", "-X", "utf8", "-X", "warn_default_encoding", "-W", "error",
+                 "-W", "error::EncodingWarning", script.name, *arguments],
                 cwd=root, env={**os.environ, "INVOCATION_WITNESS": "preserved"},
-                input="stdin witness", text=True, capture_output=True, timeout=60,
+                input="stdin witness", encoding="utf-8", capture_output=True, timeout=60,
             )
             self.assertEqual(result.returncode, 17, result.stdout + result.stderr + str(original_security))
-            self.assertEqual(result.stdout, "stdout witness\n")
-            self.assertEqual(result.stderr, "stderr witness\n")
+            needs_proof = os.name == "nt" and not HELPER["windows_test_process_status"]()["primary_eligible"]
+            self.assertEqual(result.stdout, ("auxiliary 雪\n" if needs_proof else "") + "stdout witness\n")
+            self.assertEqual(result.stderr, ("auxiliary Ω\n" if needs_proof else "") + "stderr witness\n")
             data = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(data["executable"], sys.executable)
             self.assertEqual(data["argv"], [script.name, *arguments])
@@ -725,6 +721,8 @@ class WindowsTestProcessTests(unittest.TestCase):
             self.assertEqual(data["optimize"], 1)
             self.assertEqual(data["dont_write_bytecode"], 1)
             self.assertEqual(data["utf8_mode"], 1)
+            self.assertEqual(data["warn_default_encoding"], 1)
+            self.assertIn("error::EncodingWarning", data["warnings"])
             self.assertTrue(data["write_through"])
             self.assertIn("error", data["warnings"])
             self.assertEqual(data["status"]["native"], os.name == "nt")
@@ -770,10 +768,6 @@ class NativeThreadOnlyTests(unittest.TestCase):
                         helper['exit_test_process'](status)
                     assert helper['windows_test_process_status']()['eligible']
                     api = helper['_windows_api']()
-                    proof = runpy.run_path({str(Path(__file__).resolve())!r})
-                    object_security = proof['token_object_security_sddl'](helper)
-                    object_security = object_security.replace(helper['windows_test_process_status']()['user_sid'], '<current-user>')
-                    print(json.dumps(dict(thread_caller_token_object=object_security)), file=sys.stderr, flush=True)
                     duplicate = api.security.DuplicateToken
                     duplicate.restype = api.w.BOOL
                     duplicate.argtypes = [api.w.HANDLE, api.c.c_int, api.c.POINTER(api.w.HANDLE)]
@@ -792,8 +786,8 @@ class NativeThreadOnlyTests(unittest.TestCase):
                         before = helper['windows_test_process_status']()
                         assert before['primary_eligible'] and before['thread_impersonating']
                         assert not before['eligible']
-                        # This is a new simulated caller, not a failed bootstrap retry.
-                        os.environ.pop(helper['_CHILD_MARKER'], None)
+                        # Prior successful admission consumed its own retry marker.
+                        assert helper['_CHILD_MARKER'] not in os.environ
                         os.environ['AGENT_SKILLS_TEST_THREAD_STAGE'] = '1'
                         status = helper['ensure_windows_test_process'](
                             sys.argv[0], sys.argv[1:],

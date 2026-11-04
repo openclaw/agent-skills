@@ -112,30 +112,15 @@ class AutoreviewVersionTests(unittest.TestCase):
             outputs = [operator / name for name in ("human.txt", "report.json", "status.json")]
             for path in [*outputs, operator / "config.toml", operator / "auth.json"]:
                 path.write_text("preserved fixture\n", encoding="utf-8")
-            installed = []
-            for mode in ("copy", "symlink"):
-                if mode == "symlink":
-                    # A restricted Windows test process may lack both Developer
-                    # Mode and symlink privilege. Probe the OS separately so an
-                    # installer regression never becomes a capability skip.
-                    probe = root / "symlink-capability-probe"
-                    try:
-                        os.symlink(repo / "skills/autoreview", probe, target_is_directory=True)
-                    except OSError as error:
-                        if os.name != "nt" or getattr(error, "winerror", None) != 1314:
-                            raise
-                        with self.subTest(mode=mode):
-                            self.skipTest(f"directory symlink privilege unavailable: {error}")
-                        continue
-                    else:
-                        probe.unlink()
+
+            def install(mode):
                 target = root / mode
                 result = subprocess.run([
                     sys.executable, "-B", str(repo / "scripts/install-skills"),
                     "--target", str(target), "--mode", mode, "autoreview",
                 ], cwd=cwd, capture_output=True, text=True, timeout=30)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                installed.append(target / "autoreview/scripts/autoreview")
+                return target / "autoreview/scripts/autoreview"
 
             def snapshot(directory):
                 return {
@@ -146,25 +131,29 @@ class AutoreviewVersionTests(unittest.TestCase):
                     ) for path in directory.rglob("*")
                 }
 
+            copied = install("copy")
             before = snapshot(root), snapshot(SCRIPT_PATH.parent.parent)
             env = {**os.environ, "HOME": str(operator), "USERPROFILE": str(operator),
                    "PATH": str(root / "no executables"), "AUTOREVIEW_ENGINE": "invalid",
                    "AUTOREVIEW_MAX_PRIORITY": "invalid", "AUTOREVIEW_MAX_REVIEW_PASSES": "invalid",
                    "AUTOREVIEW_ENGINE_TIMEOUT_SECONDS": "0"}
-            for helper in (SCRIPT_PATH.resolve(), *installed):
+
+            def verify_version(helper):
+                result = subprocess.run([
+                    sys.executable, "-I", "-B", str(helper), "--version",
+                    "--output", str(outputs[0]), "--json-output", str(outputs[1]),
+                    "--status-output", str(outputs[2]), "--engine-stage-dir", str(root / "stage"),
+                ], cwd=cwd, env=env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "autoreview source-sha256:"
+                                 + hashlib.sha256(helper.read_bytes()).hexdigest() + "\n")
+                self.assertEqual(result.stderr, "")
+
+            for helper in (SCRIPT_PATH.resolve(), copied):
                 with self.subTest(helper=helper):
-                    result = subprocess.run([
-                        sys.executable, "-I", "-B", str(helper), "--version",
-                        "--output", str(outputs[0]), "--json-output", str(outputs[1]),
-                        "--status-output", str(outputs[2]), "--engine-stage-dir", str(root / "stage"),
-                    ], cwd=cwd, env=env, capture_output=True, text=True, timeout=10)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout, "autoreview source-sha256:"
-                                     + hashlib.sha256(helper.read_bytes()).hexdigest() + "\n")
-                    self.assertEqual(result.stderr, "")
+                    verify_version(helper)
             self.assertEqual((snapshot(root), snapshot(SCRIPT_PATH.parent.parent)), before)
 
-            copied = installed[0]
             copied.write_bytes(copied.read_bytes() + b"\n# Changed copied source fixture.\n")
             result = subprocess.run([sys.executable, "-I", "-B", str(copied), "--version"],
                                     cwd=cwd, env=env, capture_output=True, text=True, timeout=10)
@@ -178,6 +167,25 @@ class AutoreviewVersionTests(unittest.TestCase):
                                      capture_output=True, text=True, timeout=10)
             self.assertEqual(unknown.returncode, 2)
             self.assertIn("unrecognized arguments", unknown.stderr)
+
+            # Finish every mandatory copy assertion before an optional skip:
+            # unittest fail-fast also stops the method after a skipped subtest.
+            with self.subTest(mode="symlink"):
+                probe = root / "symlink-capability-probe"
+                try:
+                    os.symlink(repo / "skills/autoreview", probe, target_is_directory=True)
+                except OSError as error:
+                    if os.name != "nt" or getattr(error, "winerror", None) != 1314:
+                        raise
+                    self.skipTest(f"directory symlink privilege unavailable: {error}")
+                else:
+                    probe.unlink()
+                # Only the OS capability probe can skip; installer failures
+                # remain failures of the real symlink installation path.
+                linked = install("symlink")
+                before = snapshot(root), snapshot(SCRIPT_PATH.parent.parent)
+                verify_version(linked)
+                self.assertEqual((snapshot(root), snapshot(SCRIPT_PATH.parent.parent)), before)
 
 
 class AutoreviewCursorTests(unittest.TestCase):

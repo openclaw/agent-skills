@@ -710,6 +710,9 @@ def ensure_windows_test_process(
         if not state["supported_identity"]:
             raise RuntimeError("Windows test bootstrap does not support this privileged account identity")
         if state["eligible"]:
+            # Admission consumed this pending launch. A later caller may need a
+            # new clean primary after starting thread impersonation.
+            os.environ.pop(_CHILD_MARKER, None)
             return None
         if os.environ.get(_CHILD_MARKER):
             raise RuntimeError("restricted test child still has unsuitable native token authority")
@@ -725,11 +728,20 @@ def ensure_windows_test_process(
             # requested invocation has NULL handles. These pipes belong only
             # to the proof process; the requested child retains its handles.
             result = subprocess.run(parent_check, check=False, env=parent_environment,
-                                    capture_output=True, text=True, errors="replace")
+                                    capture_output=True)
             for stream, output in ((sys.stdout, result.stdout), (sys.stderr, result.stderr)):
                 if stream is not None:
-                    stream.write(output)
                     stream.flush()
+                    binary = getattr(stream, "buffer", None)
+                    if binary is not None:
+                        # Forward the actual proof bytes, independent of either
+                        # interpreter's locale or strict encoding warnings.
+                        binary.write(output)
+                        binary.flush()
+                    else:
+                        encoding = getattr(stream, "encoding", None) or "utf-8"
+                        stream.write(output.decode(encoding, errors="replace"))
+                        stream.flush()
             if result.returncode:
                 return _exit_status(result.returncode)
         script = os.fspath(entrypoint)
