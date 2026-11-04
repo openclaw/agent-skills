@@ -3829,6 +3829,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             'model_instructions_file="/tmp/hostile.md"',
             'model_providers.review_api.auth.command="/tmp/credential-sink"',
             'hooks.PreToolUse.command="touch /tmp/owned"',
+            'app_server.listen="0.0.0.0:9000"',
+            'app_server.max_input_text_chars.extra=1',
         ):
             with self.subTest(override=override), self.assertRaisesRegex(
                 SystemExit,
@@ -3851,6 +3853,41 @@ class AutoreviewHardeningTests(unittest.TestCase):
             self.helper["codex_config_overrides"](args),
             args.codex_config,
         )
+
+    def test_codex_input_text_limit_is_forwarded_as_bounded_startup_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for value in ("1", "1048576", "3145728", "4194304", " 3145728 "):
+                override = f"app_server.max_input_text_chars={value}"
+                for source in ("argument", "environment"):
+                    with self.subTest(value=value, source=source), mock.patch.dict(
+                        os.environ, {"AUTOREVIEW_CODEX_CONFIG": override}, clear=True,
+                    ):
+                        args = argparse.Namespace(
+                            codex_bin=sys.executable, web_search=False, thinking=None,
+                            codex_speed="default", codex_config=[override] if source == "argument" else [],
+                        )
+                        command = self.helper["codex_command"](
+                            args, root, root, root, root / "schema.json", root / "output.json",
+                            "fixture-model", auth_config=[],
+                        )
+                        index = command.index(override.strip())
+                        self.assertEqual(command[index - 1], "-c")
+                        self.assertLess(index, command.index("exec"))
+                        self.assertEqual(command.count(override.strip()), 1)
+
+    def test_codex_input_text_limit_rejects_invalid_values_from_both_inputs(self) -> None:
+        for value in ("0", "-1", "+1", "01", "4194305", "1.5", "1e6", '"3145728"',
+                      "true", "0x100000", "3_145_728", "١", "9" * 5000,
+                      "3145728\nnotify=['untrusted']"):
+            override = f"app_server.max_input_text_chars={value}"
+            for source in ("argument", "environment"):
+                with self.subTest(value=value[:40], source=source), mock.patch.dict(
+                    os.environ, {"AUTOREVIEW_CODEX_CONFIG": override}, clear=True,
+                ), self.assertRaisesRegex(SystemExit, "integer from 1 to 4194304"):
+                    self.helper["codex_config_overrides"](argparse.Namespace(
+                        codex_config=[override] if source == "argument" else [],
+                    ))
 
     def test_codex_speed_override_accepts_ultrafast(self) -> None:
         override = self.helper["codex_speed_override"]
