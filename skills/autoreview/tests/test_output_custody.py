@@ -191,7 +191,7 @@ class OutputCustodyTests(unittest.TestCase):
         observed = []
 
         def change_after_write(*args):
-            for temporary in self.outside.glob('.report.json.*'):
+            for temporary in self.outside.glob('.autoreview-output.*'):
                 if temporary.read_text() == 'complete synthetic report' and not observed:
                     observed.append(temporary)
                     self.change_metadata()
@@ -202,7 +202,7 @@ class OutputCustodyTests(unittest.TestCase):
                 self.helper.atomic_write_text(destination, 'complete synthetic report')
         self.assertTrue(observed, 'fixture must change metadata after the real content write')
         self.assertEqual(destination.read_text(), 'previous report')
-        self.assertEqual(list(self.outside.glob('.report.json.*')), [])
+        self.assertEqual(list(self.outside.glob('.autoreview-output.*')), [])
 
     def handoff(self):
         args = self.arguments(native_handoff=str(self.alias / 'exchange'))

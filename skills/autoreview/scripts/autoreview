@@ -9833,7 +9833,9 @@ class OutputParent:
         self.windows = None
         try:
             if os.name == "posix":
-                self.fd = os.open(self.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                # Named mutations need search permission, not directory listing.
+                access = getattr(os, "O_PATH", getattr(os, "O_SEARCH", os.O_RDONLY))
+                self.fd = os.open(self.parent, access | os.O_DIRECTORY | os.O_NOFOLLOW)
                 info = os.fstat(self.fd)
             elif os.name == "nt":
                 self.windows = WindowsOutputParent(self.parent, path.name)
@@ -10068,7 +10070,7 @@ def atomic_write_text(path: Path, content: str, *,
             return atomic_write_text(path, content, _parent=parent)
     parent = _parent
     parent.check()
-    descriptor, temporary, identity = parent.temporary(f".{path.name}.")
+    descriptor, temporary, identity = parent.temporary(".autoreview-output.")
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(content)

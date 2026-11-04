@@ -89,6 +89,59 @@ class OutputReadinessTests(unittest.TestCase):
         self.helper.atomic_write_text(Path(args.json_output), 'new public report\n')
         self.assertEqual(report.read_text(encoding='utf-8'), 'new public report\n')
 
+    @unittest.skipUnless(os.name == 'posix', 'POSIX directory permission semantics')
+    def test_write_search_only_parent_allows_publication_and_stale_removal(self):
+        parent = self.root / 'write-only-drop'
+        parent.mkdir(mode=0o700)
+        report = parent / 'review.json'
+        report.write_text('previous report\n')
+        parent.chmod(0o300)
+        try:
+            try:
+                list(parent.iterdir())
+            except PermissionError:
+                pass
+            else:
+                self.skipTest('caller can list mode0300 directories; requires unprivileged permissions')
+            # Native replacement works with write/search permission, without listing.
+            temporary = parent / 'native-control'
+            temporary.write_text('native replacement\n')
+            temporary.replace(report)
+            args = self.arguments(report)
+            self.helper.prepare_output_paths(args, self.repo)
+            self.assertEqual(report.read_text(), 'native replacement\n')
+            identity = args._output_parent_identities['json_output']
+            self.helper.atomic_write_text(report, 'new report\n', expected=identity)
+            self.assertEqual(report.read_text(), 'new report\n')
+            self.helper.remove_stale_output(report, identity)
+            self.assertFalse(report.exists())
+            self.assertEqual(stat.S_IMODE(parent.stat().st_mode), 0o300)
+            for mode in (0o100, 0o200):
+                with self.subTest(missing_permission=oct(mode)):
+                    parent.chmod(mode)
+                    with self.assertRaisesRegex(SystemExit, 'output destination is not writable'):
+                        self.helper.require_output_ready(report, '--json-output')
+                    self.assertEqual(stat.S_IMODE(parent.stat().st_mode), mode)
+        finally:
+            parent.chmod(0o700)
+        self.assertEqual(list(parent.iterdir()), [])
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX filesystem component limits')
+    def test_legal_long_basenames_publish_without_temporary_name_overflow(self):
+        limit = os.pathconf(self.root, 'PC_NAME_MAX')
+        for name in ('a' * limit, '界' * (limit // 3) + 'a' * (limit % 3)):
+            with self.subTest(name_bytes=len(os.fsencode(name))):
+                report = self.root / name
+                report.write_text('previous report\n', encoding='utf-8')
+                args = self.arguments(report)
+                self.helper.prepare_output_paths(args, self.repo)
+                self.assertEqual(report.read_text(), 'previous report\n')
+                self.helper.atomic_write_text(
+                    report, 'new report\n', expected=args._output_parent_identities['json_output'])
+                self.assertEqual(report.read_text(), 'new report\n')
+                report.unlink()
+                self.assertEqual(list(self.root.iterdir()), [self.repo])
+
     def test_parent_file_and_existing_directory_refuse_without_mutation(self):
         parent = self.root / 'not-a-directory'
         parent.write_text('retain parent bytes\n', encoding='utf-8')
