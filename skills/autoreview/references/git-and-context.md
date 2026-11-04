@@ -148,9 +148,12 @@ verification uses a standard-user primary process, not temporary impersonation.
 Windows Git preflight and reviewer launches use an owned Job Object and the
 installed Python supervisor. These processes and their descendants join before
 they execute and remain owned after their leader exits. Cleanup does not invoke
-`taskkill.exe` or inspect its installation directory. The supervisor and Python
-installation still pass the ordinary source-boundary checks. An incompatible
-enclosing job fails startup; there is no breakaway or executable cleanup fallback.
+`taskkill.exe` or inspect its installation directory. The supervisor runs with
+the direct base Python interpreter, avoiding a virtual-environment redirector
+that could retain job or pipe handles. The supervisor and base Python installation
+still pass the ordinary source-boundary checks. Target arguments and environment
+are preserved. An incompatible enclosing job fails startup; there is no breakaway
+or executable cleanup fallback.
 Lost startup acknowledgement after permission to launch is a terminal
 uncertain-launch error, so it cannot silently repeat a possibly executed command.
 

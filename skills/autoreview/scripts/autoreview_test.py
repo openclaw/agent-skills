@@ -3412,31 +3412,74 @@ class WindowsOwnedProcessTransportTests(unittest.TestCase):
             self.assertEqual(json.loads(result.stdout), [0, "42\n", "", True])
             self.assertFalse(AUTOREVIEW._OWNED_PROCESSES)
 
-    def test_target_closing_stdin_does_not_block_prompt_past_deadline(self):
+    def test_target_closing_stdin_releases_writer_while_job_alive(self):
         with tempfile.TemporaryDirectory(prefix="owned-process-") as directory:
             cwd = Path(directory).resolve()
-            owner_code = (
-                "import json, pathlib, runpy, sys\n"
-                "helper = runpy.run_path(sys.argv[1])\n"
-                "target = 'import os,time; os.close(0); print(42, flush=True); time.sleep(120)'\n"
-                "result = helper['run_with_heartbeat'](\n"
-                " [sys.executable, '-I', '-S', '-c', target], pathlib.Path.cwd(),\n"
-                " input_text='x' * 1000000, label='closed-stdin', max_runtime_seconds=3)\n"
-                "print(json.dumps([isinstance(result, helper['TimedOutEngineProcess']),\n"
-                " result.returncode, result.stdout, not helper['_OWNED_PROCESSES']]))\n"
-            )
-            # The outer owner bounds the regression itself: retaining the
-            # supervisor's stdin read end would block communicate's prompt write
-            # before its timeout code could run. Owner loss closes the real job.
+            owner_code = r'''import contextlib, ctypes, json, pathlib, runpy, subprocess, sys
+from ctypes import wintypes
+helper = runpy.run_path(sys.argv[1])
+target = "import os,time; os.close(0); print(os.getpid(), flush=True); time.sleep(120)"
+proc = helper['start_owned_process'](
+    [sys.executable, '-I', '-S', '-c', target], pathlib.Path.cwd(),
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+handle = None
+try:
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    # The target reports its own PID only after closing its stdin descriptor.
+    handle = kernel.OpenProcess(0x00100000, False, int(proc.stdout.readline()))
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    before = [proc.poll() is None, kernel.WaitForSingleObject(handle, 0) == 258]
+    payload = b'x' * 1000000
+    try:
+        written = proc.stdin.write(payload)
+        proc.stdin.flush()
+        if written != len(payload):
+            raise RuntimeError('large stdin write was incomplete')
+        outcome = 'written'
+    except BrokenPipeError:
+        outcome = 'broken_pipe'
+    # Capture both liveness checks before any cleanup can release a retained
+    # read handle and manufacture the BrokenPipe result we are trying to prove.
+    after = [proc.poll() is None, kernel.WaitForSingleObject(handle, 0) == 258]
+finally:
+    try:
+        helper['terminate_process_group'](proc)
+    finally:
+        try:
+            helper['unregister_owned_process'](proc)
+        finally:
+            if handle:
+                kernel.CloseHandle(handle)
+            with contextlib.suppress(BrokenPipeError):
+                proc.stdin.close()
+            proc.stdout.close()
+print(json.dumps([outcome, before, after, not helper['_OWNED_PROCESSES']]))
+'''
+            # Bypass a venv redirector for both owner and target: a redirector
+            # retaining stdin is a separate defect from the supervisor's handle.
+            interpreter = str(Path(sys._base_executable).resolve())
             owner = subprocess.Popen(
-                [sys.executable, "-I", "-S", "-c", owner_code, str(SCRIPT_PATH.resolve())],
+                [interpreter, "-I", "-S", "-c", owner_code, str(SCRIPT_PATH.resolve())],
                 cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, encoding="utf-8",
             )
             try:
+                # The external deadline bounds a blocked synchronous write; no
+                # engine timeout or cleanup runs before the liveness observations.
                 output, error = owner.communicate(timeout=20)
                 self.assertEqual(owner.returncode, 0, error)
-                self.assertEqual(json.loads(output), [True, 124, "42\n", True])
+                outcome, before, after, empty_registry = json.loads(output)
+                self.assertIn(outcome, ("broken_pipe", "written"))
+                self.assertEqual(before, [True, True])
+                self.assertEqual(after, [True, True])
+                self.assertTrue(empty_registry)
             finally:
                 if owner.poll() is None:
                     owner.kill()

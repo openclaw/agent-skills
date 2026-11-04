@@ -2660,7 +2660,7 @@ class WindowsOwnedProcessAdmissionTests(unittest.TestCase):
             "from pathlib import Path; Path('target-started').write_bytes(b'started')",
         ]
         supervisor = SCRIPT.resolve().with_name("windows-owned-process.py")
-        interpreter = Path(sys.executable).absolute()
+        interpreter = Path(sys._base_executable).absolute()
         source_roots = self.helper["UNTRUSTED_SOURCE_ROOTS"]
         for selected in (supervisor, interpreter):
             with self.subTest(selected=selected.name):

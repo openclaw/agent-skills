@@ -2027,7 +2027,11 @@ def start_owned_process(
     try:
         if os.name == "nt":
             supervisor = Path(__file__).absolute().with_name("windows-owned-process.py")
-            interpreter = Path(sys.executable).absolute()
+            # A Windows venv executable redirects through a waiting parent that
+            # would retain inherited job and pipe handles outside the owned job.
+            # This private stdlib-only supervisor must run in the direct base
+            # interpreter; the requested target argv and environment stay intact.
+            interpreter = Path(sys._base_executable).absolute()
             # Both the parent-loaded support code and child interpreter obey the
             # same source boundary as other selected executable installations.
             admit_executable_directories(
