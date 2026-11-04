@@ -273,6 +273,48 @@ class ReviewBatchTests(unittest.TestCase):
                 self.assertEqual(destination.stat().st_ino, identity)
                 self.assertEqual(self.helper["SOURCE_METADATA_BINDINGS"].get(), ())
 
+    def test_git_launch_rechecks_linked_metadata_after_filter_discovery(self):
+        for command in ("status", "diff"):
+            for pointer in ("gitdir", "commondir"):
+                with self.subTest(command=command, pointer=pointer), self.primary_linked_fixture() as fixture:
+                    repo, _, git_dir, common, _ = fixture
+                    replacement = repo.parent / "replacement-common"
+                    shutil.copytree(common, replacement)
+                    pointer_file = repo / ".git" if pointer == "gitdir" else git_dir / "commondir"
+                    original = pointer_file.read_bytes()
+                    target = replacement / git_dir.relative_to(common) if pointer == "gitdir" else replacement
+                    redirected = ("gitdir: " if pointer == "gitdir" else "") + str(target) + "\n"
+                    real_run = subprocess.run
+                    switched = False
+                    outer_launches = []
+
+                    def switch_after_config(argv, *args, **kwargs):
+                        nonlocal switched
+                        if command in argv:
+                            outer_launches.append(argv)
+                        result = real_run(argv, *args, **kwargs)
+                        if "--get-regexp" in argv and argv[-1] == r"^filter\.":
+                            # The real query has read the original store. Change
+                            # only the metadata pointer, without executable filters.
+                            self.assertEqual(result.returncode, 1)
+                            pointer_file.write_text(redirected)
+                            switched = True
+                        return result
+
+                    with self.helper["repository_metadata_scope"]((repo,)):
+                        # The same ordinary linked worktree is usable when its
+                        # metadata remains unchanged across filter discovery.
+                        self.assertEqual(self.helper["git_bytes"](repo, command).returncode, 0)
+                        with mock.patch("subprocess.run", side_effect=switch_after_config):
+                            with self.assertRaisesRegex(SystemExit, "reviewed Git metadata changed after admission"):
+                                self.helper["git_bytes"](repo, command)
+                    self.assertTrue(switched)
+                    self.assertFalse(outer_launches, "changed metadata must be rejected before Git starts")
+                    # Stock Git can read the replacement store; rejection must
+                    # protect the retained binding, not depend on malformed data.
+                    self.assertEqual(Path(self.git(repo, "rev-parse", "--git-common-dir")).resolve(), replacement)
+                    pointer_file.write_bytes(original)
+
     def test_pre_output_metadata_binding_survives_until_capture_and_publication(self):
         for phase in ("probe", "unlink", "capture"):
             with self.subTest(phase=phase), self.linked_external_fixture() as fixture:

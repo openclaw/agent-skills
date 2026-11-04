@@ -160,8 +160,9 @@ relax `--prompt-file` or `--dataset` filename rules. Do not rename or concatenat
 blocked evidence to bypass those rules.
 
 The helper retains the initial Git metadata binding from before output preparation
-through source capture and publication. The manifest, source paths, checkout
-identity, Git metadata/object-store paths and captured source fingerprints are
+through source capture and publication. Each Git launch rechecks that binding
+after preparation queries, including executable-filter discovery. The manifest,
+source paths, checkout identity, Git metadata/object-store paths and captured source fingerprints are
 revalidated before every send, including helper-initiated retries, and before
 publication.
 Changes fail the review rather than silently rebinding a source. Freeze source

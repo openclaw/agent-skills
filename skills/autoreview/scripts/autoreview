@@ -3048,6 +3048,7 @@ def git_bytes(
     # Every launch, including nested and supplied-environment config queries,
     # gets a fresh complete admission after any preparation subprocesses.
     child_env["PATH"] = safe_git_path(repo, selected_executables=[selected_git])
+    verify_repository_metadata()
     result = subprocess.run(
         [
             selected_git,
