@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -38,6 +39,21 @@ TEST_MODULES = {
     ),
 }
 HARDENING_SHARDS = ("hardening-1", "hardening-2")
+
+
+class ProgressTestResult(unittest.TextTestResult):
+    def startTest(self, test):
+        self.started_at = time.monotonic()
+        # A complete flushed line survives CI cancellation before test cleanup.
+        self.stream.writeln(f"\ntest start: {test.id()}")
+        self.stream.flush()
+        super().startTest(test)
+
+    def stopTest(self, test):
+        duration = time.monotonic() - self.started_at
+        super().stopTest(test)
+        self.stream.writeln(f"\ntest end: {test.id()} ({duration:.3f}s)")
+        self.stream.flush()
 
 
 @contextlib.contextmanager
@@ -160,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:
                 print(f"test discovery failed: {exc}", file=sys.stderr)
                 return 1
-            result = unittest.TextTestRunner().run(suite)
+            result = unittest.TextTestRunner(resultclass=ProgressTestResult).run(suite)
             return 0 if result.wasSuccessful() else 1
     unittest_command = [python, *(["-S"] if sys.flags.no_site else []),
                         "scripts/check-skills", "--group", args.group, "--tests-only"]

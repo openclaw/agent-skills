@@ -212,6 +212,16 @@ class CheckSkillsTest(unittest.TestCase):
             text=True, encoding=output_encoding, capture_output=True, timeout=30,
         )
 
+    def assert_progress(self, result, executed):
+        events = []
+        for line in result.stderr.splitlines():
+            if line.startswith("test start: "):
+                events.append(("start", line.removeprefix("test start: ")))
+            elif line.startswith("test end: "):
+                self.assertRegex(line, r" \(\d+\.\d{3}s\)$")
+                events.append(("end", line.removeprefix("test end: ").rsplit(" (", 1)[0]))
+        self.assertEqual(events, [(event, label) for label in executed for event in ("start", "end")])
+
     def test_every_group_and_shard_runs_checkout_tests_despite_installed_package(self) -> None:
         if os.name == "nt":
             bootstrap = runpy.run_path(str(SCRIPT.with_name("windows_test_process.py")))
@@ -226,7 +236,9 @@ class CheckSkillsTest(unittest.TestCase):
                     log.unlink(missing_ok=True)
                     result = self.invoke(root, foreign, environment, group)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertEqual(sorted(log.read_text().splitlines()), sorted(labels))
+                    executed = log.read_text().splitlines()
+                    self.assertEqual(sorted(executed), sorted(labels))
+                    self.assert_progress(result, executed)
                     self.assertFalse(marker.exists())
             # Also exercise the outer command runner and its real child process.
             log.unlink()
@@ -242,7 +254,37 @@ class CheckSkillsTest(unittest.TestCase):
             result = self.invoke(root, foreign, environment, "boundaries", tests_only=False)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("FAILED (failures=1)", result.stderr)
+            self.assert_progress(result, log.read_text().splitlines())
             self.assertFalse(marker.exists())
+
+    def test_progress_continues_after_class_and_module_fixture_outcomes(self) -> None:
+        for scope in ("class", "module"):
+            for skipped in (False, True):
+                with self.subTest(scope=scope, skipped=skipped), self.fixture() as (
+                    root, foreign, marker, log, environment, groups,
+                ):
+                    first_module = root / "skills/autoreview/tests/test_native_handoff.py"
+                    body = first_module.read_text(encoding="utf-8")
+                    exception = "unittest.SkipTest" if skipped else "RuntimeError"
+                    statement = f"raise {exception}('fixture outcome')"
+                    # unittest reports setup outcomes without starting a test.
+                    # The next real method must still have a complete start line.
+                    if scope == "module":
+                        body += f"\ndef setUpModule():\n    {statement}\n"
+                    else:
+                        body = body.replace(
+                            "class Cases(unittest.TestCase):\n",
+                            "class Cases(unittest.TestCase):\n"
+                            f"    @classmethod\n    def setUpClass(cls):\n        {statement}\n",
+                        )
+                    first_module.write_text(body, encoding="utf-8")
+                    result = self.invoke(root, foreign, environment, "boundaries")
+                    self.assertEqual(result.returncode, 0 if skipped else 1, result.stderr)
+                    self.assertIn("OK (skipped=1)" if skipped else "FAILED (errors=1)", result.stderr)
+                    executed = log.read_text().splitlines()
+                    self.assertEqual(executed, groups["boundaries"][1:])
+                    self.assert_progress(result, executed)
+                    self.assertFalse(marker.exists())
 
     def test_fixture_invocation_uses_utf8_with_inherited_legacy_stream_encoding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
