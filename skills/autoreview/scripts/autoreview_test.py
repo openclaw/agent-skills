@@ -2680,7 +2680,7 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
             self.repo, ["model_context_window=1000"], self.failure, command_auth=False,
         ))
 
-    def test_login_probe_uses_operator_environment_and_captures_output(self) -> None:
+    def test_login_probe_uses_filtered_operator_environment_and_captures_output(self) -> None:
         for returncode, stdout, stderr, expected in (
             (1, "", "Not logged in\n", True),
             (0, "Not logged in\n", "", True),
@@ -2694,16 +2694,45 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
                         [], returncode, stdout, stderr,
                     )) as probe, contextlib.redirect_stdout(io.StringIO()) as out, \
                     contextlib.redirect_stderr(io.StringIO()) as err:
-                self.assertEqual(AUTOREVIEW.codex_subscription_login_missing("/codex", self.root), expected)
+                self.assertEqual(
+                    AUTOREVIEW.codex_subscription_login_missing(self.repo, "/codex", self.root), expected,
+                )
                 self.assertEqual(out.getvalue() + err.getvalue(), "")
                 self.assertEqual(probe.call_args.args, (["/codex", "login", "status"],))
                 kwargs = probe.call_args.kwargs
                 self.assertEqual(kwargs["cwd"], self.root)
-                self.assertEqual(kwargs["env"], dict(os.environ))
+                self.assertEqual(
+                    kwargs["env"], AUTOREVIEW.safe_engine_env(self.repo, [Path("/codex").parent], engine="codex"),
+                )
                 self.assertEqual(kwargs["timeout"], 10)
                 self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
                 self.assertEqual(kwargs["stdout"], subprocess.PIPE)
                 self.assertEqual(kwargs["stderr"], subprocess.PIPE)
+
+    def test_login_probe_drops_checkout_path_and_startup_hooks(self) -> None:
+        checkout_bin = self.repo / "bin"
+        checkout_bin.mkdir()
+        codex_dir = self.root / "codex-bin"
+        codex_dir.mkdir()
+        hook = str(self.repo / "setup.cjs")
+        with mock.patch.dict(os.environ, {
+            "PATH": os.pathsep.join((str(checkout_bin), os.environ.get("PATH", ""))),
+            "NODE_OPTIONS": f"--require {hook}",
+            "OPENAI_API_KEY": "operator-key",
+        }), mock.patch.object(AUTOREVIEW.subprocess, "run", return_value=subprocess.CompletedProcess(
+            [], 0, "Logged in using ChatGPT\n", "",
+        )) as probe:
+            self.assertFalse(AUTOREVIEW.codex_subscription_login_missing(
+                self.repo, str(codex_dir / "codex"), self.root,
+            ))
+        env = probe.call_args.kwargs["env"]
+        self.assertNotIn("NODE_OPTIONS", env)
+        path = env["PATH"].split(os.pathsep)
+        self.assertEqual(path[0], str(codex_dir))
+        self.assertNotIn(str(checkout_bin), path)
+        self.assertEqual(env["HOME"], str(self.root))
+        self.assertEqual(env["CODEX_HOME"], str(self.home))
+        self.assertEqual(env["OPENAI_API_KEY"], "operator-key")
 
     def test_login_probe_errors_and_timeout_are_unknown(self) -> None:
         for error in (OSError("PRIVATE_SENTINEL"), subprocess.TimeoutExpired(
@@ -2713,7 +2742,7 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
                     mock.patch.object(AUTOREVIEW.subprocess, "run", side_effect=error), \
                     contextlib.redirect_stdout(io.StringIO()) as out, \
                     contextlib.redirect_stderr(io.StringIO()) as err:
-                self.assertFalse(AUTOREVIEW.codex_subscription_login_missing("/codex", self.root))
+                self.assertFalse(AUTOREVIEW.codex_subscription_login_missing(self.repo, "/codex", self.root))
                 self.assertEqual(out.getvalue() + err.getvalue(), "")
 
     def run_codex_attempts(
@@ -2777,6 +2806,8 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
             except AUTOREVIEW.ReviewerUnavailable as exc:
                 output = str(exc)
             self.assertEqual(probe.call_count, int(configured and not explicit and not no_fallback))
+            if probe.call_count:
+                self.assertEqual(probe.call_args.args[0], self.repo)
             if no_fallback:
                 discover.assert_not_called()
         self.assertTrue(temporary_paths)
