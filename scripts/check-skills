@@ -27,12 +27,14 @@ TEST_MODULES = {
         "skills.autoreview.tests.test_codex_inference_route",
         "skills.autoreview.tests.test_git_line_endings",
         "skills.autoreview.tests.test_git_boundary",
+        "skills.autoreview.tests.test_git_source_snapshot",
         "skills.autoreview.tests.test_gitlinks",
         "skills.autoreview.tests.test_git_filter_collection",
         "skills.autoreview.tests.test_engine_stage",
         "skills.autoreview.tests.test_terminal_report_authority",
         "skills.autoreview.tests.test_output_path_interpretation",
         "skills.autoreview.tests.test_output_readiness",
+        "skills.autoreview.tests.test_output_custody",
         "skills.autoreview.tests.test_review_harness",
         "skills.autoreview.tests.test_prompt_budget",
         "skills.autoreview.tests.test_review_batches",
@@ -185,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
                        "scripts/validate-skills", "scripts/validate-skills.test.py",
                        "scripts/check-skills", "scripts/check-skills.test.py",
                        "skills/autoreview/scripts/autoreview",
+                       "skills/autoreview/scripts/windows-owned-process.py",
                        "skills/autoreview/scripts/test-review-harness.py",
                        "skills/autoreview/scripts/autoreview_test.py"]
     commands = [

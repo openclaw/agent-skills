@@ -35,12 +35,17 @@ Read for output-path edge cases, machine status, usage accounting, local stage o
 
 - All output paths must be outside repo as both final entries (resolve parent
   symlinks) and resolved referents.
-- Without `--status-output`: human/JSON outputs must name distinct final entries;
-  distinct symlinks/hardlinks may share existing referent (publication replaces entries).
-- Status enabled: all resolved referents must differ; refuse hardlink aliases.
+- When neither `--status-output` nor `--preflight-output` is enabled, human/JSON
+  outputs must name distinct final entries; distinct symlinks/hardlinks may share
+  an existing referent (publication replaces entries).
+- With either option enabled, all resolved referents must differ; refuse
+  hardlink aliases.
 - Conservatively refuse case-only/Unicode-normalization aliases on every platform.
 - Tilde/relative paths expand once, anchored to invocation directory.
 - Atomic writes replace final symlink; never modify its target.
+- Windows output names must use ordinary file names. Device names (including
+  extension forms), alternate data streams, trailing dots or spaces, control
+  characters and `< > : " / \ | ? *` are refused before output probing.
 - After path and alias checks, probe report parents for file creation, writing,
   and atomic replacement before target selection or reviewer startup. Existing
   reports remain untouched; missing parents are not created. This checks current

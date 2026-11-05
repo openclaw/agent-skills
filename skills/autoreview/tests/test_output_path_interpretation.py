@@ -525,7 +525,7 @@ class OutputPathInterpretationTests(unittest.TestCase):
         self.assertFalse((self.home / "status.json").exists())
 
     @unittest.skipIf(os.name == "nt", "directory symlink creation requires Windows developer mode")
-    def test_parent_symlinks_and_following_dotdot_keep_external_entry_semantics(self):
+    def test_parent_symlinks_preserve_source_boundary_and_trusted_external_semantics(self):
         external = self.root / "external-outputs"
         nested = external / "nested"
         nested.mkdir(parents=True)
@@ -533,22 +533,38 @@ class OutputPathInterpretationTests(unittest.TestCase):
         parent.symlink_to(nested, target_is_directory=True)
         git(self.repo, "add", "--", "outputs")
         git(self.repo, "commit", "-qm", "synthetic parent-directory symlink")
-        for prefix, directory in (("outputs", nested), ("outputs/..", external)):
-            with self.subTest(parent=prefix):
-                status = directory / "status.json"
-                status.write_bytes(b'{"status":"scoped-clean","stale":true}\n')
-                overrides = {flag: f"{prefix}/{name}" for flag, name in self.names.items()}
-                before = self.snapshot()
-                engine = self.clean_engine(status)
-                try:
-                    self.assertEqual(self.invoke(engine, overrides=overrides), 0)
-                finally:
-                    self.assertEqual(self.snapshot(), before)
-                engine.assert_called_once()
-                self.assert_clean_outputs(directory)
-                self.assertTrue(parent.is_symlink())
-                self.assertEqual(os.readlink(parent), str(nested))
-                self.assertEqual(list(self.home.iterdir()), [])
+        trusted = self.root / "trusted-outputs"
+        trusted.symlink_to(nested, target_is_directory=True)
+        for alias, admitted in ((parent, False), (trusted, True)):
+            for suffix, directory in (("", nested), ("/..", external)):
+                with self.subTest(parent=str(alias) + suffix, admitted=admitted):
+                    status = directory / "status.json"
+                    stale = b'{"status":"scoped-clean","stale":true}\n'
+                    status.write_bytes(stale)
+                    overrides = {flag: f"{alias}{suffix}/{name}" for flag, name in self.names.items()}
+                    before = self.snapshot()
+                    engine = self.clean_engine(status)
+                    try:
+                        if admitted:
+                            self.assertEqual(self.invoke(engine, overrides=overrides), 0)
+                        else:
+                            # A tracked parent may be redirected by reviewed code;
+                            # refuse before any probe or stale-output removal.
+                            with self.assertRaisesRegex(SystemExit, "must point outside"):
+                                self.invoke(engine, overrides=overrides)
+                    finally:
+                        self.assertEqual(self.snapshot(), before)
+                    if admitted:
+                        engine.assert_called_once()
+                        self.assert_clean_outputs(directory)
+                    else:
+                        engine.assert_not_called()
+                        self.assertEqual(status.read_bytes(), stale)
+                        self.assertEqual({entry.name for entry in directory.iterdir()},
+                                         {"status.json"} if directory == nested else {"nested", "status.json"})
+                    self.assertTrue(alias.is_symlink())
+                    self.assertEqual(os.readlink(alias), str(nested))
+                    self.assertEqual(list(self.home.iterdir()), [])
 
     def test_publication_keeps_prepared_paths_after_cwd_and_home_change(self):
         status = self.home / "status.json"

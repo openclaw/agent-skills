@@ -292,6 +292,59 @@ if mode == "parent-streams-subject":
     raise SystemExit(29)
 
 
+if mode == "watchdog-owner-loss":
+    import os
+    import tempfile
+    import time
+
+    create = api.kernel.CreateProcessW
+
+    def pause_after_creation(*arguments):
+        result = create(*arguments)
+        if result:
+            process = api.c.cast(arguments[-1], api.c.POINTER(api.ProcessInfo)).contents
+            receipt = Path(receipt_path)
+            temporary = receipt.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"owner": os.getpid(), "child": process.process_id}),
+                                 encoding="utf-8")
+            os.replace(temporary, receipt)
+            # Delay only returning to Python's launch implementation. The real
+            # API has already created the child with the supplied attributes.
+            time.sleep(30)
+        return result
+
+    api.kernel.CreateProcessW = pause_after_creation
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        helper["run_windows_test_proof"](
+            [sys.executable, "-I", "-S", "-c", "import time; time.sleep(30)"],
+            stdout=stdout_file, stderr=stderr_file,
+        )
+    raise AssertionError("owner-loss witness unexpectedly returned")
+
+
+if mode == "deadline-parent":
+    import subprocess
+    command = [sys.executable, "-u", "-I", "-S", "-B", "-X", "utf8=1",
+               str(Path(__file__).resolve()), helper_path, "deadline-leaf", receipt_path]
+    with helper["_process_token"](api, for_launch=True) as source:
+        with helper["_restricted_primary"](api, source) as restricted:
+            try:
+                helper["_launch"](api, restricted, command, helper["_native_environment_block"](api),
+                                  timeout=5)
+            except subprocess.TimeoutExpired:
+                Path(receipt_path).write_text(json.dumps({"timed_out": True}), encoding="utf-8")
+                raise SystemExit(31)
+    raise AssertionError("stalled native child did not reach its owned deadline")
+
+if mode == "deadline-leaf":
+    import time
+    print("native child holds stdout", flush=True)
+    print("native child holds stderr", file=sys.stderr, flush=True)
+    # Bounded even on a regression: this fixture must not leak a permanent child.
+    time.sleep(30)
+    raise SystemExit(29)
+
+
 if mode == "environment-seed":
     marker = helper["_CHILD_MARKER"]
     entries = [entry for entry in raw_entries()
@@ -378,6 +431,135 @@ class NativeLaunchProofs(unittest.TestCase):
         self.assertEqual(result.returncode, expected_exit, result.stdout + result.stderr)
         result_path = Path(str(receipt) + receipt_suffix)
         return result, json.loads(result_path.read_text(encoding="utf-8")), receipt
+
+    @unittest.skipUnless(os.name == "nt", "requires creation-time native Windows job ownership")
+    def test_watchdog_owner_death_immediately_after_native_creation_reaps_child(self):
+        api = HELPER["_windows_api"]()
+        open_process = api.kernel.OpenProcess
+        open_process.argtypes = [api.w.DWORD, api.w.BOOL, api.w.DWORD]
+        open_process.restype = api.w.HANDLE
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "owner-loss-driver.py"
+            script.write_text(textwrap.dedent(NATIVE_LAUNCH_DRIVER), encoding="utf-8")
+            receipt = root / "created.json"
+            handles = {}
+            with tempfile.TemporaryFile() as output:
+                owner = subprocess.Popen(
+                    [sys.executable, "-I", "-S", "-B", "-X", "utf8=1", str(script),
+                     str(HELPER_PATH), "watchdog-owner-loss", str(receipt)],
+                    stdout=output, stderr=output,
+                )
+                try:
+                    deadline = time.monotonic() + 10
+                    while not receipt.is_file() and owner.poll() is None and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(receipt.is_file(), "real native creation must finish before owner death")
+                    pids = json.loads(receipt.read_text(encoding="utf-8"))
+                    for name in ("owner", "child"):
+                        handle = open_process(0x00100001, False, pids[name])  # SYNCHRONIZE | TERMINATE
+                        self.assertTrue(handle, "retain the actual live process before owner death")
+                        handles[name] = handle
+                        self.assertEqual(api.kernel.WaitForSingleObject(handle, 0), 258)
+                    # Terminate the actual Python owner, including when the
+                    # Popen process is a venv redirector waiting for that owner.
+                    self.assertTrue(api.kernel.TerminateProcess(handles["owner"], 130))
+                    self.assertEqual(api.kernel.WaitForSingleObject(handles["owner"], 5000), 0)
+                    self.assertEqual(api.kernel.WaitForSingleObject(handles["child"], 5000), 0,
+                                     "creation-time job ownership must reap the child before cleanup")
+                    self.assertNotEqual(owner.wait(timeout=5), 0)
+                finally:
+                    # On the old create-then-assign path this explicitly reaps
+                    # the orphan only after the observable ownership assertion.
+                    for handle in handles.values():
+                        if api.kernel.WaitForSingleObject(handle, 0) == 258:
+                            api.kernel.TerminateProcess(handle, 130)
+                            api.kernel.WaitForSingleObject(handle, 5000)
+                        api.kernel.CloseHandle(handle)
+                    if owner.poll() is None:
+                        owner.kill()
+                    owner.wait(timeout=5)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_outer_watchdog_stops_proof_before_reduced_launch_and_owns_descendants(self):
+        api = HELPER["_windows_api"]()
+        open_process = api.kernel.OpenProcess
+        open_process.argtypes = [api.w.DWORD, api.w.BOOL, api.w.DWORD]
+        open_process.restype = api.w.HANDLE
+        for descendant in (False, True):
+            with self.subTest(descendant=descendant), tempfile.TemporaryDirectory() as directory:
+                receipt = Path(directory) / "started.json"
+                # This is deliberately before any call to _restricted_primary
+                # or _launch: only the outer watchdog can end the sleeping proof.
+                code = (
+                    "import json, os, pathlib, subprocess, sys, time\n"
+                    "pids = [os.getpid()]\n"
+                    + ("pids.append(subprocess.Popen([sys.executable, '-I', '-S', '-c', "
+                       "'import time; time.sleep(30)']).pid)\n" if descendant else "")
+                    + "receipt = pathlib.Path(sys.argv[1])\n"
+                    "temporary = receipt.with_suffix('.tmp')\n"
+                    "temporary.write_text(json.dumps(pids), encoding='utf-8')\n"
+                    "os.replace(temporary, receipt)\n"
+                    "time.sleep(30)\n"
+                )
+                errors = []
+                handles = []
+                with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+                    def run_proof():
+                        try:
+                            HELPER["run_windows_test_proof"](
+                                [sys.executable, "-I", "-S", "-c", code, str(receipt)],
+                                stdout=stdout_file, stderr=stderr_file, timeout=5,
+                            )
+                        except BaseException as error:
+                            errors.append(error)
+
+                    worker = threading.Thread(target=run_proof, daemon=True)
+                    started = time.monotonic()
+                    worker.start()
+                    try:
+                        deadline = started + 4
+                        while not receipt.is_file() and worker.is_alive() and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                        self.assertTrue(receipt.is_file(), "proof must start before testing its watchdog")
+                        pids = json.loads(receipt.read_text(encoding="utf-8"))
+                        self.assertEqual(len(pids), 2 if descendant else 1)
+                        for pid in pids:
+                            handle = open_process(0x00100001, False, pid)  # SYNCHRONIZE | TERMINATE
+                            self.assertTrue(handle, "retain the actual live process before cleanup")
+                            handles.append(handle)
+                            self.assertEqual(api.kernel.WaitForSingleObject(handle, 0), 258)
+                        worker.join(timeout=12)
+                        self.assertFalse(worker.is_alive(), "outer watchdog did not return")
+                        self.assertLess(time.monotonic() - started, 20)
+                        self.assertEqual(len(errors), 1)
+                        if not isinstance(errors[0], subprocess.TimeoutExpired):
+                            # Preserve the native API traceback on CI failures.
+                            raise errors[0]
+                        for handle in handles:
+                            self.assertEqual(api.kernel.WaitForSingleObject(handle, 0), 0,
+                                             "proof and descendants must exit before emergency cleanup")
+                    finally:
+                        # The fixture's own finite sleeps bound a regression;
+                        # retained native handles also permit immediate teardown.
+                        for handle in handles:
+                            if api.kernel.WaitForSingleObject(handle, 0) == 258:
+                                api.kernel.TerminateProcess(handle, 130)
+                                api.kernel.WaitForSingleObject(handle, 5000)
+                            api.kernel.CloseHandle(handle)
+                        worker.join(timeout=7)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows process creation")
+    def test_owned_deadline_terminates_reduced_child_and_closes_capture_pipes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            started = time.monotonic()
+            result, data, _ = self.run_driver(Path(directory), "deadline-parent", expected_exit=31)
+            # Completion before the leaf's natural exit proves it no longer
+            # holds either pipe; both readiness lines prove the child ran.
+            self.assertLess(time.monotonic() - started, 20)
+            self.assertEqual(data, {"timed_out": True})
+            self.assertEqual(result.stdout, "native child holds stdout\n")
+            self.assertEqual(result.stderr, "native child holds stderr\n")
 
     @unittest.skipUnless(os.name == "nt", "requires native Windows process creation")
     def test_native_environment_retains_hidden_drive_and_replaces_marker(self):
@@ -597,6 +779,38 @@ class NativeParentTests(unittest.TestCase):
         self.assertNotIn("skipped", result.stderr)
         self.assertTrue(HELPER["windows_test_process_status"]() == before,
                         "parent token state changed")
+
+    def test_autoreview_product_custody_before_primary_restriction(self):
+        proof = Path(__file__).resolve().with_name("windows-product-custody.test.py")
+        # File-backed capture cannot wait for pipe EOF if native cleanup fails
+        # and a reduced child survives the proof interpreter. Read only the
+        # extent present when the interpreter exits, then report its failure.
+        failure = None
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            try:
+                status = HELPER["run_windows_test_proof"](
+                    [sys.executable, "-u", "-I", "-S", "-B", "-X", "utf8=1", str(proof)],
+                    stdout=stdout_file, stderr=stderr_file,
+                )
+            except BaseException as error:
+                failure = error
+            outputs = []
+            for captured in (stdout_file, stderr_file):
+                extent = os.fstat(captured.fileno()).st_size
+                captured.seek(0)
+                outputs.append(captured.read(extent).decode("utf-8", errors="replace"))
+        for stream, output in zip((sys.stdout, sys.stderr), outputs):
+            if stream is not None:
+                stream.write(output)
+                stream.flush()
+        if failure is not None:
+            raise failure
+        self.assertEqual(status, 0, "native product custody proof failed; see output")
+        self.assertIn("Verified product custody admission for real reduced primary.", outputs[0])
+        before = HELPER["windows_test_process_status"]()
+        if before["nonordinary_privileges"] or os.environ.get("GITHUB_ACTIONS") == "true":
+            self.assertIn("Verified product custody refusal for privileged primary and restricted thread.",
+                          outputs[0])
 
     def test_parent_reporting_handles_absent_streams_before_real_child_launch(self):
         self.assertFalse(HELPER["windows_test_process_status"]()["eligible"],

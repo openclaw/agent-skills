@@ -59,6 +59,130 @@ def tree(root: Path) -> dict[str, tuple[str, bytes | str | None]]:
 
 
 class InstalledAutoreviewTests(unittest.TestCase):
+    def assert_installed_venv_owner_lifetime(self, helper, cwd, environment, runtime):
+        import contextlib
+        import ctypes
+        import time
+        import venv
+        from ctypes import wintypes
+
+        fixture = runtime / "copy-venv-owner"
+        fixture.mkdir()
+        venv.EnvBuilder(with_pip=False, symlinks=False).create(fixture / "venv")
+        executable = fixture / "venv/Scripts/python.exe"
+        self.assertFalse(executable.is_symlink())
+        base = Path(sys._base_executable).resolve()
+        target_code = (
+            "import json, os, pathlib, sys, time; "
+            "root = pathlib.Path(sys.argv[1]); "
+            "data = dict(target=os.getpid(), supervisor=os.getppid(), "
+            "cwd=os.getcwd(), marker=os.environ.get('AUTOREVIEW_INSTALL_WITNESS')); "
+            "pending = root / 'target.pending'; "
+            "pending.write_text(json.dumps(data), encoding='utf-8'); "
+            "pending.replace(root / 'target.json'); "
+            "os.close(1); time.sleep(90)"
+        )
+        owner_code = """
+import json, os, pathlib, runpy, subprocess, sys, threading, time
+root = pathlib.Path(sys.argv[3])
+def publish(name, value):
+    pending = root / (name + '.pending')
+    pending.write_text(json.dumps(value), encoding='utf-8')
+    pending.replace(root / (name + '.json'))
+assert sys.prefix != sys.base_prefix
+publish('owner', dict(pid=os.getpid(), executable=sys.executable, base=sys._base_executable))
+helper = runpy.run_path(sys.argv[1])
+process = helper['start_owned_process'](
+    [sys.argv[2], '-I', '-S', '-B', '-c', sys.argv[4], str(root)],
+    pathlib.Path.cwd(), env=dict(os.environ), stdin=subprocess.DEVNULL,
+    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+publish('launcher', dict(pid=process.pid))
+def observe_eof():
+    publish('pipe', dict(eof=process.stdout.read() == b''))
+threading.Thread(target=observe_eof, daemon=True).start()
+time.sleep(90)
+"""
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel.TerminateProcess.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+
+        @contextlib.contextmanager
+        def retained_process(pid):
+            handle = kernel.OpenProcess(0x00100001, False, pid)  # SYNCHRONIZE | TERMINATE
+            if not handle:
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                yield handle
+            finally:
+                try:
+                    # Emergency cleanup happens after the lifetime assertions.
+                    if kernel.WaitForSingleObject(handle, 0) == 258:
+                        if not kernel.TerminateProcess(handle, 1):
+                            raise ctypes.WinError(ctypes.get_last_error())
+                        self.assertEqual(kernel.WaitForSingleObject(handle, 5000), 0)
+                finally:
+                    kernel.CloseHandle(handle)
+
+        def read_witness(name):
+            path = fixture / (name + ".json")
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if path.exists():
+                    return json.loads(path.read_text(encoding="utf-8"))
+                time.sleep(0.02)
+            self.fail(f"installed copy-venv owner did not publish {name}")
+
+        # Keep artifacts outside all trees whose immutability the archive proof
+        # checks. File-backed logs cannot make teardown wait on inherited pipes.
+        child_environment = {**environment, "AUTOREVIEW_INSTALL_WITNESS": "copy-venv-owned-job"}
+        with (fixture / "owner.log").open("wb") as log, contextlib.ExitStack() as handles:
+            owner = subprocess.Popen(
+                [str(executable), "-I", "-B", "-X", "utf8=1", "-c", owner_code,
+                 str(helper), str(base), str(fixture), target_code],
+                cwd=cwd, env=child_environment, stdin=subprocess.DEVNULL,
+                stdout=log, stderr=log,
+            )
+            try:
+                identity = read_witness("owner")
+                owner_handle = handles.enter_context(retained_process(identity["pid"]))
+                self.assertEqual(Path(identity["executable"]).resolve(), executable.resolve())
+                self.assertEqual(Path(identity["base"]).resolve(), base)
+                self.assertNotEqual(identity["pid"], owner.pid,
+                                    "copy-venv fixture must exercise its redirector")
+                target = read_witness("target")
+                supervisor_handle = handles.enter_context(retained_process(target["supervisor"]))
+                target_handle = handles.enter_context(retained_process(target["target"]))
+                launcher = read_witness("launcher")
+                if launcher["pid"] != target["supervisor"]:
+                    handles.enter_context(retained_process(launcher["pid"]))
+                self.assertEqual(Path(target["cwd"]).resolve(), cwd)
+                self.assertEqual(target["marker"], child_environment["AUTOREVIEW_INSTALL_WITNESS"])
+                # EOF must arrive while both supervisor and target are still
+                # alive; teardown must not be what releases the pipe.
+                self.assertTrue(read_witness("pipe")["eof"])
+                for handle in (owner_handle, supervisor_handle, target_handle):
+                    self.assertEqual(kernel.WaitForSingleObject(handle, 0), 258)
+                # Kill the actual Python owner, not the waiting venv redirector.
+                # Only loss of its retained job handle should kill these children.
+                if not kernel.TerminateProcess(owner_handle, 37):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                self.assertEqual(kernel.WaitForSingleObject(owner_handle, 5000), 0)
+                self.assertEqual(kernel.WaitForSingleObject(supervisor_handle, 5000), 0)
+                self.assertEqual(kernel.WaitForSingleObject(target_handle, 5000), 0)
+            finally:
+                try:
+                    handles.close()
+                finally:
+                    if owner.poll() is None:
+                        owner.kill()
+                    owner.wait(timeout=5)
+
     def test_source_commit_identity_keeps_its_raw_tree_with_replacement_refs(self) -> None:
         environment = {key: value for key, value in os.environ.items()
                        if not key.upper().startswith("GIT_")}
@@ -294,6 +418,27 @@ class InstalledAutoreviewTests(unittest.TestCase):
                 before = tree(scratch)
                 helper = installed / "scripts/autoreview"
                 if os.name == "nt":
+                    # Execute the installed process owner, including its sibling
+                    # supervisor, with real pipes and no checkout imports.
+                    owned_probe = (
+                        "import pathlib, runpy, sys\n"
+                        "helper = runpy.run_path(sys.argv[1])\n"
+                        "result = helper['run_with_heartbeat'](\n"
+                        " [sys.executable, '-I', '-S', '-c',\n"
+                        "  'import sys; print(sys.stdin.read()); print(42, file=sys.stderr)'],\n"
+                        " pathlib.Path.cwd(), input_text='installed owned job',\n"
+                        " label='installed', max_runtime_seconds=10)\n"
+                        "assert result.returncode == 0, result\n"
+                        "assert result.stdout.strip() == 'installed owned job', result\n"
+                        "assert result.stderr.strip() == '42', result\n"
+                        "assert not helper['_OWNED_PROCESSES']\n"
+                    )
+                    run([sys.executable, "-I", "-S", "-B", "-c", owned_probe, str(helper)],
+                        stage="installed Windows owned job")
+                    print(f"installed-source {filename}: copy-venv owner lifetime", flush=True)
+                    self.assert_installed_venv_owner_lifetime(
+                        helper, cwd, env, Path(runtime_tmp).resolve(),
+                    )
                     powershell = shutil.which("powershell") or shutil.which("pwsh")
                     self.assertIsNotNone(powershell, "native PowerShell is required for this platform proof")
                     # The real launcher must choose the isolated proof interpreter,

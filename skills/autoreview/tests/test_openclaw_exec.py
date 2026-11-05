@@ -19,7 +19,8 @@ from skills.autoreview.tests import test_native_handoff as native
 class OpenClawExecTests(native.ReviewFixture):
     def setUp(self):
         super().setUp()
-        self.binary = self.root / "openclaw"
+        (self.root / "bin").mkdir()
+        self.binary = self.root / "bin" / "openclaw"
         self.capture = self.root / "invocations.jsonl"
         self.config = self.root / "operator.json"
         self.home = self.root / "home"
@@ -181,10 +182,11 @@ if case == "exit-failure":
                 self.status.unlink(missing_ok=True)
                 self.start_direct(case="wait", timeout="8" if cancel else ".4")
                 if cancel:
-                    deadline = time.monotonic() + 5
-                    while not self.capture.exists() and time.monotonic() < deadline:
+                    # Preparation precedes the engine timeout; cancel only after launch.
+                    deadline = time.monotonic() + 10
+                    while not self.capture.exists() and self.process.poll() is None and time.monotonic() < deadline:
                         time.sleep(.01)
-                    self.assertTrue(self.capture.exists())
+                    self.assertTrue(self.capture.exists(), f"reviewer did not launch (exit {self.process.poll()})")
                     self.process.send_signal(signal.SIGTERM)
                 records, _ = self.finish_direct(143 if cancel else 1)
                 self.assertEqual(len(records), 1)

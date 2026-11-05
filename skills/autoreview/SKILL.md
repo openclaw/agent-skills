@@ -93,6 +93,10 @@ Branch/commit mode supports repeatable `--source-context <path>` or
 `--source-context-file <path>` (intact each pass): frozen regular-file blobs,
 never working-copy substitutes. Local mode is unsupported. Before use, read
 [source context rules](references/git-and-context.md#committed-source-context).
+For required source in a separate local Git checkout, use
+`--external-source-context-file <manifest.json>` with an explicit commit and blob
+inventory. It keeps those source files intact in every pass under the same
+source-path protections; see [external committed source](references/git-and-context.md#external-committed-source).
 
 Default: **P0 only**, material operational/safety blockers. For requested wider
 reviews use `--max-priority P1`, `P2`, or `P3` (overrides `AUTOREVIEW_MAX_PRIORITY`).
