@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Update the development Node.js types to 26.6.6 while retaining Node.js 26 and the Python 3.10 installed-helper contract.
+
 - Retain the platform timeout for CodeQL instead of imposing a shorter scan budget.
 
 - Scan main daily with CodeQL while preserving pull request and manual scans and the existing skill validation and release gates.
