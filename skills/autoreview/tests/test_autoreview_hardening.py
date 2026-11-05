@@ -4992,6 +4992,43 @@ class AutoreviewHardeningTests(unittest.TestCase):
             with self.subTest(rel=rel):
                 self.assertIsNone(self.helper["tracked_sensitive_repo_path_risk"](rel))
 
+    def test_tracked_rfc_companions_are_source_not_credential_stores(self) -> None:
+        for root in ("specs/rfcs", "docs/rfcs"):
+            for name in ("README.md", "index.md", "contracts.md", "design.md", "security.md"):
+                rel = f"{root}/0042-credential-lifecycle/{name}"
+                with self.subTest(rel=rel):
+                    self.assertIsNone(self.helper["tracked_sensitive_repo_path_risk"](rel))
+                    # This exception does not admit untracked files or evidence.
+                    self.assertIsNotNone(self.helper["sensitive_repo_path_risk"](rel))
+
+    def test_rfc_shaped_credential_storage_remains_sensitive(self) -> None:
+        for rel in (
+            "credentials/contracts.md",
+            "specs/credentials/contracts.md",
+            "rfcs/0042-credential-lifecycle/contracts.md",
+            "vendor/specs/rfcs/0042-credential-lifecycle/contracts.md",
+            "specs/rfcs/credential-lifecycle/contracts.md",
+            "specs/rfcs/0042-credential-lifecycle/notes.md",
+            "specs/rfcs/0042-credential-lifecycle/credentials.md",
+            "specs/rfcs/0042-credential-lifecycle/token.md",
+            "specs/rfcs/0042-credential-lifecycle/secret.md",
+            "specs/rfcs/0042-credential-lifecycle/config.md",
+            "specs/rfcs/0042-credential-lifecycle/contracts.json",
+            "specs/rfcs/0042-credential-lifecycle/contracts.pem",
+            "specs/rfcs/0042-credential-lifecycle/.env",
+            "specs/rfcs/0042-credential-lifecycle/.ssh/contracts.md",
+            "specs/rfcs/0042-credential-lifecycle/.aws/contracts.md",
+            "specs/rfcs/0042-credential-lifecycle/credentials/contracts.md",
+            "specs/rfcs/0042-credential-lifecycle/appendix/contracts.md",
+            "specs/rfcs/0042-credential-lifecycle/contracts.md.backup",
+            "specs/rfcs/0042-credential-lifecycle/contracts.MD",
+            "specs/rfcs/0042-secret-credential-store/contracts.md",
+            "docs/rfcs/0042-credential-token-store/index.md",
+        ):
+            with self.subTest(rel=rel):
+                self.assertIsNotNone(self.helper["tracked_sensitive_repo_path_risk"](rel))
+                self.assertIsNotNone(self.helper["sensitive_repo_path_risk"](rel))
+
     def test_untracked_token_source_paths_remain_reviewable(self) -> None:
         for rel in (
             "src/token/parser.py",

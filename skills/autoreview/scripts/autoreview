@@ -2561,7 +2561,27 @@ def credential_store_path(normalized: str) -> bool:
         ".tsx",
         ".vue",
     }
-    return credential_directory and credential_data_file and not skill_instruction_path(path)
+    return (
+        credential_directory
+        and credential_data_file
+        and not skill_instruction_path(path)
+        and not rfc_source_path(path)
+    )
+
+
+def rfc_source_path(path: Path) -> bool:
+    # Only immediate, named companions of numbered public RFCs are source.
+    # Never exempt nested stores, arbitrary Markdown, or other sensitive titles.
+    parts = path.parts
+    if (
+        len(parts) != 4
+        or parts[:2] not in {("specs", "rfcs"), ("docs", "rfcs")}
+        or re.fullmatch(r"[0-9]{4}-[a-z0-9]+(?:-[a-z0-9]+)*", parts[2]) is None
+        or parts[3] not in {"README.md", "index.md", "contracts.md", "design.md", "security.md"}
+    ):
+        return False
+    title = re.sub(r"(?<=-)credentials?(?=-|$)", "source", parts[2])
+    return not any(pattern.search(title) for pattern in SENSITIVE_NAME_PATTERNS)
 
 
 def skill_instruction_path(path: Path) -> bool:
@@ -3745,10 +3765,12 @@ def capture_source_context(repo: Path, raw_path: str, commit: str) -> SourceCont
     if original.anchor:
         raise SystemExit("--source-context must be a repo-relative path")
     rel = original.as_posix()
-    # This role admits tracked source filenames, never credential directories.
+    # This role admits tracked source filenames and named RFC companions,
+    # never arbitrary content in credential directories.
     # The tracked-diff policy alone also admits private/ and credentials/ code.
     if (path_has_sensitive_part(rel)
-            or any(TRACKED_CREDENTIAL_DIR_PATTERN.fullmatch(part) for part in Path(rel).parts[:-1])
+            or (any(TRACKED_CREDENTIAL_DIR_PATTERN.fullmatch(part) for part in Path(rel).parts[:-1])
+                and not rfc_source_path(Path(rel)))
             or tracked_sensitive_repo_path_risk(rel)):
         raise SystemExit(f"refusing sensitive --source-context: {display_escape(rel, 500)}")
     if (not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit)
