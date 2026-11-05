@@ -4818,16 +4818,40 @@ def prepare_batch_review(
         manifest = json.loads(record.content, object_pairs_hook=unique_object)
     except (ValueError, RecursionError) as exc:
         raise SystemExit("invalid review-batches JSON") from exc
-    batch_object(manifest, {"version", "base", "head", "bundle_sha256", "contexts", "batches"}, "manifest")
+    version = manifest.get("version") if isinstance(manifest, dict) else None
+    if type(version) is not int or version not in {1, 2}:
+        raise SystemExit("review-batches version must be 1 or 2")
+    manifest_keys = {"version", "base", "head", "bundle_sha256", "contexts", "batches"}
+    if version == 2:
+        manifest_keys.add("evidence_files")
+    batch_object(manifest, manifest_keys, "manifest")
     bundle_digest = hashlib.sha256(captured.text.encode("utf-8")).hexdigest()
-    if (type(manifest["version"]) is not int or manifest["version"] != 1
-            or manifest["base"] != captured.base or manifest["head"] != captured.commit
+    if (manifest["base"] != captured.base or manifest["head"] != captured.commit
             or manifest["bundle_sha256"] != bundle_digest):
         raise SystemExit("review-batches version or frozen range/bundle identity mismatch")
     if not isinstance(manifest["contexts"], list) or not isinstance(manifest["batches"], list) or not manifest["batches"]:
         raise SystemExit("review-batches contexts and nonempty batches must be arrays")
     sources: dict[str, ReviewDataset] = {}
     files = [*evidence.files, record]
+    assignment_evidence: dict[str, ReviewDataset] = {}
+    evidence_metadata = []
+    if version == 2:
+        if not isinstance(manifest["evidence_files"], list):
+            raise SystemExit("review-batches evidence_files must be an array")
+        for item in manifest["evidence_files"]:
+            batch_object(item, {"path", "sha256"}, "evidence file")
+            path = batch_path(item["path"])
+            if path in assignment_evidence:
+                raise SystemExit("duplicate review-batches evidence path")
+            digest = item["sha256"]
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise SystemExit("review-batches evidence requires a lowercase SHA-256")
+            source = capture_evidence_file(repo, path, "--review-batches evidence")
+            if hashlib.sha256(source.content.encode("utf-8")).hexdigest() != digest:
+                raise SystemExit("review-batches evidence content identity mismatch")
+            files.append(source)
+            assignment_evidence[path] = ReviewDataset(path, source.content)
+            evidence_metadata.append({"path": path, "sha256": digest, "bytes": utf8_size(source.content)})
     contexts = []
     for item in manifest["contexts"]:
         batch_object(item, {"path", "blob", "mode"}, "context")
@@ -4846,18 +4870,24 @@ def prepare_batch_review(
     names: set[str] = set()
     changed_coverage: set[str] = set()
     context_coverage: set[str] = set()
+    evidence_coverage: set[str] = set()
     unit_paths = {unit["path"] for unit in units}
     plans = []
     metadata = {
-        "version": 1, "base": captured.base, "head": captured.commit,
+        "version": version, "base": captured.base, "head": captured.commit,
         "bundle_sha256": bundle_digest, "bundle_bytes": utf8_size(captured.text),
         "header_bytes": utf8_size(captured.branch_header),
         "manifest_sha256": hashlib.sha256(record.content.encode("utf-8")).hexdigest(),
         "omitted_paths": [], "units": [{key: value for key, value in unit.items() if key != "patch"} for unit in units],
         "contexts": contexts,
     }
+    if version == 2:
+        metadata["evidence_files"] = evidence_metadata
     for batch in manifest["batches"]:
-        batch_object(batch, {"name", "kind", "changes", "contexts", "obligations"}, "assignment")
+        assignment_keys = {"name", "kind", "changes", "contexts", "obligations"}
+        if version == 2:
+            assignment_keys.add("evidence_files")
+        batch_object(batch, assignment_keys, "assignment")
         name = batch["name"]
         if not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}", name) or name in names:
             raise SystemExit("review-batches assignment names must be unique identifiers")
@@ -4866,11 +4896,16 @@ def prepare_batch_review(
         changes = batch_strings(batch["changes"], "changes")
         selected_contexts = batch_strings(batch["contexts"], "contexts", nonempty=False)
         obligations = batch_strings(batch["obligations"], "obligations")
+        selected_evidence = (batch_strings(batch["evidence_files"], "evidence_files", nonempty=False)
+                             if version == 2 else [])
+        if not set(selected_evidence) <= assignment_evidence.keys():
+            raise SystemExit("review-batches assignment references unknown evidence")
         if not set(changes) <= unit_paths or not set(selected_contexts) <= sources.keys():
             raise SystemExit("review-batches assignment references an unknown change or context")
         names.add(name)
         changed_coverage.update(changes)
         context_coverage.update(selected_contexts)
+        evidence_coverage.update(selected_evidence)
         # Canonical capture order, never manifest order or reparsed diff headings,
         # owns the bytes. Overlap is explicit integration evidence, not omission.
         selected_units = [unit for unit in units if unit["path"] in changes]
@@ -4879,6 +4914,8 @@ def prepare_batch_review(
             "name": name, "kind": batch["kind"], "changes": [unit["path"] for unit in selected_units],
             "contexts": selected_contexts, "obligations": obligations,
         }
+        if version == 2:
+            assignment["evidence_files"] = selected_evidence
         instructions = (
             "# Explicit review assignment\n" + json.dumps(assignment, ensure_ascii=True) + "\n"
             "Review every assigned change and obligation, including the stated cross-owner contracts. "
@@ -4886,7 +4923,8 @@ def prepare_batch_review(
             "Do not rely on another assignment to supply a missing caller, callee or integration contract. "
             "Missing necessary evidence requires review_completion=incomplete. Other assignments cannot waive that result."
         )
-        datasets = tuple(sources[path] for path in selected_contexts)
+        datasets = (tuple(sources[path] for path in selected_contexts)
+                    + tuple(assignment_evidence[path] for path in selected_evidence))
         prompt = render_review_prompt(
             current_branch(repo), target, target_ref, chunk,
             apply_finding_threshold_prompt(args, evidence.prompt) + "\n\n" + instructions,
@@ -4896,6 +4934,8 @@ def prepare_batch_review(
                                 frozenset(changes), {**metadata, "assignment": assignment}))
     if changed_coverage != unit_paths or context_coverage != sources.keys():
         raise SystemExit("review-batches omitted original change units or declared context inputs")
+    if evidence_coverage != assignment_evidence.keys():
+        raise SystemExit("review-batches omitted declared evidence files")
     if len(plans) > 1 and not any(batch["kind"] == "integration" for batch in manifest["batches"]):
         raise SystemExit("review-batches requires an explicit cross-owner integration assignment")
     return EvidenceInputs(evidence.prompt, [], files), plans
@@ -7586,7 +7626,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", action="append", help="Extra evidence file to include in the review bundle.")
     parser.add_argument("--source-context", action="append", help="Repo-relative source path from the reviewed commit; branch/commit modes only, context without finding authority.")
     parser.add_argument("--source-context-file", action="append", help="Repo-relative source from the reviewed commit, kept intact in every pass; branch/commit modes only, context without finding authority.")
-    parser.add_argument("--review-batches", help="Repo-relative v1 allocation manifest for one frozen branch range. Whole change units and declared source contracts; no dataset/source-context partitioning. See references/git-and-context.md.")
+    parser.add_argument("--review-batches", help="Repo-relative v1/v2 allocation manifest for one frozen branch range. Whole change units and declared source contracts; no dataset/source-context partitioning. See references/git-and-context.md.")
     parser.add_argument(
         "--max-priority",
         choices=["P0", "P1", "P2", "P3"],
