@@ -144,7 +144,7 @@ class ReviewBatchTests(unittest.TestCase):
                 path = repo / rel
                 path.parent.mkdir(parents=True)
                 body = "# Service admission\n\nOnly the selected service may request this operation.\n"
-                path.write_text(body, encoding="utf-8")
+                path.write_bytes(body.encode("utf-8"))
                 self.git(repo, "add", rel)
                 self.git(repo, "commit", "--amend", "--no-edit", "-q")
                 manifest = self.manifest(repo)
