@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Run Autoreview's Codex `login status` probe with the reviewer's filtered environment, keeping the operator's login and Codex home while dropping `NODE_OPTIONS`, other startup hooks and `PATH` entries inside the reviewed checkout.
+
 - Update the development Node.js types to 26.6.6 while retaining Node.js 26 and the Python 3.10 installed-helper contract.
 
 - Retain the platform timeout for CodeQL instead of imposing a shorter scan budget.
