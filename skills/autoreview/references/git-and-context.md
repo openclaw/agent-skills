@@ -6,6 +6,15 @@
   scope; presence/edits do not make parent dirty. Ordinary adjacent files stay included.
 - Revalidate worktree boundaries without changing Git ignore rules.
 
+- Tracked RFC source companions may use a credential-named RFC directory:
+  `specs/rfcs/NNNN-lowercase-slug/` or `docs/rfcs/NNNN-lowercase-slug/`, with
+  immediate `README.md`, `index.md`, `contracts.md`, `design.md`, or `security.md`.
+  This is a path convention, not content scanning. Other sensitive title words,
+  nested storage, unknown Markdown names and credential data remain subject to
+  the existing guards. The same convention admits frozen committed source-context
+  blobs, with normal topology, identity and mutation checks. Untracked files and
+  general evidence retain their stricter credential-directory rules.
+
 - Local status columns come from the captured base → index and index → working-tree
   diff queues, not a separate HEAD-relative status. Paths are JSON strings; renames
   appear as add/delete transitions, matching the no-renames patches.
