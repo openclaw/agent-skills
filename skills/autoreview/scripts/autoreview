@@ -5821,10 +5821,11 @@ def load_codex_auth_fallback_route(
     return provider, route
 
 
-def codex_subscription_login_missing(codex_bin: str, cwd: Path) -> bool:
+def codex_subscription_login_missing(repo: Path, codex_bin: str, cwd: Path) -> bool:
+    env = safe_engine_env(repo, [Path(codex_bin).parent], engine="codex")
     try:
         result = subprocess.run(
-            [codex_bin, "login", "status"], cwd=cwd, env=os.environ.copy(),
+            [codex_bin, "login", "status"], cwd=cwd, env=env,
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding=SUBPROCESS_TEXT_ENCODING, errors=SUBPROCESS_TEXT_ERRORS,
             timeout=10, check=False,
@@ -5982,7 +5983,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                 if allow_fallback else None
             )
             if auth_fallback is not None and codex_subscription_login_missing(
-                resolve_command(args.codex_bin, repo), temp_root,
+                repo, resolve_command(args.codex_bin, repo), temp_root,
             ):
                 provider, route = auth_fallback
                 command_auth = True
