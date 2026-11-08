@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Pin the shared source-release workflow to a reviewed commit with complete release listing and exact-byte draft retry checks.
+
 - Update the development Node.js types to 26.6.6 while retaining Node.js 26 and the Python 3.10 installed-helper contract.
 
 - Retain the platform timeout for CodeQL instead of imposing a shorter scan budget.

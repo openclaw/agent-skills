@@ -6,11 +6,15 @@ runs the catalog checks and publishes frozen-commit source tar/zip archives with
 the exact changelog notes, inventory, and `SHA256SUMS`. Independent push CI must
 also pass Linux, Windows, and native macOS sandbox checks.
 
-The `Release` workflow calls the shared OpenClaw archetype at `@v1`. It
+The `Release` workflow calls the shared OpenClaw archetype at the commit pinned in
+`.github/workflows/release.yml`. It
 requires a protected `main`, matching version metadata, a dated changelog section,
 and successful independent **push** CI on the exact release commit. It verifies
 SSH-signed annotated tags against `.github/release-allowed-signers` and rejects
-moved tags or an existing GitHub Release.
+moved tags or multiple releases for the same tag. It can complete a compatible
+draft without overwriting assets; unexpected assets or bytes that differ from the
+frozen payload are refused. An existing published release is a read-only success
+only when its notes and complete asset set match the frozen payload exactly.
 
 Prepare the version and dated `## X.Y.Z - YYYY-MM-DD` changelog section in a PR,
 retain `## Unreleased`, and merge only after CI and review. After explicit release
