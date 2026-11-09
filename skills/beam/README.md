@@ -1,9 +1,9 @@
 # Beam
 
-Beam publishes a sanitized local Claude Code or Codex session to an authenticated
-OpenClaw Gateway. The Gateway shows the result in its existing external-session
-viewer; it never gains access to the source machine's filesystem, terminal,
-tools, credentials, or node runtime.
+Beam publishes a sanitized local Claude Code, Codex, or exported Grok Bot
+session to an authenticated OpenClaw Gateway. The Gateway shows the result in
+its existing external-session viewer; it never gains access to the source
+machine's filesystem, terminal, tools, credentials, or node runtime.
 
 ## How it works
 
@@ -14,10 +14,11 @@ The `beam` helper is self-contained. It does not require `agent-transcript`,
    - Claude Code: `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/**/<session-id>.jsonl`
    - Codex: `${CODEX_HOME:-~/.codex}/{sessions,archived_sessions}/**/*.jsonl`,
      verified against `session_meta.payload.id`
+   - Grok Bot: an explicit export passed with `--source grokbot --session <file>`
    - lifecycle hooks: their exact `transcript_path`
    - explicit use: `--session <file>`
-2. It reads a bounded transcript window and recognizes visible Claude Code and
-   Codex messages, including modern Codex `item_completed` records.
+2. It reads a bounded transcript window and recognizes visible Claude Code,
+   Codex, and Grok Bot messages, including modern Codex `item_completed` records.
 3. It drops system/developer setup, reasoning, raw tool inputs/outputs, images,
    browser state, and unknown records. Tool activity becomes aggregate family
    counts such as `2 read, 1 execute`.
@@ -119,6 +120,55 @@ node "$BEAM_SKILL_DIR/scripts/beam" publish \
   --dry-run --quiet
 ```
 
+### Grok Bot
+
+Grok Bot has no local session scan. Pass the exported transcript:
+
+```sh
+node "$BEAM_SKILL_DIR/scripts/beam" publish \
+  --endpoint "$BEAM_ENDPOINT" \
+  --source grokbot \
+  --session "$HOME/.grok-bot/agent-transcripts/<agent-id>/<agent-id>.jsonl"
+```
+
+`--source grokbot` is required for a JSON document. Native JSONL is also
+recognized from `--session` or a hook `transcript_path` without the flag.
+Markdown chat logs are not an input.
+
+Accepted files:
+
+- Native JSONL, one object per line:
+  `{"role":"user"|"assistant"|"tool","message":{"content":[...]}}`
+- A JSON document: an array of those records, one record, or
+  `{"id","title","model","messages":[...]}`. A simplified message may be
+  `{"role":"user"|"assistant","content":"text"}` or a `content` array of
+  `{type,text}` blocks.
+- An optional role-less JSONL header may carry `id`, `title`, and `model`.
+
+Normalization:
+
+- User text is shared. A leading `[t0u]`-style address tag is removed.
+  `[SAND_HIDDEN_PROMPT]` wakes are dropped. A leading `[Group chat:` line and
+  the room lines `It's your turn`, `The room is wrapping up`, and
+  `No new messages in the room` are dropped.
+- The visible assistant reply is `send_message` text (`input.text.content`).
+  Other tool inputs and every tool result stay local and become a compact tool
+  count. Assistant `text` and `thinking` blocks are scratch: they are omitted
+  when the file contains `send_message`. A plain export with no `send_message`
+  publishes assistant text instead.
+- The same redaction, 8 MiB head/tail window, 6,000-character item cap, 200-item
+  cap, and upload body cap apply. The receiver rejects bodies over 56 KiB; the
+  sender stays inside its existing smaller cap.
+
+Repeat uploads keep one snapshot when the conversation id is stable. Beam uses
+the first string `id`, `conversationId`, `agentId`, or `sessionId` (snake_case
+accepted) that matches 8–128 letters, digits, `_`, or `-`. Otherwise it uses
+the filename when that stem is a UUID or matches its parent directory, which is
+the native `<agent-id>/<agent-id>.jsonl` layout. Any other file falls back to
+the path. An explicit id that does not match the pattern stops publication.
+`model`, when present and safe, is sent as `sourceModel.provider` `xai`.
+Handoff uses the same `--source grokbot --session FILE` selector.
+
 ## Authentication
 
 ### Personal guest access
@@ -210,9 +260,10 @@ Viewing still requires current publisher authority and snapshot ownership.
 The same origin, endpoint-derived base path, and Beam ID URL checks apply whether
 or not the publisher can view the result.
 
-The receiver rejects transcript item text longer than 6,000 characters.
-Accordingly, explicit `--entry-max-chars` values above 6,000 fail locally
-before upload.
+The receiver rejects transcript item text longer than 6,000 characters and
+request bodies over 56 KiB. Accordingly, explicit `--entry-max-chars` values
+above 6,000 fail locally before upload, and every source, including `grokbot`,
+is trimmed to the sender's existing item count and body cap before upload.
 
 ## Live logical conversation handoff
 

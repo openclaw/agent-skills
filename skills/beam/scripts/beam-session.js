@@ -189,7 +189,7 @@ function parseRows(file) {
       // A corrupt or partial record is ignored; other records remain usable.
     }
   }
-  return { rows, truncated: bounded.truncated };
+  return { rows, truncated: bounded.truncated, text: bounded.text };
 }
 
 function textBlock(block) {
@@ -808,18 +808,237 @@ function toolSummary(stats) {
   return `${counts.join(", ") || "0 tool"}; raw tool outputs dropped: ${stats.toolOutputsDropped}`;
 }
 
+const GROK_IDENTITY_FIELDS = ["id", "conversationId", "conversation_id", "agentId", "agent_id", "sessionId", "session_id"];
+
+function isGrokRecord(row) {
+  if (!isRecord(row)) return false;
+  const role = String(row.role || "").toLowerCase();
+  if (!["user", "assistant", "tool"].includes(role)) return false;
+  return (
+    isRecord(row.message) ||
+    typeof row.message === "string" ||
+    typeof row.content === "string" ||
+    Array.isArray(row.content) ||
+    typeof row.text === "string"
+  );
+}
+
+function grokBlocksOf(record) {
+  if (Array.isArray(record.content)) return record.content.filter(isRecord);
+  if (isRecord(record.message) && Array.isArray(record.message.content)) {
+    return record.message.content.filter(isRecord);
+  }
+  return [];
+}
+
+function grokPlainText(record) {
+  if (typeof record.content === "string") return record.content;
+  if (typeof record.text === "string") return record.text;
+  if (typeof record.message === "string") return record.message;
+  if (!isRecord(record.message)) return null;
+  if (typeof record.message.content === "string") return record.message.content;
+  if (typeof record.message.text === "string") return record.message.text;
+  return null;
+}
+
+function sendMessageText(block) {
+  if (!isRecord(block) || String(block.type || "").toLowerCase() !== "tool_use") return null;
+  if (normalizedType(block.name) !== "sendmessage") return null;
+  const input = block.input;
+  if (typeof input === "string") return input;
+  if (!isRecord(input)) return "";
+  if (typeof input.text === "string") return input.text;
+  if (isRecord(input.text)) {
+    if (typeof input.text.content === "string") return input.text.content;
+    if (Array.isArray(input.text.content)) return input.text.content.map(textBlock).filter(Boolean).join("\n");
+  }
+  if (typeof input.content === "string") return input.content;
+  if (typeof input.message === "string") return input.message;
+  return "";
+}
+
+function stripGrokAddressPrefix(text) {
+  if (!text.startsWith("[")) return text;
+  const end = text.indexOf("]");
+  if (end <= 1 || !/^t\d+[A-Za-z]?$/.test(text.slice(1, end))) return text;
+  const rest = text.slice(end + 1);
+  if (rest.startsWith("\r\n")) return rest.slice(2);
+  if (rest.startsWith("\n")) return rest.slice(1);
+  return rest;
+}
+
+function stripGrokUserText(text) {
+  const stripped = stripGrokAddressPrefix(String(text || ""));
+  if (stripped.includes("[SAND_HIDDEN_PROMPT]")) return "";
+  const lines = stripped.split(/\r?\n/).filter((line, index) => {
+    const trimmed = line.trim();
+    if (index === 0 && trimmed.startsWith("[Group chat:")) return false;
+    return !/^(?:It's your turn\b|The room is wrapping up\b|No new messages in the room\b)/i.test(trimmed);
+  });
+  return lines.join("\n");
+}
+
+function grokUserBlockText(block) {
+  const type = String(block.type || "").toLowerCase();
+  if (type && !["text", "input_text", "output_text"].includes(type)) return "";
+  return typeof block.text === "string" ? block.text : "";
+}
+
+function countGrokBlock(block, stats) {
+  if (!isRecord(block)) return;
+  const type = String(block.type || "").toLowerCase();
+  if (type === "tool_result") {
+    stats.toolOutputsDropped++;
+    return;
+  }
+  if (type !== "tool_use" || sendMessageText(block) != null) return;
+  addTool(stats, block.name || block.tool || "tool");
+}
+
+function grokMetaFromRecords(records) {
+  const meta = {};
+  for (const record of records) {
+    if (!isRecord(record) || typeof record.role === "string") continue;
+    for (const key of [...GROK_IDENTITY_FIELDS, "title", "model"]) {
+      if (meta[key] == null && record[key] != null) meta[key] = record[key];
+    }
+  }
+  return meta;
+}
+
+function envelopeMeta(parsed) {
+  const meta = {};
+  for (const key of [...GROK_IDENTITY_FIELDS, "title", "model"]) {
+    if (parsed[key] != null) meta[key] = parsed[key];
+  }
+  return meta;
+}
+
+function loadGrokTranscript(text, rows, truncated) {
+  if (!truncated) {
+    const trimmed = text.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) return { records: parsed, meta: grokMetaFromRecords(parsed) };
+        if (isRecord(parsed) && Array.isArray(parsed.messages)) {
+          return {
+            records: parsed.messages,
+            meta: { ...grokMetaFromRecords(parsed.messages), ...envelopeMeta(parsed) },
+          };
+        }
+        if (isGrokRecord(parsed)) return { records: [parsed], meta: {} };
+      } catch {
+        // Multi-value JSONL is not one JSON document.
+      }
+    }
+  }
+  return { records: rows, meta: grokMetaFromRecords(rows) };
+}
+
+function explicitGrokIdentity(meta) {
+  for (const field of GROK_IDENTITY_FIELDS) {
+    const value = meta[field];
+    if (typeof value !== "string" || !value.trim()) continue;
+    const normalized = value.trim();
+    if (!/^[A-Za-z0-9_-]{8,128}$/.test(normalized)) {
+      throw new Error("Grok Bot conversation id is not a valid session identifier");
+    }
+    return normalized;
+  }
+  return null;
+}
+
+function grokPathIdentity(file) {
+  const stem = path.basename(file, path.extname(file));
+  const parent = path.basename(path.dirname(file));
+  if (!/^[A-Za-z0-9_-]{8,128}$/.test(stem)) return null;
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(stem);
+  return uuid || stem === parent ? stem : null;
+}
+
+function assistantTextBlocks(blocks) {
+  return blocks.filter((block) => {
+    const type = String(block.type || "").toLowerCase();
+    return type === "text" || type === "input_text" || type === "output_text" || (!type && typeof block.text === "string");
+  });
+}
+
+// Native Grok Bot shows send_message text to the user. Assistant text and
+// thinking blocks are scratch, so they stay local when a send_message exists.
+// Plain exports without that tool publish assistant text instead.
+function parseGrokbot(text, rows, truncated, file, options) {
+  const loaded = loadGrokTranscript(text, rows, truncated);
+  const records = loaded.records.filter(isRecord);
+  if (!records.some(isGrokRecord)) {
+    throw new Error("Grok Bot transcript did not contain any conversation records; expected JSONL or a JSON document");
+  }
+  const identity = explicitGrokIdentity(loaded.meta) || grokPathIdentity(file);
+  const sourceModel = beamSourceModel("xai", typeof loaded.meta.model === "string" ? loaded.meta.model : undefined);
+  const title = typeof loaded.meta.title === "string" ? loaded.meta.title : undefined;
+  const items = [];
+  const stats = { redactions: 0, toolCalls: 0, toolOutputsDropped: 0, toolFamilies: {} };
+  const visibleReplies = records.some((record) => grokBlocksOf(record).some((block) => sendMessageText(block) != null));
+  for (const record of records) {
+    const role = String(record.role || "").toLowerCase();
+    const blocks = grokBlocksOf(record);
+    if (role === "tool") {
+      const results = blocks.filter((block) => String(block.type || "").toLowerCase() === "tool_result");
+      stats.toolOutputsDropped += results.length || 1;
+      continue;
+    }
+    if (role === "user") {
+      const raw = blocks.length
+        ? blocks.map(grokUserBlockText).filter(Boolean).join("\n")
+        : grokPlainText(record) || "";
+      pushMessage(items, "userMessage", stripGrokUserText(raw), stats, options.maxChars);
+      for (const block of blocks) countGrokBlock(block, stats);
+      continue;
+    }
+    if (role !== "assistant") continue;
+    if (!visibleReplies) {
+      const texts = assistantTextBlocks(blocks);
+      if (texts.length) {
+        for (const block of texts) pushMessage(items, "agentMessage", block.text || "", stats, options.maxChars);
+      } else {
+        const plain = grokPlainText(record);
+        if (plain) pushMessage(items, "agentMessage", plain, stats, options.maxChars);
+      }
+    }
+    for (const block of blocks) {
+      const sent = sendMessageText(block);
+      if (sent != null) pushMessage(items, "agentMessage", sent, stats, options.maxChars);
+      else countGrokBlock(block, stats);
+    }
+  }
+  return {
+    source: "grokbot",
+    identity,
+    items,
+    stats,
+    ...(sourceModel ? { sourceModel } : {}),
+    ...(title ? { title } : {}),
+  };
+}
+
 function detectSource(rows, file) {
   if (rows.some((row) => row?.type === "session_meta" || row?.type === "response_item")) return "codex";
   if (rows.some((row) => row?.type === "user" || row?.type === "assistant" || row?.message?.role)) return "claude";
+  if (rows.some(isGrokRecord)) return "grokbot";
   if (file.includes(`${path.sep}.codex${path.sep}`)) return "codex";
   return "claude";
 }
 
 export function renderSession(file, options = {}) {
   const resolved = fs.realpathSync(file);
-  const { rows, truncated } = parseRows(resolved);
+  const { rows, truncated, text } = parseRows(resolved);
   const source = options.source || detectSource(rows, resolved);
-  const parsed = source === "codex" ? parseCodex(rows, options) : parseClaude(rows, options);
+  const parsed =
+    source === "codex"
+      ? parseCodex(rows, options)
+      : source === "grokbot"
+        ? parseGrokbot(text, rows, truncated, resolved, options)
+        : parseClaude(rows, options);
   if (parsed.stats.toolCalls || parsed.stats.toolOutputsDropped) {
     parsed.items.push({ type: "other", text: toolSummary(parsed.stats) });
   }

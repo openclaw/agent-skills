@@ -18,9 +18,9 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 
 function usage() {
   console.log(`Usage:
-  beam publish --endpoint URL [--session FILE | --session-id ID | --thread-id ID] [--title TEXT] [--complete] [--dry-run]
+  beam publish --endpoint URL [--session FILE | --session-id ID | --thread-id ID] [--source grokbot] [--title TEXT] [--complete] [--dry-run]
   beam hook --endpoint URL [--quiet] [--dry-run]
-  beam handoff --endpoint URL [--session FILE | --session-id ID | --thread-id ID]
+  beam handoff --endpoint URL [--session FILE | --session-id ID | --thread-id ID] [--source grokbot]
   beam read --endpoint URL --beam-id ID --profile-dir DIR
   beam continue --endpoint URL --beam-id ID --profile-dir DIR --message TEXT [--request-id ID]
 
@@ -30,7 +30,8 @@ Environment:
   BEAM_AUTH_TOKEN     Gateway bearer token fallback (sent as Authorization: Bearer)
 
 Guests use their own Cloudflare Access sign-in or BEAM_ACCESS_TOKEN, never a shared Gateway token.
-The hook command reads Claude Code or Codex hook JSON from stdin. Raw transcripts never leave the machine.`);
+The hook command reads Claude Code or Codex hook JSON from stdin. Raw transcripts never leave the machine.
+Grok Bot uses an exported JSONL or JSON transcript: --source grokbot --session FILE.`);
 }
 
 function parseArgs(argv) {
@@ -97,11 +98,21 @@ function resolveHookSession(hook) {
   throw new Error("no exact transcript was found for the hook session id");
 }
 
+function requestedSource(options) {
+  if (options.source == null) return undefined;
+  const source = options.source === true ? "" : String(options.source).trim().toLowerCase();
+  if (!["claude", "codex", "grokbot"].includes(source)) {
+    throw new Error("--source must be claude, codex, or grokbot");
+  }
+  return source;
+}
+
 function resolveSession(options, hook) {
+  const source = requestedSource(options);
   if (options.session) {
     return {
       file: exactFile(options.session, "session", true),
-      source: undefined,
+      source,
       identity: undefined,
     };
   }
@@ -109,10 +120,11 @@ function resolveSession(options, hook) {
   if (hookFile) {
     return {
       file: exactFile(hookFile, "hook transcript", false),
-      source: undefined,
+      source,
       identity: undefined,
     };
   }
+  if (source === "grokbot") throw new Error("Grok Bot transcripts require --session FILE");
   const explicitThreadId = options["thread-id"] || options.threadId;
   if (explicitThreadId) return resolveCodexSession(explicitThreadId);
   const explicitSessionId = options["session-id"] || options.sessionId;
@@ -244,12 +256,14 @@ function buildPayload(options, hook) {
     session.file;
   const hookEvent = typeof hook.hook_event_name === "string" ? hook.hook_event_name : undefined;
   const sanitizedExplicitTitle = explicitTitle(options.title);
+  const sanitizedRenderedTitle = sanitizedExplicitTitle ? null : explicitTitle(rendered.title);
+  const title = sanitizedExplicitTitle || sanitizedRenderedTitle || titleFromItems(items);
   return fitPayload(
     {
       version: 1,
       beamId: stableBeamId(source, identity),
       source,
-      title: sanitizedExplicitTitle || titleFromItems(items),
+      title,
       updatedAt: new Date().toISOString(),
       completed: Boolean(options.complete || hookEvent === "SessionEnd"),
       ...(rendered.truncated ? { truncated: true } : {}),
@@ -258,7 +272,7 @@ function buildPayload(options, hook) {
       items,
     },
     positiveInteger(options["max-chars"], 48_000, "--max-chars", 32),
-    Boolean(sanitizedExplicitTitle),
+    Boolean(sanitizedExplicitTitle || sanitizedRenderedTitle),
   );
 }
 
