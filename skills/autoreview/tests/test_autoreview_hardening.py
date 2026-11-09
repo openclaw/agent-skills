@@ -3697,6 +3697,81 @@ class AutoreviewHardeningTests(unittest.TestCase):
                         self.assertNotIn("\x1b", result.stderr)
 
 
+    @unittest.skipUnless(os.name == "posix", "signals and process groups require POSIX")
+    def test_cli_interruption_publishes_no_verdict_after_child_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            git(repo, "commit", "-q", "--allow-empty", "-m", "base")
+            (repo / "source.txt").write_text("review me\n")
+            ready = root / "ready"
+            executable = write_executable(root / "codex", f'''#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+import time
+if "--version" in sys.argv:
+    print("codex-cli 0.0.0-test")
+    raise SystemExit(0)
+if "login" in sys.argv:
+    raise SystemExit(1)
+sys.stdin.read()
+ready = Path({str(ready)!r})
+ready.with_suffix(".tmp").write_text(str(os.getpid()))
+ready.with_suffix(".tmp").replace(ready)
+time.sleep(60)
+''')
+            # Empty homes and an inert CLI keep this process test offline and unauthenticated.
+            env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(root),
+                   "USERPROFILE": str(root), "CODEX_HOME": str(root)}
+            if "AUTOREVIEW_GIT" in os.environ:
+                env["AUTOREVIEW_GIT"] = os.environ["AUTOREVIEW_GIT"]
+            for signum, writable in ((signal.SIGTERM, True), (signal.SIGINT, True), (signal.SIGTERM, False)):
+                with self.subTest(signum=signum, writable=writable):
+                    ready.unlink(missing_ok=True)
+                    destination = root / f"status-{signum}-{writable}"
+                    destination.mkdir()
+                    sidecar = destination / "status.json"
+                    report, human = root / "result.json", root / "result.txt"
+                    argv = [sys.executable, str(SCRIPT), "--mode", "local", "--engine", "codex",
+                            "--codex-bin", str(executable), "--codex-no-fallback", "--no-web-search",
+                            "--status-output", str(sidecar), "--json-output", str(report),
+                            "--output", str(human)]
+                    with subprocess.Popen(argv, cwd=repo, env=env, text=True,
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+                        try:
+                            deadline = time.monotonic() + 20
+                            while not ready.exists() and proc.poll() is None and time.monotonic() < deadline:
+                                time.sleep(0.01)
+                            self.assertTrue(ready.exists(), "inert reviewer did not start")
+                            child_pid = int(ready.read_text())
+                            if not writable:
+                                destination.rmdir()  # Simulate storage lost after output preflight.
+                            # Signal only the helper: its existing handler must stop the owned child.
+                            proc.send_signal(signum)
+                            stdout, stderr = proc.communicate(timeout=10)
+                            self.assertEqual(proc.returncode, 128 + signum, stdout + stderr)
+                            with self.assertRaises(ProcessLookupError):
+                                os.killpg(child_pid, 0)
+                            self.assertFalse(report.exists())
+                            self.assertFalse(human.exists())
+                            if not writable:
+                                self.assertFalse(sidecar.exists())
+                                self.assertIn("interrupted status could not be written", stderr)
+                                continue
+                            outcome = json.loads(sidecar.read_text())
+                            self.assertEqual(outcome["status"], "interrupted")
+                            self.assertEqual(outcome["reason"], "interrupted")
+                            self.assertEqual(outcome["exit_code"], 128 + signum)
+                            self.assertEqual(outcome["signal_number"], signum)
+                            self.assertFalse(outcome["report_produced"])
+                            self.assertFalse(outcome["timed_out"])
+                            self.assertIsNone(outcome["reviewer_exit_code"])
+                        finally:
+                            if proc.poll() is None:
+                                proc.terminate()
+                                proc.communicate(timeout=10)
+
     @unittest.skipIf(os.name == "nt", "the executable fixture is POSIX-only")
     def test_cli_codex_model_fallback_opt_out_preserves_failed_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

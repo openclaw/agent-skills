@@ -8661,7 +8661,8 @@ def submit_native_response(root: Path, source: Path) -> None:
 
 
 def write_review_status(args: argparse.Namespace, status: str, exit_code: int,
-                        failure: ReviewerUnavailable | None = None) -> None:
+                        failure: ReviewerUnavailable | None = None, *,
+                        interrupted: EngineInterrupted | None = None) -> None:
     if not getattr(args, "status_output", None):
         return
     envelope = {
@@ -8669,11 +8670,13 @@ def write_review_status(args: argparse.Namespace, status: str, exit_code: int,
         "status": status,
         "exit_code": exit_code,
         "engine": args.engine,
-        "report_produced": failure is None,
-        "reason": failure.reason if failure else None,
+        "report_produced": failure is None and interrupted is None,
+        "reason": failure.reason if failure else "interrupted" if interrupted else None,
         "reviewer_exit_code": failure.returncode if failure else None,
         "timed_out": failure.timed_out if failure else False,
     }
+    if interrupted is not None:
+        envelope["signal_number"] = interrupted.code - 128
     if usage := review_usage_summary(args):
         envelope["usage"] = usage
     if args.engine == "openclaw" and (models := getattr(args, "openclaw_models", None)):
@@ -8835,6 +8838,12 @@ def main_with_args(args: argparse.Namespace) -> int:
             captured,
             evidence.files,
         )
+    except EngineInterrupted as exc:
+        try:
+            write_review_status(args, "interrupted", exc.code, interrupted=exc)
+        except OSError as error:
+            print(f"interrupted status could not be written: {display_escape(error, 500)}", file=sys.stderr)
+        raise
     except ReviewerUnavailable as exc:
         write_review_status(args, "reviewer_unavailable", 1, exc)
         raise
