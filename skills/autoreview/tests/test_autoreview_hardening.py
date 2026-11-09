@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import hashlib
 import copy
 import io
 import json
@@ -1749,6 +1750,63 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "requires a committed branch or commit review"):
                     self.helper["main_impl"]()
                 self.assertFalse(sends)
+
+    def test_source_context_policy_only_admits_reviewed_path_and_bytes(self):
+        sample = b"apiVersion: v1\nkind: Service\n"
+        path = "charts/example/templates/credentials-service.yaml"
+        digest = hashlib.sha256(sample).hexdigest()
+        oid = hashlib.sha1(b"blob " + str(len(sample)).encode() + b"\0" + sample).hexdigest()
+        for role, selected, content, expected_digest, accepted in (
+            ("--source-context", path, sample, digest, True),
+            ("--source-context-file", path, sample, digest, True),
+            ("--source-context", path, sample + b"# changed\n", digest, False),
+            ("--source-context", path, sample, "0" * 64, False),
+            ("--source-context", "charts/other/templates/credentials-service.yaml", sample, digest, False),
+            ("--prompt-file", path, sample, digest, False),
+        ):
+            with self.subTest(role=role, selected=selected, accepted=accepted), self.committed_context_fixture(
+                path=selected, role=role, content=content,
+            ) as (_repo, sends, *_):
+                main = self.helper["main_impl"]
+                with mock.patch.dict(main.__globals__, {"REVIEWED_CONTEXT_BLOBS": {
+                    path: (oid, expected_digest),
+                }}):
+                    if accepted:
+                        self.assertEqual(main(), 0)
+                        self.assertIn(sample.decode(), sends[0])
+                    else:
+                        with self.assertRaisesRegex(SystemExit, "sensitive|digest"):
+                            main()
+                        self.assertFalse(sends)
+
+    def test_source_context_pin_scope_and_mode(self):
+        content = b"// synthetic module for policy review\n"
+        for path, executable, allowed in (
+            ("src/credential-proxy/index.ts", False, True),
+            ("fixtures/repository-credentials/state.mjs", False, True),
+            ("src/credential-proxy/index.ts", True, False),
+            (".ssh/credential-proxy/index.ts", False, False),
+            ("credentials/session.json", False, False),
+            ("credentials/prod.ts", False, False),
+            ("src/Secrets/runtime.ts", False, False),
+        ):
+            def setup(repo, _source):
+                if executable:
+                    git(repo, "update-index", "--chmod=+x", path)
+
+            with self.subTest(path=path, executable=executable), self.committed_context_fixture(
+                path=path, content=content, setup=setup,
+            ) as (repo, sends, *_):
+                pin = (git(repo, "rev-parse", f"HEAD:{path}").strip(), hashlib.sha256(content).hexdigest())
+                main = self.helper["main_impl"]
+                with mock.patch.dict(main.__globals__, {"REVIEWED_CONTEXT_BLOBS": {path: pin}}):
+                    if allowed:
+                        self.assertEqual(main(), 0)
+                        self.assertIn(content.decode(), sends[0])
+                    else:
+                        with self.assertRaisesRegex(SystemExit, "sensitive --source-context"):
+                            main()
+                        self.assertFalse(sends)
 
     def test_source_context_retains_strict_directories_stores_and_keyfiles(self):
         paths = (

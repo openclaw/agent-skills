@@ -70,6 +70,27 @@ TRACKED_SENSITIVE_PATH_PARTS = SENSITIVE_PATH_PARTS - {
     "private",
     ".docker",
 }
+# Installed policy only. Entries bind one regular, non-executable file's
+# original path to its Git blob ID and SHA-256 of the inspected bytes.
+# Never populate this from the reviewed checkout, environment, or CLI.
+REVIEWED_CONTEXT_BLOBS: dict[str, tuple[str, str]] = {
+    "deploy/helm/openclaw-enterprise/templates/installation-secrets.yaml": (
+        "8278b48020dda27c20ffd69cc8f35f9848288557",
+        "83b846dbd5a852b826f772995687b35526c6f466065dce576ef6159d39a5c810",
+    ),
+    "deploy/helm/openclaw-enterprise/templates/repository-credentials-service.yaml": (
+        "125fa5338910d6c2baf1fbe83a4302320921d84b",
+        "917ebbd773f01b6c4dafca6c641ca653a12ffdac6d414f3f2ace395a48030c36",
+    ),
+    "packages/contracts/src/drivers/credential-proxy/index.ts": (
+        "34f457ec40d77d278ca5a6ff9e1b6120d57e58a9",
+        "dc8daed8e8b12e0a2d0f59f66f9afc761c400d0e377e672ad745cdb76f5f866e",
+    ),
+    "tests/fixtures/repository-credentials/session-state.mjs": (
+        "6ed57fbe3c5d24e8cffd57db78e1766aa680c2e5",
+        "a3a04c494e79cd260125f02487750f3518c3c27b204e48061e8b2eaff81b81cc",
+    ),
+}
 TRACKED_CREDENTIAL_DIR_PATTERN = re.compile(
     r"^(?:.*[._-])?"
     r"(secret|secrets|credential|credentials|service[-_]?account|private[-_]?key|api[-_]?key)"
@@ -3745,12 +3766,22 @@ def capture_source_context(repo: Path, raw_path: str, commit: str) -> SourceCont
     if original.anchor:
         raise SystemExit("--source-context must be a repo-relative path")
     rel = original.as_posix()
-    # This role admits tracked source filenames, never credential directories.
-    # The tracked-diff policy alone also admits private/ and credentials/ code.
-    if (path_has_sensitive_part(rel)
-            or any(TRACKED_CREDENTIAL_DIR_PATTERN.fullmatch(part) for part in Path(rel).parts[:-1])
-            or tracked_sensitive_repo_path_risk(rel)):
-        raise SystemExit(f"refusing sensitive --source-context: {display_escape(rel, 500)}")
+    risk = tracked_sensitive_repo_path_risk(rel)
+    credential_parents = [match for part in original.parts[:-1]
+                          if (match := TRACKED_CREDENTIAL_DIR_PATTERN.fullmatch(part))]
+    pin = None
+    if path_has_sensitive_part(rel) or risk or credential_parents:
+        # A reviewed pin may resolve source naming ambiguity only. Private roots,
+        # stores, dotfiles, keys, and general YAML inputs remain ineligible.
+        chart_template = ("templates" in original.parts[:-1] and original.suffix in {".yaml", ".yml"})
+        source_name = original.suffix in {".js", ".mjs", ".ts"}
+        if (not path_has_sensitive_part(rel) and risk != "sensitive path"
+                and not any(match[0] == match[1] for match in credential_parents)
+                and not any(part.startswith(".") for part in original.parts)
+                and (chart_template or source_name)):
+            pin = REVIEWED_CONTEXT_BLOBS.get(rel)
+        if pin is None:
+            raise SystemExit(f"refusing sensitive --source-context: {display_escape(rel, 500)}")
     if (not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit)
             or validate_git_ref(repo, commit, "source context", pin=True) != commit):
         raise SystemExit("--source-context requires the frozen reviewed commit")
@@ -3758,15 +3789,20 @@ def capture_source_context(repo: Path, raw_path: str, commit: str) -> SourceCont
     path = repo / original
     if not is_within(path.resolve(), repo.resolve()):
         raise SystemExit("--source-context must stay inside the reviewed repository")
+    version = git_source_version(repo, rel, commit)
+    if pin is not None and version.identity != f"git:{pin[0]}:100644":
+        raise SystemExit(f"refusing sensitive --source-context: {display_escape(rel, 500)}")
     fingerprint = source_file_fingerprint(path)
     if fingerprint[0] != "file":
         raise SystemExit("--source-context requires a regular checkout path")
-    source = read_git_source(repo, rel, "source context", git_source_version(repo, rel, commit))
+    source = read_git_source(repo, rel, "source context", version)
     if source.mode is None:
         raise SystemExit(f"--source-context is absent from the reviewed commit: {display_escape(rel, 500)}")
     # Bind the bytes to the tree's blob, including on a damaged object store.
     assert source.content is not None
     data = source.content.encode("utf-8")
+    if pin is not None and hashlib.sha256(data).hexdigest() != pin[1]:
+        raise SystemExit("reviewed source context digest mismatch")
     oid = source.identity.split(":")[1]
     digest = hashlib.new("sha1" if len(oid) == 40 else "sha256")
     digest.update(f"blob {len(data)}\0".encode("ascii"))
