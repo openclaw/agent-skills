@@ -79,16 +79,16 @@ authentication, sandbox and mutation checks remain enabled.
 
 - Both roles: tracked-source filename classification; source names such as
   `src/token_count.py` accepted. Credential directories, stores, keyfiles forbidden.
-  A shared-policy maintainer can approve a naming false positive after inspecting
-  the entire committed source for disclosure. The installed helper binds the
-  original path, Git blob, non-executable regular mode, and content SHA-256.
-  An ambiguous compound directory (such as `credential-proxy`) is eligible;
-  literal credential directories (such as `credentials/` and `secrets/`) are not.
-  Both flags and batch-manifest contexts use this capture rule. A manifest
-  cannot approve a pin or admit omitted sensitive changed files.
-  Moving or editing those bytes requires a new decision. No per-run override;
-  private roots, credential stores, and prompt-file/dataset restrictions remain.
-  A pin admits context only; it never approves a change or a deployment.
+  A shared-policy maintainer can pin a naming false positive after reviewing the
+  full committed file for disclosure. Each installed pin matches the
+  repository-relative path, Git blob ID, Git mode `100644`, and content SHA-256.
+  Pins can cover ambiguous compound names such as `credential-proxy`. Private
+  roots, literal credential directories such as `credentials/` and `secrets/`,
+  and credential stores remain restricted.
+  Both source-context flags and batch-manifest contexts use this check. Only the
+  installed policy can supply pins. A pin stops matching after a move, edit, or
+  mode change. Pins authorize context delivery only. Changed-file, prompt-file,
+  and dataset rules still apply.
 - Every source block: path, commit, blob, mode provenance.
 - `--source-context` bytes: partition with change when needed.
 - `--source-context-file` blocks: complete every pass; must fit with instructions
