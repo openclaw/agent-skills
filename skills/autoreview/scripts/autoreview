@@ -8822,6 +8822,7 @@ def main_with_args(args: argparse.Namespace) -> int:
                 "source changed while the review bundle was being created; "
                 "rerun autoreview against the updated tree"
             )
+    interrupted = False
     try:
         if reviewer.engine == "openclaw" and args.native_handoff:
             with deferred_owned_process_signals():
@@ -8839,17 +8840,23 @@ def main_with_args(args: argparse.Namespace) -> int:
             evidence.files,
         )
     except EngineInterrupted as exc:
+        interrupted = True
         try:
             write_review_status(args, "interrupted", exc.code, interrupted=exc)
         except OSError as error:
-            print(f"interrupted status could not be written: {display_escape(error, 500)}", file=sys.stderr)
+            with contextlib.suppress(OSError):
+                print(f"interrupted status could not be written: {display_escape(error, 500)}", file=sys.stderr)
         raise
     except ReviewerUnavailable as exc:
         write_review_status(args, "reviewer_unavailable", 1, exc)
         raise
     finally:
         if usage := review_usage_summary(args):
-            print("review usage: " + json.dumps(usage, sort_keys=True), flush=True)
+            try:
+                print("review usage: " + json.dumps(usage, sort_keys=True), flush=True)
+            except OSError:
+                if not interrupted:
+                    raise
     chunk_reports = [(label, result.report) for label, result in pass_results]
     if len(chunk_reports) == 1 and not captured.mixed:
         report = chunk_reports[0][1]
@@ -8931,13 +8938,24 @@ def main_with_args(args: argparse.Namespace) -> int:
 def sanitized_main() -> int:
     stdout = ProxyRedactedOutput(sys.stdout)
     stderr = ProxyRedactedOutput(sys.stderr)
+    exit_code = None
     try:
         try:
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                return main()
+                exit_code = main()
+                return exit_code
         finally:
-            stdout.finish()
-            stderr.finish()
+            for output in (stdout, stderr):
+                try:
+                    output.finish()
+                except OSError:
+                    if exit_code not in {128 + signum for signum in _handled_signal_numbers()}:
+                        raise
+                    # Python flushes standard streams again at exit; a broken pipe
+                    # there would replace the retained signal code with 120.
+                    with contextlib.suppress(OSError, ValueError):
+                        with open(os.devnull, "w") as sink:
+                            os.dup2(sink.fileno(), output.fileno())
     except SystemExit as exc:
         if isinstance(exc.code, str):
             raise SystemExit(

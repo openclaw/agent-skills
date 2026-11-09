@@ -3726,10 +3726,13 @@ time.sleep(60)
                    "USERPROFILE": str(root), "CODEX_HOME": str(root)}
             if "AUTOREVIEW_GIT" in os.environ:
                 env["AUTOREVIEW_GIT"] = os.environ["AUTOREVIEW_GIT"]
-            for signum, writable in ((signal.SIGTERM, True), (signal.SIGINT, True), (signal.SIGTERM, False)):
-                with self.subTest(signum=signum, writable=writable):
+            cases = ((signal.SIGTERM, True, None), (signal.SIGINT, True, None),
+                     (signal.SIGTERM, False, None), (signal.SIGTERM, False, "stderr"),
+                     (signal.SIGTERM, True, "stdout"), (signal.SIGTERM, False, "both"))
+            for signum, writable, closed in cases:
+                with self.subTest(signum=signum, writable=writable, closed=closed):
                     ready.unlink(missing_ok=True)
-                    destination = root / f"status-{signum}-{writable}"
+                    destination = root / f"status-{signum}-{writable}-{closed}"
                     destination.mkdir()
                     sidecar = destination / "status.json"
                     report, human = root / "result.json", root / "result.txt"
@@ -3747,17 +3750,23 @@ time.sleep(60)
                             child_pid = int(ready.read_text())
                             if not writable:
                                 destination.rmdir()  # Simulate storage lost after output preflight.
+                            # Cancellation can also close the observer's diagnostic pipes.
+                            for name in ("stdout", "stderr"):
+                                if closed in (name, "both"):
+                                    getattr(proc, name).close()
+                                    setattr(proc, name, None)
                             # Signal only the helper: its existing handler must stop the owned child.
                             proc.send_signal(signum)
                             stdout, stderr = proc.communicate(timeout=10)
-                            self.assertEqual(proc.returncode, 128 + signum, stdout + stderr)
+                            self.assertEqual(proc.returncode, 128 + signum, (stdout or "") + (stderr or ""))
                             with self.assertRaises(ProcessLookupError):
                                 os.killpg(child_pid, 0)
                             self.assertFalse(report.exists())
                             self.assertFalse(human.exists())
                             if not writable:
                                 self.assertFalse(sidecar.exists())
-                                self.assertIn("interrupted status could not be written", stderr)
+                                if closed not in ("stderr", "both"):
+                                    self.assertIn("interrupted status could not be written", stderr)
                                 continue
                             outcome = json.loads(sidecar.read_text())
                             self.assertEqual(outcome["status"], "interrupted")
@@ -3771,6 +3780,32 @@ time.sleep(60)
                             if proc.poll() is None:
                                 proc.terminate()
                                 proc.communicate(timeout=10)
+
+    @unittest.skipUnless(os.name == "posix", "closed pipe requires POSIX")
+    def test_output_finalization_preserves_normal_run_io_errors(self) -> None:
+        for code in (0, 1, 2, 143):
+            with self.subTest(code=code):
+                reader, writer = os.pipe()
+                os.close(reader)
+                stream = os.fdopen(writer, "w")
+                def pending_output():
+                    print("pending diagnostic", end="")
+                    return code
+                try:
+                    # Exercise real finalization against a closed pipe; only the
+                    # main result is supplied so ordinary exits stay observable.
+                    with mock.patch.dict(self.helper["sanitized_main"].__globals__,
+                                         {"main": pending_output}), \
+                            contextlib.redirect_stdout(stream), contextlib.redirect_stderr(io.StringIO()):
+                        if code == 143:
+                            self.assertEqual(self.helper["sanitized_main"](), code)
+                            stream.flush()  # Interpreter shutdown must not fail again.
+                        else:
+                            with self.assertRaises(BrokenPipeError):
+                                self.helper["sanitized_main"]()
+                finally:
+                    with contextlib.suppress(OSError):
+                        stream.close()
 
     @unittest.skipIf(os.name == "nt", "the executable fixture is POSIX-only")
     def test_cli_codex_model_fallback_opt_out_preserves_failed_terminal(self) -> None:

@@ -134,5 +134,8 @@ Summary JSON carries no model prose, source text, report hash, roles, or usage.
 - Counts: observed tokens, not billing estimates or cache-hit promises.
 - Missing telemetry (including all-zero defaults without sample): unknown, never
   measured zero. `tokens: null`: no usable totals; incomplete totals: lower bounds.
-- Interrupted runs: print retained usage; never publish status/reports.
+- Interrupted runs retain usage in the [metadata-only status](#results)
+  when interrupted during reviewer execution, and print it when output remains
+  available. They publish no review report; interruptions outside that phase may
+  leave no status.
 - Other engines do not aggregate usage.
