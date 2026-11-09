@@ -59,6 +59,11 @@ See [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol),
 and [Codex reasoning modes](https://learn.chatgpt.com/docs/models#know-when-to-use-max-or-ultra).
 
 Default: ChatGPT subscription; preserve only user authentication settings.
+File-auth refreshes persist through per-attempt links. Without symlink support
+or permission, run reviews sharing that auth source sequentially; an existing
+hardlink alias fails source-custody checks.
+Caller-owned hardlinked `config.toml` or `auth.json` files require an independent
+private copy in the selected `CODEX_HOME`, outside reviewed source roots.
 Live authentication failure → stop attempt fast; retry pass once on operator's
 validated configured named command-auth route, including context + catalogue.
 Definite credential failure → immediate stop; generic auth failure → stop after
@@ -109,6 +114,13 @@ Profile settings remain ignored. Force configured route before subscription atte
 | Claude          | CLI 2.1.169+; safe mode with web-only tools                                                           |
 | Amp             | `AMP_API_KEY` for a plugin-free account; local POSIX execution, no custom endpoint or cloud/orb agent |
 | Pi              | CLI 0.79.0+; configured model; no tools or project resources                                          |
+
+- Claude's `CLAUDE_CONFIG_DIR` (default `~/.claude`) and its `settings.json`
+  must stay outside all reviewed source roots; on Windows without `USERPROFILE`,
+  set `CLAUDE_CONFIG_DIR` explicitly. Missing user settings remain supported.
+- Pi's `PI_CODING_AGENT_DIR` (default `~/.pi/agent`) and its `models.json`,
+  `auth.json` and `settings.json` must stay outside all reviewed source roots;
+  on Windows without `USERPROFILE`, set `PI_CODING_AGENT_DIR` explicitly.
 
 - `--engine kimi`: recognized, refused for reviews + `--dry-run` before any Kimi
   process, configuration read, or authentication setup.

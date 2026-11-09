@@ -89,6 +89,59 @@ class OutputReadinessTests(unittest.TestCase):
         self.helper.atomic_write_text(Path(args.json_output), 'new public report\n')
         self.assertEqual(report.read_text(encoding='utf-8'), 'new public report\n')
 
+    @unittest.skipUnless(os.name == 'posix', 'POSIX directory permission semantics')
+    def test_write_search_only_parent_allows_publication_and_stale_removal(self):
+        parent = self.root / 'write-only-drop'
+        parent.mkdir(mode=0o700)
+        report = parent / 'review.json'
+        report.write_text('previous report\n')
+        parent.chmod(0o300)
+        try:
+            try:
+                list(parent.iterdir())
+            except PermissionError:
+                pass
+            else:
+                self.skipTest('caller can list mode0300 directories; requires unprivileged permissions')
+            # Native replacement works with write/search permission, without listing.
+            temporary = parent / 'native-control'
+            temporary.write_text('native replacement\n')
+            temporary.replace(report)
+            args = self.arguments(report)
+            self.helper.prepare_output_paths(args, self.repo)
+            self.assertEqual(report.read_text(), 'native replacement\n')
+            identity = args._output_parent_identities['json_output']
+            self.helper.atomic_write_text(report, 'new report\n', expected=identity)
+            self.assertEqual(report.read_text(), 'new report\n')
+            self.helper.remove_stale_output(report, identity)
+            self.assertFalse(report.exists())
+            self.assertEqual(stat.S_IMODE(parent.stat().st_mode), 0o300)
+            for mode in (0o100, 0o200):
+                with self.subTest(missing_permission=oct(mode)):
+                    parent.chmod(mode)
+                    with self.assertRaisesRegex(SystemExit, 'output destination is not writable'):
+                        self.helper.require_output_ready(report, '--json-output')
+                    self.assertEqual(stat.S_IMODE(parent.stat().st_mode), mode)
+        finally:
+            parent.chmod(0o700)
+        self.assertEqual(list(parent.iterdir()), [])
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX filesystem component limits')
+    def test_legal_long_basenames_publish_without_temporary_name_overflow(self):
+        limit = os.pathconf(self.root, 'PC_NAME_MAX')
+        for name in ('a' * limit, '界' * (limit // 3) + 'a' * (limit % 3)):
+            with self.subTest(name_bytes=len(os.fsencode(name))):
+                report = self.root / name
+                report.write_text('previous report\n', encoding='utf-8')
+                args = self.arguments(report)
+                self.helper.prepare_output_paths(args, self.repo)
+                self.assertEqual(report.read_text(), 'previous report\n')
+                self.helper.atomic_write_text(
+                    report, 'new report\n', expected=args._output_parent_identities['json_output'])
+                self.assertEqual(report.read_text(), 'new report\n')
+                report.unlink()
+                self.assertEqual(list(self.root.iterdir()), [self.repo])
+
     def test_parent_file_and_existing_directory_refuse_without_mutation(self):
         parent = self.root / 'not-a-directory'
         parent.write_text('retain parent bytes\n', encoding='utf-8')
@@ -104,14 +157,14 @@ class OutputReadinessTests(unittest.TestCase):
     def test_probe_requires_only_one_free_inode(self):
         report = self.root / 'review.json'
         report.write_text('previous report\n', encoding='utf-8')
-        real_mkstemp = self.helper.tempfile.mkstemp
+        real_temporary = self.helper.OutputParent.temporary
 
         def one_free_inode(*args, **kwargs):
             if list(self.root.glob('.autoreview-output-probe.*')):
                 raise OSError(errno.ENOSPC, 'synthetic inode quota')
-            return real_mkstemp(*args, **kwargs)
+            return real_temporary(*args, **kwargs)
 
-        with mock.patch.object(self.helper.tempfile, 'mkstemp', side_effect=one_free_inode):
+        with mock.patch.object(self.helper.OutputParent, 'temporary', autospec=True, side_effect=one_free_inode):
             self.helper.prepare_output_paths(self.arguments(report), self.repo)
         self.assertEqual(report.read_text(encoding='utf-8'), 'previous report\n')
         self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['review.json', 'reviewed-repo'])
@@ -121,8 +174,8 @@ class OutputReadinessTests(unittest.TestCase):
         report.write_text('previous report\n', encoding='utf-8')
         metadata = types.SimpleNamespace(st_mode=report.lstat().st_mode,
                                          st_file_attributes=stat.FILE_ATTRIBUTE_READONLY)
-        with mock.patch.object(Path, 'lstat', return_value=metadata), \
-                mock.patch.object(self.helper.tempfile, 'NamedTemporaryFile') as probe:
+        with mock.patch.object(self.helper.OutputParent, 'stat', return_value=metadata), \
+                mock.patch.object(self.helper.OutputParent, 'temporary') as probe:
             with self.assertRaisesRegex(SystemExit, 'output destination is not writable'):
                 self.helper.require_output_ready(report, '--json-output')
         probe.assert_not_called()
@@ -152,7 +205,7 @@ class OutputReadinessTests(unittest.TestCase):
             'run_engine': mock.Mock(side_effect=AssertionError('engine forbidden')),
         }
         with mock.patch.dict(self.helper.main_with_args.__globals__, names), \
-                mock.patch.object(self.helper.tempfile, 'NamedTemporaryFile', side_effect=PermissionError('private diagnostic sentinel')), \
+                mock.patch.object(self.helper.OutputParent, 'temporary', side_effect=PermissionError('private diagnostic sentinel')), \
                 contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaisesRegex(SystemExit, 'output destination is not writable') as caught:
                 self.helper.main_with_args(args)
@@ -170,7 +223,7 @@ class OutputReadinessTests(unittest.TestCase):
             'run_engine': mock.Mock(side_effect=AssertionError('engine forbidden')),
         }
         with mock.patch.dict(self.helper.main_with_args.__globals__, names), \
-                mock.patch.object(self.helper.os, 'replace', side_effect=OSError(errno.ENOSPC, 'private diagnostic sentinel')), \
+                mock.patch.object(self.helper.OutputParent, 'replace', side_effect=OSError(errno.ENOSPC, 'private diagnostic sentinel')), \
                 contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaisesRegex(SystemExit, 'output destination is not writable') as caught:
                 self.helper.main_with_args(args)
@@ -200,7 +253,7 @@ class OutputReadinessTests(unittest.TestCase):
             return DiskFullWriter(real_fdopen(*args, **kwargs))
 
         boundaries = (
-            mock.patch.object(self.helper.tempfile, 'NamedTemporaryFile',
+            mock.patch.object(self.helper.OutputParent, 'temporary',
                               side_effect=OSError(errno.ENOSPC, 'private create diagnostic sentinel')),
             mock.patch.object(self.helper.os, 'fdopen', side_effect=full_writer),
         )
@@ -245,7 +298,7 @@ class OutputReadinessTests(unittest.TestCase):
     def test_full_destination_validation_precedes_probe_writes(self):
         args = self.arguments(self.root / 'review.json')
         args.output = str(self.repo / 'forbidden.md')
-        with mock.patch.object(self.helper.tempfile, 'NamedTemporaryFile') as probe:
+        with mock.patch.object(self.helper.OutputParent, 'temporary') as probe:
             with self.assertRaisesRegex(SystemExit, 'must point outside the reviewed repository'):
                 self.helper.prepare_output_paths(args, self.repo)
         probe.assert_not_called()
@@ -256,7 +309,7 @@ class OutputReadinessTests(unittest.TestCase):
             with self.subTest(first=first):
                 args = self.arguments(self.root / first)
                 args.output = str(self.root / second)
-                with mock.patch.object(self.helper.tempfile, 'NamedTemporaryFile') as probe:
+                with mock.patch.object(self.helper.OutputParent, 'temporary') as probe:
                     with self.assertRaisesRegex(SystemExit, 'must use a different path'):
                         self.helper.prepare_output_paths(args, self.repo)
                 probe.assert_not_called()
@@ -268,7 +321,7 @@ class OutputReadinessTests(unittest.TestCase):
         os.link(report, alias)
         args = self.arguments(report)
         args.status_output = str(alias)
-        with mock.patch.object(self.helper.tempfile, 'NamedTemporaryFile') as probe:
+        with mock.patch.object(self.helper.OutputParent, 'temporary') as probe:
             with self.assertRaisesRegex(SystemExit, 'must use a different path'):
                 self.helper.prepare_output_paths(args, self.repo)
         probe.assert_not_called()
@@ -305,7 +358,7 @@ class OutputReadinessTests(unittest.TestCase):
         self.symlink(final_alias, source)
         for destination in (parent_alias / 'new.json', final_alias):
             with self.subTest(destination=destination.name):
-                with mock.patch.object(self.helper.tempfile, 'NamedTemporaryFile') as probe:
+                with mock.patch.object(self.helper.OutputParent, 'temporary') as probe:
                     with self.assertRaisesRegex(SystemExit, 'must point outside the reviewed repository'):
                         self.helper.prepare_output_paths(self.arguments(destination), self.repo)
                 probe.assert_not_called()
@@ -322,7 +375,7 @@ class OutputReadinessTests(unittest.TestCase):
         args = self.arguments(self.root / 'unused.json')
         args.json_output = None
         args.engine_stage_dir = str(self.root / 'missing-stage')
-        with mock.patch.object(self.helper.tempfile, 'NamedTemporaryFile') as probe:
+        with mock.patch.object(self.helper.OutputParent, 'temporary') as probe:
             self.helper.prepare_output_paths(args, self.repo)
         probe.assert_not_called()
         self.assertFalse(Path(args.engine_stage_dir).exists())
@@ -338,7 +391,7 @@ class OutputReadinessTests(unittest.TestCase):
         args = self.arguments(self.root / 'report.json')
         args.engine_stage_dir = str(self.root / 'stage')
         args.preflight_output = str(self.root / 'stage' / 'preflight.json')
-        with mock.patch.object(self.helper.tempfile, 'NamedTemporaryFile') as probe:
+        with mock.patch.object(self.helper.OutputParent, 'temporary') as probe:
             with self.assertRaisesRegex(SystemExit, 'must stay outside --engine-stage-dir'):
                 self.helper.prepare_output_paths(args, self.repo)
         probe.assert_not_called()
@@ -347,10 +400,140 @@ class OutputReadinessTests(unittest.TestCase):
         args = self.arguments(self.root / 'report.json')
         args.native_handoff = str(self.root / 'fresh-handoff')
         args.output = str(self.root / 'fresh-handoff' / 'report.md')
-        with mock.patch.object(self.helper.tempfile, 'NamedTemporaryFile') as probe:
+        with mock.patch.object(self.helper.OutputParent, 'temporary') as probe:
             with self.assertRaisesRegex(SystemExit, 'review outputs must stay outside --native-handoff'):
                 self.helper.prepare_output_paths(args, self.repo)
         probe.assert_not_called()
+
+
+    @staticmethod
+    def windows_junction(path, target=None):
+        """Set or clear an actual mount-point reparse record on an existing directory."""
+        import ctypes
+        import struct
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                        wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                                        wintypes.HANDLE]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                            wintypes.LPVOID, wintypes.DWORD,
+                                            wintypes.LPVOID, wintypes.DWORD,
+                                            ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+        kernel32.DeviceIoControl.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        # Only write-attributes is requested: a no-delete-share directory pin
+        # does not exclude mutation of its reparse data through this handle.
+        handle = kernel32.CreateFileW(str(path), 0x100, 7, None, 3, 0x02200000, None)
+        if handle == wintypes.HANDLE(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if target is None:
+                code = 0x000900AC  # FSCTL_DELETE_REPARSE_POINT
+                data = struct.pack('<LHH', 0xA0000003, 0, 0)
+            else:
+                code = 0x000900A4  # FSCTL_SET_REPARSE_POINT
+                substitute = ('\\??\\' + str(target)).encode('utf-16-le')
+                printed = str(target).encode('utf-16-le')
+                names = substitute + b'\0\0' + printed + b'\0\0'
+                data = struct.pack('<LHHHHHH', 0xA0000003, 8 + len(names), 0,
+                                   0, len(substitute), len(substitute) + 2, len(printed)) + names
+            buffer = ctypes.create_string_buffer(data)
+            returned = wintypes.DWORD()
+            if not kernel32.DeviceIoControl(handle, code, buffer, len(data), None, 0,
+                                            ctypes.byref(returned), None):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            kernel32.CloseHandle(handle)
+
+    @unittest.skipUnless(os.name == 'nt', 'native Windows directory-relative output operations')
+    def test_windows_parent_alias_switch_cannot_redirect_output_mutations(self):
+        actual = self.root / 'actual-output'
+        source = self.root / 'source-output'
+        alias = self.root / 'output-alias'
+        for directory in (actual, source, alias):
+            directory.mkdir()
+        self.windows_junction(alias, actual)
+        try:
+            (actual / 'stale.json').write_text('old report', encoding='utf-8')
+            (source / 'stale.json').write_text('source sentinel', encoding='utf-8')
+            with self.helper.OutputParent(alias / 'report-🦜.json') as parent:
+                descriptor, name, identity = parent.temporary('.report.')
+                with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+                    stream.write('new report')
+                original_check = parent.check
+
+                def switch_after_check():
+                    original_check()
+                    self.windows_junction(alias)
+                    self.windows_junction(alias, source)
+
+                # Switch the real filesystem alias after the final admission
+                # check. Publication must still use the retained actual parent.
+                with mock.patch.object(parent, 'check', side_effect=switch_after_check):
+                    parent.replace(name, 'report-🦜.json')
+                parent.unlink('stale.json')
+                parent.remove_owned(name, identity)
+            self.assertEqual((actual / 'report-🦜.json').read_text(encoding='utf-8'), 'new report')
+            self.assertFalse((actual / 'stale.json').exists())
+            self.assertEqual((source / 'stale.json').read_text(encoding='utf-8'), 'source sentinel')
+            self.assertEqual(sorted(p.name for p in source.iterdir()), ['stale.json'])
+            self.assertEqual(sorted(p.name for p in actual.iterdir()), ['report-🦜.json'])
+        finally:
+            self.windows_junction(alias)
+
+    @unittest.skipUnless(os.name == 'nt', 'native Windows in-place reparse mutation')
+    def test_windows_in_place_parent_reparse_cannot_redirect_temporary_creation(self):
+        parent_path = self.root / 'output-parent'
+        source = self.root / 'source-parent'
+        parent_path.mkdir()
+        source.mkdir()
+        (source / 'sentinel').write_text('source sentinel', encoding='utf-8')
+        changed = False
+        with self.helper.OutputParent(parent_path / 'report.json') as parent:
+            original_check = parent.check
+
+            def redirect_after_check():
+                nonlocal changed
+                original_check()
+                self.windows_junction(parent_path, source)
+                changed = True
+
+            try:
+                # Unlike alias replacement, this alters the admitted directory
+                # itself through WRITE_ATTRIBUTES while the handle stays open.
+                try:
+                    with mock.patch.object(parent, 'check', side_effect=redirect_after_check):
+                        descriptor, name, identity = parent.temporary('.private-report.')
+                except OSError:
+                    # Some filesystems disallow children beneath the converted
+                    # directory. Refusal is safe; redirection to source is not.
+                    pass
+                else:
+                    with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+                        stream.write('private report')
+                    parent.remove_owned(name, identity)
+                self.assertTrue(changed, 'the native parent reparse mutation must occur')
+                self.assertEqual(sorted(p.name for p in source.iterdir()), ['sentinel'])
+            finally:
+                if changed:
+                    self.windows_junction(parent_path)
+        self.assertEqual(list(parent_path.iterdir()), [])
+        self.assertEqual((source / 'sentinel').read_text(encoding='utf-8'), 'source sentinel')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows output-name admission')
+    def test_windows_ambiguous_output_names_refuse_before_writing(self):
+        before = sorted(p.name for p in self.root.iterdir())
+        for name in ('report.', 'report ', 'NUL.txt', 'AUX', 'COM9', 'COM¹.txt',
+                     'LPT2.txt', 'report:stream', 'bad?file', 'bad*file', 'bad|file',
+                     'bad"file', 'bad<file', 'bad>file', 'bad\x01file'):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(OSError, 'unambiguous Windows file name'):
+                    self.helper.atomic_write_text(self.root / name, 'must not be written')
+                self.assertEqual(sorted(p.name for p in self.root.iterdir()), before)
 
 
 if __name__ == '__main__':

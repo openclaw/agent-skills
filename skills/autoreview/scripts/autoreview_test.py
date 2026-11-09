@@ -12,11 +12,15 @@ import itertools
 import json
 import os
 import runpy
+import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import traceback
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -30,6 +34,16 @@ SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 assert SPEC is not None
 AUTOREVIEW = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(AUTOREVIEW)
+
+
+@contextlib.contextmanager
+def private_engine_executable(name: str):
+    # Process transport is mocked, but selected-path admission inspects a real
+    # independent executable and its installation directory.
+    with tempfile.TemporaryDirectory(prefix="autoreview-test-bin.") as directory:
+        binary = Path(directory) / (name + (".exe" if os.name == "nt" else ""))
+        shutil.copy2(sys.executable, binary)
+        yield str(binary)
 
 
 FINAL_REPORT = {
@@ -1218,13 +1232,13 @@ class AutoreviewAmpTests(unittest.TestCase):
             "PYTHONPATH": "/tmp/attack",
             "PLUGINS": "inherited-plugins",
         }
-        with tempfile.TemporaryDirectory(prefix="autoreview-amp-run-test.") as tmpdir:
+        with tempfile.TemporaryDirectory(prefix="autoreview-amp-run-test.") as tmpdir, private_engine_executable("amp") as engine_bin:
             repo = Path(tmpdir) / "repo"
             repo.mkdir()
             with mock.patch.dict(os.environ, inherited, clear=False), mock.patch.object(
                 AUTOREVIEW,
                 "ensure_amp_isolation_supported",
-                return_value="/usr/bin/amp",
+                return_value=engine_bin,
             ), mock.patch.object(
                 AUTOREVIEW,
                 "run",
@@ -1448,13 +1462,13 @@ class AutoreviewAmpTests(unittest.TestCase):
                 "amp engine timed out after 0.01s",
             )
 
-        with tempfile.TemporaryDirectory(prefix="autoreview-amp-timeout-test.") as tmpdir:
+        with tempfile.TemporaryDirectory(prefix="autoreview-amp-timeout-test.") as tmpdir, private_engine_executable("amp") as engine_bin:
             repo = Path(tmpdir) / "repo"
             repo.mkdir()
             with mock.patch.object(
                 AUTOREVIEW,
                 "ensure_amp_isolation_supported",
-                return_value="/usr/bin/amp",
+                return_value=engine_bin,
             ), mock.patch.object(
                 AUTOREVIEW,
                 "run",
@@ -1566,13 +1580,13 @@ class AutoreviewAmpTests(unittest.TestCase):
                 "",
             )
 
-        with tempfile.TemporaryDirectory(prefix="autoreview-amp-error-test.") as tmpdir:
+        with tempfile.TemporaryDirectory(prefix="autoreview-amp-error-test.") as tmpdir, private_engine_executable("amp") as engine_bin:
             repo = Path(tmpdir) / "repo"
             repo.mkdir()
             with mock.patch.object(
                 AUTOREVIEW,
                 "ensure_amp_isolation_supported",
-                return_value="/usr/bin/amp",
+                return_value=engine_bin,
             ), mock.patch.object(
                 AUTOREVIEW,
                 "run",
@@ -1699,22 +1713,105 @@ class AutoreviewEfficiencyTests(unittest.TestCase):
     def test_interruption_retains_observed_usage_with_and_without_live_display(self):
         for streaming in (False, True):
             with self.subTest(streaming=streaming), tempfile.TemporaryDirectory() as tempdir:
-                def interrupt(*_args):
-                    raise AUTOREVIEW.EngineInterrupted(130)
+                output_ready = Path(tempdir) / "output-ready"
+                usage = self.usage_event()
+                displayed = []
+                processes = []
+                start = AUTOREVIEW.start_owned_process
 
-                script = f"import time; print({self.usage_event()!r}, flush=True); time.sleep(5)"
-                with mock.patch.object(AUTOREVIEW, "emit_heartbeat", side_effect=interrupt), \
-                        self.assertRaises(AUTOREVIEW.EngineInterrupted) as caught:
-                    AUTOREVIEW.run_with_heartbeat(
-                        [sys.executable, "-c", script], Path(tempdir), label="usage-fixture",
-                        heartbeat_seconds=0.2, stream_output=streaming, stream_display=interrupt,
-                    )
-                args = argparse.Namespace()
-                AUTOREVIEW.record_codex_usage(args, caught.exception.stdout, completed=False)
-                summary = AUTOREVIEW.review_usage_summary(args)
-                self.assertEqual(summary["tokens"]["input_tokens"], 100)
-                self.assertEqual(summary["partial_attempts"], 1)
-                self.assertFalse(summary["complete"])
+                def observe_start(*args, **kwargs):
+                    proc = start(*args, **kwargs)
+                    processes.append(proc)
+                    return proc
+
+                def interrupt_after_flush(*_args):
+                    if not streaming and output_ready.is_file():
+                        signal.raise_signal(signal.SIGINT)
+
+                def interrupt_after_display(name, line):
+                    self.assertEqual((name, line), ("stdout", usage + "\n"))
+                    displayed.append(line)
+                    signal.raise_signal(signal.SIGINT)
+
+                # A flush followed by a child-owned marker proves buffered output
+                # exists. Streaming cancellation waits for actual delivery instead,
+                # so it cannot outrun the reader queue that retains the usage.
+                script = (
+                    "import pathlib, sys, time; "
+                    f"print({usage!r}, flush=True); "
+                    "pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(30)"
+                )
+                try:
+                    with AUTOREVIEW.OwnedProcessSignalHandlers(), \
+                            mock.patch.object(AUTOREVIEW, "start_owned_process", observe_start), \
+                            mock.patch.object(AUTOREVIEW, "emit_heartbeat", interrupt_after_flush), \
+                            self.assertRaises(AUTOREVIEW.EngineInterrupted) as caught:
+                        AUTOREVIEW.run_with_heartbeat(
+                            [sys.executable, "-I", "-S", "-c", script, str(output_ready)],
+                            Path(tempdir).resolve(), label="usage-fixture", max_runtime_seconds=10,
+                            heartbeat_seconds=0.05, stream_output=streaming,
+                            stream_display=interrupt_after_display,
+                        )
+                    self.assertEqual(caught.exception.code, 130)
+                    self.assertEqual(displayed, [usage + "\n"] if streaming else [])
+                    args = argparse.Namespace()
+                    AUTOREVIEW.record_codex_usage(args, caught.exception.stdout, completed=False)
+                    summary = AUTOREVIEW.review_usage_summary(args)
+                    self.assertEqual(summary["tokens"]["input_tokens"], 100)
+                    self.assertEqual(summary["partial_attempts"], 1)
+                    self.assertFalse(summary["complete"])
+                finally:
+                    active = sys.exc_info()[1]
+                    cleanup_errors = []
+                    for proc in processes:
+                        owned = AUTOREVIEW._OWNED_PROCESSES.get(proc.pid)
+                        if owned is not None and owned.process is proc:
+                            try:
+                                AUTOREVIEW.terminate_process_group(proc)
+                            except BaseException as error:
+                                cleanup_errors.append(error)
+                        owned = AUTOREVIEW._OWNED_PROCESSES.get(proc.pid)
+                        if owned is not None and owned.process is proc:
+                            try:
+                                AUTOREVIEW.unregister_owned_process(proc)
+                            except BaseException as error:
+                                cleanup_errors.append(error)
+                        try:
+                            proc.wait(timeout=5)
+                        except BaseException as error:
+                            if not isinstance(error, subprocess.TimeoutExpired):
+                                cleanup_errors.append(error)
+                            try:
+                                proc.kill()
+                            except BaseException as error:
+                                cleanup_errors.append(error)
+                            try:
+                                proc.wait(timeout=5)
+                            except BaseException as error:
+                                cleanup_errors.append(error)
+                        for stream in (proc.stdin, proc.stdout, proc.stderr):
+                            if stream is not None:
+                                try:
+                                    stream.close()
+                                except BaseException as error:
+                                    cleanup_errors.append(error)
+                    if cleanup_errors:
+                        # Emergency teardown must finish without replacing the
+                        # assertion or cancellation that made the fixture fail.
+                        if active is not None:
+                            active.cleanup_errors = (*getattr(active, "cleanup_errors", ()), *cleanup_errors)
+                            try:
+                                print("usage-fixture emergency cleanup errors: "
+                                      + ", ".join(type(error).__name__ for error in cleanup_errors),
+                                      file=sys.stderr)
+                            except BaseException:
+                                pass  # Reporting must not replace the active failure.
+                        else:
+                            primary = next((error for error in cleanup_errors if not isinstance(error, Exception)),
+                                           cleanup_errors[0])
+                            primary.cleanup_errors = (*getattr(primary, "cleanup_errors", ()),
+                                                      *(error for error in cleanup_errors if error is not primary))
+                            raise primary
 
     def test_planner_reduces_repeated_context_without_more_passes(self):
         bundle = "# Commit Diff\n" + "+change\n" * 75_000
@@ -1936,7 +2033,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                 ("cli", "keyed-cli", "environment", "global-environment"),
             ):
                 with self.subTest(model=model, effort=effort, source=source):
-                    argv = [sys.executable, str(SCRIPT_PATH), "--engine", "codex",
+                    argv = [sys.executable, "-S", str(SCRIPT_PATH), "--engine", "codex",
                             "--codex-bin", str(Path(tempdir) / "missing-codex")]
                     env = {key: value for key, value in os.environ.items()
                            if not key.startswith("AUTOREVIEW_")}
@@ -2098,7 +2195,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         ):
             args = AUTOREVIEW.reviewer_args(AUTOREVIEW.parse_args())[0]
         prompt = "complete retry pack: unicode \u03c0\r\n-deleted line\n unchanged context\n"
-        with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir:
+        with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, private_engine_executable("codex") as engine_bin:
             events = []
 
             def fake_run(command, _cwd, **kwargs):
@@ -2116,8 +2213,8 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                 output_path.write_text(json.dumps({**FINAL_REPORT, "review_completion": "complete"}))
                 return subprocess.CompletedProcess(command, 0, AutoreviewEfficiencyTests.usage_event(2), "")
 
-            with mock.patch.object(AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex"), \
-                    mock.patch.object(AUTOREVIEW, "ensure_codex_isolation_supported", return_value="/usr/bin/codex"), \
+            with mock.patch.object(AUTOREVIEW, "resolve_command", return_value=engine_bin), \
+                    mock.patch.object(AUTOREVIEW, "ensure_codex_isolation_supported", return_value=engine_bin), \
                     mock.patch.object(AUTOREVIEW, "codex_auth_config_flags", return_value=[]), \
                     mock.patch.object(AUTOREVIEW, "prepare_codex_runtime_auth", return_value=None), \
                     mock.patch.object(AUTOREVIEW, "find_command", side_effect=AssertionError("unexpected scanner lookup")), \
@@ -2153,9 +2250,9 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                     event = {"type": "error", "message": message.format(model=model)}
                     return subprocess.CompletedProcess(command, 1, json.dumps(event), "")
 
-                with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, \
-                        mock.patch.object(AUTOREVIEW, "resolve_command", return_value="/usr/bin/codex"), \
-                        mock.patch.object(AUTOREVIEW, "ensure_codex_isolation_supported", return_value="/usr/bin/codex"), \
+                with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, private_engine_executable("codex") as engine_bin, \
+                        mock.patch.object(AUTOREVIEW, "resolve_command", return_value=engine_bin), \
+                        mock.patch.object(AUTOREVIEW, "ensure_codex_isolation_supported", return_value=engine_bin), \
                         mock.patch.object(AUTOREVIEW, "codex_auth_config_flags", return_value=[]), \
                         mock.patch.object(AUTOREVIEW, "prepare_codex_runtime_auth", return_value=None), \
                         mock.patch.object(AUTOREVIEW, "run_with_heartbeat", side_effect=fake_run):
@@ -2193,7 +2290,7 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             output_path.write_text(json.dumps(FINAL_REPORT))
             return subprocess.CompletedProcess(command, 0, "", "")
 
-        with tempfile.TemporaryDirectory(prefix="autoreview-codex-workspace-test.") as tmpdir:
+        with tempfile.TemporaryDirectory(prefix="autoreview-codex-workspace-test.") as tmpdir, private_engine_executable("codex") as engine_bin:
             repo = Path(tmpdir)
             (repo / ".env").write_text("ignored environment fixture\n")
             with mock.patch.dict(
@@ -2203,11 +2300,11 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             ), mock.patch.object(
                 AUTOREVIEW,
                 "resolve_command",
-                return_value="/usr/bin/codex",
+                return_value=engine_bin,
             ), mock.patch.object(
                 AUTOREVIEW,
                 "ensure_codex_isolation_supported",
-                return_value="/usr/bin/codex",
+                return_value=engine_bin,
             ), mock.patch.object(
                 AUTOREVIEW,
                 "codex_auth_config_flags",
@@ -2271,14 +2368,14 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
             models.append(command[command.index("--model") + 1])
             return subprocess.CompletedProcess(command, 1, "", "network timeout")
 
-        with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, mock.patch.object(
+        with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, private_engine_executable("codex") as engine_bin, mock.patch.object(
             AUTOREVIEW,
             "resolve_command",
-            return_value="/usr/bin/codex",
+            return_value=engine_bin,
         ), mock.patch.object(
             AUTOREVIEW,
             "ensure_codex_isolation_supported",
-            return_value="/usr/bin/codex",
+            return_value=engine_bin,
         ), mock.patch.object(AUTOREVIEW, "codex_auth_config_flags", return_value=[]), mock.patch.object(
             AUTOREVIEW,
             "prepare_codex_runtime_auth",
@@ -2316,14 +2413,14 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
                 "model_not_available: gpt-6-sol is temporarily unavailable due to capacity",
             )
 
-        with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, mock.patch.object(
+        with tempfile.TemporaryDirectory(prefix="autoreview-codex-fallback.") as tmpdir, private_engine_executable("codex") as engine_bin, mock.patch.object(
             AUTOREVIEW,
             "resolve_command",
-            return_value="/usr/bin/codex",
+            return_value=engine_bin,
         ), mock.patch.object(
             AUTOREVIEW,
             "ensure_codex_isolation_supported",
-            return_value="/usr/bin/codex",
+            return_value=engine_bin,
         ), mock.patch.object(AUTOREVIEW, "codex_auth_config_flags", return_value=[]), mock.patch.object(
             AUTOREVIEW,
             "prepare_codex_runtime_auth",
@@ -2426,6 +2523,11 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
         self.root = Path(self.temp.name).resolve()
         self.repo = self.root / "repo"
         self.repo.mkdir()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.codex_bin = self.bin / ("codex.cmd" if os.name == "nt" else "codex")
+        self.codex_bin.write_text("@exit /b 99\n" if os.name == "nt" else "#!/bin/sh\nexit 99\n")
+        self.codex_bin.chmod(0o755)
         self.home = self.root / "operator"
         self.home.mkdir()
         self.env = mock.patch.dict(os.environ, {
@@ -2675,9 +2777,9 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
                         [], returncode, stdout, stderr,
                     )) as probe, contextlib.redirect_stdout(io.StringIO()) as out, \
                     contextlib.redirect_stderr(io.StringIO()) as err:
-                self.assertEqual(AUTOREVIEW.codex_subscription_login_missing("/codex", self.root), expected)
+                self.assertEqual(AUTOREVIEW.codex_subscription_login_missing(str(self.codex_bin), self.root, self.repo), expected)
                 self.assertEqual(out.getvalue() + err.getvalue(), "")
-                self.assertEqual(probe.call_args.args, (["/codex", "login", "status"],))
+                self.assertEqual(probe.call_args.args, ([str(self.codex_bin), "login", "status"],))
                 kwargs = probe.call_args.kwargs
                 self.assertEqual(kwargs["cwd"], self.root)
                 self.assertEqual(kwargs["env"], dict(os.environ))
@@ -2688,13 +2790,13 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
 
     def test_login_probe_errors_and_timeout_are_unknown(self) -> None:
         for error in (OSError("PRIVATE_SENTINEL"), subprocess.TimeoutExpired(
-            ["/codex", "login", "status"], 10, output="Not logged in PRIVATE_SENTINEL",
+            [str(self.codex_bin), "login", "status"], 10, output="Not logged in PRIVATE_SENTINEL",
         )):
             with self.subTest(error=type(error).__name__), \
                     mock.patch.object(AUTOREVIEW.subprocess, "run", side_effect=error), \
                     contextlib.redirect_stdout(io.StringIO()) as out, \
                     contextlib.redirect_stderr(io.StringIO()) as err:
-                self.assertFalse(AUTOREVIEW.codex_subscription_login_missing("/codex", self.root))
+                self.assertFalse(AUTOREVIEW.codex_subscription_login_missing(str(self.codex_bin), self.root, self.repo))
                 self.assertEqual(out.getvalue() + err.getvalue(), "")
 
     def run_codex_attempts(
@@ -2911,6 +3013,49 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
                     self.assertEqual(output, "clean")
                     self.assertEqual(source_auth.read_text(), original)
 
+    def test_file_auth_refresh_survives_fallback_and_interruption_without_retained_alias(self) -> None:
+        source_auth = self.home / "auth.json"
+        refreshed = '{"tokens": {"refresh_token": "synthetic-refreshed-token"}}'
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted):
+                source_auth.write_text('{"tokens": {"refresh_token": "synthetic-old-token"}}')
+                aliases = []
+
+                def inspect(command, env, attempt):
+                    if attempt == 1:
+                        alias = Path(env["CODEX_HOME"]) / "auth.json"
+                        aliases.append(alias)
+                        self.assertTrue(os.path.samefile(alias, source_auth))
+                        alias.write_text(refreshed)
+                        if interrupted:
+                            raise KeyboardInterrupt()
+                    else:
+                        self.assertFalse(aliases[0].exists())
+                        self.assertEqual(source_auth.stat().st_nlink, 1)
+                        self.assertEqual(source_auth.read_text(), refreshed)
+
+                if interrupted:
+                    with self.assertRaises(KeyboardInterrupt):
+                        self.run_codex_attempts(["refresh_token_reused"], inspect_attempt=inspect)
+                else:
+                    _, _, output = self.run_codex_attempts(["refresh_token_reused"], inspect_attempt=inspect)
+                    self.assertEqual(output, "clean")
+                self.assertTrue(aliases)
+                self.assertFalse(aliases[0].exists())
+                self.assertEqual(source_auth.stat().st_nlink, 1)
+                self.assertEqual(source_auth.read_text(), refreshed)
+                self.assertEqual(AUTOREVIEW.codex_source_home(self.repo), self.home.resolve())
+
+    def test_file_auth_rejects_preexisting_source_owned_hardlink_before_launch(self) -> None:
+        source_auth = self.home / "auth.json"
+        source_auth.write_text('{"fixture": "synthetic"}')
+        os.link(source_auth, self.repo / "auth-alias.json")
+        launched = mock.Mock()
+        with self.assertRaisesRegex(SystemExit, r"Codex auth\.json was refused:.*outside reviewed source roots.*independent file custody"):
+            self.run_codex_attempts([], inspect_attempt=launched)
+        launched.assert_not_called()
+        self.assertEqual(source_auth.stat().st_nlink, 2)
+
     def test_explicit_route_authentication_failure_has_no_fallback_notice(self) -> None:
         commands, notice, output = self.run_codex_attempts(["401 Unauthorized"], explicit=True)
         self.assertEqual(len(commands), 1)
@@ -3093,10 +3238,10 @@ class AutoreviewPreflightTests(unittest.TestCase):
 
     def test_export_failure_preserves_native_outcome(self):
         original = AUTOREVIEW.atomic_write_text
-        def write(path, text):
+        def write(path, text, **kwargs):
             if path == self.block:
                 raise OSError("synthetic output error")
-            return original(path, text)
+            return original(path, text, **kwargs)
         self.block.write_text("stale block")
         with mock.patch.object(AUTOREVIEW, "atomic_write_text", side_effect=write):
             self.assertEqual(self.invoke(), 0)
@@ -3209,6 +3354,1941 @@ class AutoreviewPreflightTests(unittest.TestCase):
                                        "--engine-stage-dir", str(stage)))
                 engine.assert_not_called()
                 self.assertEqual(diagnostic.read_text(), "diagnostic sentinel")
+
+
+class WindowsStartupProtocolTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def protocol_startup(self):
+        module = AUTOREVIEW._load_windows_process_module(str(SCRIPT_PATH.absolute().with_name("windows-owned-process.py")))
+        startup = object.__new__(module.Startup)
+        startup.reader, response_writer = os.pipe()
+        request_reader, startup.writer = os.pipe()
+        startup.frame = module.encode_frame({"version": 1, "operation": "go", "argv": ["private-target"]})
+        startup.argv = ["private-target"]
+        startup.worker = startup.process = None
+        startup.done = threading.Event()
+        startup.state_lock = threading.Lock()
+        startup.cancelled = startup.go_sent = startup.reported_error = False
+        startup.deadline = time.monotonic() + 5
+        startup.error = None
+        startup.control_errors = []
+        # This tests the real startup pipe protocol, without claiming to create
+        # a Windows job or target on the portable test host.
+        os.write(response_writer, module.encode_frame({"version": 1, "operation": "ready"}))
+        os.close(response_writer)
+        try:
+            yield module, startup, request_reader
+        finally:
+            if startup.worker is not None:
+                startup.worker.join(timeout=5)
+                self.assertFalse(startup.worker.is_alive())
+            startup._close_control()
+            os.close(request_reader)
+
+    def test_cancellation_after_ready_closes_the_go_gate(self):
+        with self.protocol_startup() as (module, startup, request_reader):
+            read_frame = module.read_frame
+
+            def read_ready_then_interrupt(descriptor, **kwargs):
+                frame = read_frame(descriptor, **kwargs)
+                signal.raise_signal(signal.SIGTERM)
+                return frame
+
+            with self.assertRaises(AUTOREVIEW.EngineInterrupted) as raised:
+                with AUTOREVIEW.deferred_owned_process_signals():
+                    state = AUTOREVIEW._OWNED_PROCESS_SIGNAL_STATE
+                    startup.launch_decision = state.launch_decision
+                    with mock.patch.object(module, "read_frame", read_ready_then_interrupt):
+                        startup._exchange()
+            self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+            self.assertFalse(startup.go_sent)
+            self.assertEqual(os.read(request_reader, 4096), b"")
+            self.assertIsInstance(startup.error, TimeoutError)
+
+    def test_signal_and_go_have_one_shared_decision(self):
+        with self.protocol_startup() as (module, startup, request_reader):
+            paused = threading.Event()
+            resume = threading.Event()
+            observed = []
+            monotonic = time.monotonic
+            main_thread = threading.current_thread()
+
+            def pause_before_commit():
+                if threading.current_thread() is startup.worker and not paused.is_set():
+                    paused.set()
+                    if not resume.wait(5):
+                        raise AssertionError("GO decision was not released")
+                return monotonic()
+
+            class ObserveArbitration:
+                def __init__(self, lock):
+                    self.lock = lock
+
+                def __enter__(self):
+                    if threading.current_thread() is main_thread and not observed:
+                        # The signal is already recorded, but the exchange owns
+                        # arbitration. Let it commit before cancellation acquires.
+                        observed.append((bool(state.signals), startup.go_sent))
+                        resume.set()
+                    return self.lock.__enter__()
+
+                def __exit__(self, *args):
+                    return self.lock.__exit__(*args)
+
+            try:
+                with self.assertRaises(AUTOREVIEW.EngineInterrupted) as raised:
+                    with AUTOREVIEW.deferred_owned_process_signals():
+                        state = AUTOREVIEW._OWNED_PROCESS_SIGNAL_STATE
+                        state.decision_lock = ObserveArbitration(state.decision_lock)
+                        startup.launch_decision = state.launch_decision
+                        startup.worker = threading.Thread(target=startup._exchange, daemon=True)
+                        with mock.patch.object(module.time, "monotonic", pause_before_commit):
+                            startup.worker.start()
+                            self.assertTrue(paused.wait(5))
+                            signal.raise_signal(signal.SIGTERM)
+                            committed_before_cancellation = startup.go_sent
+                            resume.set()
+                            startup.worker.join(timeout=5)
+                            self.assertFalse(startup.worker.is_alive())
+                self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                self.assertEqual(observed, [(True, False)])
+                self.assertTrue(committed_before_cancellation)
+                self.assertEqual(module.read_frame(request_reader)["operation"], "go")
+                self.assertIsInstance(startup.error, EOFError)
+            finally:
+                resume.set()
+
+    def test_interrupted_cancellation_blocks_later_worker_go(self):
+        install = signal.signal
+        prior_sigint = install(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(install, signal.SIGINT, prior_sigint)
+        with self.protocol_startup() as (module, startup, request_reader):
+            ready = threading.Event()
+            release = threading.Event()
+            injected = []
+            restore_started = []
+            read_frame = module.read_frame
+            scope = AUTOREVIEW.OwnedProcessSignalHandlers()
+            scope.__enter__()
+            state = scope.state
+            previous = dict(scope.previous)
+
+            class InterruptDecisionEntry:
+                def __init__(self, lock):
+                    self.lock = lock
+
+                def __enter__(self):
+                    self.lock.__enter__()
+                    try:
+                        if threading.current_thread() is threading.main_thread() and not injected:
+                            injected.append(True)
+                            signal.raise_signal(signal.SIGINT)
+                    except BaseException:
+                        self.lock.__exit__(*sys.exc_info())
+                        raise
+                    return self
+
+                def __exit__(self, *args):
+                    return self.lock.__exit__(*args)
+
+            def hold_ready(descriptor, **kwargs):
+                frame = read_frame(descriptor, **kwargs)
+                if frame.get("operation") == "ready":
+                    ready.set()
+                    if not release.wait(5):
+                        raise AssertionError("READY worker was not released")
+                return frame
+
+            def restore_then_cancel(number, handler):
+                result = install(number, handler)
+                if number == signal.SIGINT and handler is previous[number] and not restore_started:
+                    restore_started.append(True)
+                    signal.raise_signal(signal.SIGTERM)
+                return result
+
+            try:
+                state.decision_lock = InterruptDecisionEntry(state.decision_lock)
+                startup.launch_decision = state.launch_decision
+                startup.worker = threading.Thread(target=startup._exchange, daemon=True)
+                with mock.patch.object(module, "read_frame", hold_ready), \
+                        mock.patch.object(signal, "signal", restore_then_cancel):
+                    startup.worker.start()
+                    self.assertTrue(ready.wait(5))
+                    with self.assertRaises(AUTOREVIEW.EngineInterrupted) as raised:
+                        scope.__exit__(None, None, None)
+                    self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                    # Recovery has returned before this later GO decision; it
+                    # must reject the durable request even if its callback broke.
+                    release.set()
+                    startup.worker.join(timeout=5)
+                    self.assertFalse(startup.worker.is_alive())
+                self.assertEqual(injected, [True])
+                self.assertFalse(startup.go_sent)
+                self.assertEqual(os.read(request_reader, 4096), b"")
+                self.assertIsInstance(startup.error, TimeoutError)
+            finally:
+                release.set()
+                for number, handler in previous.items():
+                    install(number, handler)
+                AUTOREVIEW._OWNED_PROCESS_SIGNAL_STATE = None
+
+    @unittest.skipIf(os.name == "nt", "portable owner composition; native job coverage runs separately")
+    def test_launch_owner_preserves_exact_eof_outcome_over_generic_metadata(self):
+        with self.protocol_startup() as (module, startup, request_reader), \
+                tempfile.TemporaryDirectory() as directory:
+            install = signal.signal
+            previous_sigint = signal.getsignal(signal.SIGINT)
+            register = AUTOREVIEW.register_owned_process
+            finish = startup.finish
+            restore_error = OSError("private-restoration-detail")
+            failures, injected, metadata = [], [], []
+
+            class NativeSelection:
+                name = "nt"
+
+                def __getattr__(self, name):
+                    return getattr(os, name)
+
+            def spawn_owner(*_args, cwd, **kwargs):
+                # Only native construction is substituted. The real root launch
+                # owner manages a real POSIX child while Startup exchanges real
+                # READY/GO/EOF frames; this does not prove native Job behavior.
+                startup.process = subprocess.Popen(
+                    [sys.executable, "-I", "-S", "-c", "import time; time.sleep(30)"],
+                    cwd=cwd, start_new_session=True, **kwargs,
+                )
+                startup.job = None
+                return startup
+
+            def register_posix_owner(proc, _job):
+                with mock.patch.object(AUTOREVIEW, "os", os):
+                    register(proc)
+
+            def abort_posix_owner():
+                with mock.patch.object(AUTOREVIEW, "os", os):
+                    AUTOREVIEW.terminate_process_group(startup.process)
+
+            def observe_finish(*args, **kwargs):
+                try:
+                    return finish(*args, **kwargs)
+                except module.LaunchIndeterminate as failure:
+                    failures.append(failure)
+                    raise
+
+            def restore_with_active_error(signum, handler):
+                previous = install(signum, handler)
+                if signum == signal.SIGINT and handler is previous_sigint and not injected:
+                    injected.append(True)
+                    try:
+                        raise restore_error
+                    except OSError:
+                        # A restoration error is active at signal delivery;
+                        # the launch owner must retain its exact EOF outcome.
+                        metadata.append(sys.exc_info()[1])
+                        signal.raise_signal(signal.SIGTERM)
+                return previous
+
+            try:
+                with mock.patch.object(AUTOREVIEW, "os", NativeSelection()), \
+                        mock.patch.object(AUTOREVIEW, "admit_executable_directories"), \
+                        mock.patch.object(AUTOREVIEW, "register_owned_process", register_posix_owner), \
+                        mock.patch.object(module, "spawn", spawn_owner), \
+                        mock.patch.object(startup, "abort", abort_posix_owner), \
+                        mock.patch.object(startup, "finish", observe_finish), \
+                        mock.patch.object(signal, "signal", restore_with_active_error):
+                    with self.assertRaises(AUTOREVIEW.EngineInterrupted) as raised:
+                        AUTOREVIEW.start_owned_process(
+                            startup.argv, Path(directory).resolve(), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                        )
+                self.assertEqual(injected, [True])
+                self.assertEqual(len(failures), 1)
+                self.assertEqual(metadata, [restore_error])
+                self.assertTrue(startup.go_sent)
+                self.assertEqual(module.read_frame(request_reader)["operation"], "go")
+                self.assertIs(raised.exception.__cause__, failures[0])
+                self.assertIs(failures[0].__cause__, startup.error)
+                self.assertIsInstance(startup.error, EOFError)
+                self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                self.assertNotIn("private-restoration-detail", str(raised.exception.__cause__))
+                startup.process.wait(timeout=5)
+                self.assertNotIn(startup.process.pid, AUTOREVIEW._OWNED_PROCESSES)
+                self.assertIsNone(startup.reader)
+                self.assertIsNone(startup.writer)
+                self.assertTrue(startup.process.stdout.closed)
+                self.assertTrue(startup.process.stderr.closed)
+            finally:
+                if startup.process is not None and startup.process.pid in AUTOREVIEW._OWNED_PROCESSES:
+                    AUTOREVIEW.finish_owned_process(startup.process, abort_posix_owner, startup.close)
+
+    @unittest.skipIf(os.name == "nt", "portable owner composition; native job coverage runs separately")
+    def test_overlapping_launch_deliveries_keep_their_own_eof_causes(self):
+        with self.protocol_startup() as (module, first, first_request), \
+                self.protocol_startup() as (_, second, second_request), \
+                tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory).resolve()
+            startups = [first, second]
+            spawned, failures, delivered, shared_errors = [], {}, {}, []
+            register = AUTOREVIEW.register_owned_process
+            finishes = {startup: startup.finish for startup in startups}
+
+            class NativeSelection:
+                name = "nt"
+
+                def __getattr__(self, name):
+                    return getattr(os, name)
+
+            def spawn_owner(*_args, cwd, **kwargs):
+                startup = startups[len(spawned)]
+                spawned.append(startup)
+                # Native construction is the only substituted platform boundary.
+                # Each real root owner has real pipes and a real POSIX child;
+                # the launches overlap by nesting, not simultaneous execution.
+                startup.process = subprocess.Popen(
+                    [sys.executable, "-I", "-S", "-c", "import time; time.sleep(30)"],
+                    cwd=cwd, start_new_session=True, **kwargs,
+                )
+                startup.job = None
+                if startup is second:
+                    close = startup.process.stdout.close
+                    descriptor = startup.process.stdout.fileno()
+
+                    def close_then_fail():
+                        close()
+                        try:
+                            os.fstat(descriptor)
+                        except OSError as error:
+                            shared_errors.append(error)
+                            raise
+
+                    startup.process.stdout.close = close_then_fail
+                return startup
+
+            def register_owner(proc, _job):
+                with mock.patch.object(AUTOREVIEW, "os", os):
+                    register(proc)
+
+            def launch():
+                return AUTOREVIEW.start_owned_process(
+                    first.argv, cwd, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+
+            def abort(startup):
+                with mock.patch.object(AUTOREVIEW, "os", os):
+                    AUTOREVIEW.terminate_process_group(startup.process)
+                    if startup is second:
+                        signal.raise_signal(signal.SIGTERM)
+                    else:
+                        # A cleanup operation enters the real launch owner after
+                        # cancellation. It must receive its own denied delivery.
+                        launch()
+
+            def finish(startup, *args, **kwargs):
+                try:
+                    return finishes[startup](*args, **kwargs)
+                except module.LaunchIndeterminate as failure:
+                    failures[startup] = failure
+                    if startup is first:
+                        try:
+                            launch()
+                        except AUTOREVIEW.EngineInterrupted as interrupted:
+                            delivered[second] = interrupted
+                            self.assertIs(interrupted.__cause__, failures[second])
+                            interrupted.stdout = "second-owner-output"
+                    # Resume A's original typed EOF through its actual owner.
+                    raise
+
+            try:
+                with mock.patch.object(AUTOREVIEW, "os", NativeSelection()), \
+                        mock.patch.object(AUTOREVIEW, "admit_executable_directories"), \
+                        mock.patch.object(AUTOREVIEW, "register_owned_process", register_owner), \
+                        mock.patch.object(module, "spawn", spawn_owner), \
+                        mock.patch.object(first, "finish", lambda *a, **kw: finish(first, *a, **kw)), \
+                        mock.patch.object(second, "finish", lambda *a, **kw: finish(second, *a, **kw)), \
+                        mock.patch.object(first, "abort", lambda: abort(first)), \
+                        mock.patch.object(second, "abort", lambda: abort(second)):
+                    with self.assertRaises(AUTOREVIEW.EngineInterrupted) as raised:
+                        launch()
+                    delivered[first] = raised.exception
+                self.assertEqual(spawned, startups)
+                self.assertIs(delivered[second].__cause__, failures[second])
+                self.assertIsNot(delivered[first], delivered[second])
+                for startup, request in ((first, first_request), (second, second_request)):
+                    error = delivered[startup]
+                    self.assertEqual(error.code, 128 + signal.SIGTERM)
+                    self.assertIs(error.__cause__, failures[startup])
+                    self.assertIs(failures[startup].__cause__, startup.error)
+                    self.assertIsInstance(startup.error, EOFError)
+                    self.assertEqual(module.read_frame(request)["operation"], "go")
+                    startup.process.wait(timeout=5)
+                    self.assertNotIn(startup.process.pid, AUTOREVIEW._OWNED_PROCESSES)
+                    self.assertTrue(startup.process.stdout.closed)
+                    self.assertTrue(startup.process.stderr.closed)
+                self.assertEqual(delivered[second].stdout, "second-owner-output")
+                self.assertEqual(delivered[first].stdout, "")
+                self.assertEqual(len(shared_errors), 1)
+                for error in delivered.values():
+                    self.assertIn(shared_errors[0], error.cleanup_errors)
+            finally:
+                for startup in spawned:
+                    if startup.process.pid in AUTOREVIEW._OWNED_PROCESSES:
+                        AUTOREVIEW.finish_owned_process(
+                            startup.process,
+                            lambda startup=startup: AUTOREVIEW.terminate_process_group(startup.process),
+                            startup.close,
+                        )
+
+    def test_restoration_preserves_real_protocol_uncertainty(self):
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel), self.protocol_startup() as (module, startup, request_reader):
+                install = signal.signal
+                previous_sigint = signal.getsignal(signal.SIGINT)
+                injected = []
+                restore_error = OSError("private-restore-detail")
+
+                def fail_restoration(signum, handler):
+                    previous = install(signum, handler)
+                    if signum == signal.SIGINT and handler is previous_sigint and not injected:
+                        injected.append(True)
+                        if cancel:
+                            signal.raise_signal(signal.SIGTERM)
+                        else:
+                            raise restore_error
+                    return previous
+
+                expected = AUTOREVIEW.EngineInterrupted if cancel else module.LaunchIndeterminate
+                with mock.patch.object(signal, "signal", fail_restoration):
+                    with self.assertRaises(expected) as raised:
+                        with AUTOREVIEW.OwnedProcessSignalHandlers():
+                            startup.finish(time.monotonic() + 5)
+                self.assertTrue(startup.go_sent)
+                self.assertEqual(module.read_frame(request_reader)["operation"], "go")
+                prior = raised.exception.startup_failure if cancel else raised.exception
+                self.assertIsInstance(prior, module.LaunchIndeterminate)
+                self.assertIsInstance(prior.__cause__, EOFError)
+                if cancel:
+                    self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                else:
+                    self.assertIn(restore_error, prior.cleanup_errors)
+                self.assertNotIn("private-restore-detail", str(prior))
+
+
+class OwnedProcessCleanupTests(unittest.TestCase):
+    def test_new_launch_inside_prior_delivery_except_gets_fresh_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory).resolve()
+            witness = cwd / "must-not-run"
+            deliveries = []
+
+            def launch():
+                proc = AUTOREVIEW.start_owned_process(
+                    [sys.executable, "-I", "-S", "-c",
+                     "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(witness)],
+                    cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                self.addCleanup(AUTOREVIEW.finish_owned_process, proc,
+                                lambda: AUTOREVIEW.terminate_process_group(proc))
+                return proc
+
+            with self.assertRaises(AUTOREVIEW.EngineInterrupted):
+                with AUTOREVIEW.deferred_owned_process_signals():
+                    signal.raise_signal(signal.SIGTERM)
+                    try:
+                        launch()
+                    except AUTOREVIEW.EngineInterrupted as first:
+                        first.stdout = "first-delivery-output"
+                        deliveries.append(first)
+                        # sys.exc_info() still identifies first. This is a new
+                        # launch, not continuation of first's exception unwind.
+                        try:
+                            launch()
+                        except AUTOREVIEW.EngineInterrupted as second:
+                            deliveries.append(second)
+            self.assertEqual(len(deliveries), 2)
+            self.assertEqual(deliveries[1].stdout, "")
+            self.assertIsNot(deliveries[0], deliveries[1])
+            self.assertEqual([error.code for error in deliveries], [128 + signal.SIGTERM] * 2)
+            self.assertEqual(deliveries[0].stdout, "first-delivery-output")
+            self.assertIsNone(deliveries[1].__cause__)
+            self.assertFalse(witness.exists())
+            self.assertEqual(AUTOREVIEW._OWNED_PROCESSES, {})
+
+    def test_worker_entering_after_recovery_snapshot_inherits_cancellation(self):
+        install = signal.signal
+        previous = install(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(install, signal.SIGINT, previous)
+        real_sweep = AUTOREVIEW.terminate_owned_processes
+        calls, outcomes, workers = [], [], []
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory).resolve()
+            witness = cwd / "must-not-run"
+            scope = AUTOREVIEW.OwnedProcessSignalHandlers()
+
+            def late_launch():
+                proc = None
+                try:
+                    proc = AUTOREVIEW.start_owned_process(
+                        [sys.executable, "-I", "-S", "-c",
+                         "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(witness)],
+                        cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True,
+                    )
+                    proc.communicate(timeout=5)
+                    outcomes.append(proc)
+                except BaseException as error:
+                    outcomes.append(error)
+                finally:
+                    if proc is not None:
+                        AUTOREVIEW.finish_owned_process(
+                            proc, lambda: AUTOREVIEW.terminate_process_group(proc))
+
+            def sweep_then_launch(progress):
+                calls.append(progress)
+                if len(calls) == 1:
+                    # SIGINT now has its real caller disposition. Interrupt the
+                    # owned SIGTERM so scope exit must perform recovery.
+                    signal.raise_signal(signal.SIGINT)
+                real_sweep(progress)
+                self.assertIsNotNone(progress.owned)
+                worker = threading.Thread(target=late_launch, daemon=True)
+                workers.append(worker)
+                worker.start()
+                worker.join(timeout=10)
+                self.assertFalse(worker.is_alive())
+
+            def restore_then_cancel(number, handler):
+                result = install(number, handler)
+                if number == signal.SIGINT and handler is scope.previous[number] and not calls:
+                    signal.raise_signal(signal.SIGTERM)
+                return result
+
+            try:
+                with mock.patch.object(AUTOREVIEW, "terminate_owned_processes", sweep_then_launch), \
+                        mock.patch.object(signal, "signal", restore_then_cancel):
+                    with self.assertRaises(AUTOREVIEW.EngineInterrupted) as raised:
+                        with scope:
+                            pass
+                self.assertEqual(len(calls), 2)
+                self.assertIs(calls[0], calls[1])
+                self.assertFalse(witness.exists(), "late worker target executed during recovery")
+                self.assertEqual(len(outcomes), 1)
+                self.assertIsNot(outcomes[0], raised.exception)
+                self.assertEqual(outcomes[0].code, raised.exception.code)
+                self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                self.assertEqual(AUTOREVIEW._OWNED_PROCESSES, {})
+            finally:
+                for worker in workers:
+                    worker.join(timeout=10)
+                for number, handler in getattr(scope, "previous", {}).items():
+                    install(number, handler)
+                AUTOREVIEW._OWNED_PROCESS_SIGNAL_STATE = None
+
+    def test_concurrent_first_cancellation_keeps_worker_and_sweep_evidence(self):
+        real_init = AUTOREVIEW.EngineInterrupted.__init__
+        real_sweep = AUTOREVIEW.terminate_owned_processes
+        construction_started = threading.Event()
+        release_constructor = threading.Event()
+        sweep_entered = threading.Event()
+        outcomes = []
+        worker_errors = []
+        cleanup_error = OSError("private-concurrent-cleanup-detail")
+        worker = None
+        releaser = None
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory).resolve()
+            witness = cwd / "must-not-run"
+            # A previous real operation has completed, but this worker still
+            # owns its output stream and finalization when its next launch is denied.
+            previous = AUTOREVIEW.start_owned_process(
+                [sys.executable, "-I", "-S", "-c", "pass"], cwd,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True,
+            )
+
+            def close_then_fail():
+                close()
+                try:
+                    os.fstat(descriptor)
+                except OSError as error:
+                    worker_errors.append(error)
+                    raise
+
+            def paused_init(interrupted, code, **kwargs):
+                real_init(interrupted, code, **kwargs)
+                if threading.current_thread() is worker:
+                    construction_started.set()
+                    if not release_constructor.wait(5):
+                        raise TimeoutError("test did not release cancellation construction")
+
+            def denied_launch():
+                proc = None
+                try:
+                    proc = AUTOREVIEW.start_owned_process(
+                        [sys.executable, "-I", "-S", "-c",
+                         "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(witness)],
+                        cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    outcomes.append(proc)
+                except BaseException as error:
+                    AUTOREVIEW.finish_owned_process(previous, unwinding=error)
+                    # The caller propagates its cancellation with the actual
+                    # close failure as safe provenance. This is cleanup evidence,
+                    # not a simulated Windows post-GO acknowledgement failure.
+                    try:
+                        raise error from worker_errors[0]
+                    except BaseException as retained:
+                        outcomes.append(retained)
+                finally:
+                    if proc is not None:
+                        AUTOREVIEW.finish_owned_process(
+                            proc, lambda: AUTOREVIEW.terminate_process_group(proc))
+
+            def release_when_main_reaches_sweep():
+                # Bound the paused delivery if another implementation waits
+                # for it before sweeping instead of delivering concurrently.
+                sweep_entered.wait(1)
+                release_constructor.set()
+
+            def sweep_then_fail(progress):
+                real_sweep(progress)
+                sweep_entered.set()
+                worker.join(timeout=5)
+                self.assertFalse(worker.is_alive())
+                raise cleanup_error
+
+            try:
+                self.assertEqual(previous.wait(timeout=5), 0)
+                descriptor = previous.stdout.fileno()
+                close = previous.stdout.close
+                with mock.patch.object(previous.stdout, "close", close_then_fail), \
+                        mock.patch.object(AUTOREVIEW.EngineInterrupted, "__init__", paused_init), \
+                        mock.patch.object(AUTOREVIEW, "terminate_owned_processes", sweep_then_fail):
+                    with self.assertRaises(AUTOREVIEW.EngineInterrupted) as raised:
+                        with AUTOREVIEW.deferred_owned_process_signals():
+                            signal.raise_signal(signal.SIGTERM)
+                            worker = threading.Thread(target=denied_launch, daemon=True)
+                            worker.start()
+                            self.assertTrue(construction_started.wait(5))
+                            releaser = threading.Thread(target=release_when_main_reaches_sweep, daemon=True)
+                            releaser.start()
+                self.assertTrue(sweep_entered.is_set())
+                self.assertEqual(len(outcomes), 1)
+                self.assertIsNot(outcomes[0], raised.exception)
+                self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                self.assertIn(cleanup_error, raised.exception.cleanup_errors)
+                self.assertEqual(len(worker_errors), 1)
+                self.assertIn(worker_errors[0], raised.exception.cleanup_errors)
+                self.assertIs(outcomes[0].__cause__, worker_errors[0])
+                self.assertIsNone(raised.exception.__cause__)
+                self.assertIn(cleanup_error, outcomes[0].cleanup_errors)
+                self.assertEqual(outcomes[0].code, raised.exception.code)
+                self.assertTrue(previous.stdout.closed)
+                self.assertIsNotNone(previous.poll())
+                self.assertFalse(witness.exists())
+                self.assertEqual(AUTOREVIEW._OWNED_PROCESSES, {})
+            finally:
+                release_constructor.set()
+                for thread in (worker, releaser):
+                    if thread is not None:
+                        thread.join(timeout=10)
+                if previous.pid in AUTOREVIEW._OWNED_PROCESSES:
+                    AUTOREVIEW.finish_owned_process(
+                        previous, lambda: AUTOREVIEW.terminate_process_group(previous))
+
+    def test_independent_direct_launches_each_honor_deferred_interrupt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory).resolve()
+            processes = []
+            register = AUTOREVIEW.register_owned_process
+
+            def interrupt_after_registration(proc, job=None):
+                register(proc, job)
+                processes.append(proc)
+                signal.raise_signal(signal.SIGTERM)
+
+            try:
+                with mock.patch.object(AUTOREVIEW, "register_owned_process", interrupt_after_registration):
+                    for attempt in range(2):
+                        with self.subTest(attempt=attempt):
+                            witness = cwd / (str(attempt) + ".started")
+                            # Direct helper consumers can catch one cancellation
+                            # and start an independent operation in this process.
+                            with self.assertRaises(AUTOREVIEW.EngineInterrupted) as raised:
+                                AUTOREVIEW.start_owned_process(
+                                    [sys.executable, "-I", "-S", "-c",
+                                     "import pathlib,sys,time; pathlib.Path(sys.argv[1]).touch(); time.sleep(30)",
+                                     str(witness)], cwd,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                )
+                            self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                            self.assertNotIn(processes[-1].pid, AUTOREVIEW._OWNED_PROCESSES)
+                            processes[-1].wait(timeout=5)
+                            if os.name == "nt":
+                                # The real Windows supervisor must never allow
+                                # either target through its pre-GO registration gate.
+                                self.assertFalse(witness.exists())
+            finally:
+                for proc in processes:
+                    owned = AUTOREVIEW._OWNED_PROCESSES.get(proc.pid)
+                    if owned is not None and owned.process is proc:
+                        try:
+                            AUTOREVIEW.terminate_process_group(proc)
+                        finally:
+                            AUTOREVIEW.unregister_owned_process(proc)
+                    elif proc.poll() is None:
+                        proc.kill()
+                        proc.wait(timeout=5)
+
+    def test_nested_registration_cancellation_aborts_before_the_outer_sweep(self):
+        with tempfile.TemporaryDirectory() as directory:
+            register = AUTOREVIEW.register_owned_process
+            terminate = AUTOREVIEW.terminate_process_group
+            finish = AUTOREVIEW.finish_owned_process
+            sweep = AUTOREVIEW.terminate_owned_processes
+            processes, sweeps, observations, releases = [], [], [], []
+            cleanup_error = OSError("private-cleanup-detail")
+
+            def interrupt_registration(proc, job=None):
+                register(proc, job)
+                processes.append(proc)
+                signal.raise_signal(signal.SIGTERM)
+
+            def finish_then_fail(proc, *args, **kwargs):
+                # Use the common lifetime boundary after real POSIX termination
+                # or native Windows abort, job release and control-pipe closure.
+                finish(proc, *args, **kwargs)
+                releases.append((proc.pid in AUTOREVIEW._OWNED_PROCESSES, proc.poll()))
+                raise cleanup_error
+
+            def observe_sweep(*args, **kwargs):
+                sweeps.append(True)
+                sweep(*args, **kwargs)
+
+            try:
+                with mock.patch.object(AUTOREVIEW, "register_owned_process", interrupt_registration), \
+                        mock.patch.object(AUTOREVIEW, "finish_owned_process", finish_then_fail), \
+                        mock.patch.object(AUTOREVIEW, "terminate_owned_processes", observe_sweep):
+                    with self.assertRaises(AUTOREVIEW.EngineInterrupted) as raised:
+                        with AUTOREVIEW.deferred_owned_process_signals():
+                            try:
+                                AUTOREVIEW.start_owned_process(
+                                    [sys.executable, "-I", "-S", "-c", "import time; time.sleep(30)"],
+                                    Path(directory).resolve(), stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                )
+                            except AUTOREVIEW.EngineInterrupted as interrupted:
+                                observations.append((interrupted, list(sweeps),
+                                                     processes[0].pid in AUTOREVIEW._OWNED_PROCESSES))
+                                raise
+                self.assertEqual(len(observations), 1)
+                self.assertIs(observations[0][0], raised.exception)
+                self.assertEqual(observations[0][1:], ([], False))
+                self.assertEqual(sweeps, [True])
+                self.assertEqual(len(releases), 1)
+                self.assertFalse(releases[0][0])
+                self.assertIsNotNone(releases[0][1])
+                self.assertIn(cleanup_error, raised.exception.cleanup_errors)
+                processes[0].wait(timeout=5)
+            finally:
+                for proc in processes:
+                    if proc.pid in AUTOREVIEW._OWNED_PROCESSES:
+                        try:
+                            terminate(proc)
+                        finally:
+                            AUTOREVIEW.unregister_owned_process(proc)
+                    elif proc.poll() is None:
+                        proc.kill()
+                        proc.wait(timeout=5)
+
+    def test_first_signal_is_claimed_before_interruptible_scope_lookup(self):
+        current_thread = threading.current_thread
+        inside_first_callback = []
+        injected = []
+
+        def lookup_then_interrupt():
+            if inside_first_callback and not injected:
+                injected.append(True)
+                signal.raise_signal(signal.SIGINT)
+            return current_thread()
+
+        with self.assertRaises(AUTOREVIEW.EngineInterrupted) as raised:
+            with AUTOREVIEW.deferred_owned_process_signals():
+                # On the old callback, scope lookup could deliver SIGINT before
+                # SIGTERM was recorded. The callback now needs no such lookup.
+                with mock.patch.object(threading, "current_thread", lookup_then_interrupt):
+                    inside_first_callback.append(True)
+                    signal.raise_signal(signal.SIGTERM)
+                    inside_first_callback.clear()
+                if not injected:
+                    signal.raise_signal(signal.SIGINT)
+        self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+
+    def test_nested_signal_releases_arbitration_before_sweep(self):
+        with tempfile.TemporaryDirectory() as directory, AUTOREVIEW.OwnedProcessSignalHandlers() as scope:
+            proc = AUTOREVIEW.start_owned_process(
+                [sys.executable, "-I", "-S", "-c", "import time; time.sleep(30)"],
+                Path(directory).resolve(), stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            sweep = AUTOREVIEW.terminate_owned_processes
+            sweeps = []
+            injected = []
+
+            class NestedSignalLock:
+                def __init__(self, lock):
+                    self.lock = lock
+                    self.depth = 0
+
+                def __enter__(self):
+                    self.lock.__enter__()
+                    self.depth += 1
+                    try:
+                        if not injected:
+                            injected.append(True)
+                            signal.raise_signal(signal.SIGINT)
+                    except BaseException:
+                        self.__exit__(*sys.exc_info())
+                        raise
+                    return self
+
+                def __exit__(self, *args):
+                    self.depth -= 1
+                    return self.lock.__exit__(*args)
+
+            lock = NestedSignalLock(scope.state.decision_lock)
+
+            def observe_sweep(*args, **kwargs):
+                sweeps.append(lock.depth)
+                sweep(*args, **kwargs)
+
+            try:
+                with mock.patch.object(scope.state, "decision_lock", lock), \
+                        mock.patch.object(AUTOREVIEW, "terminate_owned_processes", observe_sweep):
+                    with self.assertRaises(AUTOREVIEW.EngineInterrupted) as raised:
+                        signal.raise_signal(signal.SIGTERM)
+                self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                self.assertEqual(sweeps, [0])
+                proc.wait(timeout=5)
+            finally:
+                if proc.pid in AUTOREVIEW._OWNED_PROCESSES:
+                    AUTOREVIEW.finish_owned_process(proc, lambda: AUTOREVIEW.terminate_process_group(proc))
+
+    def test_restoration_resumes_sweep_interrupted_before_snapshot(self):
+        install = signal.signal
+        prior_sigint = install(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(install, signal.SIGINT, prior_sigint)
+        with tempfile.TemporaryDirectory() as directory:
+            scope = AUTOREVIEW.OwnedProcessSignalHandlers()
+            scope.__enter__()
+            processes = []
+            injected = []
+            restore_started = []
+            attempts = []
+            registry_lock = AUTOREVIEW._OWNED_PROCESS_LOCK
+            signal_group = AUTOREVIEW._signal_owned_process_group
+
+            class InterruptSnapshot:
+                def __enter__(self):
+                    registry_lock.__enter__()
+                    try:
+                        if not injected:
+                            injected.append(True)
+                            signal.raise_signal(signal.SIGINT)
+                    except BaseException:
+                        registry_lock.__exit__(*sys.exc_info())
+                        raise
+                    return self
+
+                def __exit__(self, *args):
+                    return registry_lock.__exit__(*args)
+
+            def restore_then_cancel(number, handler):
+                result = install(number, handler)
+                if number == signal.SIGINT and handler is scope.previous[number] and not restore_started:
+                    restore_started.append(True)
+                    signal.raise_signal(signal.SIGTERM)
+                return result
+
+            def observe_signal(proc, **kwargs):
+                attempts.append(proc)
+                return signal_group(proc, **kwargs)
+
+            try:
+                for _ in range(2):
+                    processes.append(AUTOREVIEW.start_owned_process(
+                        [sys.executable, "-I", "-S", "-c", "import time; time.sleep(30)"],
+                        Path(directory).resolve(), stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    ))
+                self.assertTrue(all(proc.poll() is None for proc in processes))
+                with mock.patch.object(AUTOREVIEW, "_OWNED_PROCESS_LOCK", InterruptSnapshot()), \
+                        mock.patch.object(AUTOREVIEW, "_signal_owned_process_group", observe_signal), \
+                        mock.patch.object(signal, "signal", restore_then_cancel):
+                    with self.assertRaises(AUTOREVIEW.EngineInterrupted) as raised:
+                        scope.__exit__(None, None, None)
+                self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                self.assertEqual(injected, [True])
+                # A first-exception flag cannot stand in for cleanup: both real
+                # children must exit before emergency finalization can help.
+                for proc in processes:
+                    proc.wait(timeout=5)
+                self.assertEqual(attempts, processes)
+            finally:
+                for number, handler in scope.previous.items():
+                    install(number, handler)
+                AUTOREVIEW._OWNED_PROCESS_SIGNAL_STATE = None
+                for proc in processes:
+                    if proc.pid in AUTOREVIEW._OWNED_PROCESSES:
+                        AUTOREVIEW.finish_owned_process(proc, lambda proc=proc: AUTOREVIEW.terminate_process_group(proc))
+
+    @unittest.skipIf(os.name == "nt", "POSIX SIGTERM resistance and SIGKILL observation")
+    def test_restoration_retries_interrupted_enforcement_without_repeating_grace(self):
+        install = signal.signal
+        prior_sigint = install(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(install, signal.SIGINT, prior_sigint)
+        with tempfile.TemporaryDirectory() as directory:
+            scope = AUTOREVIEW.OwnedProcessSignalHandlers()
+            previous = {number: signal.getsignal(number) for number in AUTOREVIEW._handled_signal_numbers()}
+            proc = None
+            ready = Path(directory) / "ready"
+            signal_group = AUTOREVIEW._signal_owned_process_group
+            await_groups = AUTOREVIEW._await_owned_process_groups
+            enforce_group = AUTOREVIEW._enforce_owned_process_group
+            signaled = []
+            waited = []
+            enforced = []
+            restoring = []
+
+            def restore_then_cancel(number, handler):
+                result = install(number, handler)
+                if number == signal.SIGINT and handler is scope.previous[number] and not restoring:
+                    restoring.append(True)
+                    signal.raise_signal(signal.SIGTERM)
+                return result
+
+            def observe_signal(process, **kwargs):
+                signaled.append(process)
+                return signal_group(process, **kwargs)
+
+            def observe_wait(processes, grace):
+                waited.append(tuple(processes))
+                return await_groups(processes, grace)
+
+            def interrupt_first_enforcement(process, grace, **kwargs):
+                enforced.append(process)
+                if len(enforced) == 1:
+                    # SIGTERM cannot end this child. Interrupt before the first
+                    # real force-kill, after its shared grace has already elapsed.
+                    self.assertIsNone(process.poll())
+                    signal.raise_signal(signal.SIGINT)
+                return enforce_group(process, grace, **kwargs)
+
+            try:
+                scope.__enter__()
+                script = (
+                    "import pathlib, signal, sys, time; "
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                    "pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(30)"
+                )
+                proc = AUTOREVIEW.start_owned_process(
+                    [sys.executable, "-I", "-S", "-c", script, str(ready)],
+                    Path(directory).resolve(), stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                deadline = time.monotonic() + 5
+                while not ready.is_file() and proc.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.is_file(), "child did not install its SIGTERM disposition")
+                with mock.patch.object(AUTOREVIEW, "_OWNED_PROCESS_GRACE_SECONDS", 0.05), \
+                        mock.patch.object(AUTOREVIEW, "_signal_owned_process_group", observe_signal), \
+                        mock.patch.object(AUTOREVIEW, "_await_owned_process_groups", observe_wait), \
+                        mock.patch.object(AUTOREVIEW, "_enforce_owned_process_group", interrupt_first_enforcement), \
+                        mock.patch.object(signal, "signal", restore_then_cancel):
+                    with self.assertRaises(AUTOREVIEW.EngineInterrupted) as raised:
+                        scope.__exit__(None, None, None)
+                self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                self.assertTrue(any(isinstance(error, KeyboardInterrupt)
+                                    for error in raised.exception.cleanup_errors))
+                # Observe actual SIGKILL exit before emergency cleanup can help.
+                self.assertEqual(proc.wait(timeout=2), -signal.SIGKILL)
+                self.assertEqual(signaled, [proc])
+                self.assertEqual(waited, [(proc,)])
+                self.assertEqual(enforced, [proc, proc])
+            finally:
+                for number, handler in previous.items():
+                    install(number, handler)
+                AUTOREVIEW._OWNED_PROCESS_SIGNAL_STATE = None
+                if proc is not None:
+                    try:
+                        AUTOREVIEW.terminate_process_group(proc, grace_seconds=0.05)
+                    finally:
+                        AUTOREVIEW.unregister_owned_process(proc)
+
+    def test_restoration_recovers_interrupt_between_dispositions(self):
+        install = signal.signal
+        prior_sigint = install(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(install, signal.SIGINT, prior_sigint)
+        scope = AUTOREVIEW.OwnedProcessSignalHandlers()
+        previous = {number: signal.getsignal(number) for number in AUTOREVIEW._handled_signal_numbers()}
+        injected = []
+
+        class InterruptBetweenDispositions(dict):
+            def items(self):
+                for number, handler in super().items():
+                    yield number, handler
+                    if number == signal.SIGINT and not injected:
+                        # Advance the real restoration loop only after SIGINT
+                        # has its caller disposition, outside either setter.
+                        injected.append(True)
+                        signal.raise_signal(signal.SIGINT)
+
+        try:
+            scope.__enter__()
+            scope.previous = InterruptBetweenDispositions(previous)
+            with self.assertRaises(KeyboardInterrupt):
+                scope.__exit__(None, None, None)
+            self.assertEqual(injected, [True])
+            for number, handler in previous.items():
+                self.assertIs(signal.getsignal(number), handler)
+            self.assertIsNone(AUTOREVIEW._OWNED_PROCESS_SIGNAL_STATE)
+        finally:
+            for number, handler in previous.items():
+                install(number, handler)
+            AUTOREVIEW._OWNED_PROCESS_SIGNAL_STATE = None
+
+    def test_owned_signal_during_help_exit_wins_and_retains_cli_exit(self):
+        install = signal.signal
+        previous = {number: signal.getsignal(number) for number in AUTOREVIEW._handled_signal_numbers()}
+        interruptions = []
+        exits = []
+        output = io.StringIO()
+        errors = io.StringIO()
+
+        def restore_then_cancel(number, handler):
+            result = install(number, handler)
+            if number == signal.SIGINT and handler is previous[number] and not interruptions:
+                # argparse's real --help SystemExit is already unwinding, while
+                # SIGTERM still belongs to this invocation's signal handler.
+                active = sys.exc_info()[1]
+                self.assertIsInstance(active, SystemExit)
+                self.assertEqual(active.code, 0)
+                exits.append(active)
+                interruptions.append(signal.getsignal(signal.SIGTERM))
+                signal.raise_signal(signal.SIGTERM)
+            return result
+
+        try:
+            with mock.patch.object(sys, "argv", ["autoreview", "--help"]), \
+                    mock.patch.object(signal, "signal", restore_then_cancel), \
+                    contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                try:
+                    result = AUTOREVIEW.main()
+                except SystemExit as error:
+                    result = error.code
+            self.assertIn("usage:", output.getvalue())
+            self.assertEqual(result, 128 + signal.SIGTERM)
+            self.assertNotIn("process cleanup failed", errors.getvalue())
+            self.assertEqual(len(exits), 1)
+            interruption = interruptions[0].cancellation()
+            self.assertTrue(getattr(interruption, "startup_failure", None) is exits[0]
+                            or any(error is exits[0] for error in getattr(interruption, "prior_outcomes", ())))
+            for number, handler in previous.items():
+                self.assertIs(signal.getsignal(number), handler)
+            self.assertIsNone(AUTOREVIEW._OWNED_PROCESS_SIGNAL_STATE)
+        finally:
+            for number, handler in previous.items():
+                install(number, handler)
+            AUTOREVIEW._OWNED_PROCESS_SIGNAL_STATE = None
+
+    def test_restoration_preserves_a_new_caller_disposition(self):
+        install = signal.signal
+        previous = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(install, signal.SIGTERM, previous)
+        failure = OSError("private-restore-detail")
+        changes = []
+        replacement = lambda *_args: None
+        scope = AUTOREVIEW.OwnedProcessSignalHandlers()
+        scope.__enter__()
+
+        def change_before_failed_restore(number, handler):
+            if number == signal.SIGTERM and handler is previous:
+                changes.append(number)
+                install(number, replacement)
+                raise failure
+            return install(number, handler)
+
+        try:
+            with mock.patch.object(signal, "signal", change_before_failed_restore):
+                with self.assertRaises(OSError) as raised:
+                    scope.__exit__(None, None, None)
+            self.assertIs(raised.exception, failure)
+            self.assertEqual(changes, [signal.SIGTERM])
+            self.assertIs(signal.getsignal(signal.SIGTERM), replacement)
+        finally:
+            for number, handler in scope.previous.items():
+                install(number, handler)
+            AUTOREVIEW._OWNED_PROCESS_SIGNAL_STATE = None
+
+    def test_restoration_keeps_first_observed_cancellation(self):
+        install = signal.signal
+        ambient = {number: signal.getsignal(number) for number in AUTOREVIEW._handled_signal_numbers()}
+
+        def restore_ambient():
+            for number, handler in ambient.items():
+                install(number, handler)
+
+        self.addCleanup(restore_ambient)
+        install(signal.SIGINT, signal.default_int_handler)
+        for first_owned in (True, False):
+            with self.subTest(first_owned=first_owned), tempfile.TemporaryDirectory() as directory:
+                previous = {number: signal.getsignal(number) for number in ambient}
+                injected = []
+                dispatch_interrupted = []
+                scope = AUTOREVIEW.OwnedProcessSignalHandlers()
+                proc = None
+                try:
+                    scope.__enter__()
+                    proc = AUTOREVIEW.start_owned_process(
+                        [sys.executable, "-I", "-S", "-c", "import time; time.sleep(30)"],
+                        Path(directory).resolve(), stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                    self.assertIsNone(proc.poll())
+                    state = scope.state
+                    dispatch = state.dispatch
+
+                    def interrupt_before_sweep(*args, **kwargs):
+                        if not dispatch_interrupted:
+                            dispatch_interrupted.append(True)
+                            signal.raise_signal(signal.SIGINT)
+                        dispatch(*args, **kwargs)
+
+                    def restore_with_signals(number, handler):
+                        if handler is not previous[number]:
+                            return install(number, handler)
+                        if number == signal.SIGINT and not injected:
+                            result = install(number, handler)
+                            injected.append(number)
+                            if first_owned:
+                                # SIGTERM is recorded by the still-owned callback;
+                                # the restored SIGINT then interrupts before its sweep.
+                                signal.raise_signal(signal.SIGTERM)
+                            else:
+                                signal.raise_signal(signal.SIGINT)
+                            return result
+                        if number == signal.SIGTERM and not first_owned and number not in injected:
+                            # Interrupt before installation. Production must retry
+                            # the still-owned disposition without replacing the
+                            # earlier restored SIGINT's cancellation.
+                            injected.append(number)
+                            signal.raise_signal(signal.SIGTERM)
+                        return install(number, handler)
+
+                    expected = AUTOREVIEW.EngineInterrupted if first_owned else KeyboardInterrupt
+                    with mock.patch.object(state, "dispatch", interrupt_before_sweep if first_owned else dispatch), \
+                            mock.patch.object(signal, "signal", restore_with_signals):
+                        with self.assertRaises(expected) as raised:
+                            scope.__exit__(None, None, None)
+                    if first_owned:
+                        self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                        self.assertTrue(any(isinstance(error, KeyboardInterrupt)
+                                            for error in raised.exception.cleanup_errors))
+                    # The first callback was interrupted before its sweep;
+                    # owning-scope finalization must finish cancellation itself.
+                    proc.wait(timeout=5)
+                    self.assertIsNone(AUTOREVIEW._OWNED_PROCESS_SIGNAL_STATE)
+                    for number, handler in previous.items():
+                        self.assertIs(signal.getsignal(number), handler)
+                finally:
+                    for number, handler in previous.items():
+                        install(number, handler)
+                    AUTOREVIEW._OWNED_PROCESS_SIGNAL_STATE = None
+                    if proc is not None and proc.pid in AUTOREVIEW._OWNED_PROCESSES:
+                        AUTOREVIEW.finish_owned_process(proc, lambda: AUTOREVIEW.terminate_process_group(proc))
+
+    def test_direct_launch_scope_exit_interrupt_releases_unreturned_process(self):
+        prior_sigint = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, prior_sigint)
+        for signum, error_type in ((signal.SIGTERM, AUTOREVIEW.EngineInterrupted),
+                                   (signal.SIGINT, KeyboardInterrupt)):
+            with self.subTest(signum=signum), tempfile.TemporaryDirectory() as directory:
+                register = AUTOREVIEW.register_owned_process
+                install = signal.signal
+                previous_sigint = signal.getsignal(signal.SIGINT)
+                processes = []
+                injected = []
+
+                def remember_process(proc, job=None):
+                    register(proc, job)
+                    processes.append(proc)
+
+                def restore_then_interrupt(restoring, handler):
+                    previous = install(restoring, handler)
+                    if (processes and not injected and restoring == signal.SIGINT
+                            and handler is previous_sigint):
+                        injected.append(True)
+                        # SIGINT is already restored; SIGTERM still belongs to
+                        # the scope. Either route must release the unreturned child.
+                        signal.raise_signal(signum)
+                    return previous
+
+                try:
+                    with mock.patch.object(AUTOREVIEW, "register_owned_process", remember_process), \
+                            mock.patch.object(signal, "signal", restore_then_interrupt):
+                        with self.assertRaises(error_type):
+                            AUTOREVIEW.start_owned_process(
+                                [sys.executable, "-I", "-S", "-c", "import time; time.sleep(30)"],
+                                Path(directory).resolve(), stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            )
+                    self.assertEqual(injected, [True])
+                    proc = processes[0]
+                    self.assertNotIn(proc.pid, AUTOREVIEW._OWNED_PROCESSES)
+                    proc.wait(timeout=5)
+                    self.assertTrue(all(stream.closed for stream in (proc.stdin, proc.stdout, proc.stderr)))
+                finally:
+                    for proc in processes:
+                        owned = AUTOREVIEW._OWNED_PROCESSES.get(proc.pid)
+                        if owned is not None and owned.process is proc:
+                            try:
+                                AUTOREVIEW.terminate_process_group(proc)
+                            finally:
+                                AUTOREVIEW.unregister_owned_process(proc)
+                        elif proc.poll() is None:
+                            proc.kill()
+                            proc.wait(timeout=5)
+
+    def test_nested_deferral_keeps_first_signal_until_outer_exit(self):
+        for failure in (None, ValueError("private-body-detail"), KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as directory:
+                proc = None
+                reached_outer = False
+                original_handlers = {sig: signal.getsignal(sig) for sig in AUTOREVIEW._handled_signal_numbers()}
+                try:
+                    with self.assertRaises(AUTOREVIEW.EngineInterrupted) as raised:
+                        with AUTOREVIEW.deferred_owned_process_signals():
+                            with AUTOREVIEW.deferred_owned_process_signals():
+                                proc = AUTOREVIEW.start_owned_process(
+                                    [sys.executable, "-I", "-S", "-c", "import time; time.sleep(30)"],
+                                    Path(directory).resolve(), stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                )
+                                signal.raise_signal(signal.SIGTERM)
+                            # The outer critical section still owns unfinished
+                            # registration work; no inner exit may sweep it early.
+                            reached_outer = True
+                            self.assertIsNone(proc.poll())
+                            signal.raise_signal(signal.SIGINT)
+                            if failure is not None:
+                                raise failure
+                    self.assertTrue(reached_outer)
+                    self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                    proc.wait(timeout=5)
+                    self.assertEqual({sig: signal.getsignal(sig) for sig in original_handlers}, original_handlers)
+                finally:
+                    if proc is not None:
+                        try:
+                            AUTOREVIEW.terminate_process_group(proc)
+                        finally:
+                            AUTOREVIEW.unregister_owned_process(proc)
+
+    def test_signal_during_handler_installation_restores_invocation(self):
+        for cleanup_fails in (False, True):
+            with self.subTest(cleanup_fails=cleanup_fails):
+                install = signal.signal
+                original_handlers = {sig: signal.getsignal(sig) for sig in AUTOREVIEW._handled_signal_numbers()}
+                injected = []
+                restored = []
+
+                def install_then_interrupt(signum, handler):
+                    previous = install(signum, handler)
+                    if not injected and signum == signal.SIGINT and isinstance(handler, AUTOREVIEW._OwnedProcessSignalState):
+                        injected.append(True)
+                        signal.raise_signal(signal.SIGINT)
+                    if injected and handler is original_handlers[signum]:
+                        restored.append(signum)
+                        if cleanup_fails and signum == signal.SIGINT:
+                            raise OSError("private-restore-detail")
+                    return previous
+
+                errors = io.StringIO()
+                with mock.patch.object(signal, "signal", install_then_interrupt), \
+                        mock.patch.object(AUTOREVIEW, "main_impl") as body, contextlib.redirect_stderr(errors):
+                    self.assertEqual(AUTOREVIEW.main(), 128 + signal.SIGINT)
+                body.assert_not_called()
+                # Acquisition stopped after SIGINT. Already-original caller
+                # dispositions must not be overwritten during rollback.
+                self.assertEqual(restored, [signal.SIGINT])
+                self.assertEqual({sig: signal.getsignal(sig) for sig in original_handlers}, original_handlers)
+                self.assertNotIn("private-restore-detail", errors.getvalue())
+                if cleanup_fails:
+                    self.assertIn("process cleanup failed: OSError", errors.getvalue())
+                with mock.patch.object(AUTOREVIEW, "main_impl", lambda: signal.raise_signal(signal.SIGTERM)):
+                    self.assertEqual(AUTOREVIEW.main(), 128 + signal.SIGTERM)
+
+    def test_worker_thread_launch_does_not_install_signal_handlers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            outcomes = []
+
+            def run():
+                try:
+                    outcomes.append(AUTOREVIEW.run_with_heartbeat(
+                        [sys.executable, "-I", "-S", "-c", "print('worker completed')"],
+                        Path(directory).resolve(), label="worker", max_runtime_seconds=5,
+                    ))
+                except BaseException as error:
+                    outcomes.append(error)
+
+            worker = threading.Thread(target=run, daemon=True)
+            worker.start()
+            worker.join(timeout=10)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(outcomes), 1)
+            self.assertIsInstance(outcomes[0], subprocess.CompletedProcess)
+            self.assertEqual(outcomes[0].returncode, 0)
+            self.assertEqual(outcomes[0].stdout.strip(), "worker completed")
+
+    def test_real_signal_survives_failed_sweep_and_reaches_other_children(self):
+        for streamed in (False, True):
+            with self.subTest(streamed=streamed), tempfile.TemporaryDirectory() as directory:
+                cwd = Path(directory).resolve()
+                processes = []
+                observed = []
+                start_process = AUTOREVIEW.start_owned_process
+                signal_group = AUTOREVIEW._signal_owned_process_group
+                terminate = AUTOREVIEW.terminate_process_group
+
+                def remember_process(*args, **kwargs):
+                    proc = start_process(*args, **kwargs)
+                    processes.append(proc)
+                    return proc
+
+                def fail_first_signal(proc, **kwargs):
+                    observed.append(proc)
+                    if proc is processes[0]:
+                        # A second real signal while a registry lock is held must
+                        # neither recurse nor replace the first signal's status.
+                        with AUTOREVIEW._OWNED_PROCESS_LOCK:
+                            signal.raise_signal(signal.SIGINT)
+                        raise OSError("private-sweep-detail")
+                    return signal_group(proc, **kwargs)
+
+                def fail_after_termination(proc, *args, **kwargs):
+                    terminate(proc, *args, **kwargs)
+                    raise RuntimeError("private-finalizer-detail")
+
+                def run_engine():
+                    return AUTOREVIEW.run_with_heartbeat(
+                        [sys.executable, "-I", "-S", "-c", "import time; time.sleep(30)"],
+                        cwd, label="signal test", heartbeat_seconds=0.01,
+                        max_runtime_seconds=10, stream_output=streamed,
+                    )
+
+                try:
+                    remember_process(
+                        [sys.executable, "-I", "-S", "-c", "import time; time.sleep(30)"], cwd,
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                    errors = io.StringIO()
+                    # Exercise the real handler and the real caller's unwind:
+                    # both the sweep and subsequent finalization can fail.
+                    with mock.patch.object(AUTOREVIEW, "start_owned_process", remember_process), \
+                            mock.patch.object(AUTOREVIEW, "_signal_owned_process_group", fail_first_signal), \
+                            mock.patch.object(AUTOREVIEW, "terminate_process_group", fail_after_termination), \
+                            mock.patch.object(AUTOREVIEW, "emit_heartbeat", lambda *args: signal.raise_signal(signal.SIGTERM)), \
+                            mock.patch.object(AUTOREVIEW, "main_impl", run_engine), \
+                            contextlib.redirect_stderr(errors):
+                        self.assertEqual(AUTOREVIEW.main(), 128 + signal.SIGTERM)
+                    self.assertEqual(observed[:2], processes)
+                    self.assertEqual(observed.count(processes[0]), 1)
+                    for proc in processes:
+                        proc.wait(timeout=5)
+                    self.assertNotIn(processes[1].pid, AUTOREVIEW._OWNED_PROCESSES)
+                    self.assertIn("process cleanup failed: OSError, RuntimeError", errors.getvalue())
+                    self.assertNotIn("private-sweep-detail", errors.getvalue())
+                    self.assertNotIn("private-finalizer-detail", errors.getvalue())
+                finally:
+                    for proc in processes:
+                        owned = AUTOREVIEW._OWNED_PROCESSES.get(proc.pid)
+                        if owned is not None and owned.process is proc:
+                            try:
+                                AUTOREVIEW.terminate_process_group(proc)
+                            finally:
+                                AUTOREVIEW.unregister_owned_process(proc)
+                        elif proc.poll() is None:
+                            proc.kill()
+                            proc.wait(timeout=5)
+
+    def test_git_preflight_reports_startup_cleanup_failure_without_arguments(self):
+        for outcome in ("timeout", "oserror"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as patches:
+                cwd = Path(directory).resolve()
+                processes = []
+                failure = RuntimeError("private-cleanup-detail")
+                register = AUTOREVIEW.register_owned_process
+                terminate = AUTOREVIEW.terminate_process_group
+
+                def expire_after_registration(proc, job=None):
+                    register(proc, job)
+                    processes.append(proc)
+                    if job is not None:
+                        terminate_job = job.terminate
+
+                        def fail_after_job_termination():
+                            terminate_job()
+                            raise failure
+
+                        patches.enter_context(mock.patch.object(job, "terminate", fail_after_job_termination))
+                    if outcome == "timeout":
+                        raise subprocess.TimeoutExpired("private-git-argument", 10)
+                    raise OSError(5, "private-git-argument")
+
+                def fail_after_termination(proc, *args, **kwargs):
+                    terminate(proc, *args, **kwargs)
+                    raise failure
+
+                patches.enter_context(mock.patch.object(AUTOREVIEW, "register_owned_process", expire_after_registration))
+                patches.enter_context(mock.patch.object(AUTOREVIEW, "terminate_process_group", fail_after_termination))
+                errors = io.StringIO()
+                try:
+                    with mock.patch.object(Path, "cwd", return_value=cwd), contextlib.redirect_stderr(errors):
+                        self.assertFalse(AUTOREVIEW.preflight_git())
+                    self.assertEqual(len(processes), 1)
+                    self.assertNotIn(processes[0].pid, AUTOREVIEW._OWNED_PROCESSES)
+                    reason = "timed out after 10s" if outcome == "timeout" else "could not execute (errno 5)"
+                    self.assertIn(reason + "; startup cleanup failed: RuntimeError", errors.getvalue())
+                    self.assertNotIn("private-cleanup-detail", errors.getvalue())
+                    self.assertNotIn("private-git-argument", errors.getvalue())
+                finally:
+                    patches.close()
+                    for proc in processes:
+                        if proc.poll() is None:
+                            proc.kill()
+                        proc.wait(timeout=5)
+                        AUTOREVIEW.unregister_owned_process(proc)
+
+
+    def test_startup_timeout_preserves_cleanup_cancellation_and_details(self):
+        for streamed, outcome in itertools.product((False, True), ("error", "engine", "keyboard")):
+            with self.subTest(streamed=streamed, outcome=outcome), \
+                    tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as patches:
+                processes = []
+                startup_failure = subprocess.TimeoutExpired("private-startup-argument", 0.001)
+                if outcome == "engine":
+                    cleanup_failure = AUTOREVIEW.EngineInterrupted(130)
+                elif outcome == "keyboard":
+                    cleanup_failure = KeyboardInterrupt()
+                else:
+                    cleanup_failure = RuntimeError("private-cleanup-detail")
+                register = AUTOREVIEW.register_owned_process
+                terminate = AUTOREVIEW.terminate_process_group
+
+                def fail_after_termination(proc, *args, **kwargs):
+                    terminate(proc, *args, **kwargs)
+                    raise cleanup_failure
+
+                def expire_after_registration(proc, job=None):
+                    register(proc, job)
+                    processes.append(proc)
+                    if job is not None:
+                        terminate_job = job.terminate
+
+                        def interrupt_job():
+                            terminate_job()
+                            raise cleanup_failure
+
+                        patches.enter_context(mock.patch.object(job, "terminate", interrupt_job))
+                    # The actual process is registered; only startup completion
+                    # is made to fail after the caller's deadline has elapsed.
+                    time.sleep(0.02)
+                    raise startup_failure
+
+                patches.enter_context(mock.patch.object(AUTOREVIEW, "register_owned_process", expire_after_registration))
+                patches.enter_context(mock.patch.object(AUTOREVIEW, "terminate_process_group", fail_after_termination))
+                try:
+                    def run():
+                        return AUTOREVIEW.run_with_heartbeat(
+                            [sys.executable, "-I", "-S", "-c", "import time; time.sleep(5)"],
+                            Path(directory).resolve(), label="startup-cleanup", stream_output=streamed,
+                            max_runtime_seconds=0.001,
+                        )
+
+                    if outcome != "error":
+                        with self.assertRaises(type(cleanup_failure)) as raised:
+                            run()
+                        self.assertIs(raised.exception, cleanup_failure)
+                        self.assertIs(raised.exception.startup_failure, startup_failure)
+                        self.assertIsNone(raised.exception.__cause__)
+                        diagnostic = "".join(traceback.format_exception(raised.exception))
+                        self.assertNotIn("private-startup-argument", diagnostic)
+                        if outcome == "engine":
+                            self.assertEqual(raised.exception.code, 130)
+                    else:
+                        result = run()
+                        self.assertIsInstance(result, AUTOREVIEW.TimedOutEngineProcess)
+                        self.assertEqual(result.returncode, 124)
+                        self.assertIn("startup cleanup failed: RuntimeError", result.stderr)
+                        self.assertNotIn("private-cleanup-detail", result.stderr)
+                        self.assertNotIn("private-startup-argument", result.stderr)
+                        self.assertEqual(result.cleanup_errors, (cleanup_failure,))
+                    self.assertEqual(len(processes), 1)
+                    self.assertNotIn(processes[0].pid, AUTOREVIEW._OWNED_PROCESSES)
+                    for stream in (processes[0].stdin, processes[0].stdout, processes[0].stderr):
+                        if stream is not None:
+                            self.assertTrue(stream.closed)
+                finally:
+                    patches.close()
+                    for proc in processes:
+                        if proc.poll() is None:
+                            proc.kill()
+                        proc.wait(timeout=5)
+                        AUTOREVIEW.unregister_owned_process(proc)
+                        for stream in (proc.stdin, proc.stdout, proc.stderr):
+                            if stream is not None:
+                                stream.close()
+
+    def test_startup_control_close_attempts_both_real_descriptors(self):
+        module = AUTOREVIEW._load_windows_process_module(str(SCRIPT_PATH.with_name("windows-owned-process.py")))
+        startup = object.__new__(module.Startup)
+        startup.reader, startup.writer = os.pipe()
+        startup.control_errors = []
+        descriptors = (startup.reader, startup.writer)
+        close = os.close
+        failure = OSError("injected control close failure")
+
+        def close_then_fail(descriptor):
+            close(descriptor)
+            if descriptor == descriptors[0]:
+                raise failure
+
+        try:
+            # This unit covers the raw descriptor owner, without pretending to
+            # construct a Windows job or exercise the native launch protocol.
+            with mock.patch.object(module.os, "close", close_then_fail):
+                startup._close_control()
+            self.assertEqual(startup.control_errors, [failure])
+            self.assertIsNone(startup.reader)
+            self.assertIsNone(startup.writer)
+            for descriptor in descriptors:
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+        finally:
+            for name in ("reader", "writer"):
+                descriptor = getattr(startup, name)
+                if descriptor is not None:
+                    with contextlib.suppress(OSError):
+                        close(descriptor)
+                    setattr(startup, name, None)
+
+    def test_new_operation_cleanup_failure_does_not_modify_handled_cancellation(self):
+        for caller in ("buffered", "streamed", "git-preflight"):
+            with self.subTest(caller=caller), tempfile.TemporaryDirectory() as directory:
+                cwd = Path(directory).resolve()
+                processes = []
+                jobs = []
+                start = AUTOREVIEW.start_owned_process
+                terminate = AUTOREVIEW.terminate_process_group
+                failure = RuntimeError("new operation finalization failed")
+
+                def observe_start(*args, **kwargs):
+                    proc = start(*args, **kwargs)
+                    processes.append(proc)
+                    jobs.append(AUTOREVIEW._OWNED_PROCESSES[proc.pid].job)
+                    return proc
+
+                def terminate_then_fail(proc, *args, **kwargs):
+                    # The new command really completed; fail only after its
+                    # actual group teardown, at the current finalizer boundary.
+                    self.assertEqual(proc.returncode, 0)
+                    terminate(proc, *args, **kwargs)
+                    raise failure
+
+                try:
+                    try:
+                        with AUTOREVIEW.OwnedProcessSignalHandlers():
+                            signal.raise_signal(signal.SIGTERM)
+                    except AUTOREVIEW.EngineInterrupted as prior:
+                        prior_errors = prior.cleanup_errors
+                        # This except block intentionally remains active while a
+                        # fresh command runs. Its old cancellation is not the new
+                        # command's unwinding outcome or owner of cleanup errors.
+                        with mock.patch.object(AUTOREVIEW, "start_owned_process", observe_start), \
+                                mock.patch.object(AUTOREVIEW, "terminate_process_group", terminate_then_fail), \
+                                mock.patch.object(Path, "cwd", return_value=cwd):
+                            with self.assertRaises(RuntimeError) as raised:
+                                if caller == "git-preflight":
+                                    AUTOREVIEW.preflight_git()
+                                else:
+                                    AUTOREVIEW.run_with_heartbeat(
+                                        [sys.executable, "-I", "-S", "-c", "print('completed')"],
+                                        cwd, label="fresh-operation", max_runtime_seconds=10,
+                                        stream_output=caller == "streamed",
+                                        stream_display=lambda *_args: None,
+                                    )
+                        self.assertIs(raised.exception, failure)
+                        self.assertEqual(prior.cleanup_errors, prior_errors)
+                    else:
+                        self.fail("the first invocation did not observe SIGTERM")
+                    self.assertEqual(len(processes), 1)
+                    proc = processes[0]
+                    self.assertEqual(proc.wait(timeout=5), 0)
+                    self.assertNotIn(proc.pid, AUTOREVIEW._OWNED_PROCESSES)
+                    for stream in (proc.stdin, proc.stdout, proc.stderr):
+                        if stream is not None:
+                            self.assertTrue(stream.closed)
+                    if jobs[0] is not None:
+                        self.assertIsNone(jobs[0].handle)
+                finally:
+                    for proc in processes:
+                        owned = AUTOREVIEW._OWNED_PROCESSES.get(proc.pid)
+                        if owned is not None and owned.process is proc:
+                            try:
+                                terminate(proc)
+                            finally:
+                                AUTOREVIEW.unregister_owned_process(proc)
+                        proc.wait(timeout=5)
+                        for stream in (proc.stdin, proc.stdout, proc.stderr):
+                            if stream is not None:
+                                stream.close()
+
+    def test_buffered_cleanup_releases_streams_and_owner_after_termination_failure(self):
+        for close_fails in (False, True):
+            with self.subTest(close_fails=close_fails), tempfile.TemporaryDirectory() as directory:
+                processes = []
+                jobs = []
+                terminate_error = RuntimeError("injected termination failure")
+                close_error = OSError("injected stdout close failure")
+                start = AUTOREVIEW.start_owned_process
+                with contextlib.ExitStack() as patches:
+                    def observe_start(*args, **kwargs):
+                        proc = start(*args, **kwargs)
+                        processes.append(proc)
+                        jobs.append(AUTOREVIEW._OWNED_PROCESSES[proc.pid].job)
+                        return proc
+
+                    def fail_finalization(proc):
+                        # communicate() must finish normally before the close fault
+                        # is armed: Windows also closes pipes in its reader threads.
+                        self.assertEqual(proc.returncode, 0)
+                        if close_fails:
+                            close = proc.stdout.close
+
+                            def close_then_fail():
+                                close()
+                                raise close_error
+
+                            patches.enter_context(mock.patch.object(proc.stdout, "close", close_then_fail))
+                        raise terminate_error
+
+                    patches.enter_context(mock.patch.object(AUTOREVIEW, "start_owned_process", observe_start))
+                    patches.enter_context(mock.patch.object(AUTOREVIEW, "terminate_process_group",
+                                                            side_effect=fail_finalization))
+                    try:
+                        # The real child completes. Only explicit teardown fails;
+                        # its pipes and registered lifetime owner must still close.
+                        with self.assertRaises(RuntimeError) as raised:
+                            AUTOREVIEW.run_with_heartbeat(
+                                [sys.executable, "-I", "-S", "-c", "print(42)"],
+                                Path(directory).resolve(), label="cleanup-failure", max_runtime_seconds=10,
+                            )
+                        self.assertIs(raised.exception, terminate_error)
+                        if close_fails:
+                            self.assertIn(close_error, raised.exception.cleanup_errors)
+                        self.assertEqual(len(processes), 1)
+                        proc = processes[0]
+                        self.assertEqual(proc.wait(timeout=5), 0)
+                        self.assertTrue(proc.stdout.closed)
+                        self.assertTrue(proc.stderr.closed)
+                        self.assertNotIn(proc.pid, AUTOREVIEW._OWNED_PROCESSES)
+                        if jobs[0] is not None:
+                            self.assertIsNone(jobs[0].handle)
+                    finally:
+                        patches.close()
+                        for proc in processes:
+                            if proc.poll() is None:
+                                proc.kill()
+                                proc.wait(timeout=5)
+                            AUTOREVIEW.unregister_owned_process(proc)
+                            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                                if stream is not None:
+                                    stream.close()
+
+    def test_git_preflight_unregisters_owner_after_termination_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory).resolve()
+            processes = []
+            jobs = []
+            start = AUTOREVIEW.start_owned_process
+            failure = RuntimeError("injected preflight termination failure")
+
+            def observe_start(*args, **kwargs):
+                proc = start(*args, **kwargs)
+                processes.append(proc)
+                jobs.append(AUTOREVIEW._OWNED_PROCESSES[proc.pid].job)
+                return proc
+
+            with mock.patch.object(Path, "cwd", return_value=cwd), \
+                    mock.patch.object(AUTOREVIEW, "start_owned_process", observe_start), \
+                    mock.patch.object(AUTOREVIEW, "terminate_process_group", side_effect=failure):
+                try:
+                    with self.assertRaises(RuntimeError) as raised:
+                        AUTOREVIEW.preflight_git()
+                    self.assertIs(raised.exception, failure)
+                    self.assertEqual(len(processes), 1)
+                    self.assertIsNotNone(processes[0].poll())
+                    self.assertNotIn(processes[0].pid, AUTOREVIEW._OWNED_PROCESSES)
+                    if jobs[0] is not None:
+                        self.assertIsNone(jobs[0].handle)
+                finally:
+                    for proc in processes:
+                        if proc.poll() is None:
+                            proc.kill()
+                            proc.wait(timeout=5)
+                        AUTOREVIEW.unregister_owned_process(proc)
+
+
+@unittest.skipUnless(os.name == "nt", "requires native Windows process jobs")
+class WindowsOwnedProcessTransportTests(unittest.TestCase):
+    def test_stdio_environment_working_directory_and_exit_status(self):
+        with tempfile.TemporaryDirectory(prefix="owned-process-") as directory:
+            cwd = Path(directory).resolve() / "working directory 雪"
+            cwd.mkdir()
+            environment = os.environ.copy()
+            environment["AUTOREVIEW_JOB_TRANSPORT"] = "environment 雪"
+            script = (
+                "import json, os, sys; "
+                "print(json.dumps([sys.argv[1:], os.getcwd(), "
+                "os.environ['AUTOREVIEW_JOB_TRANSPORT'], sys.stdin.read()])); "
+                "print('diagnostic 雪', file=sys.stderr); sys.exit(37)"
+            )
+            arguments = [sys.executable, "-I", "-S", "-X", "utf8=1", "-c", script,
+                         "argument with spaces", "雪"]
+            for streamed in (False, True):
+                with self.subTest(streamed=streamed), contextlib.redirect_stdout(io.StringIO()):
+                    result = AUTOREVIEW.run_with_heartbeat(
+                        arguments, cwd, input_text="input 雪", label="transport",
+                        stream_output=streamed, env=environment, max_runtime_seconds=10,
+                    )
+                self.assertEqual(result.returncode, 37)
+                self.assertEqual(json.loads(result.stdout),
+                                 [["argument with spaces", "雪"], str(cwd),
+                                  "environment 雪", "input 雪"])
+                self.assertEqual(result.stderr.strip(), "diagnostic 雪")
+                self.assertFalse(AUTOREVIEW._OWNED_PROCESSES)
+
+    def test_owned_launch_can_nest_inside_an_owned_job(self):
+        with tempfile.TemporaryDirectory(prefix="owned-process-") as directory:
+            cwd = Path(directory).resolve()
+            nested_owner = (
+                "import json, pathlib, runpy, sys\n"
+                "helper = runpy.run_path(sys.argv[1])\n"
+                "result = helper['run_with_heartbeat'](\n"
+                " [sys.executable, '-I', '-S', '-c', 'print(42)'], pathlib.Path.cwd(),\n"
+                " label='inner-job', max_runtime_seconds=10)\n"
+                "print(json.dumps([result.returncode, result.stdout, result.stderr,\n"
+                " not helper['_OWNED_PROCESSES']]))\n"
+            )
+            # The inner owner itself runs inside a real outer owned job. This
+            # establishes nesting independently of the CI runner's own policy.
+            result = AUTOREVIEW.run_with_heartbeat(
+                [sys.executable, "-I", "-S", "-c", nested_owner, str(SCRIPT_PATH.resolve())],
+                cwd, label="outer-job", max_runtime_seconds=20,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), [0, "42\n", "", True])
+            self.assertFalse(AUTOREVIEW._OWNED_PROCESSES)
+
+    def test_target_closing_stdin_releases_writer_while_job_alive(self):
+        with tempfile.TemporaryDirectory(prefix="owned-process-") as directory:
+            cwd = Path(directory).resolve()
+            owner_code = r'''import ctypes, errno, json, pathlib, runpy, subprocess, sys
+from ctypes import wintypes
+helper = runpy.run_path(sys.argv[1])
+target = "import os,time; os.close(0); print(os.getpid(), flush=True); time.sleep(120)"
+proc = helper['start_owned_process'](
+    [sys.executable, '-I', '-S', '-c', target], pathlib.Path.cwd(),
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+handle = None
+try:
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    # The target reports its own PID only after closing its stdin descriptor.
+    handle = kernel.OpenProcess(0x00100000, False, int(proc.stdout.readline()))
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    before = [proc.poll() is None, kernel.WaitForSingleObject(handle, 0) == 258]
+    payload = b'x' * 1000000
+    try:
+        written = proc.stdin.write(payload)
+        proc.stdin.flush()
+        if written != len(payload):
+            raise RuntimeError('large stdin write was incomplete')
+        outcome = 'written'
+    except OSError as exc:
+        # Like Popen._stdin_write, accept Windows EINVAL for a closed pipe
+        # even while its child remains alive; unrelated I/O errors still fail.
+        if not isinstance(exc, BrokenPipeError) and exc.errno != errno.EINVAL:
+            raise
+        outcome = 'closed_pipe'
+    # Capture both liveness checks before any cleanup can release a retained
+    # read handle and manufacture the closed-pipe result we are trying to prove.
+    after = [proc.poll() is None, kernel.WaitForSingleObject(handle, 0) == 258]
+finally:
+    try:
+        helper['terminate_process_group'](proc)
+    finally:
+        try:
+            helper['unregister_owned_process'](proc)
+        finally:
+            if handle:
+                kernel.CloseHandle(handle)
+            try:
+                proc.stdin.close()
+            except OSError as exc:
+                if not isinstance(exc, BrokenPipeError) and exc.errno != errno.EINVAL:
+                    raise
+            proc.stdout.close()
+print(json.dumps([outcome, before, after, not helper['_OWNED_PROCESSES']]))
+'''
+            # Bypass a venv redirector for both owner and target: a redirector
+            # retaining stdin is a separate defect from the supervisor's handle.
+            interpreter = str(Path(sys._base_executable).resolve())
+            owner = subprocess.Popen(
+                [interpreter, "-I", "-S", "-c", owner_code, str(SCRIPT_PATH.resolve())],
+                cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            )
+            try:
+                # The external deadline bounds a blocked synchronous write; no
+                # engine timeout or cleanup runs before the liveness observations.
+                output, error = owner.communicate(timeout=20)
+                self.assertEqual(owner.returncode, 0, error)
+                outcome, before, after, empty_registry = json.loads(output)
+                self.assertIn(outcome, ("closed_pipe", "written"))
+                self.assertEqual(before, [True, True])
+                self.assertEqual(after, [True, True])
+                self.assertTrue(empty_registry)
+            finally:
+                if owner.poll() is None:
+                    owner.kill()
+                    owner.wait(timeout=5)
+                owner.stdout.close()
+                owner.stderr.close()
+
+    def test_merged_output_reaches_eof_before_target_exit(self):
+        with tempfile.TemporaryDirectory(prefix="owned-process-") as directory:
+            cwd = Path(directory).resolve()
+            owner_code = (
+                "import json, pathlib, runpy, subprocess, sys\n"
+                "helper = runpy.run_path(sys.argv[1])\n"
+                "target = 'import os,time; os.close(1); os.close(2); time.sleep(120)'\n"
+                "proc = helper['start_owned_process'](\n"
+                " [sys.executable, '-I', '-S', '-c', target], pathlib.Path.cwd(),\n"
+                " stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,\n"
+                " stderr=subprocess.STDOUT, text=True)\n"
+                "try:\n"
+                " output = proc.stdout.read()\n"
+                " alive = proc.poll() is None\n"
+                "finally:\n"
+                " helper['terminate_process_group'](proc)\n"
+                " helper['unregister_owned_process'](proc)\n"
+                " proc.stdout.close()\n"
+                "print(json.dumps([output, alive, not helper['_OWNED_PROCESSES']]))\n"
+            )
+            # Retained or aliased supervisor output handles would keep read()
+            # blocked until target exit, despite the target closing both outputs.
+            owner = subprocess.Popen(
+                [sys.executable, "-I", "-S", "-c", owner_code, str(SCRIPT_PATH.resolve())],
+                cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            )
+            try:
+                output, error = owner.communicate(timeout=20)
+                self.assertEqual(owner.returncode, 0, error)
+                self.assertEqual(json.loads(output), ["", True, True])
+            finally:
+                if owner.poll() is None:
+                    owner.kill()
+                    owner.wait(timeout=5)
+                owner.stdout.close()
+                owner.stderr.close()
+
+    def test_expired_startup_deadline_never_launches_target(self):
+        with tempfile.TemporaryDirectory(prefix="owned-process-") as directory:
+            cwd = Path(directory).resolve()
+            marker = cwd / "target-started"
+            command = [sys.executable, "-I", "-S", "-c",
+                       "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(marker)]
+            with self.assertRaises(subprocess.TimeoutExpired):
+                AUTOREVIEW.start_owned_process(
+                    command, cwd, deadline=time.monotonic() - 1,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            self.assertFalse(marker.exists())
+            self.assertFalse(AUTOREVIEW._OWNED_PROCESSES)
+
+    def test_absent_inherited_standard_handles_preserve_stdin_eof(self):
+        with tempfile.TemporaryDirectory(prefix="owned-process-") as directory:
+            cwd = Path(directory).resolve()
+            result_path = cwd / "result.json"
+            owner_code = (
+                "import json, pathlib, runpy, sys\n"
+                "helper = runpy.run_path(sys.argv[1])\n"
+                "result = helper['run_with_heartbeat'](\n"
+                " [sys.executable, '-I', '-S', '-c', 'import sys; print(repr(sys.stdin.read()))'],\n"
+                " pathlib.Path.cwd(), label='absent-stdin', max_runtime_seconds=10)\n"
+                "pathlib.Path(sys.argv[2]).write_text(\n"
+                " json.dumps([result.returncode, result.stdout, result.stderr]), encoding='utf-8')\n"
+            )
+            # A detached caller can have no standard handles. The ordinary
+            # Popen boundary supplies EOF for absent stdin; the supervisor must
+            # preserve it while forwarding the requested output pipes.
+            startup = subprocess.STARTUPINFO(
+                dwFlags=subprocess.STARTF_USESTDHANDLES,
+                hStdInput=0, hStdOutput=0, hStdError=0,
+            )
+            owner = subprocess.Popen(
+                [sys.executable, "-I", "-S", "-c", owner_code,
+                 str(SCRIPT_PATH.resolve()), str(result_path)],
+                cwd=cwd, startupinfo=startup, close_fds=True,
+            )
+            try:
+                self.assertEqual(owner.wait(timeout=20), 0)
+            finally:
+                if owner.poll() is None:
+                    owner.kill()
+                    owner.wait(timeout=5)
+            self.assertEqual(json.loads(result_path.read_text(encoding="utf-8")),
+                             [0, "''\n", ""])
+
+    def test_native_startup_error_and_full_dword_exit_code(self):
+        with tempfile.TemporaryDirectory(prefix="owned-process-") as directory:
+            cwd = Path(directory).resolve()
+            missing = str(cwd / "missing.exe")
+            with self.assertRaises(FileNotFoundError) as caught:
+                AUTOREVIEW.start_owned_process(
+                    [missing], cwd, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            self.assertEqual(caught.exception.filename, missing)
+            self.assertFalse(AUTOREVIEW._OWNED_PROCESSES)
+            result = AUTOREVIEW.run_with_heartbeat(
+                [sys.executable, "-I", "-S", "-c",
+                 "import ctypes; stop=ctypes.windll.kernel32.ExitProcess; "
+                 "stop.argtypes=[ctypes.c_uint]; stop(0xC1234567)"],
+                cwd, label="exit-status", max_runtime_seconds=10,
+            )
+            self.assertEqual(result.returncode, 0xC1234567)
+            self.assertFalse(AUTOREVIEW._OWNED_PROCESSES)
 
 
 if __name__ == "__main__":

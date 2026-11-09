@@ -8,6 +8,7 @@ import copy
 import io
 import json
 import os
+import py_compile
 import re
 import runpy
 import shutil
@@ -34,6 +35,17 @@ fixture_git = runpy.run_path(str(SCRIPT.with_name("test-review-harness.py")))["f
 FIXTURES = Path(__file__).with_name("fixtures")
 PRIVATE_KEY_BEGIN_TEXT = "BEGIN " + "PRIVATE KEY"
 RSA_PRIVATE_KEY_BEGIN_TEXT = "BEGIN RSA " + "PRIVATE KEY"
+
+
+@contextlib.contextmanager
+def working_directory(repo: Path):
+    # Main discovers its source boundary from cwd before invoking Git.
+    previous = Path.cwd()
+    try:
+        os.chdir(repo)
+        yield
+    finally:
+        os.chdir(previous)
 
 
 def write_executable(path: Path, text: str) -> Path:
@@ -1161,8 +1173,7 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                         if expect:
                             argv.append("--expect-findings")
                         text = io.StringIO()
-                        with mock.patch.dict(self.helper["main_impl"].__globals__, {
-                            "repo_root": lambda: repo,
+                        with working_directory(repo), mock.patch.dict(self.helper["main_impl"].__globals__, {
                             "prepare_review_prompts": lambda *args: original_prepare(*args) * count,
                             "run_engine": lambda *_: json.dumps({**provider, "review_completion": "complete"}),
                         }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(text), \
@@ -1368,7 +1379,16 @@ class AutoreviewBinaryDeletionTests(unittest.TestCase):
                         self.assert_deletion(repo, captured, asset.name, "local", ref)
                         self.assertEqual(captured.mixed, ())
                         heading = "# Staged Diff" if staged else "# Unstaged Diff"
-                        self.assertIn("Binary files ", captured.text.split(heading, 1)[1])
+                        section = captured.text.split(heading, 1)[1].split("# Unstaged Diff", 1)[0]
+                        self.assertIn("Binary files ", section)
+                        # Skipping an empty side's stat must not suppress the
+                        # nonempty opposite side, including binary deletions.
+                        stat_args = ("--cached",) if staged else ()
+                        if staged and ref:
+                            stat_args += ("--end-of-options", ref)
+                        expected_stat = git(repo, "diff", *self.helper["SAFE_DIFF_FLAGS"], "--stat", *stat_args)
+                        self.assertTrue(expected_stat)
+                        self.assertIn(expected_stat, section)
 
     def test_committed_deletion_is_reviewable_from_pinned_base_commit_and_branch(self):
         with self.asset_repo() as (repo, asset, base):
@@ -1578,6 +1598,28 @@ class AutoreviewBinaryDeletionTests(unittest.TestCase):
 
 
 class AutoreviewHardeningTests(unittest.TestCase):
+    def test_windows_supervisor_loads_source_instead_of_conflicting_bytecode(self) -> None:
+        # Both normal and redirected Python caches are outside the admitted
+        # source-file contract. A valid cache must not choose the implementation.
+        for redirected in (False, True):
+            with self.subTest(redirected=redirected), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                source = root / "windows-owned-process.py"
+                prefix = str(root / "bytecode") if redirected else None
+                with mock.patch.object(sys, "pycache_prefix", prefix):
+                    source.write_text("ORIGIN = 'cached'\n", encoding="utf-8")
+                    cache = py_compile.compile(
+                        str(source), doraise=True,
+                        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+                    )
+                    self.assertTrue(Path(cache).is_file())
+                    source.write_text("ORIGIN = 'source'\n", encoding="utf-8")
+                    module = self.helper["_load_windows_process_module"](str(source))
+                self.assertEqual(module.ORIGIN, "source")
+                self.assertEqual(module.__name__, "autoreview_windows_process")
+                self.assertEqual(module.__file__, str(source))
+                self.assertEqual(module.__spec__.origin, str(source))
+
     def setUp(self) -> None:
         self.helper = load_helper()
 
@@ -1592,7 +1634,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
     @contextlib.contextmanager
     def preparation_fixture(self, *options):
         with tempfile.TemporaryDirectory() as tempdir:
-            repo = init_repo(Path(tempdir))
+            repo = init_repo(Path(tempdir)).resolve()
             # Protected review reads ignore host Git config, including Windows autocrlf.
             git(repo, "config", "core.autocrlf", "false")
             for index in range(24):
@@ -1618,12 +1660,16 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 })
 
             with self.without_reviewer_defaults(), mock.patch.dict(self.helper["main_impl"].__globals__, {
-                "repo_root": lambda: repo,
                 "run_engine": engine,
                 "resolve_engine_binary": lambda *_args: (True, None),
             }), mock.patch.object(sys, "argv", [str(SCRIPT), "--engine", "codex", "--mode", "local", *options]), \
                     contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                yield repo, sends, stdout, stderr
+                previous_cwd = Path.cwd()
+                try:
+                    os.chdir(repo)
+                    yield repo, sends, stdout, stderr
+                finally:
+                    os.chdir(previous_cwd)
 
     @contextlib.contextmanager
     def committed_context_fixture(self, *options, path="src/token_count.py", role="--source-context",
@@ -1813,12 +1859,12 @@ class AutoreviewHardeningTests(unittest.TestCase):
             absent_commit = git(repo, "rev-parse", "HEAD^^").strip()
             with self.assertRaisesRegex(SystemExit, "absent from the reviewed commit"):
                 capture(repo, "src/token_count.py", absent_commit)
-            original = self.helper["read_git_source"]
+            original = self.helper["committed_source_versions"]
 
             def corrupt(*args):
-                return original(*args)._replace(content="wrong object bytes\n")
+                return {path: source._replace(content="wrong object bytes\n") for path, source in original(*args).items()}
 
-            with mock.patch.dict(capture.__globals__, {"read_git_source": corrupt}):
+            with mock.patch.dict(capture.__globals__, {"committed_source_versions": corrupt}):
                 with self.assertRaisesRegex(SystemExit, "do not match the committed blob"):
                     self.helper["main_impl"]()
             self.assertFalse(sends)
@@ -1838,7 +1884,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     source.write_bytes(original_bytes.replace(b"7", b"8"))
                     os.utime(source, ns=(info.st_atime_ns, info.st_mtime_ns))
 
-                name = {"capture": "read_git_source", "preparation": "prepare_review_prompts"}.get(timing, "run_engine")
+                name = {"capture": "committed_source_versions", "preparation": "prepare_review_prompts"}.get(timing, "run_engine")
                 original = self.helper["main_impl"].__globals__[name]
 
                 def mutation(*args):
@@ -2156,7 +2202,15 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 # Explicit evidence has its own initial capture and three fresh
                 # checks; finding membership never adds another content read.
                 self.assertEqual(read.call_count, 5 if explicit else 1)
-                self.assertEqual(fingerprint.call_count, 3 * 27)
+                # Metadata custody also fingerprints .git records; these checks
+                # count each reviewed working file in the three full snapshots.
+                working_files = [repo / name for name in (".gitignore", "source.md", "note.md")]
+                working_files.extend(repo / f"unchanged-{index}.txt" for index in range(24))
+                self.assertCountEqual(
+                    [call.args[0] for call in fingerprint.call_args_list
+                     if not call.args[0].is_relative_to(repo / ".git")],
+                    working_files * 3,
+                )
                 for index in range(24):
                     self.assertEqual(sum(call.args[0] == repo / f"unchanged-{index}.txt"
                                          for call in fingerprint.call_args_list), 3)
@@ -2813,8 +2867,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 return json.dumps({**report, "review_completion": "complete"})
 
             main = self.helper["main_impl"]
-            with mock.patch.dict(main.__globals__, {
-                "repo_root": lambda: repo,
+            with working_directory(repo), mock.patch.dict(main.__globals__, {
                 "run_engine": run_engine,
                 "resolve_engine_binary": lambda _reviewer, _repo: (True, None),
             }):
@@ -2954,8 +3007,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
             argv = [str(SCRIPT), "--engine", "codex", "--mode", "local", "--base", "review-base",
                     *datasets, "--json-output", str(root / "report.json"),
                     "--status-output", str(root / "status.json")]
-            with self.without_reviewer_defaults(), mock.patch.dict(main.__globals__, {
-                "repo_root": lambda: repo, "run_engine": engine,
+            with working_directory(repo), self.without_reviewer_defaults(), mock.patch.dict(main.__globals__, {
+                "run_engine": engine,
                 "resolve_engine_binary": lambda _reviewer, _repo: (True, None),
             }):
                 output = io.StringIO()
@@ -3097,8 +3150,8 @@ class AutoreviewHardeningTests(unittest.TestCase):
                             "--base", base if mode == "local" else head,
                             "--json-output", str(outputs / "report.json"),
                             "--status-output", str(outputs / "status.json")]
-                    with self.without_reviewer_defaults(), mock.patch.dict(self.helper["main_impl"].__globals__, {
-                        "repo_root": lambda: repo, "run_engine": engine,
+                    with working_directory(repo), self.without_reviewer_defaults(), mock.patch.dict(self.helper["main_impl"].__globals__, {
+                        "run_engine": engine,
                     }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                         if exit_code is None:
                             with self.assertRaises(self.helper["ReviewerUnavailable"]):
@@ -3290,8 +3343,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                             argv.extend(["--require-finding", needle])
                         if expect:
                             argv.append("--expect-findings")
-                        with self.without_reviewer_defaults(), mock.patch.dict(self.helper["main_impl"].__globals__, {
-                            "repo_root": lambda: repo,
+                        with working_directory(repo), self.without_reviewer_defaults(), mock.patch.dict(self.helper["main_impl"].__globals__, {
                             "build_review_prompts": lambda *_args: ["synthetic pack"] * count,
                             "run_engine": lambda *_args: json.dumps({**provider, "review_completion": "complete"}),
                         }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -3426,8 +3478,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     engine = mock.Mock(side_effect=reply)
                     stdout, stderr = io.StringIO(), io.StringIO()
                     main = self.helper["main_impl"]
-                    with mock.patch.dict(main.__globals__, {
-                        "repo_root": lambda: repo,
+                    with working_directory(repo), mock.patch.dict(main.__globals__, {
                         "resolve_engine_binary": lambda *_args: (True, None),
                         "run_engine": engine,
                     }), mock.patch.object(sys, "argv", argv), \
@@ -3517,8 +3568,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                                 expected_exit = 2 if not complete else int(not has_finding) if expect else int(has_finding)
                                 finalized = mock.Mock(wraps=status_fn)
                                 text = io.StringIO()
-                                with mock.patch.dict(self.helper["main_impl"].__globals__, {
-                                    "repo_root": lambda: repo,
+                                with working_directory(repo), mock.patch.dict(self.helper["main_impl"].__globals__, {
                                     "build_review_prompts": lambda *_: ["synthetic pack"] * len(completions),
                                     "run_engine": engine, "review_status": finalized,
                                 }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(text), \
@@ -3591,8 +3641,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                                 "--output", str(human)]
                         engine = mock.Mock(side_effect=[clean] * (count - 1) + [failure])
                         stdout = io.StringIO()
-                        with mock.patch.dict(self.helper["main_impl"].__globals__, {
-                            "repo_root": lambda: repo,
+                        with working_directory(repo), mock.patch.dict(self.helper["main_impl"].__globals__, {
                             "build_review_prompts": lambda *_args: ["synthetic pack"] * count,
                             "run_engine": engine,
                         }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
@@ -3667,6 +3716,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
     def test_cli_status_for_launched_codex_and_claude_failures(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             git(repo, "commit", "-q", "--allow-empty", "-m", "base")
             (repo / "source.txt").write_text("review me\n")
@@ -3677,7 +3727,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                     with self.subTest(engine=engine, timeout=timeout):
                         # Help/version preflights succeed; only the launched review fails.
                         injected = "import time; sys.stdin.read(); time.sleep(30)" if timeout else "print('DIAGNOSTIC_SENTINEL\\x1b[31m', file=sys.stderr); raise SystemExit(17)"
-                        executable = write_executable(root / engine, source.replace('record = os.environ["AUTOREVIEW_FAKE_RECORD"]', injected + '\nrecord = os.environ["AUTOREVIEW_FAKE_RECORD"]'))
+                        executable = write_executable(root / "bin" / engine, source.replace('record = os.environ["AUTOREVIEW_FAKE_RECORD"]', injected + '\nrecord = os.environ["AUTOREVIEW_FAKE_RECORD"]'))
                         sidecar = root / "status.json"
                         report = root / "result.json"
                         argv = [sys.executable, str(SCRIPT), "--mode", "local", "--engine", engine,
@@ -3811,6 +3861,7 @@ time.sleep(60)
     def test_cli_codex_model_fallback_opt_out_preserves_failed_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             git(repo, "commit", "-q", "--allow-empty", "-m", "base")
             (repo / "source.txt").write_text("review me\n")
@@ -3827,7 +3878,7 @@ time.sleep(60)
                     'f"The model {model} does not exist or you do not have access to it."}))\n'
                     '    raise SystemExit(17)\n'
                 )
-                executable = write_executable(root / "codex", fake_codex_script().replace(
+                executable = write_executable(root / "bin" / "codex", fake_codex_script().replace(
                     'print("fake codex ok")', failure + 'print("fake codex ok")',
                 ))
                 for disabled in (True, False):
@@ -5596,6 +5647,7 @@ time.sleep(60)
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             repo = init_repo(root)
+            selected_git = self.helper["resolve_git"](repo)
             repo_bin = repo / "bin"
             trusted_bin = root / "trusted-bin"
             repo_bin.mkdir()
@@ -5610,7 +5662,7 @@ time.sleep(60)
                 },
                 clear=False,
             ):
-                env = self.helper["safe_git_env"](repo)
+                env = self.helper["safe_git_env"](repo, selected_git=selected_git)
 
         self.assertNotIn(str(repo_bin.resolve()), env["PATH"].split(os.pathsep))
         self.assertIn(str(trusted_bin.resolve()), env["PATH"].split(os.pathsep))
@@ -5651,13 +5703,14 @@ time.sleep(60)
     def test_git_preflight_failures_stop_before_target_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             for body, diagnostic, minimum in (
                 ("exit 7", "exit 7", 0),
                 ("exec sleep 60", "timed out after 10s", 9),
             ):
                 with self.subTest(diagnostic=diagnostic):
-                    binary = write_executable(root / f"git-stub-{minimum}", f"#!/bin/sh\n{body}\n")
+                    binary = write_executable(root / "bin" / f"git-stub-{minimum}", f"#!/bin/sh\n{body}\n")
                     started = time.monotonic()
                     result = subprocess.run(
                         [sys.executable, str(SCRIPT), "--mode", "local", "--dry-run"],
@@ -5678,8 +5731,9 @@ time.sleep(60)
     def test_git_override_uses_trusted_resolution_and_preserves_git_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
-            binary = write_executable(root / "git-stub", "#!/bin/sh\nexit 0\n")
+            binary = write_executable(root / "bin" / "git-stub", "#!/bin/sh\nexit 0\n")
             developer = str(root / "Xcode.app/Contents/Developer")
             with mock.patch.dict(os.environ, {"AUTOREVIEW_GIT": str(binary), "DEVELOPER_DIR": developer,
                                                "GIT_DIR": "untrusted", "DYLD_INSERT_LIBRARIES": "untrusted"}):
@@ -5748,6 +5802,216 @@ time.sleep(60)
                 self.helper["validate_evidence_file"](repo, "link.md", "--dataset")
             with self.assertRaisesRegex(SystemExit, "symlinked"):
                 self.helper["capture_evidence_file"](repo, str(link.resolve().parent / "link.md"), "--prompt-file")
+
+    @unittest.skipIf(os.name == "nt", "uses executable POSIX fixtures and symbolic links")
+    def test_claude_checks_effective_settings_before_probe_and_preserves_trusted_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "bin").mkdir()
+            repo, upstream, config = root / "repo", root / "upstream", root / ".claude"
+            for path in (repo, upstream, config):
+                path.mkdir()
+            source_settings = upstream / "settings.json"
+            source_settings.write_text("{}")
+            settings = config / "settings.json"
+            record, calls = root / "record.json", root / "calls.jsonl"
+            fixture = fake_claude_script().replace(
+                "args = sys.argv[1:]", "args = sys.argv[1:]\n"
+                "with open(os.environ['AUTOREVIEW_FAKE_CALLS'], 'a') as out:\n"
+                "    out.write(json.dumps({'argv': args, 'config': os.environ.get('CLAUDE_CONFIG_DIR')}) + '\\n')",
+            )
+            binary = write_executable(root / "bin" / "claude", fixture)
+            args = argparse.Namespace(claude_bin=str(binary), model=None, tools=False,
+                                      thinking=None, stream_engine_output=False)
+            environment = {"PATH": os.environ.get("PATH", ""), "HOME": str(root),
+                           "USERPROFILE": str(root), "AUTOREVIEW_FAKE_CALLS": str(calls),
+                           "AUTOREVIEW_FAKE_RECORD": str(record)}
+            boundary = self.helper["UNTRUSTED_SOURCE_ROOTS"]
+            for explicit in (False, True):
+                with self.subTest(explicit=explicit), mock.patch.dict(os.environ, environment, clear=True):
+                    if explicit:
+                        os.environ["CLAUDE_CONFIG_DIR"] = str(config)
+                    token = boundary.set((repo, upstream))
+                    try:
+                        # Validation permits absent user settings without creating them.
+                        env = self.helper["safe_engine_env"](repo, engine="claude")
+                        self.assertEqual(env.get("CLAUDE_CONFIG_DIR"), str(config) if explicit else None)
+                        self.assertFalse(settings.exists())
+                        settings.symlink_to(source_settings)
+                        with self.assertRaisesRegex(SystemExit, "Claude configuration.*outside"):
+                            self.helper["run_claude"](args, repo, "fixture review")
+                        self.assertFalse(calls.exists(), "source-owned settings reached the version probe")
+                        settings.unlink()
+                        # Trusted settings preserve the supported user-settings route.
+                        settings.write_text('{"theme":"dark"}')
+                        self.helper["run_claude"](args, repo, "fixture review")
+                        launches = [json.loads(line) for line in calls.read_text().splitlines()]
+                        live = launches[-1]
+                        self.assertIn("--safe-mode", live["argv"])
+                        self.assertEqual(live["argv"][live["argv"].index("--setting-sources") + 1], "user")
+                        self.assertEqual(live["config"], str(config) if explicit else None)
+                        self.assertEqual(settings.read_text(), '{"theme":"dark"}')
+                        calls.unlink()
+                        record.unlink()
+                        settings.unlink()
+                    finally:
+                        boundary.reset(token)
+                        for path in (settings, calls, record):
+                            path.unlink(missing_ok=True)
+            # A trusted HOME does not admit a default config directory owned by a source.
+            token = boundary.set((repo, config))
+            try:
+                with mock.patch.dict(os.environ, environment, clear=True), \
+                        self.assertRaisesRegex(SystemExit, "Claude configuration.*outside"):
+                    self.helper["run_claude"](args, repo, "fixture review")
+                self.assertFalse(calls.exists())
+            finally:
+                boundary.reset(token)
+
+    @unittest.skipIf(os.name == "nt", "uses executable POSIX fixtures and symbolic links")
+    def test_claude_rechecks_settings_after_preflight_before_live_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "bin").mkdir()
+            repo, source, config = root / "repo", root / "source", root / "config"
+            for path in (repo, source, config):
+                path.mkdir()
+            settings = config / "settings.json"
+            settings.write_text("{}")
+            source_settings = source / "settings.json"
+            source_settings.write_text("{}")
+            record = root / "live.json"
+            fixture = fake_claude_script().replace(
+                'if "--help" in args or "-h" in args:',
+                'if "--help" in args or "-h" in args:\n'
+                '    settings = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "settings.json"\n'
+                '    settings.unlink()\n'
+                '    settings.symlink_to(os.environ["AUTOREVIEW_FAKE_SETTINGS"])',
+            )
+            binary = write_executable(root / "bin" / "claude", fixture)
+            args = argparse.Namespace(claude_bin=str(binary), model=None, tools=False,
+                                      thinking=None, stream_engine_output=False)
+            token = self.helper["UNTRUSTED_SOURCE_ROOTS"].set((repo, source))
+            try:
+                with mock.patch.dict(os.environ, {
+                    "PATH": os.environ.get("PATH", ""), "HOME": str(root), "USERPROFILE": str(root),
+                    "CLAUDE_CONFIG_DIR": str(config), "AUTOREVIEW_FAKE_RECORD": str(record),
+                    "AUTOREVIEW_FAKE_SETTINGS": str(source_settings),
+                }, clear=True), self.assertRaisesRegex(SystemExit, "Claude configuration.*outside"):
+                    self.helper["run_claude"](args, repo, "fixture review")
+                self.assertTrue(settings.is_symlink(), "fixture must reach the successful help probe")
+                self.assertFalse(record.exists(), "source-owned settings reached live launch")
+            finally:
+                self.helper["UNTRUSTED_SOURCE_ROOTS"].reset(token)
+
+    def test_pi_config_leaves_cannot_come_from_any_reviewed_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = root / "repo"
+            upstream = root / "upstream"
+            config = root / "operator"
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            for path in (repo, upstream, config):
+                path.mkdir()
+            boundary = self.helper["UNTRUSTED_SOURCE_ROOTS"]
+            token = boundary.set((repo, upstream))
+            try:
+                for owner in (repo, upstream):
+                    for name in ("models.json", "auth.json", "settings.json"):
+                        with self.subTest(owner=owner.name, file=name):
+                            source = owner / name
+                            source.write_text("{}")
+                            link = config / name
+                            try:
+                                link.symlink_to(source)
+                            except OSError as exc:
+                                if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                                    self.skipTest("Windows symlink privilege is not available")
+                                raise
+                            try:
+                                with mock.patch.dict(os.environ, {
+                                    "PATH": str(bin_dir), "HOME": str(root), "USERPROFILE": str(root),
+                                    "PI_CODING_AGENT_DIR": str(config),
+                                }, clear=True), self.assertRaisesRegex(SystemExit, "Pi configuration.*outside"):
+                                    self.helper["safe_engine_env"](repo, engine="pi")
+                            finally:
+                                link.unlink()
+            finally:
+                boundary.reset(token)
+
+    def test_pi_default_config_is_checked_and_pinned(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = root / "repo"
+            repo.mkdir()
+            config = root / ".pi" / "agent"
+            config.mkdir(parents=True)
+            boundary = self.helper["UNTRUSTED_SOURCE_ROOTS"]
+            token = boundary.set((repo, config))
+            try:
+                with mock.patch.dict(os.environ, {"HOME": str(root), "USERPROFILE": str(root),
+                                                  "PI_CODING_AGENT_DIR": ""}, clear=True):
+                    with self.assertRaisesRegex(SystemExit, "Pi configuration.*outside"):
+                        self.helper["safe_engine_env"](repo, engine="pi")
+            finally:
+                boundary.reset(token)
+            with mock.patch.dict(os.environ, {"HOME": str(root), "USERPROFILE": str(root),
+                                              "PI_CODING_AGENT_DIR": ""}, clear=True):
+                env = self.helper["safe_engine_env"](repo, engine="pi")
+            self.assertEqual(env["PI_CODING_AGENT_DIR"], str(config))
+            self.assertEqual(list(config.iterdir()), [], "admission must not create auth or settings")
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(os, "name", "nt"):
+                with self.assertRaisesRegex(SystemExit, "PI_CODING_AGENT_DIR.*USERPROFILE"):
+                    self.helper["pi_config_directory"](repo)
+
+    def test_pi_source_config_refuses_before_the_version_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = root / "repo"
+            upstream = root / "upstream"
+            repo.mkdir()
+            upstream.mkdir()
+            boundary = self.helper["UNTRUSTED_SOURCE_ROOTS"]
+            token = boundary.set((repo, upstream))
+            try:
+                args = argparse.Namespace(pi_bin=sys.executable)
+                with mock.patch.dict(os.environ, {"PI_CODING_AGENT_DIR": str(upstream)}, clear=True), \
+                        mock.patch.dict(self.helper["ensure_pi_isolation_supported"].__globals__,
+                                        {"run": mock.Mock(side_effect=AssertionError("probe executed"))}), \
+                        self.assertRaisesRegex(SystemExit, "Pi configuration.*outside"):
+                    self.helper["ensure_pi_isolation_supported"](args, repo)
+            finally:
+                boundary.reset(token)
+
+    def test_claude_mtls_paths_exclude_sources_and_preserve_operator_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = root / "repo"
+            upstream = root / "upstream"
+            for path in (repo, upstream):
+                path.mkdir()
+            boundary = self.helper["UNTRUSTED_SOURCE_ROOTS"]
+            token = boundary.set((repo, upstream))
+            keys = ("CLAUDE_CODE_CLIENT_CERT", "CLAUDE_CODE_CLIENT_KEY")
+            try:
+                for owner in (repo, upstream, root):
+                    with self.subTest(owner=owner.name):
+                        identity = owner / "identity.pem"
+                        identity.write_text("synthetic identity fixture")
+                        values = {key: str(identity) for key in keys}
+                        values["CLAUDE_CODE_CLIENT_KEY_PASSPHRASE"] = str(upstream / "scalar-value")
+                        with mock.patch.dict(os.environ, values, clear=True):
+                            env = self.helper["safe_engine_env"](repo, engine="claude")
+                        for key in keys:
+                            if owner == root:
+                                self.assertEqual(env[key], str(identity))
+                            else:
+                                self.assertNotIn(key, env)
+                        self.assertEqual(env["CLAUDE_CODE_CLIENT_KEY_PASSPHRASE"],
+                                         values["CLAUDE_CODE_CLIENT_KEY_PASSPHRASE"])
+            finally:
+                boundary.reset(token)
 
     def test_safe_engine_env_strips_process_injection_variables(self) -> None:
         old = os.environ.copy()
@@ -5880,107 +6144,971 @@ time.sleep(60)
                 os.environ.clear()
                 os.environ.update(old)
 
-    def test_terminate_process_group_uses_windows_process_api(self) -> None:
-        proc = mock.Mock(pid=1234)
-        fake_taskkill = r"C:\Windows\System32\taskkill.exe"
-        with mock.patch.object(os, "name", "nt"), mock.patch.dict(
-            self.helper["terminate_process_group"].__globals__,
-            {"_resolve_windows_taskkill": lambda: fake_taskkill},
-        ), mock.patch(
-            "subprocess.run",
-            return_value=subprocess.CompletedProcess([], 0),
-        ) as run:
-            self.helper["terminate_process_group"](proc, grace_seconds=0.01)
-        argv = run.call_args.args[0]
-        self.assertEqual(argv, [fake_taskkill, "/PID", "1234", "/T", "/F"])
-        # A repo-local taskkill.exe on PATH/CWD must never be reachable here:
-        # the resolved argv[0] has to be an absolute path, never the bare name.
-        self.assertTrue(PureWindowsPath(argv[0]).is_absolute())
-        self.assertNotEqual(argv[0], "taskkill")
-        proc.kill.assert_not_called()
+    def wait_for_process_witness(self, path: Path) -> str:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if path.exists():
+                value = path.read_text(encoding="utf-8")
+                if value:
+                    return value
+            time.sleep(0.01)
+        self.fail(f"process did not write {path.name}")
 
-    def test_successful_windows_taskkill_still_waits_for_owned_processes(self) -> None:
+    @contextlib.contextmanager
+    def windows_process_handle(self, pid: int):
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel.TerminateProcess.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.CloseHandle.restype = wintypes.BOOL
+        # Retain the exact process identity even after its PID becomes reusable.
+        handle = kernel.OpenProcess(0x00100001, False, pid)  # SYNCHRONIZE | TERMINATE
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            yield lambda milliseconds: kernel.WaitForSingleObject(handle, milliseconds)
+        finally:
+            try:
+                if kernel.WaitForSingleObject(handle, 0) == 258:
+                    if not kernel.TerminateProcess(handle, 1):
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    self.assertEqual(kernel.WaitForSingleObject(handle, 5000), 0)
+            finally:
+                kernel.CloseHandle(handle)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_outer_deferral_cancels_registration_and_ready_before_go(self) -> None:
+        module = self.helper["_load_windows_process_module"](
+            str(SCRIPT.with_name("windows-owned-process.py")))
+        namespace = self.helper["start_owned_process"].__globals__
+        real_spawn = module.spawn
+        real_read = module.read_frame
+        real_write = module.write_frame
+        real_register = self.helper["register_owned_process"]
+        real_sweep = self.helper["terminate_owned_processes"]
+        interrupted = self.helper["EngineInterrupted"]
+        for phase in ("registration", "ready", "ready-close-error"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as handles:
+                cwd = Path(temp).resolve()
+                witness = cwd / "must-not-run"
+                startups = []
+                supervisor_waits = []
+                events = []
+                writes = []
+                finishes = []
+                interruptions = []
+                close_failures = []
+                close_error = OSError("private-control-close-detail")
+                ready = threading.Event()
+                release_ready = threading.Event()
+
+                def cancel():
+                    # The outer deferral owns delivery, but cannot authorize GO.
+                    signal.raise_signal(signal.SIGTERM)
+                    signal.raise_signal(signal.SIGINT)
+
+                def observe_spawn(*args, **kwargs):
+                    startup = real_spawn(*args, **kwargs)
+                    startups.append(startup)
+                    supervisor_waits.append(handles.enter_context(
+                        self.windows_process_handle(startup.process.pid)))
+                    finish = startup.finish
+
+                    def observe_finish(*finish_args, **finish_kwargs):
+                        finishes.append(True)
+                        return finish(*finish_args, **finish_kwargs)
+
+                    startup.finish = observe_finish
+                    if phase == "ready-close-error":
+                        close = module.os.close
+                        reader = startup.reader
+
+                        def fail_after_close(descriptor):
+                            close(descriptor)
+                            if descriptor == reader and not close_failures:
+                                close_failures.append(True)
+                                raise close_error
+
+                        handles.enter_context(mock.patch.object(module.os, "close", fail_after_close))
+                    if phase.startswith("ready"):
+                        wait = startup.done.wait
+
+                        def signal_during_ready(timeout):
+                            self.assertTrue(ready.wait(10), "supervisor did not send READY")
+                            cancel()
+                            release_ready.set()
+                            return wait(timeout)
+
+                        startup.done.wait = signal_during_ready
+                    return startup
+
+                def register_then_cancel(proc, job=None):
+                    real_register(proc, job)
+                    if phase == "registration":
+                        cancel()
+
+                def hold_ready(descriptor):
+                    frame = real_read(descriptor)
+                    if phase.startswith("ready") and frame.get("operation") == "ready":
+                        # Consume a real READY, then let the main thread's actual
+                        # signal handler run before the worker decides about GO.
+                        ready.set()
+                        if not release_ready.wait(10):
+                            raise TimeoutError("test did not release the READY gate")
+                    return frame
+
+                def observe_write(descriptor, frame):
+                    writes.append(frame)
+                    return real_write(descriptor, frame)
+
+                def observe_sweep(*args, **kwargs):
+                    events.append("sweep")
+                    return real_sweep(*args, **kwargs)
+
+                def invocation():
+                    with self.helper["deferred_owned_process_signals"]():
+                        with self.assertRaises(interrupted) as raised:
+                            self.helper["start_owned_process"](
+                                [sys.executable, "-I", "-S", "-c",
+                                 "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(witness)],
+                                cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True,
+                            )
+                        interruptions.append(raised.exception)
+                        self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                        self.assertEqual(events, [])
+                        self.assertEqual(namespace["_OWNED_PROCESSES"], {})
+                        self.assertEqual(supervisor_waits[0](5000), 0)
+                        events.append("local cleanup")
+                    self.fail("outermost deferral did not deliver cancellation")
+
+                try:
+                    with mock.patch.object(module, "spawn", observe_spawn), \
+                            mock.patch.object(module, "read_frame", hold_ready), \
+                            mock.patch.object(module, "write_frame", observe_write), \
+                            mock.patch.dict(namespace, {
+                                "register_owned_process": register_then_cancel,
+                                "terminate_owned_processes": observe_sweep,
+                                "main_impl": invocation,
+                            }):
+                        self.assertEqual(self.helper["main"](), 128 + signal.SIGTERM)
+                    self.assertEqual(events, ["local cleanup", "sweep"])
+                    self.assertEqual(finishes, [] if phase == "registration" else [True])
+                    if phase == "ready-close-error":
+                        self.assertEqual(close_failures, [True])
+                        self.assertIn(close_error, interruptions[0].cleanup_errors)
+                        self.assertIsInstance(interruptions[0].startup_failure, subprocess.TimeoutExpired)
+                    self.assertEqual(writes, [])
+                    self.assertFalse(witness.exists())
+                    self.assertEqual(len(startups), 1)
+                    startup = startups[0]
+                    self.assertFalse(startup.go_sent)
+                    self.assertIsNone(startup.reader)
+                    self.assertIsNone(startup.writer)
+                    self.assertTrue(startup.process.stdout.closed)
+                    self.assertTrue(startup.process.stderr.closed)
+                finally:
+                    release_ready.set()
+                    for startup in startups:
+                        if startup.process.pid in namespace["_OWNED_PROCESSES"]:
+                            self.helper["finish_owned_process"](
+                                startup.process, startup.abort, startup.close)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_restoration_recovers_cancel_before_worker_go(self) -> None:
+        module = self.helper["_load_windows_process_module"](
+            str(SCRIPT.with_name("windows-owned-process.py")))
+        namespace = self.helper["start_owned_process"].__globals__
+        real_spawn, real_read, real_write = module.spawn, module.read_frame, module.write_frame
+        real_signal = signal.signal
+        ready, release = threading.Event(), threading.Event()
+        startups, waits, descriptors, writes, outcomes, injected = [], [], [], [], [], []
+        worker = None
+        decisions_before_deadline = []
+        with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as handles:
+            cwd = Path(temp).resolve()
+            witness = cwd / "must-not-run"
+            for number in self.helper["_handled_signal_numbers"]():
+                handles.callback(real_signal, number, signal.getsignal(number))
+            # Give restored SIGINT an explicit prior disposition instead of
+            # depending on an ambient ignored signal or returning callback.
+            real_signal(signal.SIGINT, signal.default_int_handler)
+
+            def observe_spawn(*args, **kwargs):
+                startup = real_spawn(*args, **kwargs)
+                startups.append(startup)
+                descriptors.extend((startup.reader, startup.writer))
+                waits.append(handles.enter_context(self.windows_process_handle(startup.process.pid)))
+                return startup
+
+            def hold_ready(descriptor):
+                frame = real_read(descriptor)
+                if frame.get("operation") == "ready":
+                    ready.set()
+                    if not release.wait(15):
+                        raise TimeoutError("test did not release READY after restoration")
+                return frame
+
+            def observe_write(descriptor, frame):
+                writes.append(frame)
+                return real_write(descriptor, frame)
+
+            def launch_worker():
+                try:
+                    proc = self.helper["start_owned_process"](
+                        [sys.executable, "-I", "-S", "-c",
+                         "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", str(witness)],
+                        cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True,
+                    )
+                    outcomes.append(proc)
+                except BaseException as error:
+                    outcomes.append(error)
+
+            try:
+                with mock.patch.object(module, "spawn", observe_spawn), \
+                        mock.patch.object(module, "read_frame", hold_ready), \
+                        mock.patch.object(module, "write_frame", observe_write):
+                    with self.assertRaises(self.helper["EngineInterrupted"]) as raised:
+                        with self.helper["OwnedProcessSignalHandlers"]() as scope:
+                            state = scope.state
+                            decision_lock = state.decision_lock
+
+                            class InterruptedLockEntry:
+                                def __enter__(self):
+                                    decision_lock.acquire()
+                                    try:
+                                        if (threading.current_thread() is threading.main_thread()
+                                                and state.signals and not injected):
+                                            injected.append(state.signals["first"])
+                                            # The first callback recorded SIGTERM but
+                                            # has not finished its guarded transition.
+                                            signal.raise_signal(signal.SIGINT)
+                                    except BaseException:
+                                        # The fault belongs to callback entry, not a
+                                        # leaked fixture lock that blocks the worker.
+                                        decision_lock.release()
+                                        raise
+                                    if threading.current_thread() is not threading.main_thread():
+                                        decisions_before_deadline.append(
+                                            time.monotonic() < startups[0].deadline)
+                                    return self
+
+                                def __exit__(self, *exc_info):
+                                    decision_lock.release()
+
+                            def restore_then_interrupt(number, handler):
+                                result = real_signal(number, handler)
+                                if (number == signal.SIGINT and handler is signal.default_int_handler
+                                        and ready.is_set() and not injected):
+                                    signal.raise_signal(signal.SIGTERM)
+                                return result
+
+                            # Keep both hooks live through the owning scope exit.
+                            handles.enter_context(mock.patch.object(state, "decision_lock", InterruptedLockEntry()))
+                            handles.enter_context(mock.patch.object(signal, "signal", restore_then_interrupt))
+                            worker = threading.Thread(target=launch_worker, daemon=True)
+                            worker.start()
+                            self.assertTrue(ready.wait(10), "worker did not consume native READY")
+                            self.assertIn(startups[0].process.pid, namespace["_OWNED_PROCESSES"])
+                    self.assertEqual(injected, [signal.SIGTERM])
+                    self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                    # Scope recovery must leave durable cancellation for a worker
+                    # that retained the state but has not made its GO decision.
+                    self.assertTrue(worker.is_alive())
+                    self.assertFalse(startups[0].cancelled)
+                    release.set()
+                    worker.join(timeout=10)
+                    self.assertFalse(worker.is_alive())
+                    self.assertEqual(len(outcomes), 1)
+                    self.assertIsNot(outcomes[0], raised.exception)
+                    self.assertEqual(outcomes[0].code, raised.exception.code)
+                    self.assertEqual(decisions_before_deadline, [True])
+                    self.assertEqual(writes, [])
+                    self.assertFalse(witness.exists())
+                    self.assertEqual(len(startups), 1)
+                    startup = startups[0]
+                    self.assertFalse(startup.go_sent)
+                    self.assertEqual(waits[0](5000), 0)
+                    self.assertEqual(namespace["_OWNED_PROCESSES"], {})
+                    self.assertIsNone(startup.reader)
+                    self.assertIsNone(startup.writer)
+                    for descriptor in descriptors:
+                        with self.assertRaises(OSError):
+                            os.fstat(descriptor)
+                    self.assertTrue(startup.process.stdout.closed)
+                    self.assertTrue(startup.process.stderr.closed)
+            finally:
+                release.set()
+                if worker is not None:
+                    worker.join(timeout=10)
+                for startup in startups:
+                    if startup.process.pid in namespace["_OWNED_PROCESSES"]:
+                        self.helper["finish_owned_process"](
+                            startup.process, startup.abort, startup.close)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_go_wins_signal_overlap_retains_launch_outcome(self) -> None:
+        module = self.helper["_load_windows_process_module"](
+            str(SCRIPT.with_name("windows-owned-process.py")))
+        namespace = self.helper["start_owned_process"].__globals__
+        real_spawn = module.spawn
+        real_write = module.write_frame
+        real_sweep = self.helper["terminate_owned_processes"]
+        startups, native_waits, records, sweeps, interruptions = [], [], [], [], []
+        control_descriptors = []
+        entered = threading.Event()
+        release = threading.Event()
+        observer = None
+        with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as handles:
+            cwd = Path(temp).resolve()
+            witness = cwd / "target.pid"
+            with self.helper["OwnedProcessSignalHandlers"]() as scope:
+                state = scope.state
+                real_decision = state.launch_decision
+
+                @contextlib.contextmanager
+                def hold_authorized_decision():
+                    with real_decision() as allowed:
+                        # Authorization acquired the real shared guard first.
+                        # Pause before GO commits so the signal must arbitrate.
+                        entered.set()
+                        if not release.wait(10):
+                            raise TimeoutError("test did not release GO arbitration")
+                        yield allowed
+
+                def release_after_signal_recorded():
+                    try:
+                        deadline = time.monotonic() + 5
+                        while time.monotonic() < deadline:
+                            if state.signals:
+                                records.append((state.signals["first"], startups[0].go_sent))
+                                return
+                            time.sleep(0.001)
+                    finally:
+                        release.set()
+
+                def observe_spawn(*args, **kwargs):
+                    startup = real_spawn(*args, **kwargs)
+                    startups.append(startup)
+                    control_descriptors.extend((startup.reader, startup.writer))
+                    native_waits.append(handles.enter_context(
+                        self.windows_process_handle(startup.process.pid)))
+                    wait = startup.done.wait
+
+                    def interrupt_while_guard_held(timeout):
+                        nonlocal observer
+                        self.assertTrue(entered.wait(10), "worker did not acquire GO guard")
+                        observer = threading.Thread(target=release_after_signal_recorded)
+                        observer.start()
+                        # This actual main-thread handler records SIGTERM, then
+                        # waits for the worker's already-owned decision guard.
+                        signal.raise_signal(signal.SIGTERM)
+                        return wait(timeout)
+
+                    startup.done.wait = interrupt_while_guard_held
+                    return startup
+
+                def observe_go(descriptor, frame):
+                    real_write(descriptor, frame)
+                    # The real target executes before outer deferral permits a
+                    # sweep. Retain its exact native identity for the exit check.
+                    pid = int(self.wait_for_process_witness(witness))
+                    wait = handles.enter_context(self.windows_process_handle(pid))
+                    native_waits.append(wait)
+                    self.assertEqual(wait(0), 258)
+
+                def observe_sweep(*args, **kwargs):
+                    sweeps.append(True)
+                    real_sweep(*args, **kwargs)
+
+                try:
+                    with mock.patch.object(state, "launch_decision", hold_authorized_decision), \
+                            mock.patch.object(module, "spawn", observe_spawn), \
+                            mock.patch.object(module, "write_frame", observe_go), \
+                            mock.patch.dict(namespace, {"terminate_owned_processes": observe_sweep}):
+                        with self.assertRaises(self.helper["EngineInterrupted"]) as raised:
+                            with self.helper["deferred_owned_process_signals"]():
+                                try:
+                                    self.helper["start_owned_process"](
+                                        [sys.executable, "-I", "-S", "-c",
+                                         "import os,pathlib,sys,time; "
+                                         "p=pathlib.Path(sys.argv[1]); q=p.with_suffix('.pending'); "
+                                         "q.write_text(str(os.getpid())); q.replace(p); time.sleep(120)",
+                                         str(witness)], cwd, stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                    )
+                                except self.helper["EngineInterrupted"] as interrupted:
+                                    interruptions.append(interrupted)
+                                    self.assertEqual(sweeps, [])
+                                    self.assertEqual(namespace["_OWNED_PROCESSES"], {})
+                                    raise
+                        self.assertEqual(sweeps, [True])
+                    self.assertEqual(records, [(signal.SIGTERM, False)])
+                    self.assertEqual(len(interruptions), 1)
+                    self.assertIs(raised.exception, interruptions[0])
+                    self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                    self.assertIsInstance(raised.exception.__cause__, module.LaunchIndeterminate)
+                    self.assertIs(raised.exception.startup_failure, raised.exception.__cause__)
+                    self.assertIsNone(raised.exception.__cause__.__cause__)
+                    self.assertNotIn(str(witness), str(raised.exception.__cause__))
+                    self.assertEqual(len(native_waits), 2)
+                    for wait in native_waits:
+                        self.assertEqual(wait(5000), 0)
+                    startup = startups[0]
+                    self.assertTrue(startup.go_sent)
+                    self.assertFalse(startup.worker.is_alive())
+                    self.assertIsNone(startup.reader)
+                    self.assertIsNone(startup.writer)
+                    for descriptor in control_descriptors:
+                        with self.assertRaises(OSError):
+                            os.fstat(descriptor)
+                    self.assertTrue(startup.process.stdout.closed)
+                    self.assertTrue(startup.process.stderr.closed)
+                finally:
+                    release.set()
+                    if observer is not None:
+                        observer.join(timeout=10)
+                        self.assertFalse(observer.is_alive())
+                    for startup in startups:
+                        if startup.process.pid in namespace["_OWNED_PROCESSES"]:
+                            self.helper["finish_owned_process"](
+                                startup.process, startup.abort, startup.close)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_successful_start_restore_failure_is_indeterminate(self) -> None:
+        self.assert_successful_start_restore_outcome("error")
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_successful_start_restore_cancellation_retains_outcome(self) -> None:
+        for fault in ("owned-signal", "restored-signal"):
+            with self.subTest(fault=fault):
+                self.assert_successful_start_restore_outcome(fault)
+
+    def assert_successful_start_restore_outcome(self, fault: str) -> None:
+        module = self.helper["_load_windows_process_module"](
+            str(SCRIPT.with_name("windows-owned-process.py")))
+        real_spawn = module.spawn
+        real_signal = signal.signal
+        restore_error = OSError("private-handler-restore-detail")
+        startups = []
+        target_waits = []
+        successful = []
+        faults = []
+        cancellations = []
+        with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as handles:
+            cwd = Path(temp).resolve()
+            witness = cwd / "target.pid"
+            # A restored SIGINT must raise independently of the test runner's
+            # ambient disposition (which may be SIG_IGN or a returning callback).
+            ambient_int = signal.getsignal(signal.SIGINT)
+            handles.callback(real_signal, signal.SIGINT, ambient_int)
+            real_signal(signal.SIGINT, signal.default_int_handler)
+            previous = {number: signal.getsignal(number)
+                        for number in self.helper["_handled_signal_numbers"]()}
+            for number, handler in previous.items():
+                handles.callback(real_signal, number, handler)
+
+            def observe_spawn(*args, **kwargs):
+                startup = real_spawn(*args, **kwargs)
+                startups.append(startup)
+                finish = startup.finish
+
+                def observe_finish(*finish_args, **finish_kwargs):
+                    result = finish(*finish_args, **finish_kwargs)
+                    # STARTED was received; independently prove the target has
+                    # executed and is still alive before failure at handoff.
+                    pid = int(self.wait_for_process_witness(witness))
+                    wait = handles.enter_context(self.windows_process_handle(pid))
+                    target_waits.append(wait)
+                    self.assertEqual(wait(0), 258)
+                    successful.append(True)
+                    return result
+
+                startup.finish = observe_finish
+                return startup
+
+            def restore_then_fail(number, handler):
+                result = real_signal(number, handler)
+                if (successful and not faults and number == signal.SIGINT
+                        and handler is previous[number]):
+                    faults.append(True)
+                    if fault == "error":
+                        raise restore_error
+                    # SIGINT has just been restored; SIGTERM is still owned by
+                    # the invocation. Both can interrupt the successful handoff.
+                    try:
+                        signal.raise_signal(signal.SIGTERM if fault == "owned-signal" else signal.SIGINT)
+                    except BaseException as cancellation:
+                        cancellations.append(cancellation)
+                        raise
+                return result
+
+            with mock.patch.object(module, "spawn", observe_spawn), \
+                    mock.patch.object(signal, "signal", restore_then_fail):
+                expected = (module.LaunchIndeterminate if fault == "error" else
+                            self.helper["EngineInterrupted"] if fault == "owned-signal" else KeyboardInterrupt)
+                with self.assertRaises(expected) as raised:
+                    self.helper["start_owned_process"](
+                        [sys.executable, "-I", "-S", "-c",
+                         "import os,pathlib,sys,time; "
+                         "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(120)",
+                         str(witness)], cwd, stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    )
+            self.assertEqual(successful, [True])
+            self.assertEqual(faults, [True])
+            if fault == "error":
+                outcome = raised.exception
+                self.assertIn(restore_error, outcome.cleanup_errors)
+            else:
+                self.assertEqual(len(cancellations), 1)
+                self.assertIs(raised.exception, cancellations[0])
+                if fault == "owned-signal":
+                    self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                outcome = raised.exception.__cause__
+                self.assertIsInstance(outcome, module.LaunchIndeterminate)
+                self.assertIs(raised.exception.startup_failure, outcome)
+            self.assertIsNone(outcome.__cause__)
+            self.assertIn("Windows target may have started", str(outcome))
+            self.assertNotIn("private-handler-restore-detail", str(outcome))
+            self.assertNotIn(str(witness), str(outcome))
+            self.assertEqual(target_waits[0](5000), 0)
+            startup = startups[0]
+            startup.process.wait(timeout=5)
+            self.assertEqual(self.helper["_OWNED_PROCESSES"], {})
+            self.assertIsNone(startup.reader)
+            self.assertIsNone(startup.writer)
+            self.assertTrue(startup.process.stdout.closed)
+            self.assertTrue(startup.process.stderr.closed)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_lost_start_acknowledgement_terminates_owned_target(self) -> None:
+        self.assert_lost_acknowledgement_cleanup(abort_fails=False)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_lost_acknowledgement_survives_abort_timeout(self) -> None:
+        self.assert_lost_acknowledgement_cleanup(abort_fails=True)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_lost_acknowledgement_survives_control_close_failure(self) -> None:
+        self.assert_lost_acknowledgement_cleanup(abort_fails=False, control_close_fails=True)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_stalled_exchange_closes_after_abort_failure(self) -> None:
+        self.assert_lost_acknowledgement_cleanup(abort_fails=True, stalled=True)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_cleanup_cancellation_retains_post_go_uncertainty(self) -> None:
+        self.assert_lost_acknowledgement_cleanup(abort_fails=True, cancelled=True)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_lost_acknowledgement_survives_handler_restore_failure(self) -> None:
+        self.assert_lost_acknowledgement_cleanup(abort_fails=False, restore_fault="error")
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_restore_signal_retains_lost_acknowledgement(self) -> None:
+        self.assert_lost_acknowledgement_cleanup(abort_fails=False, restore_fault="signal")
+
+    def assert_lost_acknowledgement_cleanup(self, *, abort_fails: bool,
+                                           control_close_fails: bool = False,
+                                           stalled: bool = False, cancelled: bool = False,
+                                           restore_fault: str | None = None) -> None:
+        supervisor = str(SCRIPT.with_name("windows-owned-process.py"))
+        module = self.helper["_load_windows_process_module"](supervisor)
+        real_spawn = module.spawn
+        real_write_frame = module.write_frame
+        startups = []
+        supervisor_waits = []
+        cleanup_error = (self.helper["EngineInterrupted"](130) if cancelled
+                         else subprocess.TimeoutExpired("private-target-argument", 2))
+        control_error = OSError("private-control-detail")
+        restore_error = OSError("private-handler-restore-detail")
+        launch_failures = []
+        restore_faults = []
+        real_signal = signal.signal
+        previous = {number: signal.getsignal(number)
+                    for number in self.helper["_handled_signal_numbers"]()}
+        control_descriptors = []
+        control_faults = []
+        target_waits = []
+        injected = []
+        target_code = (
+            "import os, pathlib, sys, time; "
+            "witness = pathlib.Path(sys.argv[1]); "
+            "pending = witness.with_suffix('.pending'); "
+            "pending.write_text(str(os.getpid()), encoding='utf-8'); "
+            "pending.replace(witness); time.sleep(120)"
+        )
+        with tempfile.TemporaryDirectory() as temp, contextlib.ExitStack() as handles:
+            cwd = Path(temp).resolve()
+            witness = cwd / "target.pid"
+            # Keep an actual EOF endpoint available without allocating descriptors
+            # after closing the owned response pipe. Only its contents change.
+            eof_reader, eof_writer = os.pipe()
+            held_writer = handles.enter_context(os.fdopen(eof_writer, "wb", buffering=0))
+            if not stalled:
+                held_writer.close()
+            handles.callback(os.close, eof_reader)
+
+            def observe_spawn(*args, **kwargs):
+                startup = real_spawn(*args, **kwargs)
+                startups.append(startup)
+                finish = startup.finish
+
+                def observe_finish(*finish_args, **finish_kwargs):
+                    try:
+                        return finish(*finish_args, **finish_kwargs)
+                    except module.LaunchIndeterminate as failure:
+                        launch_failures.append(failure)
+                        raise
+
+                startup.finish = observe_finish
+                supervisor_waits.append(startup.process.wait)
+                control_descriptors.extend((startup.reader, startup.writer))
+                if control_close_fails:
+                    close = os.close
+                    reader = startup.reader
+
+                    def close_then_fail(descriptor):
+                        close(descriptor)
+                        if descriptor == reader and not control_faults:
+                            control_faults.append(True)
+                            raise control_error
+
+                    handles.enter_context(mock.patch.object(module.os, "close", close_then_fail))
+                if abort_fails:
+                    # The native target really starts; inject only a failed wait
+                    # during abort, after native job termination was requested.
+                    handles.enter_context(mock.patch.object(startup.process, "wait", side_effect=cleanup_error))
+                return startup
+
+            def lose_acknowledgement(descriptor, frame):
+                real_write_frame(descriptor, frame)
+                self.assertEqual(len(startups), 1)
+                startup = startups[0]
+                self.assertEqual(descriptor, startup.writer)
+                pid = int(self.wait_for_process_witness(witness))
+                wait = handles.enter_context(self.windows_process_handle(pid))
+                target_waits.append(wait)
+                self.assertEqual(wait(0), 258)
+                # GO reached the real supervisor and the target is live. Replace
+                # the response with EOF, or a held-open pipe for a real timeout,
+                # before this worker can consume even a buffered STARTED.
+                os.dup2(eof_reader, startup.reader, inheritable=False)
+                injected.append(True)
+
+            def restore_then_fault(number, handler):
+                result = real_signal(number, handler)
+                if (restore_fault and launch_failures and not restore_faults
+                        and number == signal.SIGINT and handler is previous[number]):
+                    restore_faults.append(True)
+                    if restore_fault == "signal":
+                        # Keep a generic restoration error active when the real
+                        # handler observes SIGTERM. The root owner must retain
+                        # this launch's exact lost-STARTED outcome over that metadata.
+                        try:
+                            raise restore_error
+                        except OSError:
+                            signal.raise_signal(signal.SIGTERM)
+                    else:
+                        raise restore_error
+                return result
+
+            for number, handler in previous.items():
+                handles.callback(real_signal, number, handler)
+            with mock.patch.object(module, "spawn", observe_spawn), mock.patch.object(
+                module, "write_frame", lose_acknowledgement,
+            ), mock.patch.object(signal, "signal", restore_then_fault):
+                expected = (self.helper["EngineInterrupted"]
+                            if cancelled or restore_fault == "signal" else module.LaunchIndeterminate)
+                with self.assertRaises(expected) as raised:
+                    self.helper["run_with_heartbeat"](
+                        [sys.executable, "-I", "-S", "-c", target_code, str(witness)],
+                        cwd, label="lost-start-acknowledgement", max_runtime_seconds=5 if stalled else 20,
+                    )
+
+            launch_failure = (raised.exception.__cause__
+                              if cancelled or restore_fault == "signal" else raised.exception)
+            self.assertIsInstance(launch_failure, module.LaunchIndeterminate)
+            self.assertEqual(len(launch_failures), 1)
+            self.assertIs(launch_failure, launch_failures[0])
+            if restore_fault:
+                self.assertEqual(restore_faults, [True])
+                if restore_fault == "signal":
+                    self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+                else:
+                    self.assertIn(restore_error, launch_failure.cleanup_errors)
+                    self.assertNotIn("private-handler-restore-detail", str(launch_failure))
+            if stalled:
+                self.assertIn("acknowledgement timed out", str(launch_failure))
+            else:
+                self.assertIsInstance(launch_failure.__cause__, EOFError)
+            if cancelled:
+                self.assertIs(raised.exception, cleanup_error)
+                self.assertEqual(raised.exception.code, 130)
+            elif abort_fails:
+                self.assertEqual(launch_failure.cleanup_errors, (cleanup_error,))
+                self.assertIn("cleanup also failed: TimeoutExpired", str(launch_failure))
+                self.assertNotIn("private-target-argument", str(launch_failure))
+            if control_close_fails:
+                self.assertEqual(control_faults, [True])
+                self.assertEqual(launch_failure.cleanup_errors, (control_error,))
+                self.assertNotIn("private-control-detail", str(launch_failure))
+            # Release the test-held pipe and independently join the worker.
+            # No second production finalizer may conceal missing fd ownership.
+            held_writer.close()
+            startups[0].worker.join(timeout=5)
+            self.assertFalse(startups[0].worker.is_alive())
+            self.assertIsNone(startups[0].reader)
+            self.assertIsNone(startups[0].writer)
+            for descriptor in control_descriptors:
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+            self.assertEqual(injected, [True])
+            self.assertEqual(len(startups), 1)
+            self.assertEqual(len(target_waits), 1)
+            # Check real cleanup before the observation handle's emergency
+            # teardown could terminate a process and conceal an ownership bug.
+            self.assertEqual(target_waits[0](5000), 0)
+            # Target and supervisor shutdown are independent observations. The
+            # injected abort wait cannot substitute for either process witness.
+            supervisor_waits[0](timeout=5)
+            self.assertIsNotNone(startups[0].process.poll())
+            self.assertEqual(self.helper["_OWNED_PROCESSES"], {})
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_stalled_startup_worker_does_not_hold_owner_exit(self) -> None:
+        owner_code = r'''import json, os, pathlib, runpy, subprocess, sys, time
+helper_path, directory = sys.argv[1:]
+cwd = pathlib.Path(directory)
+helper = runpy.run_path(helper_path, run_name="autoreview_under_test")
+module = helper["_load_windows_process_module"](str(pathlib.Path(helper_path).with_name("windows-owned-process.py")))
+real_spawn, real_write = module.spawn, module.write_frame
+startups = []
+def spawn(*args, **kwargs):
+    startup = real_spawn(*args, **kwargs)
+    startups.append(startup)
+    (cwd / "supervisor.pid").write_text(str(startup.process.pid))
+    def failed_wait(*args, **kwargs):
+        raise subprocess.TimeoutExpired("private-target", 2)
+    startup.process.wait = failed_wait
+    return startup
+def stall_response(descriptor, frame):
+    real_write(descriptor, frame)
+    deadline = time.monotonic() + 10
+    while not (cwd / "target.pid").exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("target did not start")
+        time.sleep(0.01)
+    # The outer harness owns this pipe's writer and keeps it open past owner exit.
+    os.dup2(sys.stdin.fileno(), startups[0].reader, inheritable=False)
+module.spawn, module.write_frame = spawn, stall_response
+code = "import os,pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(120)"
+try:
+    helper["run_with_heartbeat"]([sys.executable, "-I", "-S", "-c", code, str(cwd / "target.pid")],
+                               cwd, label="stalled-owner", max_runtime_seconds=5)
+except module.LaunchIndeterminate as error:
+    assert "acknowledgement timed out" in str(error)
+    assert isinstance(error.cleanup_errors[0], subprocess.TimeoutExpired)
+    print(json.dumps([startups[0].worker.is_alive(), startups[0].reader is not None,
+                      not helper["_OWNED_PROCESSES"]]), flush=True)
+else:
+    raise RuntimeError("stalled startup unexpectedly succeeded")
+'''
+        with tempfile.TemporaryDirectory() as temporary, contextlib.ExitStack() as handles:
+            cwd = Path(temporary).resolve()
+            interpreter = getattr(sys, "_base_executable", None) or sys.executable
+            owner = subprocess.Popen(
+                [interpreter, "-I", "-S", "-c", owner_code, str(SCRIPT), str(cwd)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8",
+            )
+            try:
+                supervisor = int(self.wait_for_process_witness(cwd / "supervisor.pid"))
+                target = int(self.wait_for_process_witness(cwd / "target.pid"))
+                waits = [handles.enter_context(self.windows_process_handle(pid))
+                         for pid in (supervisor, target)]
+                self.assertFalse(owner.stdin.closed)
+                # wait() does not close stdin. The owner must exit while its
+                # daemon exchange is still blocked on our live writer.
+                self.assertEqual(owner.wait(timeout=20), 0)
+                self.assertFalse(owner.stdin.closed)
+                output, error = owner.communicate(timeout=5)
+                self.assertEqual(json.loads(output), [True, True, True], error)
+                for wait in waits:
+                    self.assertEqual(wait(5000), 0)
+            finally:
+                if owner.poll() is None:
+                    owner.kill()
+                owner.communicate(timeout=5)
+
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_jobs_retain_descendants_after_leader_exit(self) -> None:
+        child_code = (
+            "import os, pathlib, sys, time; "
+            "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8'); "
+            "time.sleep(120)"
+        )
+        leader_code = (
+            "import subprocess, sys; "
+            "subprocess.Popen([sys.executable, '-I', '-S', '-c', sys.argv[1], sys.argv[2]])"
+        )
         for batched in (False, True):
-            for force_required in (False, True):
-                with self.subTest(batched=batched, force_required=force_required):
-                    events = []
-                    processes = []
-                    for pid in ((1234, 5678) if batched else (1234,)):
-                        proc = mock.Mock(pid=pid, returncode=None)
-                        proc.poll.side_effect = lambda proc=proc: proc.returncode
-
-                        def wait(*, timeout, proc=proc):
-                            events.append(("wait", proc.pid))
-                            self.assertGreater(timeout, 0)
-                            if force_required and not proc.kill.called:
-                                raise subprocess.TimeoutExpired("reviewer", timeout)
-                            proc.returncode = 1
-                            return proc.returncode
-
-                        proc.wait.side_effect = wait
-                        processes.append(proc)
-
-                    def taskkill(argv, **kwargs):
-                        events.append(("signal", int(argv[2])))
-                        # Success can precede the owned handle becoming signaled.
-                        self.assertTrue(all(proc.returncode is None for proc in processes))
-                        return subprocess.CompletedProcess(argv, 0)
-
-                    with mock.patch.object(os, "name", "nt"), mock.patch.dict(
-                        self.helper["terminate_process_group"].__globals__,
-                        {"_resolve_windows_taskkill": lambda: r"C:\Windows\System32\taskkill.exe"},
-                    ), mock.patch("subprocess.run", side_effect=taskkill):
+            with self.subTest(batched=batched), tempfile.TemporaryDirectory() as temp:
+                cwd = Path(temp).resolve()
+                processes = []
+                unrelated = subprocess.Popen(
+                    [sys.executable, "-I", "-S", "-c", "import time; time.sleep(120)"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                try:
+                    with contextlib.ExitStack() as handles:
+                        descendants = []
+                        for index in range(2 if batched else 1):
+                            witness = cwd / f"descendant-{index}.pid"
+                            proc = self.helper["start_owned_process"](
+                                [sys.executable, "-I", "-S", "-c", leader_code,
+                                 child_code, str(witness)], cwd,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                            processes.append(proc)
+                            pid = int(self.wait_for_process_witness(witness))
+                            wait = handles.enter_context(self.windows_process_handle(pid))
+                            descendants.append(wait)
+                            self.assertEqual(proc.wait(timeout=10), 0)
+                            # The leader and supervisor are gone; the live child
+                            # must remain owned by the retained job, not their PID tree.
+                            self.assertEqual(wait(0), 258)
                         if batched:
-                            for proc in processes:
-                                self.helper["register_owned_process"](proc)
-                            try:
-                                self.helper["terminate_owned_processes"]()
-                            finally:
-                                for proc in processes:
-                                    self.helper["unregister_owned_process"](proc)
+                            self.helper["terminate_owned_processes"]()
                         else:
                             self.helper["terminate_process_group"](processes[0])
-
-                    self.assertEqual(events[:len(processes)], [
-                        ("signal", proc.pid) for proc in processes
-                    ])
+                        for wait in descendants:
+                            self.assertEqual(wait(5000), 0)
+                        self.assertIsNone(unrelated.poll())
+                finally:
                     for proc in processes:
-                        self.assertIsNotNone(proc.returncode)
-                        self.assertEqual(proc.wait.call_count, 2 if force_required else 1)
-                        self.assertEqual(proc.kill.call_count, int(force_required))
+                        try:
+                            self.helper["terminate_process_group"](proc)
+                        finally:
+                            self.helper["unregister_owned_process"](proc)
+                    unrelated.kill()
+                    unrelated.wait(timeout=5)
 
-    def test_terminate_process_group_skips_taskkill_when_unresolved(self) -> None:
-        proc = mock.Mock(pid=1234)
-        proc.poll.return_value = None
-        with mock.patch.object(os, "name", "nt"), mock.patch.dict(
-            self.helper["terminate_process_group"].__globals__,
-            {"_resolve_windows_taskkill": lambda: None},
-        ), mock.patch("subprocess.run") as run:
-            self.helper["terminate_process_group"](proc, grace_seconds=0.01)
-        run.assert_not_called()
-        proc.kill.assert_called_once()
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_owned_job_disallows_child_breakaway(self) -> None:
+        target_code = r'''import json, subprocess, sys
+child_code = "import pathlib, sys; pathlib.Path(sys.argv[1]).write_text('escaped', encoding='utf-8')"
+try:
+    child = subprocess.Popen(
+        [sys.executable, "-I", "-S", "-c", child_code, sys.argv[1]],
+        creationflags=subprocess.CREATE_BREAKAWAY_FROM_JOB)
+except OSError as error:
+    print(json.dumps({"winerror": error.winerror}))
+else:
+    child.wait(timeout=5)
+    print(json.dumps({"unexpected_child": child.pid}))
+'''
+        with tempfile.TemporaryDirectory() as temp:
+            cwd = Path(temp).resolve()
+            witness = cwd / "escaped.txt"
+            proc = self.helper["start_owned_process"](
+                [sys.executable, "-I", "-S", "-c", target_code, str(witness)], cwd,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                stdout, stderr = proc.communicate(timeout=10)
+                self.assertEqual(proc.returncode, 0, stderr)
+                # Both implicit and explicitly requested escape must be denied:
+                # the supported owner never sets either job breakaway flag.
+                self.assertEqual(json.loads(stdout), {"winerror": 5})
+                self.assertFalse(witness.exists())
+            finally:
+                try:
+                    self.helper["terminate_process_group"](proc)
+                finally:
+                    self.helper["unregister_owned_process"](proc)
+                    proc.stdout.close()
+                    proc.stderr.close()
 
-    def test_terminate_process_group_attempts_taskkill_when_leader_already_exited(
-        self,
-    ) -> None:
-        # Regression for detached descendants leaking: taskkill /T is still
-        # worth attempting even once the leader PID has exited (it can still
-        # fell the tree while the PID is valid), but the direct-kill fallback
-        # only ever makes sense for a leader that is still alive.
-        proc = mock.Mock(pid=1234)
-        proc.poll.return_value = 0
-        fake_taskkill = r"C:\Windows\System32\taskkill.exe"
-        with mock.patch.object(os, "name", "nt"), mock.patch.dict(
-            self.helper["terminate_process_group"].__globals__,
-            {"_resolve_windows_taskkill": lambda: fake_taskkill},
-        ), mock.patch(
-            "subprocess.run",
-            return_value=subprocess.CompletedProcess([], 1),
-        ) as run:
-            self.helper["terminate_process_group"](proc, grace_seconds=0.01)
-        self.assertEqual(run.call_args.args[0][0], fake_taskkill)
-        proc.kill.assert_not_called()
+    @unittest.skipUnless(os.name == "nt", "requires native Windows job ownership")
+    def test_windows_jobs_fail_closed_when_owner_dies(self) -> None:
+        owner_code = r'''import json, pathlib, runpy, sys, time
+helper_path, directory, mode = sys.argv[1:]
+cwd = pathlib.Path(directory)
+helper = runpy.run_path(helper_path, run_name="autoreview_under_test")
+child_code = "import time; time.sleep(120)"
+target_code = (
+    "import json, os, pathlib, subprocess, sys, time; "
+    "child = subprocess.Popen([sys.executable, '-I', '-S', '-c', sys.argv[2]]); "
+    "pathlib.Path(sys.argv[1]).write_text(json.dumps([os.getpid(), child.pid]), encoding='utf-8'); "
+    "time.sleep(120)"
+)
+argv = [sys.executable, "-I", "-S", "-c", target_code, str(cwd / "target.json"), child_code]
+import subprocess
+stdio = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+if mode == "before-go":
+    supervisor = str(pathlib.Path(helper_path).with_name("windows-owned-process.py"))
+    helper["admit_executable_directories"](
+        cwd, selected_executables=[sys.executable, supervisor], include_search_path=False)
+    module = helper["_load_windows_process_module"](supervisor)
+    startup = module.spawn(sys.executable, supervisor, argv, cwd=cwd, **stdio)
+    helper["register_owned_process"](startup.process, startup.job)
+    # Observe the real supervisor's assignment acknowledgement, but never grant GO.
+    if module.read_frame(startup.reader) != {"version": 1, "operation": "ready"}:
+        raise RuntimeError("supervisor did not become ready")
+    proc = startup.process
+else:
+    proc = helper["start_owned_process"](argv, cwd, **stdio)
+(cwd / "owner-ready.pid").write_text(str(proc.pid), encoding="utf-8")
+time.sleep(120)
+'''
+        for phase in ("before-go", "after-started"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temp:
+                cwd = Path(temp).resolve()
+                # This owner is deliberately outside the owned job: killing it
+                # must close its last job handle without invoking Python cleanup.
+                owner = subprocess.Popen(
+                    [sys.executable, "-I", "-S", "-c", owner_code, str(SCRIPT),
+                     str(cwd), phase], stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                )
+                try:
+                    with contextlib.ExitStack() as handles:
+                        supervisor_pid = int(self.wait_for_process_witness(cwd / "owner-ready.pid"))
+                        waits = [handles.enter_context(self.windows_process_handle(supervisor_pid))]
+                        if phase == "after-started":
+                            target_pids = json.loads(self.wait_for_process_witness(cwd / "target.json"))
+                            waits.extend(handles.enter_context(self.windows_process_handle(pid))
+                                         for pid in target_pids)
+                        else:
+                            self.assertFalse((cwd / "target.json").exists())
+                        for wait in waits:
+                            self.assertEqual(wait(0), 258)
+                        owner.kill()
+                        owner.wait(timeout=5)
+                        for wait in waits:
+                            self.assertEqual(wait(5000), 0)
+                        if phase == "before-go":
+                            self.assertFalse((cwd / "target.json").exists())
+                finally:
+                    if owner.poll() is None:
+                        owner.kill()
+                    _, errors = owner.communicate(timeout=5)
+                    self.assertNotIn(b"Traceback", errors)
 
+    @unittest.skipIf(os.name == "nt", "POSIX registry sequencing; Windows requires real jobs")
     def test_owned_process_registry_terminates_all_tracked_groups(self) -> None:
         terminated: list[object] = []
         proc_a = mock.Mock(pid=111)
@@ -6002,6 +7130,7 @@ time.sleep(60)
                 self.helper["unregister_owned_process"](proc_b)
         self.assertEqual(set(terminated), {proc_a, proc_b})
 
+    @unittest.skipIf(os.name == "nt", "POSIX registry sequencing; Windows requires real jobs")
     def test_terminate_owned_processes_signals_all_groups_before_grace_wait(
         self,
     ) -> None:
@@ -6162,27 +7291,6 @@ time.sleep(60)
                 ),
                 repo,
             )
-            alternate_repo = repo.with_name(repo.name.swapcase())
-            with (
-                mock.patch.object(
-                    os.path,
-                    "samefile",
-                    side_effect=lambda left, right: (
-                        str(left).casefold() == str(right).casefold()
-                    ),
-                ),
-                self.assertRaisesRegex(
-                    SystemExit,
-                    "--json-output must point outside",
-                ),
-            ):
-                self.helper["prepare_output_paths"](
-                    argparse.Namespace(
-                        json_output=str(alternate_repo / "review.json"),
-                        output=None,
-                    ),
-                    repo,
-                )
 
     def test_atomic_output_replaces_hard_link_without_touching_repo_file(
         self,
@@ -6238,6 +7346,7 @@ time.sleep(60)
     def test_cli_detects_source_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             source = repo / "source.txt"
             source.write_text("before\n", encoding="utf-8")
@@ -6245,7 +7354,7 @@ time.sleep(60)
             git(repo, "commit", "-qm", "initial")
             source.write_text("review me\n", encoding="utf-8")
             codex_bin = write_executable(
-                root / "codex",
+                root / "bin" / "codex",
                 fake_codex_script(),
             )
             record_path = root / "record.json"
@@ -6458,8 +7567,9 @@ time.sleep(60)
     def test_claude_probe_captures_help_from_pipe_sensitive_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
-            cli = write_executable(root / "claude", r'''#!/usr/bin/env python3
+            cli = write_executable(root / "bin" / "claude", r'''#!/usr/bin/env python3
 import os
 import stat
 import sys
@@ -6701,6 +7811,129 @@ else:
                 os.environ.clear()
                 os.environ.update(old)
 
+    @unittest.skipIf(os.name == "nt", "requires local symlink privilege")
+    def test_credential_parent_components_preserve_source_link_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = root / "repo"
+            source = root / "source"
+            outside = root / "outside"
+            for path in (repo, source, outside / "deep"):
+                path.mkdir(parents=True)
+            (source / "link").symlink_to(outside / "deep", target_is_directory=True)
+            (root / "alias").symlink_to(source / "link", target_is_directory=True)
+            (root / "trusted-link").symlink_to(outside / "deep", target_is_directory=True)
+            boundary = self.helper["UNTRUSTED_SOURCE_ROOTS"]
+            token = boundary.set((repo, source))
+            try:
+                # An exact root/.. escape keeps the ordinary output/credential
+                # spelling, but a mutable source descendant cannot gain it.
+                for owner in (repo, source):
+                    raw = owner / ".." / "outside" / "identity"
+                    self.assertEqual(self.helper["normalize_external_env_path_value"](
+                        repo, "AWS_CONFIG_FILE", str(raw)), str(outside / "identity"))
+                (source / "child").mkdir()
+                mutable = source / "child" / ".." / ".." / "outside" / "identity"
+                self.assertEqual(mutable.resolve(), outside / "identity")
+                self.assertIsNone(self.helper["normalize_external_env_path_value"](
+                    repo, "AWS_CONFIG_FILE", str(mutable)))
+                for raw in (source / "link" / ".." / "identity", root / "alias" / ".." / "identity"):
+                    self.assertEqual(raw.resolve(), outside / "identity")
+                    self.assertIsNone(self.helper["normalize_external_env_path_value"](
+                        repo, "AWS_CONFIG_FILE", str(raw)))
+                trusted = root / "trusted-link" / ".." / "identity"
+                self.assertEqual(self.helper["normalize_external_env_path_value"](
+                    repo, "AWS_CONFIG_FILE", str(trusted)), str(outside / "identity"))
+            finally:
+                boundary.reset(token)
+
+    @unittest.skipIf(os.name == "nt", "uses executable POSIX fixtures and symbolic links")
+    def test_unsafe_certificate_directory_stops_before_probe_and_live_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo, source, certs, trusted = (root / name for name in ("repo", "source", "certs", "trusted"))
+            for path in (repo, source, certs, trusted):
+                path.mkdir()
+            external = trusted / "certificate.pem"
+            external.write_text("trusted inert certificate fixture")
+            record, calls = root / "record.json", root / "calls.jsonl"
+            fixture = fake_claude_script().replace(
+                "args = sys.argv[1:]", "args = sys.argv[1:]\n"
+                "with open(os.environ['AUTOREVIEW_FAKE_CALLS'], 'a') as out:\n"
+                "    out.write(json.dumps({'argv': args, 'certs': os.environ.get('SSL_CERT_DIR')}) + '\\n')",
+            )
+            binary_dir = root / "bin"
+            binary_dir.mkdir()
+            binary = write_executable(binary_dir / "claude", fixture)
+            args = argparse.Namespace(claude_bin=str(binary), model=None, tools=False,
+                                      thinking=None, stream_engine_output=False)
+            environment = {"PATH": os.environ.get("PATH", ""), "HOME": str(root), "USERPROFILE": str(root),
+                           "SSL_CERT_DIR": os.pathsep.join((str(trusted), str(certs))),
+                           "AUTOREVIEW_FAKE_CALLS": str(calls), "AUTOREVIEW_FAKE_RECORD": str(record)}
+            token = self.helper["UNTRUSTED_SOURCE_ROOTS"].set((repo, source))
+            try:
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    for name in ("012345ab.0", "012345ab.r0", "notes.txt"):
+                        for owner in (repo, source):
+                            with self.subTest(name=name, owner=owner.name):
+                                leaf = owner / "anchor.pem"
+                                leaf.write_text("inert certificate fixture")
+                                entry = certs / name
+                                entry.symlink_to(leaf)
+                                try:
+                                    # No child may fall back to a compiled default that
+                                    # selects this same rejected certificate directory.
+                                    with self.assertRaisesRegex(SystemExit, "^unsafe SSL_CERT_DIR;"):
+                                        self.helper["run_claude"](args, repo, "fixture review")
+                                    self.assertFalse(calls.exists())
+                                    self.assertFalse(record.exists())
+                                finally:
+                                    entry.unlink()
+                                    calls.unlink(missing_ok=True)
+                    # Both hashed and arbitrary filenames remain usable when their referents are trusted.
+                    (certs / "012345ab.0").symlink_to(external)
+                    (certs / "notes.txt").symlink_to(external)
+                    self.helper["run_claude"](args, repo, "fixture review")
+                    launches = [json.loads(line) for line in calls.read_text().splitlines()]
+                    self.assertTrue(all(launch["certs"] == environment["SSL_CERT_DIR"] for launch in launches))
+            finally:
+                self.helper["UNTRUSTED_SOURCE_ROOTS"].reset(token)
+
+    def test_certificate_directory_hardlinks_are_inputs_but_include_roots_are_not_cert_stores(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo, source, certs = root / "repo", root / "source", root / "certs"
+            for path in (repo, source, certs):
+                path.mkdir()
+            certificate = source / "certificate.pem"
+            certificate.write_text("inert certificate fixture")
+            os.link(certificate, certs / "arbitrary.pem")
+            token = self.helper["UNTRUSTED_SOURCE_ROOTS"].set((repo, source))
+            try:
+                with mock.patch.dict(os.environ, {
+                    "PATH": os.environ.get("PATH", ""), "HOME": str(root), "USERPROFILE": str(root),
+                    "SSL_CERT_DIR": str(certs),
+                }, clear=True):
+                    for engine in self.helper["ENGINES"]:
+                        with self.subTest(engine=engine), self.assertRaisesRegex(SystemExit, "^unsafe SSL_CERT_DIR;"):
+                            self.helper["safe_engine_env"](repo, engine=engine)
+                    with self.assertRaisesRegex(SystemExit, "^unsafe SSL_CERT_DIR;"):
+                        self.helper["safe_git_env"](repo)
+                    # Unset and empty selectors retain the caller's implicit
+                    # default policy; the helper has not rejected a store.
+                    for selector in (None, ""):
+                        if selector is None:
+                            os.environ.pop("SSL_CERT_DIR")
+                        else:
+                            os.environ["SSL_CERT_DIR"] = selector
+                        self.assertNotIn("SSL_CERT_DIR", self.helper["safe_engine_env"](repo, engine="codex"))
+                        self.assertNotIn("SSL_CERT_DIR", self.helper["safe_git_env"](repo))
+                self.assertEqual(self.helper["normalize_external_env_path_value"](
+                    repo, "OPENCLAW_INCLUDE_ROOTS", os.pathsep.join((str(certs), str(root / "missing")))),
+                    os.pathsep.join((str(certs), str(root / "missing"))))
+            finally:
+                self.helper["UNTRUSTED_SOURCE_ROOTS"].reset(token)
+
     def test_provider_credential_paths_are_forwarded_as_absolute(self) -> None:
         old_env = os.environ.copy()
         old_cwd = Path.cwd()
@@ -6746,16 +7979,16 @@ else:
                 os.environ["SSL_CERT_FILE"] = str(repo / "tls-ca.pem")
                 os.environ["HOME"] = str(repo)
                 os.environ["USERPROFILE"] = str(repo)
-                claude_env = self.helper["safe_engine_env"](repo, engine="claude")
+                with self.assertRaisesRegex(SystemExit, "Claude configuration.*outside"):
+                    self.helper["safe_engine_env"](repo, engine="claude")
                 codex_env = self.helper["safe_engine_env"](repo, engine="codex")
-                pi_env = self.helper["safe_engine_env"](repo, engine="pi")
-                self.assertNotIn("CLAUDE_CONFIG_DIR", claude_env)
+                with self.assertRaisesRegex(SystemExit, "Pi configuration.*outside"):
+                    self.helper["safe_engine_env"](repo, engine="pi")
                 self.assertNotIn("CODEX_HOME", codex_env)
                 self.assertNotIn("CODEX_CA_CERTIFICATE", codex_env)
                 self.assertNotIn("SSL_CERT_FILE", codex_env)
-                self.assertNotIn("PI_CODING_AGENT_DIR", pi_env)
-                self.assertNotIn("HOME", claude_env)
-                self.assertNotIn("USERPROFILE", claude_env)
+                self.assertNotIn("HOME", codex_env)
+                self.assertNotIn("USERPROFILE", codex_env)
             finally:
                 os.environ.clear()
                 os.environ.update(old)
@@ -6796,32 +8029,128 @@ else:
             )
             try:
                 os.environ["CODEX_HOME"] = str(source_home)
-                linked = self.helper["prepare_codex_runtime_auth"](repo, runtime_home)
-                self.assertTrue(linked)
-                self.assertTrue((runtime_home / "auth.json").is_file())
-                self.assertTrue(
-                    os.path.samefile(source_auth, runtime_home / "auth.json")
-                )
-                self.assertFalse((runtime_home / "config.toml").exists())
                 self.assertIn(
                     'cli_auth_credentials_store="file"',
-                    self.helper["codex_auth_config_flags"](
-                        repo,
-                        force_file=True,
-                    ),
+                    self.helper["codex_auth_config_flags"](repo, force_file=True),
                 )
-
-                (runtime_home / "auth.json").write_text(
-                    '{"token":"test-auth-token"}',
-                    encoding="utf-8",
-                )
+                with self.helper["codex_runtime_auth"](repo, runtime_home, expected_file_auth=True):
+                    self.assertTrue(os.path.samefile(source_auth, runtime_home / "auth.json"))
+                    self.assertFalse((runtime_home / "config.toml").exists())
+                    (runtime_home / "auth.json").write_text(
+                        '{"token":"test-auth-token"}', encoding="utf-8",
+                    )
+                self.assertFalse((runtime_home / "auth.json").exists())
+                self.assertEqual(source_auth.stat().st_nlink, 1)
                 self.assertEqual(
                     json.loads(source_auth.read_text(encoding="utf-8"))["token"],
                     "test-auth-token",
                 )
+                self.assertEqual(self.helper["codex_source_home"](repo), source_home.resolve())
             finally:
                 os.environ.clear()
                 os.environ.update(old)
+
+    def test_codex_auth_scope_preserves_replacements_and_primary_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo, home, runtime = root / "repo", root / "home", root / "runtime"
+            for path in (repo, home, runtime):
+                path.mkdir()
+            (home / "auth.json").write_text('{"fixture":"synthetic"}')
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}):
+                with self.assertRaisesRegex(SystemExit, "changed before reviewer launch"):
+                    with self.helper["codex_runtime_auth"](repo, runtime, expected_file_auth=False):
+                        self.fail("changed eligibility must not reach launch")
+                self.assertFalse((runtime / "auth.json").exists())
+                for primary_error, closed_stderr in ((False, False), (True, False), (True, True)):
+                    with self.subTest(primary_error=primary_error, closed_stderr=closed_stderr):
+                        alias = runtime / "auth.json"
+                        detached = runtime / "detached.json"
+                        expected = RuntimeError if primary_error else SystemExit
+                        message = "original failure" if primary_error else "refusing cleanup"
+                        diagnostics = io.StringIO()
+                        if closed_stderr:
+                            diagnostics.close()
+                        with self.assertRaisesRegex(expected, message), contextlib.redirect_stderr(diagnostics):
+                            with self.helper["codex_runtime_auth"](repo, runtime, expected_file_auth=True):
+                                alias.rename(detached)
+                                alias.write_text("unrelated replacement")
+                                if primary_error:
+                                    raise RuntimeError("original failure")
+                        self.assertEqual(alias.read_text(), "unrelated replacement")
+                        alias.unlink()
+                        detached.unlink()
+
+    def test_codex_auth_scope_removes_created_alias_when_source_changes_during_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo, home, runtime = root / "repo", root / "home", root / "runtime"
+            for path in (repo, home, runtime):
+                path.mkdir()
+            source = home / "auth.json"
+            source.write_text('{"fixture":"original"}')
+            prepare = self.helper["prepare_codex_runtime_auth"]
+
+            def replace_then_prepare(*args):
+                # A concurrent credential replacement occurs before real link creation.
+                source.rename(home / "previous.json")
+                source.write_text('{"fixture":"replacement"}')
+                return prepare(*args)
+
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}), \
+                    mock.patch.dict(self.helper["codex_runtime_auth"].__wrapped__.__globals__, {
+                        "prepare_codex_runtime_auth": replace_then_prepare,
+                    }), self.assertRaisesRegex(SystemExit, "link changed before reviewer launch"):
+                with self.helper["codex_runtime_auth"](repo, runtime, expected_file_auth=True):
+                    self.fail("a changed source must not reach launch")
+            self.assertFalse((runtime / "auth.json").exists())
+            self.assertEqual(source.stat().st_nlink, 1)
+            self.assertEqual(source.read_text(), '{"fixture":"replacement"}')
+
+    def test_codex_auth_scope_hardlink_fallback_preserves_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo, home, runtime = root / "repo", root / "home", root / "runtime"
+            for path in (repo, home, runtime):
+                path.mkdir()
+            source = home / "auth.json"
+            source.write_text('{"fixture":"synthetic"}')
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}), \
+                    mock.patch.object(Path, "symlink_to", side_effect=OSError("symlink unavailable")):
+                with self.helper["codex_runtime_auth"](repo, runtime, expected_file_auth=True):
+                    alias = runtime / "auth.json"
+                    self.assertFalse(alias.is_symlink())
+                    self.assertTrue(os.path.samefile(source, alias))
+                    self.assertEqual(source.stat().st_nlink, 2)
+                    alias.write_text('{"fixture":"refreshed"}')
+                self.assertFalse(alias.exists())
+                self.assertEqual(source.stat().st_nlink, 1)
+                self.assertEqual(source.read_text(), '{"fixture":"refreshed"}')
+                self.assertEqual(self.helper["codex_source_home"](repo), home)
+
+    def test_codex_auth_symlink_scopes_can_overlap_and_share_refreshes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo, home = root / "repo", root / "home"
+            repo.mkdir()
+            home.mkdir()
+            source = home / "auth.json"
+            source.write_text('{"fixture":"original"}')
+            first, second = root / "first", root / "second"
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}):
+                with self.helper["codex_runtime_auth"](repo, first, expected_file_auth=True):
+                    if os.name == "nt" and not (first / "auth.json").is_symlink():
+                        self.skipTest("native symlink privilege unavailable")
+                    self.assertTrue((first / "auth.json").is_symlink())
+                    with self.helper["codex_runtime_auth"](repo, second, expected_file_auth=True):
+                        self.assertTrue((second / "auth.json").is_symlink())
+                        self.assertEqual(source.stat().st_nlink, 1)
+                        (second / "auth.json").write_text('{"fixture":"refreshed"}')
+                        self.assertEqual((first / "auth.json").read_text(), source.read_text())
+                    self.assertFalse((second / "auth.json").exists())
+                    self.assertEqual(self.helper["codex_source_home"](repo), home)
+                self.assertFalse((first / "auth.json").exists())
+                self.assertEqual(source.read_text(), '{"fixture":"refreshed"}')
 
     def test_codex_runtime_home_does_not_promote_keyring_fallback_file(self) -> None:
         old = os.environ.copy()
@@ -8066,12 +9395,13 @@ os.execv(target, [str(target), *sys.argv[1:]])
     def test_dry_run_flag_exits_zero_when_bundle_and_engine_resolve(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             source = repo / "source.txt"
             source.write_text("staged\n", encoding="utf-8")
             git(repo, "add", "source.txt")
             codex_bin = write_executable(
-                root / "codex",
+                root / "bin" / "codex",
                 fake_codex_script(),
             )
             env = {**os.environ, "CODEX_HOME": str(root)}
@@ -8276,13 +9606,14 @@ os.execv(target, [str(target), *sys.argv[1:]])
     def test_dry_run_flag_exits_zero_for_plain_commit_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             source = repo / "source.txt"
             source.write_text("staged\n", encoding="utf-8")
             git(repo, "add", "source.txt")
             git(repo, "commit", "-q", "-m", "seed")
             codex_bin = write_executable(
-                root / "codex",
+                root / "bin" / "codex",
                 fake_codex_script(),
             )
             env = {**os.environ, "CODEX_HOME": str(root)}
@@ -8321,9 +9652,10 @@ os.execv(target, [str(target), *sys.argv[1:]])
         # the binary resolves on PATH.
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             pi_bin = write_executable(
-                root / "pi",
+                root / "bin" / "pi",
                 fake_pi_script(),
             )
             env = os.environ.copy()
@@ -8356,12 +9688,13 @@ os.execv(target, [str(target), *sys.argv[1:]])
     def test_dry_run_flag_exits_zero_when_pi_version_supported(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             source = repo / "source.txt"
             source.write_text("staged\n", encoding="utf-8")
             git(repo, "add", "source.txt")
             pi_bin = write_executable(
-                root / "pi",
+                root / "bin" / "pi",
                 fake_pi_script(),
             )
             env = os.environ.copy()
@@ -8399,12 +9732,13 @@ os.execv(target, [str(target), *sys.argv[1:]])
         # flags resolved.
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             source = repo / "source.txt"
             source.write_text("staged\n", encoding="utf-8")
             git(repo, "add", "source.txt")
             claude_bin = write_executable(
-                root / "claude",
+                root / "bin" / "claude",
                 fake_claude_script(),
             )
             env = os.environ.copy()
@@ -8461,12 +9795,13 @@ os.execv(target, [str(target), *sys.argv[1:]])
         # would fail before an engine starts.
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             source = repo / "source.txt"
             source.write_text("staged\n", encoding="utf-8")
             git(repo, "add", "source.txt")
             codex_bin = write_executable(
-                root / "codex",
+                root / "bin" / "codex",
                 fake_codex_script(),
             )
             env = {**os.environ, "CODEX_HOME": str(root)}
@@ -8503,6 +9838,7 @@ os.execv(target, [str(target), *sys.argv[1:]])
     def test_dry_run_flag_exits_zero_when_prompt_file_valid(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             source = repo / "source.txt"
             source.write_text("staged\n", encoding="utf-8")
@@ -8510,7 +9846,7 @@ os.execv(target, [str(target), *sys.argv[1:]])
             prompt_file = repo / "prompt.md"
             prompt_file.write_text("Focus on error handling.\n", encoding="utf-8")
             codex_bin = write_executable(
-                root / "codex",
+                root / "bin" / "codex",
                 fake_codex_script(),
             )
             env = {**os.environ, "CODEX_HOME": str(root)}
@@ -8545,12 +9881,13 @@ os.execv(target, [str(target), *sys.argv[1:]])
         # get the same pre-engine existence check as prompt files.
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
+            (root / "bin").mkdir()
             repo = init_repo(root)
             source = repo / "source.txt"
             source.write_text("staged\n", encoding="utf-8")
             git(repo, "add", "source.txt")
             codex_bin = write_executable(
-                root / "codex",
+                root / "bin" / "codex",
                 fake_codex_script(),
             )
             env = os.environ.copy()
@@ -8664,8 +10001,11 @@ class AuthenticatedProxyTests(unittest.TestCase):
                             key: str(path) for key in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
                                                       "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE")
                         }, clear=True):
+                            with self.assertRaisesRegex(SystemExit, "^unsafe SSL_CERT_DIR;"):
+                                self.helper["safe_engine_env"](repo, engine=engine)
+                            os.environ.pop("SSL_CERT_DIR")
                             env = self.helper["safe_engine_env"](repo, engine=engine)
-                            for key in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+                            for key in ("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE",
                                         "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
                                 self.assertNotIn(key, env)
 
@@ -8754,7 +10094,9 @@ class AuthenticatedProxyTests(unittest.TestCase):
             git(repo, "add", ".")
             git(repo, "commit", "-qm", "fixture")
             (repo / "source.txt").write_text("after\n")
-            fake = root / "codex-fixture"
+            installation = root / "bin"
+            installation.mkdir()
+            fake = installation / "codex-fixture"
             fake.write_text(f"#!{sys.executable}\n" + '''import json, os, sys
 from pathlib import Path
 if "--version" in sys.argv:

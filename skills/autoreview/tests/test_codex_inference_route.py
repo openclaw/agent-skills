@@ -20,7 +20,7 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib
 
-from .test_autoreview_hardening import init_repo, load_helper, write_executable
+from .test_autoreview_hardening import git, init_repo, load_helper, write_executable
 
 
 class CodexInferenceRouteTests(unittest.TestCase):
@@ -29,6 +29,11 @@ class CodexInferenceRouteTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.repo = init_repo(self.root)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.codex = write_executable(
+            self.bin / "codex", "#!" + sys.executable + " -S\nraise SystemExit(99)\n"
+        )
         self.home = self.root / "operator-home"
         self.home.mkdir()
         self.runtime_helper = write_executable(
@@ -66,7 +71,7 @@ class CodexInferenceRouteTests(unittest.TestCase):
         }
         self.helper = load_helper()
         self.args = argparse.Namespace(
-            engine="codex", codex_bin="synthetic-codex", codex_config=['model_provider="review_api"'], codex_speed=None,
+            engine="codex", codex_bin=str(self.codex), codex_config=['model_provider="review_api"'], codex_speed=None,
             fallback_model=None, model="gpt-6-sol", stream_engine_output=False,
             thinking="high", tools=True, web_search=False,
         )
@@ -76,6 +81,115 @@ class CodexInferenceRouteTests(unittest.TestCase):
         })
         self.environment.start()
         self.addCleanup(self.environment.stop)
+
+    @unittest.skipIf(os.name == "nt", "uses POSIX symbolic links")
+    def test_source_owned_links_cannot_select_codex_home_or_provider_paths(self):
+        upstream = self.root / "upstream"
+        upstream.mkdir()
+        controlled = upstream / "selector"
+        alias = self.root / "operator-alias"
+        alias.symlink_to(controlled)
+        token = self.helper["UNTRUSTED_SOURCE_ROOTS"].set((self.repo, upstream))
+        try:
+            controlled.symlink_to(self.home, target_is_directory=True)
+            with self.subTest(path="CODEX_HOME"), mock.patch.dict(os.environ, {"CODEX_HOME": str(alias)}):
+                self.assertIsNone(self.helper["codex_source_home"](self.repo))
+            for key, target in (("command", self.runtime_helper), ("cwd", self.home)):
+                with self.subTest(key=key):
+                    controlled.unlink()
+                    controlled.symlink_to(target, target_is_directory=target.is_dir())
+                    original = self.auth.copy()
+                    self.auth[key] = str(alias)
+                    self.write_config()
+                    try:
+                        with self.assertRaisesRegex(SystemExit, "authentication .*outside"):
+                            self.helper["load_codex_inference_route"](self.repo, self.args.codex_config)
+                    finally:
+                        self.auth = original
+            # An operator-owned link directly to the same external directory remains valid.
+            alias.unlink()
+            alias.symlink_to(self.home, target_is_directory=True)
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(alias)}):
+                self.assertEqual(self.helper["codex_source_home"](self.repo), self.home.resolve())
+        finally:
+            self.helper["UNTRUSTED_SOURCE_ROOTS"].reset(token)
+
+    def test_relative_engine_config_is_pinned_before_changing_child_directory(self):
+        scratch = self.root / "scratch"
+        child = scratch / "run"
+        child.mkdir(parents=True)
+        source = scratch / "operator-home"
+        source.mkdir()
+        (source / "selected.txt").write_text("source-owned")
+        (self.home / "selected.txt").write_text("operator-owned")
+        token = self.helper["UNTRUSTED_SOURCE_ROOTS"].set((self.repo, source))
+        previous = Path.cwd()
+        try:
+            os.chdir(self.repo)
+            for engine, key in (("claude", "CLAUDE_CONFIG_DIR"), ("codex", "CODEX_HOME")):
+                with self.subTest(engine=engine), mock.patch.dict(os.environ, {key: "../operator-home"}):
+                    env = self.helper["safe_engine_env"](self.repo, engine=engine)
+                    result = subprocess.run([
+                        sys.executable, "-S", "-c",
+                        "import os,pathlib,sys; print((pathlib.Path(os.environ[sys.argv[1]])/'selected.txt').read_text())",
+                        key,
+                    ], cwd=child, env=env, text=True, capture_output=True, check=True)
+                    self.assertEqual(result.stdout.strip(), "operator-owned")
+                    self.assertEqual(env[key], str(self.home.resolve()))
+        finally:
+            os.chdir(previous)
+            self.helper["UNTRUSTED_SOURCE_ROOTS"].reset(token)
+
+    @unittest.skipIf(os.name == "nt", "uses executable POSIX login wrapper")
+    def test_entry_distinguishes_operator_login_from_external_source_review(self):
+        child = self.root / "login-child"
+        child.mkdir()
+        wrapper = write_executable(self.bin / "login-wrapper", "#!" + sys.executable + " -S\n"
+            "import os,sys\n"
+            "configured = os.environ.get('XDG_CONFIG_HOME', '').endswith('/operator-settings')\n"
+            "configured = configured and os.path.isabs(os.environ.get('CODEX_HOME', ''))\n"
+            "print('Logged in using ChatGPT' if configured else 'Not logged in')\n"
+            "sys.exit(0 if configured else 1)\n")
+        upstream_parent = self.root / "external"
+        upstream_parent.mkdir()
+        upstream = init_repo(upstream_parent)
+        (upstream / "context.txt").write_text("external source fixture")
+        git(upstream, "add", "context.txt")
+        git(upstream, "commit", "-qm", "source fixture")
+        manifest = {
+            "version": 1, "root": str(upstream.resolve()),
+            "commit": git(upstream, "rev-parse", "HEAD").strip(),
+            "files": [{"path": "context.txt", "mode": "100644",
+                       "blob": git(upstream, "rev-parse", "HEAD:context.txt").strip()}],
+        }
+        (self.repo / "external-context.json").write_text(json.dumps(manifest))
+        observed = []
+        def login_from_boundary(args, repo):
+            self.assertEqual(repo, self.repo)
+            roots = self.helper["UNTRUSTED_SOURCE_ROOTS"].get()
+            self.assertIn(self.repo, roots)
+            self.assertEqual(upstream in roots, bool(args.external_source_manifests))
+            observed.append(self.helper["codex_subscription_login_missing"](str(wrapper), child, repo))
+            return 0
+        previous = Path.cwd()
+        try:
+            os.chdir(self.repo)
+            for manifests in ([], ["external-context.json"]):
+                with self.subTest(manifests=manifests), mock.patch.dict(os.environ, {
+                    "XDG_CONFIG_HOME": str(self.root / "operator-settings"),
+                    "CODEX_HOME": "../operator-home",
+                }), mock.patch.dict(self.helper["main_with_args"].__globals__, {
+                    "main_with_source_boundary": login_from_boundary,
+                }):
+                    with mock.patch.object(sys, "argv", ["autoreview"]):
+                        args = self.helper["parse_args"]()
+                    args.external_source_context_file = manifests
+                    self.assertEqual(self.helper["main_with_args"](args), 0)
+            self.assertEqual(observed, [False, True],
+                             "ordinary entry retains operator settings; external review keeps its filtered environment")
+            self.assertFalse(self.helper["EXTERNAL_SOURCE_REVIEW"].get())
+        finally:
+            os.chdir(previous)
 
     def write_config(self):
         def value(item):
@@ -123,8 +237,7 @@ class CodexInferenceRouteTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, "", "")
 
         replacements = {
-            "ensure_codex_isolation_supported": mock.Mock(return_value="synthetic-codex"),
-            "resolve_command": mock.Mock(return_value="synthetic-codex"),
+            "ensure_codex_isolation_supported": mock.Mock(return_value=str(self.codex)),
             "run_with_heartbeat": fake_run,
         }
         if prepare_auth is not None:
@@ -172,7 +285,6 @@ class CodexInferenceRouteTests(unittest.TestCase):
 
     def available(self):
         replacements = {
-            "find_command": mock.Mock(return_value="synthetic-codex"),
             "ENGINE_ISOLATION_PROBES": {"codex": mock.Mock()},
         }
         with (
@@ -279,6 +391,30 @@ class CodexInferenceRouteTests(unittest.TestCase):
         self.run_review(during_run=respond)
         self.assertEqual(events, ["gpt-6.1-sol", "gpt-6-sol"])
         self.assertEqual(launchers[0], launchers[1])
+
+    @unittest.skipIf(os.name == "nt", "uses POSIX symbolic links")
+    def test_retry_revalidates_original_auth_command_directory(self):
+        self.use_default_models()
+        self.write_config()
+        source_module = self.repo / "auth_dependency.py"
+        source_module.write_text("raise SystemExit('source must not execute')\n")
+        dependency = self.home / "auth_dependency.py"
+        attempts = []
+
+        def respond(observed):
+            attempts.append(observed["command"])
+            if len(attempts) == 1:
+                # The staged launcher stays unchanged, but its original helper
+                # directory must remain independent of reviewed source on retry.
+                dependency.symlink_to(source_module)
+                return subprocess.CompletedProcess(
+                    observed["command"], 1, "",
+                    "The model gpt-6.1-sol does not exist or you do not have access to it.",
+                )
+
+        with self.assertRaisesRegex(SystemExit, "trusted installation"):
+            self.run_review(during_run=respond)
+        self.assertEqual(len(attempts), 1, "a contaminated auth installation must prevent the fallback send")
 
     def test_primary_only_catalogue_does_not_block_successful_primary(self):
         self.use_default_models()
@@ -615,10 +751,9 @@ class CodexInferenceRouteTests(unittest.TestCase):
         runtime.mkdir(mode=0o700)
         workspace = self.root / "workspace"
         workspace.mkdir()
-        with mock.patch.dict(self.helper["codex_command"].__globals__, {"resolve_command": lambda *_: "synthetic-codex"}):
-            command = self.helper["codex_command"](
-                self.args, self.repo, workspace, runtime, runtime / "schema", runtime / "output", self.args.model,
-            )
+        command = self.helper["codex_command"](
+            self.args, self.repo, workspace, runtime, runtime / "schema", runtime / "output", self.args.model,
+        )
         flags = [command[index + 1] for index, part in enumerate(command) if part == "-c"]
         flag = next(value for value in flags if value.startswith("model_providers.review_api.auth.command="))
         launcher = Path(tomllib.loads("value=" + flag.partition("=")[2])["value"])

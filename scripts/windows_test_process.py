@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 
 _CHILD_MARKER = "AGENT_SKILLS_WINDOWS_TEST_CHILD"
@@ -93,6 +94,22 @@ def _windows_api():
         _fields_ = [("process", w.HANDLE), ("thread", w.HANDLE),
                     ("process_id", w.DWORD), ("thread_id", w.DWORD)]
 
+    class JobBasicLimits(c.Structure):
+        _fields_ = [("process_time", c.c_longlong), ("job_time", c.c_longlong),
+                    ("flags", w.DWORD), ("minimum_working_set", c.c_size_t),
+                    ("maximum_working_set", c.c_size_t), ("active_limit", w.DWORD),
+                    ("affinity", c.c_size_t), ("priority", w.DWORD), ("scheduling", w.DWORD)]
+
+    class JobExtendedLimits(c.Structure):
+        _fields_ = [("basic", JobBasicLimits), ("io_counters", c.c_ulonglong * 6),
+                    ("process_memory", c.c_size_t), ("job_memory", c.c_size_t),
+                    ("peak_process_memory", c.c_size_t), ("peak_job_memory", c.c_size_t)]
+
+    class JobAccounting(c.Structure):
+        _fields_ = [("times", c.c_longlong * 4), ("page_faults", w.DWORD),
+                    ("total_processes", w.DWORD), ("active_processes", w.DWORD),
+                    ("terminated_processes", w.DWORD)]
+
     class Api:
         pass
 
@@ -106,6 +123,8 @@ def _windows_api():
     api.AclSizeInfo = AclSizeInfo
     api.StartupInfoEx = StartupInfoEx
     api.ProcessInfo = ProcessInfo
+    api.JobExtendedLimits = JobExtendedLimits
+    api.JobAccounting = JobAccounting
     api.kernel = c.WinDLL("kernel32", use_last_error=True)
     api.security = c.WinDLL("advapi32", use_last_error=True)
 
@@ -134,6 +153,15 @@ def _windows_api():
     bind(api.kernel, "WaitForSingleObject", w.DWORD, w.HANDLE, w.DWORD)
     bind(api.kernel, "GetExitCodeProcess", w.BOOL, w.HANDLE, dword_pointer)
     bind(api.kernel, "TerminateProcess", w.BOOL, w.HANDLE, w.UINT)
+    bind(api.kernel, "CreateJobObjectW", w.HANDLE, c.c_void_p, w.LPCWSTR)
+    bind(api.kernel, "SetInformationJobObject", w.BOOL,
+         w.HANDLE, c.c_int, c.c_void_p, w.DWORD)
+    bind(api.kernel, "QueryInformationJobObject", w.BOOL,
+         w.HANDLE, c.c_int, c.c_void_p, w.DWORD, c.c_void_p)
+    bind(api.kernel, "TerminateJobObject", w.BOOL, w.HANDLE, w.UINT)
+    bind(api.kernel, "CreateProcessW", w.BOOL,
+         w.LPCWSTR, w.LPWSTR, c.c_void_p, c.c_void_p, w.BOOL, w.DWORD,
+         c.c_void_p, w.LPCWSTR, c.POINTER(StartupInfo), c.POINTER(ProcessInfo))
     bind(api.security, "OpenProcessToken", w.BOOL, w.HANDLE, w.DWORD, handle_pointer)
     bind(api.security, "OpenThreadToken", w.BOOL, w.HANDLE, w.DWORD, w.BOOL, handle_pointer)
     bind(api.security, "GetTokenInformation", w.BOOL, w.HANDLE,
@@ -518,7 +546,7 @@ def _restricted_primary(api, source):
         api.kernel.CloseHandle(restricted)
 
 
-def _launch(api, token, command, environment):
+def _launch(api, token, command, environment, *, timeout=None, job=None, standard_handles=None):
     c, w = api.c, api.w
     startup = api.StartupInfoEx()
     startup.startup.cb = c.sizeof(startup.startup)
@@ -537,7 +565,8 @@ def _launch(api, token, command, environment):
     try:
         current = api.kernel.GetCurrentProcess()
         for identifier, field in ((-10, "stdin"), (-11, "stdout"), (-12, "stderr")):
-            original = api.kernel.GetStdHandle(identifier)
+            original = (standard_handles[identifier] if standard_handles is not None
+                        else api.kernel.GetStdHandle(identifier))
             if original == c.c_void_p(-1).value:
                 raise RuntimeError(f"native {field} handle is invalid")
             if not original:
@@ -564,13 +593,14 @@ def _launch(api, token, command, environment):
             if not set_handle_information(sentinel, 1, 1):  # HANDLE_FLAG_INHERIT
                 raise c.WinError(c.get_last_error())
         creation_flags = 0x00000400  # CREATE_UNICODE_ENVIRONMENT
+        attribute_count = 1 if job is None else 2
         size = c.c_size_t()
-        result = api.kernel.InitializeProcThreadAttributeList(None, 1, 0, c.byref(size))
+        result = api.kernel.InitializeProcThreadAttributeList(None, attribute_count, 0, c.byref(size))
         if result or c.get_last_error() != 122 or not 0 < size.value <= 1048576:
             raise RuntimeError("cannot size native process attribute list")
         attribute_buffer = c.create_string_buffer(size.value)
         startup.attributes = c.cast(attribute_buffer, c.c_void_p)
-        if not api.kernel.InitializeProcThreadAttributeList(startup.attributes, 1, 0, c.byref(size)):
+        if not api.kernel.InitializeProcThreadAttributeList(startup.attributes, attribute_count, 0, c.byref(size)):
             raise c.WinError(c.get_last_error())
         attributes_initialized = True
         inherited = (w.HANDLE * len(handles))(*(handle.value for handle in handles))
@@ -578,6 +608,15 @@ def _launch(api, token, command, environment):
             startup.attributes, 0, 0x00020002, inherited, c.sizeof(inherited), None, None,
         ):  # PROC_THREAD_ATTRIBUTE_HANDLE_LIST
             raise c.WinError(c.get_last_error())
+        if job is not None:
+            # Creation-time association closes the owner-death gap between
+            # creating a process and assigning it to the kill-on-close job.
+            # Keep this array alive until the attribute list is destroyed.
+            jobs = (w.HANDLE * 1)(job)
+            if not api.kernel.UpdateProcThreadAttribute(
+                startup.attributes, 0, 0x0002000D, jobs, c.sizeof(jobs), None, None,
+            ):  # PROC_THREAD_ATTRIBUTE_JOB_LIST (Windows 10 / Server 2016+)
+                raise c.WinError(c.get_last_error())
         startup.startup.cb = c.sizeof(startup)
         creation_flags |= 0x00080000  # EXTENDED_STARTUPINFO_PRESENT
         command_line = c.create_unicode_buffer(subprocess.list2cmdline(command))
@@ -602,13 +641,21 @@ def _launch(api, token, command, environment):
         # This callback is process-local, unlike the inheritable ignore flag
         # set by SetConsoleCtrlHandler(NULL, TRUE). The child handles Ctrl+C.
         # Only the standard handles (or inert sentinel) enter the allow-list.
-        if not api.security.CreateProcessAsUserW(
-            token, command[0], command_line, None, None, True, creation_flags,
-            block, os.getcwd(), c.byref(startup.startup), c.byref(process),
-        ):
+        arguments = (command[0], command_line, None, None, True, creation_flags,
+                     block, os.getcwd(), c.byref(startup.startup), c.byref(process))
+        created = (api.kernel.CreateProcessW(*arguments) if token is None
+                   else api.security.CreateProcessAsUserW(token, *arguments))
+        if not created:
             raise c.WinError(c.get_last_error())
+        # The process owner enforces the proof deadline. Killing an outer
+        # capture process would leave this child holding its output pipes open.
+        deadline = None if timeout is None else time.monotonic() + timeout
         while True:
-            waited = api.kernel.WaitForSingleObject(process.process, 1000)
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            wait_ms = 1000 if remaining is None else min(1000, max(1, int(remaining * 1000)))
+            waited = api.kernel.WaitForSingleObject(process.process, wait_ms)
             if waited == 0:
                 finished = True
                 break
@@ -620,9 +667,21 @@ def _launch(api, token, command, environment):
         return c.c_int32(code.value).value
     finally:
         try:
+            cleanup_error = None
             if process.process and not finished:
-                api.kernel.TerminateProcess(process.process, 130)
-                api.kernel.WaitForSingleObject(process.process, 5000)
+                # A creation-associated process is already covered by job
+                # termination. Re-terminating its departing leader can fail
+                # with ACCESS_DENIED before that leader becomes signaled.
+                if job is not None:
+                    if not api.kernel.TerminateJobObject(job, 130):
+                        cleanup_error = c.WinError(c.get_last_error())
+                elif not api.kernel.TerminateProcess(process.process, 130):
+                    termination_error = c.WinError(c.get_last_error())
+                    if api.kernel.WaitForSingleObject(process.process, 0) != 0:
+                        cleanup_error = termination_error
+                waited = api.kernel.WaitForSingleObject(process.process, 5000)
+                if waited != 0 and cleanup_error is None:
+                    cleanup_error = RuntimeError("native test child did not terminate within cleanup deadline")
             if process.thread:
                 api.kernel.CloseHandle(process.thread)
             if process.process:
@@ -631,6 +690,8 @@ def _launch(api, token, command, environment):
                 api.kernel.DeleteProcThreadAttributeList(startup.attributes)
             for handle in handles:
                 api.kernel.CloseHandle(handle)
+            if cleanup_error is not None:
+                raise cleanup_error
         finally:
             accept_shared_interrupt = False
             if control_registered:
@@ -639,6 +700,50 @@ def _launch(api, token, command, environment):
                 # Keep even a removed callback pinned for this test process:
                 # an already-dispatched native handler thread may still be
                 # waiting to enter Python. Its inactive closure returns FALSE.
+
+
+def run_windows_test_proof(command, *, stdout, stderr, timeout=60):
+    """Bound the complete proof under its original primary token, including descendants."""
+    import msvcrt
+
+    api = _windows_api()
+    job = api.kernel.CreateJobObjectW(None, None)
+    if not job:
+        raise api.c.WinError(api.c.get_last_error())
+    try:
+        limits = api.JobExtendedLimits()
+        limits.basic.flags = 0x2000  # KILL_ON_JOB_CLOSE, without breakaway.
+        if not api.kernel.SetInformationJobObject(job, 9, api.c.byref(limits), api.c.sizeof(limits)):
+            raise api.c.WinError(api.c.get_last_error())
+        try:
+            return _launch(
+                api, None, command, _native_environment_block(api), timeout=timeout, job=job,
+                standard_handles={-10: api.kernel.GetStdHandle(-10),
+                                  -11: msvcrt.get_osfhandle(stdout.fileno()),
+                                  -12: msvcrt.get_osfhandle(stderr.fileno())},
+            )
+        finally:
+            # Even a normally exited proof may have left a descendant. The
+            # job contains the initial interpreter before it can spawn one.
+            if not api.kernel.TerminateJobObject(job, 130):
+                raise api.c.WinError(api.c.get_last_error())
+            deadline = time.monotonic() + 5
+            while True:
+                accounting = api.JobAccounting()
+                if not api.kernel.QueryInformationJobObject(
+                    job, 1, api.c.byref(accounting), api.c.sizeof(accounting), None,
+                ):
+                    raise api.c.WinError(api.c.get_last_error())
+                if not accounting.active_processes:
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("native proof job did not terminate within cleanup deadline")
+                time.sleep(0.01)
+    finally:
+        # Never retain the last handle when explicit termination or observation
+        # fails. File-backed output lets the caller report that failure.
+        if not api.kernel.CloseHandle(job):
+            raise api.c.WinError(api.c.get_last_error())
 
 
 def _native_environment_block(api) -> bytes:

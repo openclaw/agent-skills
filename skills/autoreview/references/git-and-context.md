@@ -92,6 +92,148 @@ authentication, sandbox and mutation checks remain enabled.
 "$AUTOREVIEW" --mode branch --base origin/main --source-context-file src/token_count.py
 ```
 
+## External committed source
+
+When a change integrates another repository, supply its required source with
+`--external-source-context-file <repo-relative-manifest.json>`. The manifest lives
+in the reviewed repository; an ignored directory keeps it out of the change.
+The source checkout must be a separate, canonical absolute Git worktree path.
+The helper does not clone, fetch, install dependencies, or execute source code.
+
+```json
+{
+  "version": 1,
+  "root": "/absolute/path/to/upstream-checkout",
+  "commit": "<full source commit OID>",
+  "files": [
+    {"path": "src/owner.ts", "blob": "<blob OID at that commit>", "mode": "100644"}
+  ]
+}
+```
+
+Resolve the exact commit and each blob/mode with Git before constructing this
+inventory. Mutable refs, unknown fields, duplicate paths, missing files and
+blob/mode mismatches fail preparation. Both SHA-1 and SHA-256 repositories are
+supported. A linked worktree is permitted. For both the reviewed repository and
+external sources, roots and Git metadata paths must not traverse symlinks or
+Windows junctions; alternate object stores are unsupported. External source paths
+have the same traversal restriction. The source root cannot contain or be inside
+the reviewed repository. Before any Git probe, the helper discovers the reviewed
+and external repositories' Git, common and object directories without running Git. These
+directories and source roots are excluded from host executable selection, child
+`PATH`, authentication and configuration paths, including reviewer probes and
+trusted wrappers. A trusted `PATH` directory is excluded if
+any entry redirects into a source root. Paths with source-owned intermediate
+symlinks are also rejected, even when their final target is outside the source tree.
+The same entry checks apply to selected executables' original and resolved
+installation directories, including directories outside `PATH`.
+Reports, status files and diagnostic outputs must stay outside every source root
+and its Git metadata, including linked-worktree common directories and object
+stores. Git rejects source-owned `HOME`, default ignore files and global
+configuration paths that could hide changes. Trusted caller exclusions retain
+their existing behavior.
+
+Shared hardlinks in executable search directories or selected executable,
+configuration, authentication and certificate files require custody independent
+of the caller. Caller-owned read-only hardlinks are insufficient; use independent
+single-link copies. On Linux, shared-file custody requires an empty permitted
+capability set. On Windows, it allows only traversal, shutdown, undocking,
+working-set and time-zone privileges; other available privileges fail custody
+even when disabled, in either the process primary or effective thread token.
+This conservative check applies only to shared inodes and does not assert
+universal immutability. Independent single-link files bypass this custody check,
+but do not relax the checks for other selected files. Native positive
+verification uses a standard-user primary process, not temporary impersonation.
+
+Windows Git preflight and reviewer launches use an owned Job Object and the
+installed Python supervisor. These processes and their descendants join before
+they execute and remain owned after their leader exits. Cleanup does not invoke
+`taskkill.exe` or inspect its installation directory. The supervisor runs with
+the direct base Python interpreter, avoiding a virtual-environment redirector
+that could retain job or pipe handles. The supervisor and base Python installation
+still pass the ordinary source-boundary checks. Target arguments and environment
+are preserved. An incompatible enclosing job fails startup; there is no breakaway
+or executable cleanup fallback.
+Lost startup acknowledgement after permission to launch is a terminal
+uncertain-launch error, so it cannot silently repeat a possibly executed command.
+Startup cleanup waits are bounded. A stalled acknowledgement reader retains its
+pipe descriptors until its I/O ends, but cannot keep the helper alive after
+cleanup returns. Bounded waiting does not establish that failed cleanup completed.
+Git startup timeouts and execution errors report cleanup failure types without printing command
+arguments or raw exception messages.
+
+Handled interrupts attempt termination for every registered process even if one
+attempt fails. The first signal retains its exit status through buffered and
+streaming cleanup; later handled signals do not restart the sweep. Cleanup
+failures are reported by exception type, without changing cancellation into a
+retryable launch failure. Nested startup deferrals delay the batch sweep until
+the outer critical section finishes registration. The first signal records a
+durable cancellation request. Later Windows GO decisions reject it; a decision
+already holding the shared guard may finish authorizing the target. The callback
+waits for that guard before sweeping. The guard never spans pipe I/O or cleanup.
+Each invocation keeps one signal callback; direct helper launches have independent
+signal state, so catching one interrupt cannot disable cancellation of a later launch.
+The state remains visible through scope recovery: entering workers inherit its
+cancellation. One invocation-owned evidence collection retains cleanup failures
+and prior outcomes. For CLI-managed processes, each new cancellation delivery
+has its own exception, cause, traceback, and partial output.
+An exception already unwinding through its owning context is preserved. A new
+operation started from an earlier error handler reports its own cleanup failures.
+An interrupted sweep retains its process snapshot and completed phase attempts.
+Scope finalization makes one bounded recovery attempt, revisiting interrupted
+force-kill operations without repeating completed attempts or the shared grace wait.
+Handler restoration makes at most two passes, including recovery from an interrupt
+between handlers, and changes only dispositions still observed to be owned by that
+invocation. An owned signal takes priority over routine help or validation exits,
+while retaining the prior exit as diagnostic evidence. Ordinary exit and launch
+observations are retained separately from actual cleanup failures. Repeated
+interruptions or native cleanup errors remain reported failures; these bounds do
+not guarantee completed teardown or exactly-once operating-system effects.
+Handler-restoration failures retain an uncertain launch outcome. When cancellation
+supersedes that outcome, including interruption after a successful STARTED
+acknowledgement, direct launch callers receive this launch's exact known failure
+as the safe exception cause, preserving its protocol error chain. If no precise
+failure was observed, the cause records that the target may have started.
+The CLI retains this evidence internally and exits with the signal's status.
+
+Normalized `PATH`, `SSL_CERT_DIR` and `OPENCLAW_INCLUDE_ROOTS` entries must
+survive path-list serialization unchanged.
+`SSL_CERT_DIR` also checks its directory entries for source ownership and file
+custody, including certificate and CRL links.
+An unsafe or malformed nonempty `SSL_CERT_DIR` stops preparation before a child
+starts: removing it could select the same rejected store through TLS defaults.
+Configure independently held certificate directories outside the source roots.
+Unset or empty selectors retain normal default lookup; implicit system stores
+are not inventoried. Malformed include lists are omitted from reviewer
+environments; an empty filtered executable `PATH` fails preparation.
+
+The helper reads complete UTF-8 regular-file blobs from the declared commit,
+not the source checkout's working bytes. Headers retain the original path,
+source worktree, commit, blob and mode. Existing committed-source protections
+still reject credential directories, stores and keyfiles. This role does not
+relax `--prompt-file` or `--dataset` filename rules. Do not rename or concatenate
+blocked evidence to bypass those rules.
+
+The helper retains the initial Git metadata binding from before output preparation
+through source capture and publication. Git collection rechecks that binding
+before launch, after preparation queries such as executable-filter discovery.
+The manifest, source paths, checkout identity, Git metadata/object-store paths
+and captured source fingerprints are revalidated before every send, including
+helper-initiated retries, and before publication.
+Changes fail the review rather than silently rebinding a source. Freeze source
+checkouts during the review, including their working files and metadata.
+
+External source is context only. It does not add finding targets or certify the
+upstream repository, release provenance, or runtime behavior. The operator must
+establish that the chosen source commit matches the dependency being reviewed.
+Report missing required contracts instead of inferring them from a source pin.
+
+This option is repeatable, supports committed branch/commit mode, and composes
+with `--review-batches`. Every selected external file stays whole in **every**
+pass, including allocated passes. It cannot be partitioned by an allocation.
+The complete input must fit the explicit prompt budget and model context; an
+oversized plan fails before a reviewer starts.
+
 ## Runtime diagnostics
 
 - Before repository detection/target selection: Git must pass `--version` within
@@ -101,6 +243,9 @@ authentication, sandbox and mutation checks remain enabled.
   inaccessible explicit executable override still fails preflight.
 - Set `AUTOREVIEW_GIT` to trusted external Git executable: override every
   helper-owned Git invocation.
+  If an installation directory contains a rejected shared hardlink, select an
+  independently admitted installation; the override still checks its directory
+  entries. The diagnostic names the first rejected entry and reason.
 - macOS, broken selected Xcode: use
   `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` for invocation.
 - Git sanitized environment additionally retains only absolute, external
