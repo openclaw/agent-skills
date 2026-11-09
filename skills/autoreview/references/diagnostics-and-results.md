@@ -54,6 +54,11 @@ Read for output-path edge cases, machine status, usage accounting, local stage o
   `--json-output` report format unchanged. Completed status values:
   `scoped-clean`, `findings`, `filtered`, `incorrect`, `incomplete`.
 - Launched reviewer fails or returns invalid output: `reviewer_unavailable` (exit 1).
+- A handled signal while configuring or running reviewers publishes `interrupted`,
+  with `reason: interrupted`,
+  `report_produced: false`, `signal_number`, and exit code `128 + signal_number`.
+  `reviewer_exit_code` stays null: the signal was received by the helper, not an
+  observed reviewer exit. Owned-child cleanup still runs; this is no review verdict.
 - Failed later pass never publishes partial report.
 
 ```json
@@ -90,8 +95,9 @@ Read for output-path edge cases, machine status, usage accounting, local stage o
   old status before target selection.
 - Dry runs validate output paths but do not create, replace, or remove output files.
   Any existing status belongs to a prior invocation, not the dry run.
-- Preflight/pre-launch isolation refusals, source mutations, interruptions,
-  output failures: no new status. Absence never means clean verdict.
+- Preflight/pre-launch isolation refusals, source mutations, interruptions outside
+  reviewer execution, and output failures may produce no new status. Absence never
+  means a clean verdict.
 
 ## Preflight summary
 
@@ -128,5 +134,8 @@ Summary JSON carries no model prose, source text, report hash, roles, or usage.
 - Counts: observed tokens, not billing estimates or cache-hit promises.
 - Missing telemetry (including all-zero defaults without sample): unknown, never
   measured zero. `tokens: null`: no usable totals; incomplete totals: lower bounds.
-- Interrupted runs: print retained usage; never publish status/reports.
+- Interrupted runs retain usage in the [metadata-only status](#results)
+  when interrupted during reviewer execution, and print it when output remains
+  available. They publish no review report; interruptions outside that phase may
+  leave no status.
 - Other engines do not aggregate usage.

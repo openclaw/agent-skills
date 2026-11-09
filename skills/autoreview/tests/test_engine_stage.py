@@ -707,10 +707,12 @@ class StageTests(unittest.TestCase):
                 self.assertEqual(sidecar['terminal'], 'returned')
                 self.assertIs(sidecar['acceptance'], False)
                 self.assertEqual((directory / 'report.json').exists(), outcome == 'incomplete')
+                status = json.loads((directory / 'status.json').read_text())
                 if outcome == 'interrupted':
-                    self.assertFalse((directory / 'status.json').exists())
+                    self.assertEqual(status['status'], 'interrupted')
+                    self.assertFalse(status['report_produced'])
+                    self.assertEqual(status['usage']['attempts'], 1)
                 else:
-                    status = json.loads((directory / 'status.json').read_text())
                     self.assertEqual(status['status'], 'incomplete' if outcome == 'incomplete' else 'reviewer_unavailable')
                     self.assertEqual(status['usage']['attempts'], 1 if outcome == 'incomplete' else 2)
 
