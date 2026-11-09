@@ -74,6 +74,18 @@ TRACKED_SENSITIVE_PATH_PARTS = SENSITIVE_PATH_PARTS - {
 # original path to its Git blob ID and SHA-256 of the inspected bytes.
 # Never populate this from the reviewed checkout, environment, or CLI.
 REVIEWED_CONTEXT_BLOBS: dict[str, tuple[str, str]] = {
+    "apps/controller/src/composition/repository-credentials/contracts.ts": (
+        "d3c7c6a14db3159ae4e2b23717bdab3749ec41c1",
+        "67a28f235fc5397f63207cd743d2af325206c7f6e8f53c578aae37a190057673",
+    ),
+    "apps/controller/src/composition/repository-credentials/custody-selection.ts": (
+        "049ceace69087168dbaef7e43693d6a32fae586e",
+        "d539dcc47c6b62e7dd806d80e51b372d1ce28ba5f20c334914df2d48c269f2e4",
+    ),
+    "apps/controller/src/composition/repository-credentials/transport.ts": (
+        "04383146313df3fd3774baae6e5b87bd06df7b17",
+        "70f11d8205bce38a312468ec572ef89ef7265870d3d80601ce6474ed18cbe71b",
+    ),
     "deploy/helm/openclaw-enterprise/templates/installation-secrets.yaml": (
         "8278b48020dda27c20ffd69cc8f35f9848288557",
         "83b846dbd5a852b826f772995687b35526c6f466065dce576ef6159d39a5c810",
