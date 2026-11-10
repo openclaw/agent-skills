@@ -3813,7 +3813,10 @@ time.sleep(60)
 ''')
             # Empty homes and an inert CLI keep this process test offline and unauthenticated.
             env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(root),
-                   "USERPROFILE": str(root), "CODEX_HOME": str(root)}
+                   "USERPROFILE": str(root), "CODEX_HOME": str(root),
+                   # Without OS temp settings, macOS Python chooses shared /tmp
+                   # and isolation refuses startup before this test can signal it.
+                   "TMPDIR": str(root)}
             if "AUTOREVIEW_GIT" in os.environ:
                 env["AUTOREVIEW_GIT"] = os.environ["AUTOREVIEW_GIT"]
             cases = ((signal.SIGTERM, True, None), (signal.SIGINT, True, None),
