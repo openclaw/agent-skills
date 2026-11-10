@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import copy
 import io
+import itertools
 import json
 import os
 import re
@@ -1667,10 +1668,11 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertNotIn("src/token_count.py", sends[0].split("# Change Bundle\n", 1)[1])
 
     def test_source_context_credential_flow_uses_frozen_document(self):
-        path = "docs/flows/credential-source-egress/model-requests.md"
+        paths = ("docs/flows/credential-source-egress/model-requests.md",
+                 "docs/reference/repository-credentials/prepared-native-git.md")
         content = b"# Model requests\n\nAuthorize each request before releasing a key.\n"
-        for role in ("--source-context", "--source-context-file"):
-            with self.subTest(role=role), self.committed_context_fixture(
+        for path, role in itertools.product(paths, ("--source-context", "--source-context-file")):
+            with self.subTest(path=path, role=role), self.committed_context_fixture(
                 path=path, role=role, content=content,
             ) as (repo, sends, *_):
                 commit = git(repo, "rev-parse", "HEAD").strip()
@@ -1771,9 +1773,13 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "sensitive filename"):
                     self.helper["main_impl"]()
                 self.assertFalse(sends)
-        for role in ("--dataset", "--prompt-file"):
-            with self.subTest(role=role), self.committed_context_fixture(
-                path="docs/flows/credential-source-egress/model-requests.md", role=role,
+        for path, role in itertools.product(
+            ("docs/flows/credential-source-egress/model-requests.md",
+             "docs/reference/repository-credentials/prepared-native-git.md"),
+            ("--dataset", "--prompt-file"),
+        ):
+            with self.subTest(path=path, role=role), self.committed_context_fixture(
+                path=path, role=role,
             ) as (_repo, sends, *_):
                 with self.assertRaisesRegex(SystemExit, "sensitive"):
                     self.helper["main_impl"]()
@@ -1894,6 +1900,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "docs/flows/credentials/model-requests.md",
             "private/docs/flows/credential-source-egress/model-requests.md",
             "docs/Flows/credential-source-egress/model-requests.md",
+            "docs/reference/repository-credentials/session.json",
+            "docs/reference/repository-credentials/credentials.md",
+            "docs/reference/repository-credentials/.env",
+            "docs/reference/repository-credentials/signing.key",
+            "docs/reference/repository-credentials/nested/guide.md",
+            "docs/reference/credentials/guide.md",
+            "private/docs/reference/repository-credentials/guide.md",
+            "docs/Reference/repository-credentials/guide.md",
             "drivers/repository-credentials/session.json",
             "drivers/repository-credentials/.env",
             "drivers/repository-credentials/signing.pem",
@@ -5161,43 +5175,46 @@ time.sleep(60)
                 self.assertIn("+review me", bundle)
 
     def test_credential_flow_changes_remain_finding_targets(self) -> None:
-        path = "docs/flows/credential-source-egress/model-requests.md"
-        with tempfile.TemporaryDirectory() as tempdir:
-            repo = init_repo(Path(tempdir))
-            (repo / "base.txt").write_text("base\n")
-            git(repo, "add", "base.txt")
-            git(repo, "commit", "-qm", "base")
-            base = git(repo, "rev-parse", "HEAD").strip()
-            doc = repo / path
-            doc.parent.mkdir(parents=True)
-            doc.write_text("# Model request flow\n")
-            # The exception is for tracked behavior docs, not arbitrary evidence.
-            untracked = self.helper["local_bundle"](repo)
-            self.assertNotIn("Model request flow", untracked.text)
-            self.assertNotIn(path, untracked.paths)
-            git(repo, "add", path)
-            staged = self.helper["local_bundle"](repo)
-            self.assertIn("+# Model request flow", staged.text)
-            self.assertIn(path, staged.paths)
-            git(repo, "commit", "-qm", "document flow")
-            for bundle in (self.helper["branch_bundle"](repo, base),
-                           self.helper["commit_bundle"](repo, "HEAD")):
-                self.assertIn(path, bundle.text)
-                self.assertIn("+# Model request flow", bundle.text)
-                self.assertIn(path, bundle.paths)
+        paths = ("docs/flows/credential-source-egress/model-requests.md",
+                 "docs/reference/repository-credentials/prepared-native-git.md")
+        for path in paths:
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                (repo / "base.txt").write_text("base\n")
+                git(repo, "add", "base.txt")
+                git(repo, "commit", "-qm", "base")
+                base = git(repo, "rev-parse", "HEAD").strip()
+                doc = repo / path
+                doc.parent.mkdir(parents=True)
+                doc.write_text("# Model request flow\n")
+                # The exception is for tracked behavior docs, not arbitrary evidence.
+                untracked = self.helper["local_bundle"](repo)
+                self.assertNotIn("Model request flow", untracked.text)
+                self.assertNotIn(path, untracked.paths)
+                git(repo, "add", path)
+                staged = self.helper["local_bundle"](repo)
+                self.assertIn("+# Model request flow", staged.text)
+                self.assertIn(path, staged.paths)
+                git(repo, "commit", "-qm", "document flow")
+                for bundle in (self.helper["branch_bundle"](repo, base),
+                               self.helper["commit_bundle"](repo, "HEAD")):
+                    self.assertIn(path, bundle.text)
+                    self.assertIn("+# Model request flow", bundle.text)
+                    self.assertIn(path, bundle.paths)
 
     def test_credential_flow_exception_requires_regular_changed_modes(self) -> None:
-        path = "docs/flows/credential-source-egress/guide.md"
+        paths = ("docs/flows/credential-source-egress/guide.md",
+                 "docs/reference/repository-credentials/guide.md")
         url = "https://example.invalid/private-flow-repository.git"
-        for old_mode, new_mode, allowed in (
+        for path, (old_mode, new_mode, allowed) in itertools.product(paths, (
             ("160000", "160000", False), ("120000", "120000", False),
             ("000000", "160000", False), ("000000", "120000", False),
             ("100644", "160000", False), ("160000", "100644", False),
             ("100644", "120000", False), ("120000", "100644", False),
             ("160000", "000000", False), ("120000", "000000", False),
             ("100644", "000000", True), ("100644", "100755", True),
-        ):
-            with self.subTest(old_mode=old_mode, new_mode=new_mode), tempfile.TemporaryDirectory() as tempdir:
+        )):
+            with self.subTest(path=path, old_mode=old_mode, new_mode=new_mode), tempfile.TemporaryDirectory() as tempdir:
                 repo = init_repo(Path(tempdir))
                 git(repo, "config", "core.filemode", "false")
                 if os.name == "nt":

@@ -2590,10 +2590,13 @@ def skill_instruction_path(path: Path) -> bool:
     return skill_root and path.name.lower() in {"agents.md", "claude.md", "skill.md"}
 
 
-def credential_flow_document_path(path: Path) -> bool:
-    # This named flow directory documents behavior; it is not a credential store.
+def credential_document_path(path: Path) -> bool:
+    # These named documentation directories describe behavior, not credential stores.
     return (
-        path.parts[:3] == ("docs", "flows", "credential-source-egress")
+        path.parts[:3] in {
+            ("docs", "flows", "credential-source-egress"),
+            ("docs", "reference", "repository-credentials"),
+        }
         and len(path.parts) == 4
         and path.suffix == ".md"
         and not any(pattern.search(path.name) for pattern in SENSITIVE_NAME_PATTERNS)
@@ -2609,7 +2612,7 @@ def tracked_sensitive_repo_path_risk(rel: str, *, regular_file: bool = True) -> 
         or f"/{normalized.lower()}".endswith("/.docker/config.json")
         or parts & TRACKED_SENSITIVE_PATH_PARTS
         or (credential_store_path(normalized)
-            and not (regular_file and credential_flow_document_path(path)))
+            and not (regular_file and credential_document_path(path)))
         or token_credential_store_path(normalized)
     ):
         return "sensitive path"
