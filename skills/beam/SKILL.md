@@ -1,6 +1,6 @@
 ---
 name: beam
-description: "Share a redacted coding session or hand its logical conversation to an authenticated OpenClaw Gateway."
+description: "Share a redacted Claude Code, Codex, or Grok Bot session, or hand its logical conversation to an authenticated OpenClaw Gateway."
 ---
 
 # Beam
@@ -11,7 +11,7 @@ Use when the user explicitly asks to beam, publish, or share the current local c
 
 - Treat invoking this skill as approval for one snapshot upload to the named destination.
 - Never upload raw JSONL, reasoning, system/developer prompts, tool output, environment values, credentials, browser state, cookies, or local paths.
-- The helper is self-contained: it resolves and parses exact Claude Code or Codex transcripts, then uploads only locally redacted user/assistant messages and compact tool counts.
+- The helper is self-contained: it resolves and parses exact Claude Code or Codex transcripts, or an exported Grok Bot transcript, then uploads only locally redacted user/assistant messages and compact tool counts.
 - Ordinary publishing shares a read-only snapshot. A separately requested `handoff` releases the source Beam identity and moves its logical conversation to Team. After handoff, use Beam's authenticated `read` and `continue` commands for subsequent work; do not resume independent source work or publish another transcript copy.
 - Team owns one durable conversation after release. The source history imports once; reads, reconnects and continuations resolve that same conversation. Native provider runtime IDs need not survive. Do not connect a node, expose a terminal, transfer credentials or grant filesystem/tool access.
 - Require HTTPS except for loopback development endpoints.
@@ -50,12 +50,14 @@ Prefer exact harness metadata when available:
 - Codex shell tools: `CODEX_THREAD_ID` identifies the current thread.
 - Hook adapters: pass their JSON to `beam hook`; `transcript_path` is authoritative.
 - Exact fallback: Beam scans only the native Claude/Codex session roots for the supplied id and fails closed on no match or ambiguity.
+- Grok Bot: pass `--source grokbot` and `--session FILE`. Beam does not scan a Grok Bot home directory.
 
 Useful options:
 
 ```bash
 node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --session /path/to/session.jsonl
 node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --thread-id "$CODEX_THREAD_ID"
+node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --source grokbot --session /path/to/agent-id.jsonl
 node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --title "Fix upload flow"
 node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --complete
 node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --dry-run
@@ -83,7 +85,7 @@ node "$BEAM_SKILL_DIR/scripts/beam" read --endpoint "$BEAM_ENDPOINT" --beam-id B
 node "$BEAM_SKILL_DIR/scripts/beam" continue --endpoint "$BEAM_ENDPOINT" --beam-id BEAM_ID --profile-dir /path/to/own/remote-profile --message "Continue the work"
 ```
 
-Use `--session-id` for Claude Code. The handoff receipt prints `BEAM_ID`. `--profile-dir` selects an existing normal OpenClaw remote profile for that exact Gateway; configure your own authentication first. No shared account or provider token is requested or copied. Permission or runtime denial stays a denial.
+Use `--session-id` for Claude Code. For a Grok Bot export, use `--source grokbot --session FILE`. The handoff receipt prints `BEAM_ID`. `--profile-dir` selects an existing normal OpenClaw remote profile for that exact Gateway; configure your own authentication first. No shared account or provider token is requested or copied. Permission or runtime denial stays a denial.
 
 The helper durably retires this source identity before network dispatch. A pending handoff stays retired after errors; recover with `handoff --endpoint "$BEAM_ENDPOINT" --beam-id BEAM_ID`, including when the source transcript is gone. Never delete the retirement record to retry. Snapshot expiry or archive cannot restore source ownership. A `read` with no destination returns a visible pending result and creates nothing; `continue` creates the destination once. Deleted or reset destinations require reconciliation, not a new transcript copy.
 

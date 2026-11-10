@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -520,6 +521,173 @@ test("standalone parser ignores persisted Codex inter-agent messages", () => {
   assert.doesNotMatch(JSON.stringify(rendered), /private inter-agent coordination/);
 });
 
+function beamIdFor(source, identity) {
+  return createHash("sha256").update(`${source}:${identity}`).digest("hex").slice(0, 32);
+}
+
+function grokNativeRows(id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee") {
+  return [
+    { id, title: "Ship the parser", model: "grok-4" },
+    {
+      role: "user",
+      message: {
+        content: [{ type: "text", text: "[t0u]\n[SAND_HIDDEN_PROMPT]\nDo not reveal HIDDEN_WAKE_9f3a" }],
+      },
+    },
+    {
+      role: "user",
+      message: {
+        content: [{
+          type: "text",
+          text: "[t3u]\n[Group chat: Room]\nInspect /Users/tester/code with Bearer abcdefghijklmnopqrstuvwxyz123456\nIt's your turn to speak.",
+        }],
+      },
+    },
+    {
+      role: "assistant",
+      message: {
+        content: [
+          { type: "thinking", thinking: "PRIVATE_THINKING_9f3a" },
+          { type: "text", text: "PRIVATE_SCRATCH_9f3a" },
+          { type: "tool_use", name: "read", input: { path: "/Users/tester/code/secret.txt" } },
+        ],
+      },
+    },
+    {
+      role: "tool",
+      message: {
+        content: [{ type: "tool_result", name: "read", result: { success: "RAW_TOOL_OUTPUT_9f3a" } }],
+      },
+    },
+    {
+      role: "assistant",
+      message: {
+        content: [
+          { type: "text", text: "still scratch" },
+          { type: "tool_use", name: "shell", input: { command: "cat /tmp/secret" } },
+        ],
+      },
+    },
+    {
+      role: "tool",
+      message: {
+        content: [{ type: "tool_result", name: "shell", result: { success: "RAW_SHELL_9f3a" } }],
+      },
+    },
+    {
+      role: "assistant",
+      message: {
+        content: [{
+          type: "tool_use",
+          name: "send_message",
+          input: { text: { content: "Inspection complete" }, toolCallId: "call-1" },
+        }],
+      },
+    },
+    {
+      role: "tool",
+      message: {
+        content: [{ type: "tool_result", name: "send_message", result: { success: { messageId: "t0s0" } } }],
+      },
+    },
+  ];
+}
+
+test("standalone Grok Bot parser publishes visible turns and drops scratch, wakes, and tool output", () => {
+  const id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  const session = path.join(tempDir(), id, `${id}.jsonl`);
+  fs.mkdirSync(path.dirname(session), { recursive: true });
+  writeJsonl(session, grokNativeRows(id));
+
+  const rendered = renderSession(session);
+  assert.equal(rendered.source, "grokbot");
+  assert.equal(rendered.identity, id);
+  assert.equal(rendered.title, "Ship the parser");
+  assert.deepEqual(rendered.sourceModel, { provider: "xai", model: "grok-4" });
+  assert.deepEqual(rendered.items.slice(0, 2), [
+    { type: "userMessage", text: "Inspect [LOCAL_PATH] with [REDACTED_AUTH_HEADER]" },
+    { type: "agentMessage", text: "Inspection complete" },
+  ]);
+  assert.deepEqual(rendered.items.at(-1), {
+    type: "other",
+    text: "1 read, 1 execute; raw tool outputs dropped: 3",
+  });
+  assert.doesNotMatch(
+    JSON.stringify(rendered),
+    /HIDDEN_WAKE_9f3a|PRIVATE_THINKING_9f3a|PRIVATE_SCRATCH_9f3a|still scratch|RAW_TOOL_OUTPUT_9f3a|RAW_SHELL_9f3a|secret\.txt|\/tmp\/secret|It's your turn|Group chat/,
+  );
+});
+
+test("standalone Grok Bot parser keeps assistant text when the export has no send_message", () => {
+  const session = path.join(tempDir(), "plain-grok.json");
+  fs.writeFileSync(session, JSON.stringify({
+    id: "grokconv-0123456789",
+    title: "Plain export",
+    messages: [
+      { role: "system", content: "hidden system prompt" },
+      { role: "user", content: "Hello" },
+      { role: "assistant", content: [{ type: "thinking", thinking: "PRIVATE_THINKING_9f3a" }, { type: "text", text: "Hi there" }] },
+    ],
+  }, null, 2));
+
+  const rendered = renderSession(session, { source: "grokbot" });
+  assert.equal(rendered.identity, "grokconv-0123456789");
+  assert.deepEqual(rendered.items, [
+    { type: "userMessage", text: "Hello" },
+    { type: "agentMessage", text: "Hi there" },
+  ]);
+  assert.equal(rendered.sourceModel, undefined);
+});
+
+test("Grok Bot conversation ids stay stable across export paths and reject invalid ids", () => {
+  const id = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+  const rows = [{ role: "user", content: "Same conversation" }, { role: "assistant", content: "Same reply" }];
+  const first = path.join(tempDir(), `${id}.jsonl`);
+  const secondDir = path.join(tempDir(), "copy");
+  fs.mkdirSync(secondDir);
+  const second = path.join(secondDir, `${id}.jsonl`);
+  writeJsonl(first, rows);
+  writeJsonl(second, rows);
+  assert.equal(renderSession(first).identity, id);
+  assert.equal(renderSession(second).identity, id);
+
+  const named = path.join(tempDir(), "sand-subagent-0123456789abcdef", "sand-subagent-0123456789abcdef.jsonl");
+  fs.mkdirSync(path.dirname(named), { recursive: true });
+  writeJsonl(named, rows);
+  assert.equal(renderSession(named).identity, "sand-subagent-0123456789abcdef");
+
+  const loose = path.join(tempDir(), "conversation.jsonl");
+  writeJsonl(loose, rows);
+  assert.equal(renderSession(loose).identity, null);
+
+  const invalid = path.join(tempDir(), `${id}.jsonl`);
+  writeJsonl(invalid, [{ id: "short" }, ...rows]);
+  assert.throws(() => renderSession(invalid), /not a valid session identifier/);
+  assert.throws(() => renderSession(sessionWithMarkdown(), { source: "grokbot" }), /conversation records/);
+});
+
+function sessionWithMarkdown() {
+  const session = path.join(tempDir(), "chat.md");
+  fs.writeFileSync(session, "# Chat\n\n**User:** Hello\n\n**Grok:** Hi\n");
+  return session;
+}
+
+test("bounded Grok Bot reads retain head and tail messages", (t) => {
+  const session = path.join(tempDir(), "large.jsonl");
+  const row = (text) => JSON.stringify({ role: "user", content: text });
+  fs.writeFileSync(session, `${row("Head message")}\n${"x".repeat(8 * 1024 * 1024)}\n${row("Tail message")}\n`);
+  const read = fs.readSync;
+  t.mock.method(fs, "readSync", (fd, buffer, offset, length, position) =>
+    read(fd, buffer, offset, Math.min(length, 4096), position));
+  const rendered = renderSession(session);
+  assert.equal(rendered.source, "grokbot");
+  assert.equal(rendered.truncated, true);
+  assert.deepEqual(rendered.items, [
+    { type: "userMessage", text: "Head message" },
+    { type: "userMessage", text: "Tail message" },
+  ]);
+});
+
 test("publish dry-run emits a sanitized versioned payload", async () => {
   const session = claudeSession();
   const result = await run([
@@ -541,6 +709,140 @@ test("publish dry-run emits a sanitized versioned payload", async () => {
   assert.match(payload.items[0].text, /\[REDACTED_AUTH_HEADER\]/);
   assert.doesNotMatch(result.stdout, /abcdefghijklmnopqrstuvwxyz123456|hidden compact summary/);
   assert.equal(payload.beamId.length, 32);
+});
+
+test("publish dry-run sends a Grok Bot export with source grokbot", async () => {
+  const id = "cccccccc-dddd-4eee-8fff-000000000001";
+  const dirA = path.join(tempDir(), "one");
+  const dirB = path.join(tempDir(), "two");
+  fs.mkdirSync(dirA);
+  fs.mkdirSync(dirB);
+  const sessionA = path.join(dirA, `${id}.jsonl`);
+  const sessionB = path.join(dirB, `${id}.jsonl`);
+  writeJsonl(sessionA, grokNativeRows(id));
+  writeJsonl(sessionB, grokNativeRows(id));
+  const args = (session) => [
+    "publish",
+    "--endpoint",
+    "http://127.0.0.1:9/api/v1/beam/sessions",
+    "--source",
+    "GrokBot",
+    "--session",
+    session,
+    "--dry-run",
+    "--quiet",
+  ];
+  const first = await run(args(sessionA));
+  const second = await run(args(sessionB));
+  assert.equal(first.code, 0, first.stderr);
+  assert.equal(second.code, 0, second.stderr);
+  const payload = JSON.parse(first.stdout);
+  const again = JSON.parse(second.stdout);
+  assert.equal(payload.version, 1);
+  assert.equal(payload.source, "grokbot");
+  assert.equal(payload.beamId, beamIdFor("grokbot", id));
+  assert.equal(again.beamId, payload.beamId);
+  assert.equal(payload.title, "Ship the parser");
+  assert.deepEqual(payload.sourceModel, { provider: "xai", model: "grok-4" });
+  assert.equal(payload.items[0].text, "Inspect [LOCAL_PATH] with [REDACTED_AUTH_HEADER]");
+  assert.equal(payload.items[1].text, "Inspection complete");
+  assert.ok(payload.items.every((item) => item.text.length <= 6_000));
+  assert.doesNotMatch(first.stdout, /HIDDEN_WAKE_9f3a|PRIVATE_SCRATCH_9f3a|RAW_TOOL_OUTPUT_9f3a/);
+});
+
+test("publish keeps a Grok Bot transcript within item, character, and body limits", async () => {
+  const session = path.join(tempDir(), "grok-limits.jsonl");
+  writeJsonl(
+    session,
+    Array.from({ length: 210 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: index === 209 ? "é".repeat(7_000) : `message-${index}`,
+    })),
+  );
+  const result = await run([
+    "publish",
+    "--endpoint",
+    "http://127.0.0.1:9/api/v1/beam/sessions",
+    "--source",
+    "grokbot",
+    "--session",
+    session,
+    "--dry-run",
+    "--quiet",
+  ]);
+  assert.equal(result.code, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.source, "grokbot");
+  assert.equal(payload.truncated, true);
+  assert.equal(payload.items.length, 200);
+  assert.ok(payload.items.every((item) => item.text.length <= 6_000));
+  assert.match(payload.items.find((item) => item.text.includes("truncated")).text, /\n\.\.\.\[truncated \d+ chars\]$/);
+  assert.ok(Buffer.byteLength(JSON.stringify(payload)) <= 52 * 1024);
+});
+
+test("publish trims a large Grok Bot body without dropping its exported title", async () => {
+  const session = path.join(tempDir(), "grok-body.json");
+  fs.writeFileSync(session, JSON.stringify({
+    id: "grokbody-0123456789abcdef",
+    title: "Ship the parser",
+    messages: Array.from({ length: 80 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `body-${index} ${"word ".repeat(400)}`,
+    })),
+  }));
+  const result = await run([
+    "publish",
+    "--endpoint",
+    "http://127.0.0.1:9/api/v1/beam/sessions",
+    "--source",
+    "grokbot",
+    "--session",
+    session,
+    "--dry-run",
+    "--quiet",
+  ]);
+  assert.equal(result.code, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.truncated, true);
+  assert.equal(payload.title, "Ship the parser");
+  assert.ok(payload.items.length <= 200);
+  assert.ok(payload.items.every((item) => item.text.length <= 6_000));
+  assert.ok(Buffer.byteLength(JSON.stringify(payload)) <= 52 * 1024);
+  assert.equal(payload.beamId, beamIdFor("grokbot", "grokbody-0123456789abcdef"));
+});
+
+test("Grok Bot publish requires a transcript file and a known source", async () => {
+  const endpoint = ["--endpoint", "http://127.0.0.1:9/api/v1/beam/sessions", "--dry-run"];
+  const missing = await run(["publish", ...endpoint, "--source", "grokbot"]);
+  assert.equal(missing.code, 1);
+  assert.match(missing.stderr, /Grok Bot transcripts require --session FILE/);
+  const unknown = await run(["publish", ...endpoint, "--source", "other", "--session", sessionWithMarkdown()]);
+  assert.equal(unknown.code, 1);
+  assert.match(unknown.stderr, /--source must be claude, codex, or grokbot/);
+  const markdown = await run(["publish", ...endpoint, "--source", "grokbot", "--session", sessionWithMarkdown()]);
+  assert.equal(markdown.code, 1);
+  assert.match(markdown.stderr, /conversation records/);
+});
+
+test("hook can publish a Grok Bot transcript_path", async () => {
+  const id = "dddddddd-eeee-4fff-8000-111111111111";
+  const session = path.join(tempDir(), `${id}.jsonl`);
+  writeJsonl(session, [
+    { role: "user", content: "Continue the export" },
+    { role: "assistant", content: "Published the visible reply" },
+  ]);
+  const result = await run(
+    ["hook", "--endpoint", "http://127.0.0.1:9/api/v1/beam/sessions", "--dry-run", "--quiet"],
+    { stdin: JSON.stringify({ hook_event_name: "Stop", transcript_path: session }) },
+  );
+  assert.equal(result.code, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.source, "grokbot");
+  assert.equal(payload.beamId, beamIdFor("grokbot", id));
+  assert.deepEqual(payload.items.map((item) => item.text), [
+    "Continue the export",
+    "Published the visible reply",
+  ]);
 });
 
 test("publish bounds transcript item count for the receiver schema", async () => {

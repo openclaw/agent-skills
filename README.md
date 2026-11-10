@@ -16,7 +16,8 @@ repo. See [VISION.md](VISION.md) for catalog boundaries and admission principles
 - `behavior-validator`: source-blind validation of user-visible behavior against
   a contract.
 - [`beam`](skills/beam/README.md): self-contained, authenticated, redacted
-  publication of local coding sessions to a read-only OpenClaw catalog.
+  publication of Claude Code, Codex, and exported Grok Bot sessions to a
+  read-only OpenClaw catalog.
 - `crabbox`: Crabbox/Testbox remote validation workflow for broad or CI-parity
   proof.
 - `handoff`: path-free prompt handoff workflow for delegating a task to another
