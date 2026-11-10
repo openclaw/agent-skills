@@ -2610,6 +2610,16 @@ def skill_instruction_path(path: Path) -> bool:
     return skill_root and path.name.lower() in {"agents.md", "claude.md", "skill.md"}
 
 
+def credential_flow_document_path(path: Path) -> bool:
+    # This named flow directory documents behavior; it is not a credential store.
+    return (
+        path.parts[:3] == ("docs", "flows", "credential-source-egress")
+        and len(path.parts) == 4
+        and path.suffix == ".md"
+        and not any(pattern.search(path.name) for pattern in SENSITIVE_NAME_PATTERNS)
+    )
+
+
 def tracked_sensitive_repo_path_risk(rel: str) -> str | None:
     normalized = rel.replace(os.sep, "/")
     path = Path(normalized)
@@ -2618,7 +2628,7 @@ def tracked_sensitive_repo_path_risk(rel: str) -> str | None:
         "/.config/gcloud/" in f"/{normalized.lower()}/"
         or f"/{normalized.lower()}".endswith("/.docker/config.json")
         or parts & TRACKED_SENSITIVE_PATH_PARTS
-        or credential_store_path(normalized)
+        or (credential_store_path(normalized) and not credential_flow_document_path(path))
         or token_credential_store_path(normalized)
     ):
         return "sensitive path"
@@ -3786,7 +3796,8 @@ def capture_source_context(repo: Path, raw_path: str, commit: str) -> SourceCont
     credential_parents = [match for part in original.parts[:-1]
                           if (match := TRACKED_CREDENTIAL_DIR_PATTERN.fullmatch(part))]
     pin = None
-    if path_has_sensitive_part(rel) or risk or credential_parents:
+    if (path_has_sensitive_part(rel) or risk
+            or (credential_parents and not credential_flow_document_path(original))):
         # A reviewed pin may resolve source naming ambiguity only. Private roots,
         # stores, dotfiles, keys, and general YAML inputs remain ineligible.
         chart_template = ("templates" in original.parts[:-1] and original.suffix in {".yaml", ".yml"})

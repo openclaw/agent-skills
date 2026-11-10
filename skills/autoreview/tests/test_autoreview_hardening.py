@@ -1666,6 +1666,22 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertNotIn("newer committed bytes", sends[0])
                 self.assertNotIn("src/token_count.py", sends[0].split("# Change Bundle\n", 1)[1])
 
+    def test_source_context_credential_flow_uses_frozen_document(self):
+        path = "docs/flows/credential-source-egress/model-requests.md"
+        content = b"# Model requests\n\nAuthorize each request before releasing a key.\n"
+        for role in ("--source-context", "--source-context-file"):
+            with self.subTest(role=role), self.committed_context_fixture(
+                path=path, role=role, content=content,
+            ) as (repo, sends, *_):
+                commit = git(repo, "rev-parse", "HEAD").strip()
+                oid = git(repo, "rev-parse", f"HEAD:{path}").strip()
+                (repo / path).write_text("Dirty document must not replace committed context.\n")
+                self.assertEqual(self.helper["main_impl"](), 0)
+                self.assertEqual(len(sends), 1)
+                self.assertIn(content.decode(), sends[0])
+                self.assertIn(f"commit={commit} blob={oid} mode=100644; context only", sends[0])
+                self.assertNotIn("Dirty document", sends[0])
+
     def test_source_context_duplicates_keep_full_source_in_one_planned_pass(self):
         content = b"# context\n" * 30_000
         for role in ("--source-context", "--source-context-file"):
@@ -1737,6 +1753,13 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 role, "src/token_count.py",
             ) as (_repo, sends, *_):
                 with self.assertRaisesRegex(SystemExit, "sensitive filename"):
+                    self.helper["main_impl"]()
+                self.assertFalse(sends)
+        for role in ("--dataset", "--prompt-file"):
+            with self.subTest(role=role), self.committed_context_fixture(
+                path="docs/flows/credential-source-egress/model-requests.md", role=role,
+            ) as (_repo, sends, *_):
+                with self.assertRaisesRegex(SystemExit, "sensitive"):
                     self.helper["main_impl"]()
                 self.assertFalse(sends)
 
@@ -1847,6 +1870,14 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ".docker/Dockerfile", ".config/gcloud/client.py", "tokens/session.json",
             "src/auth-token.json", "src/.env", "src/.netrc", "src/.git-credentials",
             "keys/id_ed25519", "keys/signing.pem", "keys/signing.p12", "keys/signing.key",
+            "docs/flows/credential-source-egress/session.json",
+            "docs/flows/credential-source-egress/credentials.md",
+            "docs/flows/credential-source-egress/.env",
+            "docs/flows/credential-source-egress/signing.key",
+            "docs/flows/credential-source-egress/nested/model-requests.md",
+            "docs/flows/credentials/model-requests.md",
+            "private/docs/flows/credential-source-egress/model-requests.md",
+            "docs/Flows/credential-source-egress/model-requests.md",
         )
         cases = [("--source-context", path) for path in paths]
         cases.append(("--source-context-file", "credentials/prod.py"))
@@ -5123,6 +5154,27 @@ time.sleep(60)
                 self.assertNotIn(".env", bundle)
                 self.assertNotIn("placeholder=true", bundle)
                 self.assertIn("+review me", bundle)
+
+    def test_credential_flow_changes_remain_finding_targets(self) -> None:
+        path = "docs/flows/credential-source-egress/model-requests.md"
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            (repo / "base.txt").write_text("base\n")
+            git(repo, "add", "base.txt")
+            git(repo, "commit", "-qm", "base")
+            base = git(repo, "rev-parse", "HEAD").strip()
+            doc = repo / path
+            doc.parent.mkdir(parents=True)
+            doc.write_text("# Model request flow\n")
+            # The exception is for tracked behavior docs, not arbitrary evidence.
+            self.assertNotIn("Model request flow", self.helper["local_bundle"](repo).text)
+            git(repo, "add", path)
+            self.assertIn("+# Model request flow", self.helper["local_bundle"](repo).text)
+            git(repo, "commit", "-qm", "document flow")
+            for bundle in (self.helper["branch_bundle"](repo, base),
+                           self.helper["commit_bundle"](repo, "HEAD")):
+                self.assertIn(path, bundle.text)
+                self.assertIn("+# Model request flow", bundle.text)
 
     def test_secret_named_workflows_are_reviewable_in_all_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

@@ -79,6 +79,12 @@ authentication, sandbox and mutation checks remain enabled.
 
 - Both roles: tracked-source filename classification; source names such as
   `src/token_count.py` accepted. Credential directories, stores, keyfiles forbidden.
+  Direct Markdown flow documents under `docs/flows/credential-source-egress/`
+  use ordinary tracked-source rules: the compound directory describes behavior,
+  not credential storage. Sensitive basenames, nested directories, other file
+  types and private roots retain their restrictions. This also keeps these
+  documents in tracked change bundles; untracked, prompt-file and dataset rules
+  remain unchanged.
   A shared-policy maintainer can pin a naming false positive after reviewing the
   full committed file for disclosure. Each installed pin matches the
   repository-relative path, Git blob ID, Git mode `100644`, and content SHA-256.
