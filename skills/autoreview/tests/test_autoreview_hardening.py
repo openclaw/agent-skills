@@ -1669,7 +1669,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
 
     def test_source_context_credential_flow_uses_frozen_document(self):
         paths = ("docs/flows/credential-source-egress/model-requests.md",
-                 "docs/reference/repository-credentials/prepared-native-git.md")
+                 "docs/reference/repository-credentials/prepared-native-git.md",
+                 "docs/reference/credential-sources/protected-inference.md",
+                 "specs/rfcs/0023-egress-proxy-credential-lifecycle/github-installation-access.md",
+                 "specs/rfcs/0023-egress-proxy-credential-lifecycle/index.md")
         content = b"# Model requests\n\nAuthorize each request before releasing a key.\n"
         for path, role in itertools.product(paths, ("--source-context", "--source-context-file")):
             with self.subTest(path=path, role=role), self.committed_context_fixture(
@@ -1775,7 +1778,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertFalse(sends)
         for path, role in itertools.product(
             ("docs/flows/credential-source-egress/model-requests.md",
-             "docs/reference/repository-credentials/prepared-native-git.md"),
+             "docs/reference/repository-credentials/prepared-native-git.md",
+             "docs/reference/credential-sources/protected-inference.md",
+             "specs/rfcs/0023-egress-proxy-credential-lifecycle/github-installation-access.md",
+             "specs/rfcs/0023-egress-proxy-credential-lifecycle/index.md"),
             ("--dataset", "--prompt-file"),
         ):
             with self.subTest(path=path, role=role), self.committed_context_fixture(
@@ -1908,6 +1914,24 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "docs/reference/credentials/guide.md",
             "private/docs/reference/repository-credentials/guide.md",
             "docs/Reference/repository-credentials/guide.md",
+            "docs/reference/credential-sources/session.json",
+            "docs/reference/credential-sources/credentials.md",
+            "docs/reference/credential-sources/.env",
+            "docs/reference/credential-sources/signing.key",
+            "docs/reference/credential-sources/nested/guide.md",
+            "docs/reference/credential-sources/guide.MD",
+            "private/docs/reference/credential-sources/guide.md",
+            "specs/rfcs/0023-egress-proxy-credential-lifecycle/session.json",
+            "specs/rfcs/0023-egress-proxy-credential-lifecycle/credentials.md",
+            "specs/rfcs/0023-egress-proxy-credential-lifecycle/.env",
+            "specs/rfcs/0023-egress-proxy-credential-lifecycle/signing.key",
+            "specs/rfcs/0023-egress-proxy-credential-lifecycle/nested/guide.md",
+            "specs/rfcs/0023-egress-proxy-credential-lifecycle/guide.MD",
+            "private/specs/rfcs/0023-egress-proxy-credential-lifecycle/guide.md",
+            "docs/Reference/credential-sources/guide.md",
+            "specs/RFCs/0023-egress-proxy-credential-lifecycle/guide.md",
+            "specs/rfcs/credentials/guide.md",
+            "specs/rfcs/0024-egress-proxy-credential-lifecycle/guide.md",
             "drivers/repository-credentials/session.json",
             "drivers/repository-credentials/.env",
             "drivers/repository-credentials/signing.pem",
@@ -5179,7 +5203,10 @@ time.sleep(60)
 
     def test_credential_flow_changes_remain_finding_targets(self) -> None:
         paths = ("docs/flows/credential-source-egress/model-requests.md",
-                 "docs/reference/repository-credentials/prepared-native-git.md")
+                 "docs/reference/repository-credentials/prepared-native-git.md",
+                 "docs/reference/credential-sources/protected-inference.md",
+                 "specs/rfcs/0023-egress-proxy-credential-lifecycle/github-installation-access.md",
+                 "specs/rfcs/0023-egress-proxy-credential-lifecycle/index.md")
         for path in paths:
             with self.subTest(path=path), tempfile.TemporaryDirectory() as tempdir:
                 repo = init_repo(Path(tempdir))
@@ -5207,7 +5234,9 @@ time.sleep(60)
 
     def test_credential_flow_exception_requires_regular_changed_modes(self) -> None:
         paths = ("docs/flows/credential-source-egress/guide.md",
-                 "docs/reference/repository-credentials/guide.md")
+                 "docs/reference/repository-credentials/guide.md",
+                 "docs/reference/credential-sources/guide.md",
+                 "specs/rfcs/0023-egress-proxy-credential-lifecycle/guide.md")
         url = "https://example.invalid/private-flow-repository.git"
         for path, (old_mode, new_mode, allowed) in itertools.product(paths, (
             ("160000", "160000", False), ("120000", "120000", False),

@@ -82,9 +82,10 @@ authentication, sandbox and mutation checks remain enabled.
   as `credential-proxy` use the same tracked source/store classification, without
   requiring content pins. Literal credential directories, stores and keyfiles
   remain restricted.
-  Regular-file Markdown documents directly under `docs/flows/credential-source-egress/`
-  or `docs/reference/repository-credentials/` use ordinary tracked-source rules.
-  These compound directories describe behavior, not credential storage. Sensitive
+  Regular-file Markdown documents directly under `docs/flows/credential-source-egress/`,
+  `docs/reference/repository-credentials/`, `docs/reference/credential-sources/` or
+  `specs/rfcs/0023-egress-proxy-credential-lifecycle/` use ordinary tracked-source rules.
+  These named directories hold behavior docs or proposals, not credential storage. Sensitive
   basenames, nested directories, other file types and private roots retain their
   restrictions. This also keeps these
   documents in tracked change bundles. Both changed sides must be regular files
