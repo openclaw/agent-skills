@@ -303,18 +303,19 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                 self.assertEqual(captured.text.encode()[span.start:span.end], expected.encode())
 
     def test_partial_document_staging_survives_an_omitted_sibling_type_change(self):
-        for staged, reverse, sibling_name in itertools.product(
+        for directory, staged, reverse, sibling_name in itertools.product(
+            ("docs/flows/credential-source-egress", "docs/reference/credential-sources",
+             "specs/rfcs/0023-egress-proxy-credential-lifecycle"),
             (False, True), (False, True), ("a-sibling.md", "z-sibling.md"),
         ):
             if os.name == "nt" and not staged:
                 continue  # Working-tree type changes require native symlinks.
-            with self.subTest(staged=staged, reverse=reverse, sibling=sibling_name), \
+            with self.subTest(directory=directory, staged=staged, reverse=reverse, sibling=sibling_name), \
                     tempfile.TemporaryDirectory() as tempdir:
                 repo = init_repo(Path(tempdir))
                 git(repo, "config", "core.autocrlf", "false")
                 if os.name == "nt":
                     git(repo, "config", "core.symlinks", "false")
-                directory = "docs/flows/credential-source-egress"
                 doc_path = f"{directory}/guide.md"
                 sibling_path = f"{directory}/{sibling_name}"
                 doc = repo / doc_path
