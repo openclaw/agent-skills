@@ -2643,6 +2643,24 @@ def tracked_sensitive_paths(paths: list[str], raw_diff: str = "") -> set[str]:
     }
 
 
+def diff_section_paths(paths: list[str], raw_diff: str, label: str) -> list[str]:
+    section_paths = paths
+    if raw_diff:
+        records = raw_diff.split("\0")
+        raw_paths = records[1::2]
+        if raw_paths != paths:
+            raise SystemExit(f"cannot establish {label} patch ownership")
+        # With renames disabled, a raw type change has a deletion and addition
+        # section at the same position. Bind both to the raw path, not headings.
+        section_paths = []
+        for index, path in enumerate(raw_paths):
+            fields = records[index * 2].split()
+            if len(fields) != 5:
+                raise SystemExit(f"cannot establish {label} patch ownership")
+            section_paths.extend([path] * (2 if fields[-1] == "T" else 1))
+    return section_paths
+
+
 def omit_tracked_sensitive_diff_units(
     patch: str,
     paths: list[str],
@@ -2655,20 +2673,7 @@ def omit_tracked_sensitive_diff_units(
     diff_indexes = [
         index for index, unit in enumerate(units) if unit.startswith("diff --git ")
     ]
-    section_paths = paths
-    if raw_diff:
-        records = raw_diff.split("\0")
-        raw_paths = records[1::2]
-        if raw_paths != paths:
-            raise SystemExit("cannot establish sensitive patch ownership")
-        # With renames disabled, a raw type change has a deletion and addition
-        # section at the same position. Bind both to the raw path, not headings.
-        section_paths = []
-        for index, path in enumerate(raw_paths):
-            fields = records[index * 2].split()
-            if len(fields) != 5:
-                raise SystemExit("cannot establish sensitive patch ownership")
-            section_paths.extend([path] * (2 if fields[-1] == "T" else 1))
+    section_paths = diff_section_paths(paths, raw_diff, "sensitive")
     if len(diff_indexes) != len(section_paths):
         raise SystemExit("cannot establish sensitive patch ownership")
     path_by_unit = dict(zip(diff_indexes, section_paths))
@@ -2882,7 +2887,7 @@ def working_gitlink_diff(raw_diff: str, patch: str, paths: list[str]) -> str:
     links = {record[0] for record in gitlink_records(raw_diff) if record[2] == "160000"}
     if not links:
         return raw_diff
-    patches = dict(local_patch_ownership(patch, paths))
+    patches = dict(local_patch_ownership(patch, paths, raw_diff=raw_diff))
     records = raw_diff.split("\0")
     for index in range(0, len(records) - 1, 2):
         path = records[index + 1]
@@ -3221,13 +3226,19 @@ def removed_source_lines(patch: str) -> tuple[tuple[int, str], ...]:
     return tuple(removed)
 
 
-def local_patch_ownership(patch: str, paths: list[str], label: str = "mixed local") -> list[tuple[str, str]]:
-    # Git supplies the path order. Never infer identity from source-controlled
-    # path headings; require a one-to-one mapping before attaching ownership.
+def local_patch_ownership(
+    patch: str, paths: list[str], label: str = "mixed local", *, raw_diff: str = "",
+) -> list[tuple[str, str]]:
+    # Git supplies the path order and type changes. Never infer identity from
+    # source-controlled headings; bind every section before attaching ownership.
     units = review_bundle_units(patch)
-    if len(units) != len(paths) or any(not unit.startswith("diff --git ") for unit in units):
+    section_paths = diff_section_paths(paths, raw_diff, label)
+    if len(units) != len(section_paths) or any(not unit.startswith("diff --git ") for unit in units):
         raise SystemExit(f"cannot establish {label} patch ownership")
-    return list(zip(paths, units))
+    owned = {}
+    for path, unit in zip(section_paths, units):
+        owned[path] = owned.get(path, "") + unit
+    return list(owned.items())
 
 
 def capture_mixed_paths(
@@ -3308,10 +3319,10 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
     unstaged_patch, unstaged_raw, unstaged_numstat, unstaged_paths = local_diff_capture(repo)
     require_no_binary_diff("local staged diff", staged_numstat, staged_raw)
     require_no_binary_diff("local unstaged diff", unstaged_numstat, unstaged_raw)
-    unstaged_link_paths = {record[0] for record in gitlink_records(unstaged_raw)}
+    unstaged_link_paths = {record[0] for record in gitlink_records(unstaged_raw) if record[2] == "160000"}
     if unstaged_link_paths and any(
         re.search(r"^\+Subproject commit [0-9a-f]+-dirty$", patch, re.MULTILINE)
-        for path, patch in local_patch_ownership(unstaged_patch, unstaged_paths)
+        for path, patch in local_patch_ownership(unstaged_patch, unstaged_paths, raw_diff=unstaged_raw)
         if path in unstaged_link_paths
     ):
         raise SystemExit("uncommitted submodule contents are not bundled; commit them or use branch mode")
@@ -3354,8 +3365,8 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
                     "re-addition is not in validated untracked membership"
                 )
     mixed_paths = (set(staged_paths) & (set(unstaged_paths) | set(untracked))) - staged_blocked_paths - unstaged_blocked_paths
-    staged_units = local_patch_ownership(staged_patch, staged_paths) if mixed_paths else []
-    unstaged_units = local_patch_ownership(unstaged_patch, unstaged_paths) if mixed_paths else []
+    staged_units = local_patch_ownership(staged_patch, staged_paths, raw_diff=staged_raw) if mixed_paths else []
+    unstaged_units = local_patch_ownership(unstaged_patch, unstaged_paths, raw_diff=unstaged_raw) if mixed_paths else []
     staged_patch = validate_review_patch(staged_paths, staged_patch, staged_raw)
     unstaged_patch = validate_review_patch(unstaged_paths, unstaged_patch, unstaged_raw)
     parts = [
