@@ -1666,6 +1666,38 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertNotIn("newer committed bytes", sends[0])
                 self.assertNotIn("src/token_count.py", sends[0].split("# Change Bundle\n", 1)[1])
 
+    def test_source_context_credential_flow_uses_frozen_document(self):
+        path = "docs/flows/credential-source-egress/model-requests.md"
+        content = b"# Model requests\n\nAuthorize each request before releasing a key.\n"
+        for role in ("--source-context", "--source-context-file"):
+            with self.subTest(role=role), self.committed_context_fixture(
+                path=path, role=role, content=content,
+            ) as (repo, sends, *_):
+                commit = git(repo, "rev-parse", "HEAD").strip()
+                oid = git(repo, "rev-parse", f"HEAD:{path}").strip()
+                (repo / path).write_text("Dirty document must not replace committed context.\n")
+                self.assertEqual(self.helper["main_impl"](), 0)
+                self.assertEqual(len(sends), 1)
+                self.assertIn(content.decode(), sends[0])
+                self.assertIn(f"commit={commit} blob={oid} mode=100644; context only", sends[0])
+                self.assertNotIn("Dirty document", sends[0])
+
+    def test_source_context_compound_directories_use_tracked_source_rules(self):
+        for path in (
+            "packages/contracts/src/drivers/credential-proxy/index.ts",
+            "drivers/repository-credentials/store.go",
+            ".agents/skills/credential-proxy/SKILL.md",
+        ):
+            for content in (b"// first source revision\n", b"// revised source\n"):
+                with self.subTest(path=path, content=content), self.committed_context_fixture(
+                    path=path, content=content,
+                ) as (_repo, sends, *_):
+                    # Normal source capture is independent of the reviewed-pin table.
+                    main = self.helper["main_impl"]
+                    with mock.patch.dict(main.__globals__, {"REVIEWED_CONTEXT_BLOBS": {}}):
+                        self.assertEqual(main(), 0)
+                    self.assertIn(content.decode(), sends[0])
+
     def test_source_context_duplicates_keep_full_source_in_one_planned_pass(self):
         content = b"# context\n" * 30_000
         for role in ("--source-context", "--source-context-file"):
@@ -1739,6 +1771,13 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "sensitive filename"):
                     self.helper["main_impl"]()
                 self.assertFalse(sends)
+        for role in ("--dataset", "--prompt-file"):
+            with self.subTest(role=role), self.committed_context_fixture(
+                path="docs/flows/credential-source-egress/model-requests.md", role=role,
+            ) as (_repo, sends, *_):
+                with self.assertRaisesRegex(SystemExit, "sensitive"):
+                    self.helper["main_impl"]()
+                self.assertFalse(sends)
 
     def test_source_context_requires_committed_review_mode(self):
         for role, mode in ((role, mode) for role in ("--source-context", "--source-context-file")
@@ -1788,7 +1827,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ("apps/controller/src/drivers/secret/kubernetes/index.ts", True, False),
             ("apps/controller/src/drivers/secret/kubernetes/other.ts", False, False),
             ("apps/controller/src/drivers/secrets/kubernetes/index.ts", False, False),
-            ("src/credential-proxy/index.ts", True, False),
+            ("src/credential-proxy/index.ts", True, True),
             (".ssh/credential-proxy/index.ts", False, False),
             ("credentials/session.json", False, False),
             ("credentials/prod.ts", False, False),
@@ -1847,6 +1886,20 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ".docker/Dockerfile", ".config/gcloud/client.py", "tokens/session.json",
             "src/auth-token.json", "src/.env", "src/.netrc", "src/.git-credentials",
             "keys/id_ed25519", "keys/signing.pem", "keys/signing.p12", "keys/signing.key",
+            "docs/flows/credential-source-egress/session.json",
+            "docs/flows/credential-source-egress/credentials.md",
+            "docs/flows/credential-source-egress/.env",
+            "docs/flows/credential-source-egress/signing.key",
+            "docs/flows/credential-source-egress/nested/model-requests.md",
+            "docs/flows/credentials/model-requests.md",
+            "private/docs/flows/credential-source-egress/model-requests.md",
+            "docs/Flows/credential-source-egress/model-requests.md",
+            "drivers/repository-credentials/session.json",
+            "drivers/repository-credentials/.env",
+            "drivers/repository-credentials/signing.pem",
+            ".ssh/credential-proxy/index.ts",
+            "private/credential-proxy/index.ts",
+            ".aws/skills/credential-proxy/SKILL.md",
         )
         cases = [("--source-context", path) for path in paths]
         cases.append(("--source-context-file", "credentials/prod.py"))
@@ -5043,25 +5096,17 @@ time.sleep(60)
                     expected = expected[:9]
                 self.assertEqual(events, expected)
 
-    def test_review_patch_does_not_disclose_controls_in_omitted_paths(self) -> None:
+    def test_review_patch_does_not_disclose_controls_in_refused_paths(self) -> None:
         path = ".env.\x1b]52;c;VEVTVA==\x07\udc9b"
+        with self.assertRaises(SystemExit) as refusal:
+            self.helper["validate_review_patch"]([path], "")
+        message = str(refusal.exception)
+        self.assertEqual(message, "cannot establish sensitive patch ownership")
+        self.assertNotIn("\x1b", message)
+        self.assertNotIn("\x07", message)
+        self.assertNotIn("\udc9b", message)
 
-        redacted = self.helper["validate_review_patch"](
-            [path],
-            "",
-        )
-
-        self.assertEqual(
-            redacted,
-            self.helper["REVIEW_SECURITY_OMISSION"] + "\n",
-        )
-        self.assertNotIn("\x1b", redacted)
-        self.assertNotIn("\x07", redacted)
-        self.assertNotIn("\udc9b", redacted)
-
-    def test_review_patch_omits_everything_when_sensitive_paths_cannot_be_mapped(
-        self,
-    ) -> None:
+    def test_review_patch_refuses_unmapped_sensitive_paths(self) -> None:
         patch = (
             "commit metadata that must not survive a mapping failure\n"
             "diff --cc .env\n"
@@ -5069,17 +5114,8 @@ time.sleep(60)
             "++placeholder=true\n"
         )
 
-        redacted = self.helper["validate_review_patch"](
-            [".env"],
-            patch,
-        )
-
-        self.assertEqual(
-            redacted,
-            self.helper["REVIEW_SECURITY_OMISSION"] + "\n",
-        )
-        self.assertNotIn("placeholder", redacted)
-        self.assertNotIn("commit metadata", redacted)
+        with self.assertRaisesRegex(SystemExit, "cannot establish sensitive patch ownership"):
+            self.helper["validate_review_patch"]([".env"], patch)
 
     def test_review_patch_preserves_combined_and_headerless_hunk_content(self) -> None:
         credential_shaped_code = '+token = "ordinary-hardcoded-value-12345"\n'
@@ -5123,6 +5159,98 @@ time.sleep(60)
                 self.assertNotIn(".env", bundle)
                 self.assertNotIn("placeholder=true", bundle)
                 self.assertIn("+review me", bundle)
+
+    def test_credential_flow_changes_remain_finding_targets(self) -> None:
+        path = "docs/flows/credential-source-egress/model-requests.md"
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            (repo / "base.txt").write_text("base\n")
+            git(repo, "add", "base.txt")
+            git(repo, "commit", "-qm", "base")
+            base = git(repo, "rev-parse", "HEAD").strip()
+            doc = repo / path
+            doc.parent.mkdir(parents=True)
+            doc.write_text("# Model request flow\n")
+            # The exception is for tracked behavior docs, not arbitrary evidence.
+            untracked = self.helper["local_bundle"](repo)
+            self.assertNotIn("Model request flow", untracked.text)
+            self.assertNotIn(path, untracked.paths)
+            git(repo, "add", path)
+            staged = self.helper["local_bundle"](repo)
+            self.assertIn("+# Model request flow", staged.text)
+            self.assertIn(path, staged.paths)
+            git(repo, "commit", "-qm", "document flow")
+            for bundle in (self.helper["branch_bundle"](repo, base),
+                           self.helper["commit_bundle"](repo, "HEAD")):
+                self.assertIn(path, bundle.text)
+                self.assertIn("+# Model request flow", bundle.text)
+                self.assertIn(path, bundle.paths)
+
+    def test_credential_flow_exception_requires_regular_changed_modes(self) -> None:
+        path = "docs/flows/credential-source-egress/guide.md"
+        url = "https://example.invalid/private-flow-repository.git"
+        for old_mode, new_mode, allowed in (
+            ("160000", "160000", False), ("120000", "120000", False),
+            ("000000", "160000", False), ("000000", "120000", False),
+            ("100644", "160000", False), ("160000", "100644", False),
+            ("100644", "120000", False), ("120000", "100644", False),
+            ("160000", "000000", False), ("120000", "000000", False),
+            ("100644", "000000", True), ("100644", "100755", True),
+        ):
+            with self.subTest(old_mode=old_mode, new_mode=new_mode), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                git(repo, "config", "core.filemode", "false")
+                if os.name == "nt":
+                    git(repo, "config", "core.symlinks", "false")
+                (repo / "base.txt").write_text("base\n")
+                git(repo, "add", "base.txt")
+                git(repo, "commit", "-qm", "first pin")
+                first = git(repo, "rev-parse", "HEAD").strip()
+                git(repo, "commit", "--allow-empty", "-qm", "second pin")
+                second = git(repo, "rev-parse", "HEAD").strip()
+                (repo / ".gitmodules").write_text(
+                    f'[submodule "flow"]\npath = {path}\nurl = {url}\n'
+                )
+                git(repo, "add", ".gitmodules")
+
+                def select(mode, pin, text):
+                    target = repo / path
+                    if target.is_symlink() or target.is_file():
+                        target.unlink()
+                    elif target.is_dir():
+                        target.rmdir()
+                    if mode == "000000":
+                        git(repo, "update-index", "--force-remove", path)
+                        return
+                    payload = repo.parent / "payload"
+                    payload.write_text(text)
+                    oid = pin if mode == "160000" else git(repo, "hash-object", "-w", str(payload)).strip()
+                    git(repo, "update-index", "--add", "--cacheinfo", f"{mode},{oid},{path}")
+                    if mode == "160000":
+                        target.mkdir(parents=True)
+                    else:
+                        git(repo, "checkout-index", "--force", "--", path)
+
+                select(old_mode, first, "original-flow-marker\n")
+                git(repo, "commit", "-qm", "baseline mapping")
+                base = git(repo, "rev-parse", "HEAD").strip()
+                select(new_mode, second, "updated-flow-marker\n")
+                (repo / "base.txt").write_text("base\npermitted-sibling-edit\n")
+                git(repo, "add", "base.txt")
+                local = self.helper["local_bundle"](repo)
+                git(repo, "commit", "-qm", "change flow object")
+                for bundle in (local, self.helper["branch_bundle"](repo, base),
+                               self.helper["commit_bundle"](repo, "HEAD")):
+                    # Filtering either section of a type change must retain its sibling.
+                    self.assertIn("base.txt", bundle.paths)
+                    self.assertIn("+permitted-sibling-edit", bundle.text)
+                    # An unchanged mapping must never be disclosed by a rejected gitlink.
+                    self.assertNotIn(url, bundle.text)
+                    self.assertEqual(path in bundle.paths, allowed)
+                    self.assertEqual("original-flow-marker" in bundle.text, allowed)
+                    if not allowed:
+                        self.assertNotIn("updated-flow-marker", bundle.text)
+                        self.assertNotIn(path, bundle.text)
 
     def test_secret_named_workflows_are_reviewable_in_all_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
