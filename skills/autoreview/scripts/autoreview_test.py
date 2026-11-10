@@ -2408,6 +2408,25 @@ class AutoreviewCompatibilityTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "result was not structured JSON"):
             AUTOREVIEW.extract_json(json.dumps(payload))
 
+class AutoreviewHostnameOptionTests(unittest.TestCase):
+    def parse(self, *arguments):
+        with mock.patch.object(sys, "argv", ["autoreview", *arguments]):
+            return AUTOREVIEW.parse_args()
+
+    def test_explicit_hostname_option_is_codex_only_and_single_selection(self):
+        args = self.parse("--codex-route", "API.Example.Invalid.", "--codex-no-fallback")
+        reviewer = AUTOREVIEW.reviewer_args(args)[0]
+        self.assertEqual(AUTOREVIEW.codex_route_selector(reviewer), "api.example.invalid")
+        self.assertIsNone(reviewer.fallback_model)
+        for arguments, message in (
+            (("--engine", "claude", "--codex-route", "api.example.invalid"), "only supported for codex"),
+            (("--codex-route", "api.example.invalid", "--codex-route", "other.invalid"), "exactly one"),
+        ):
+            with self.subTest(arguments=arguments), self.assertRaisesRegex(SystemExit, message):
+                AUTOREVIEW.reviewer_args(self.parse(*arguments))
+        self.assertIsNone(AUTOREVIEW.codex_route_selector(self.parse()))
+
+
 class AutoreviewAuthFallbackTests(unittest.TestCase):
     # Native Codex 360319d8 login/src/auth/manager.rs:217–221, independent of markers.
     NATIVE_REFRESH_FAILURES = (
@@ -2448,7 +2467,7 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
 
     def test_route_projects_websocket_transport_and_rejects_non_boolean(self) -> None:
         self.configure_provider(extra="supports_websockets = true\n")
-        flags, _catalogue = AUTOREVIEW.load_codex_inference_route(self.repo, ["model_provider=review_api"])
+        flags = AUTOREVIEW.load_codex_inference_route(self.repo, ["model_provider=review_api"]).flags
         self.assertIn("model_providers.review_api.supports_websockets=true", flags)
         self.configure_provider(extra='supports_websockets = "yes"\n')
         with self.assertRaises(SystemExit):

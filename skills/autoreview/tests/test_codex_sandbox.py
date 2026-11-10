@@ -41,8 +41,20 @@ class CodexSandboxTests(unittest.TestCase):
                 inside.write_text("owned inside\n")
                 outside.write_text("owned outside\n")
                 flags = helper["codex_config_isolation_flags"](workspace, root / "runtime")
-                runtime_file = root / "runtime" / "synthetic-auth.txt"
-                runtime_file.write_text("synthetic runtime sentinel\n")
+                runtime = root / "runtime"
+                token = "synthetic-sandbox-route-token"
+                route = helper["CodexInferenceRoute"]([
+                    "-c", 'model_provider="synthetic_route"',
+                ], None, token)
+                auth_flags = helper["prepare_codex_inference_config"](route, runtime)
+                # Native client command auth can read it; reviewer tools cannot.
+                import json
+                settings = dict(item.split("=", 1) for item in auth_flags[1::2])
+                prefix = "model_providers.synthetic_route.auth."
+                reader = [json.loads(settings[prefix + "command"]), *json.loads(settings[prefix + "args"])]
+                credential = subprocess.run(reader, capture_output=True, check=True, timeout=10)
+                self.assertEqual(credential.stdout.decode(), token)
+                runtime_file = runtime / "route-token"
                 scratch_link = workspace / "scratch-link"
                 scratch_link.symlink_to(outside)
                 runtime_link = workspace / "runtime-link"
@@ -50,7 +62,7 @@ class CodexSandboxTests(unittest.TestCase):
                 alias = Path(str(outside).removeprefix("/private"))
                 for path in (outside, alias, scratch_link):
                     self.assertEqual(path.read_text(), "owned outside\n")
-                self.assertEqual(runtime_link.read_text(), "synthetic runtime sentinel\n")
+                self.assertEqual(runtime_link.read_text(), token)
                 subprocess.run(
                     ["/bin/ls", "-f", scratch_root], check=True,
                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -81,7 +93,7 @@ class CodexSandboxTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(inside.read_text(), "owned inside\n")
                 self.assertEqual(outside.read_text(), "owned outside\n")
-                self.assertEqual(runtime_file.read_text(), "synthetic runtime sentinel\n")
+                self.assertEqual(runtime_file.read_text(), token)
                 self.assertFalse((Path(scratch) / "created").exists())
 
 
