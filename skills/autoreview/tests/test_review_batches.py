@@ -185,7 +185,7 @@ class ReviewBatchTests(unittest.TestCase):
                 else:
                     (repo / "image.bin").write_bytes(b"\0binary")
                     self.git(repo, "add", "image.bin")
-                    expected = "refusing unsupported or malformed image in branch diff"
+                    expected = "refusing unsupported binary in branch diff"
                 self.git(repo, "commit", "--amend", "--no-edit", "-q")
                 # Binary capture itself refuses before a manifest can be bound.
                 # Other cases use a fully valid allocation of the captured range.
