@@ -5189,14 +5189,80 @@ time.sleep(60)
             doc.parent.mkdir(parents=True)
             doc.write_text("# Model request flow\n")
             # The exception is for tracked behavior docs, not arbitrary evidence.
-            self.assertNotIn("Model request flow", self.helper["local_bundle"](repo).text)
+            untracked = self.helper["local_bundle"](repo)
+            self.assertNotIn("Model request flow", untracked.text)
+            self.assertNotIn(path, untracked.paths)
             git(repo, "add", path)
-            self.assertIn("+# Model request flow", self.helper["local_bundle"](repo).text)
+            staged = self.helper["local_bundle"](repo)
+            self.assertIn("+# Model request flow", staged.text)
+            self.assertIn(path, staged.paths)
             git(repo, "commit", "-qm", "document flow")
             for bundle in (self.helper["branch_bundle"](repo, base),
                            self.helper["commit_bundle"](repo, "HEAD")):
                 self.assertIn(path, bundle.text)
                 self.assertIn("+# Model request flow", bundle.text)
+                self.assertIn(path, bundle.paths)
+
+    def test_credential_flow_exception_requires_regular_changed_modes(self) -> None:
+        path = "docs/flows/credential-source-egress/guide.md"
+        url = "https://example.invalid/private-flow-repository.git"
+        for old_mode, new_mode, allowed in (
+            ("160000", "160000", False), ("120000", "120000", False),
+            ("000000", "160000", False), ("000000", "120000", False),
+            ("100644", "160000", False), ("160000", "100644", False),
+            ("100644", "120000", False), ("120000", "100644", False),
+            ("160000", "000000", False), ("120000", "000000", False),
+            ("100644", "000000", True), ("100644", "100755", True),
+        ):
+            with self.subTest(old_mode=old_mode, new_mode=new_mode), tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                git(repo, "config", "core.filemode", "false")
+                if os.name == "nt":
+                    git(repo, "config", "core.symlinks", "false")
+                (repo / "base.txt").write_text("base\n")
+                git(repo, "add", "base.txt")
+                git(repo, "commit", "-qm", "first pin")
+                first = git(repo, "rev-parse", "HEAD").strip()
+                git(repo, "commit", "--allow-empty", "-qm", "second pin")
+                second = git(repo, "rev-parse", "HEAD").strip()
+                (repo / ".gitmodules").write_text(
+                    f'[submodule "flow"]\npath = {path}\nurl = {url}\n'
+                )
+                git(repo, "add", ".gitmodules")
+
+                def select(mode, pin, text):
+                    target = repo / path
+                    if target.is_symlink() or target.is_file():
+                        target.unlink()
+                    elif target.is_dir():
+                        target.rmdir()
+                    if mode == "000000":
+                        git(repo, "update-index", "--force-remove", path)
+                        return
+                    payload = repo.parent / "payload"
+                    payload.write_text(text)
+                    oid = pin if mode == "160000" else git(repo, "hash-object", "-w", str(payload)).strip()
+                    git(repo, "update-index", "--add", "--cacheinfo", f"{mode},{oid},{path}")
+                    if mode == "160000":
+                        target.mkdir(parents=True)
+                    else:
+                        git(repo, "checkout-index", "--force", "--", path)
+
+                select(old_mode, first, "original-flow-marker\n")
+                git(repo, "commit", "-qm", "baseline mapping")
+                base = git(repo, "rev-parse", "HEAD").strip()
+                select(new_mode, second, "updated-flow-marker\n")
+                local = self.helper["local_bundle"](repo)
+                git(repo, "commit", "-qm", "change flow object")
+                for bundle in (local, self.helper["branch_bundle"](repo, base),
+                               self.helper["commit_bundle"](repo, "HEAD")):
+                    # An unchanged mapping must never be disclosed by a rejected gitlink.
+                    self.assertNotIn(url, bundle.text)
+                    self.assertEqual(path in bundle.paths, allowed)
+                    self.assertEqual("original-flow-marker" in bundle.text, allowed)
+                    if not allowed:
+                        self.assertNotIn("updated-flow-marker", bundle.text)
+                        self.assertNotIn(path, bundle.text)
 
     def test_secret_named_workflows_are_reviewable_in_all_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

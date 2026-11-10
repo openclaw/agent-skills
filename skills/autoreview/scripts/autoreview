@@ -2600,7 +2600,7 @@ def credential_flow_document_path(path: Path) -> bool:
     )
 
 
-def tracked_sensitive_repo_path_risk(rel: str) -> str | None:
+def tracked_sensitive_repo_path_risk(rel: str, *, regular_file: bool = True) -> str | None:
     normalized = rel.replace(os.sep, "/")
     path = Path(normalized)
     parts = {part.lower() for part in path.parts}
@@ -2608,7 +2608,8 @@ def tracked_sensitive_repo_path_risk(rel: str) -> str | None:
         "/.config/gcloud/" in f"/{normalized.lower()}/"
         or f"/{normalized.lower()}".endswith("/.docker/config.json")
         or parts & TRACKED_SENSITIVE_PATH_PARTS
-        or (credential_store_path(normalized) and not credential_flow_document_path(path))
+        or (credential_store_path(normalized)
+            and not (regular_file and credential_flow_document_path(path)))
         or token_credential_store_path(normalized)
     ):
         return "sensitive path"
@@ -2621,11 +2622,20 @@ def tracked_sensitive_repo_path_risk(rel: str) -> str | None:
     return None
 
 
-def tracked_sensitive_paths(paths: list[str]) -> set[str]:
+def tracked_sensitive_paths(paths: list[str], raw_diff: str = "") -> set[str]:
+    # Both sides must be regular or absent. A document-shaped gitlink or symlink
+    # must not borrow the flow exception, including deletions and type changes.
+    records = raw_diff.split("\0")
+    regular = set()
+    for index in range(0, len(records) - 1, 2):
+        fields = records[index].removeprefix(":").split()
+        if (len(fields) == 5 and not records[index].startswith("::")
+                and all(mode in {"000000", "100644", "100755"} for mode in fields[:2])
+                and fields[:2] != ["000000", "000000"]):
+            regular.add(records[index + 1])
     return {
-        rel
-        for rel in paths
-        if tracked_sensitive_repo_path_risk(rel) is not None
+        rel for rel in paths
+        if tracked_sensitive_repo_path_risk(rel, regular_file=rel in regular) is not None
     }
 
 
@@ -2655,8 +2665,9 @@ def omit_tracked_sensitive_diff_units(
 def validate_review_patch(
     paths: list[str],
     patch: str,
+    raw_diff: str = "",
 ) -> str:
-    blocked_paths = tracked_sensitive_paths(paths)
+    blocked_paths = tracked_sensitive_paths(paths, raw_diff)
     return omit_tracked_sensitive_diff_units(patch, paths, blocked_paths)
 
 
@@ -2758,7 +2769,7 @@ def capture_added_branch_images(
         if path in binary_deletions:
             continue
         binary = path in binary_paths
-        if tracked_sensitive_paths([path]):
+        if tracked_sensitive_paths([path], raw_diff):
             if binary:
                 raise SystemExit("refusing sensitive binary image path")
             continue
@@ -2840,7 +2851,7 @@ def gitlink_records(raw_diff: str) -> list[tuple[str, str, str, str, str]]:
         if (records[index].startswith("::") or len(fields) != 5
                 or not all(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid) for oid in fields[2:4])):
             raise SystemExit("unsupported gitlink diff metadata; use a parent-relative review")
-        if not tracked_sensitive_repo_path_risk(records[index + 1]):
+        if not tracked_sensitive_repo_path_risk(records[index + 1], regular_file=False):
             links.append((records[index + 1], *fields[:4]))
     return links
 
@@ -3296,7 +3307,7 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
     )
     untracked = [rel for rel, _content in untracked_snapshots]
     omitted_tracked = len(
-        tracked_sensitive_paths(staged_paths) | tracked_sensitive_paths(unstaged_paths)
+        tracked_sensitive_paths(staged_paths, staged_raw) | tracked_sensitive_paths(unstaged_paths, unstaged_raw)
     )
     empty_scope = (
         not staged_patch.strip()
@@ -3307,8 +3318,8 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
     )
     if empty_scope and base_ref is None:
         raise SystemExit("no local changes to review")
-    staged_blocked_paths = tracked_sensitive_paths(staged_paths)
-    unstaged_blocked_paths = tracked_sensitive_paths(unstaged_paths)
+    staged_blocked_paths = tracked_sensitive_paths(staged_paths, staged_raw)
+    unstaged_blocked_paths = tracked_sensitive_paths(unstaged_paths, unstaged_raw)
     raw_records = staged_raw.split("\0")
     for index in range(0, len(raw_records) - 1, 2):
         metadata = raw_records[index]
@@ -3325,8 +3336,8 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
     mixed_paths = (set(staged_paths) & (set(unstaged_paths) | set(untracked))) - staged_blocked_paths - unstaged_blocked_paths
     staged_units = local_patch_ownership(staged_patch, staged_paths) if mixed_paths else []
     unstaged_units = local_patch_ownership(unstaged_patch, unstaged_paths) if mixed_paths else []
-    staged_patch = validate_review_patch(staged_paths, staged_patch)
-    unstaged_patch = validate_review_patch(unstaged_paths, unstaged_patch)
+    staged_patch = validate_review_patch(staged_paths, staged_patch, staged_raw)
+    unstaged_patch = validate_review_patch(unstaged_paths, unstaged_patch, unstaged_raw)
     parts = [
         "# Git Status",
         local_status(
@@ -3338,14 +3349,14 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
         "# Staged Diff" if base_ref is None else f"# Staged Diff\nbase: {base_ref}",
         (
             REVIEW_SECURITY_OMISSION
-            if tracked_sensitive_paths(staged_paths)
+            if tracked_sensitive_paths(staged_paths, staged_raw)
             else git(repo, "diff", *SAFE_DIFF_FLAGS, "--cached", "--stat", *staged_base)
         ),
         staged_patch,
         "# Unstaged Diff",
         (
             REVIEW_SECURITY_OMISSION
-            if tracked_sensitive_paths(unstaged_paths)
+            if tracked_sensitive_paths(unstaged_paths, unstaged_raw)
             else git(repo, "diff", *SAFE_DIFF_FLAGS, "--stat")
         ),
         unstaged_patch,
@@ -3388,7 +3399,8 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
     for part_index, part in enumerate(parts):
         if part_index in owned_parts and mixed_paths:
             units, target = owned_parts[part_index]
-            retained = [(path, unit) for path, unit in units if not tracked_sensitive_repo_path_risk(path)]
+            blocked = staged_blocked_paths if target == "index" else unstaged_blocked_paths
+            retained = [(path, unit) for path, unit in units if path not in blocked]
             prefix = REVIEW_SECURITY_OMISSION + "\n" if len(retained) != len(units) else ""
             if prefix + "".join(unit for _, unit in retained) != part:
                 raise SystemExit("cannot establish mixed local bundle coverage")
@@ -3585,11 +3597,12 @@ def branch_bundle(repo: Path, base_ref: str) -> CapturedBundle:
     branch_patch = git(
         repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--patch", "--end-of-options", merge_base, head_ref,
     )
-    omitted_paths = tracked_sensitive_paths(branch_paths)
+    omitted_paths = tracked_sensitive_paths(branch_paths, branch_raw)
     original_patch = branch_patch
     branch_patch = validate_review_patch(
         branch_paths,
         branch_patch,
+        branch_raw,
     )
     header = "\n\n".join(
         [
@@ -3657,8 +3670,8 @@ def commit_bundle(repo: Path, commit_ref: str) -> CapturedBundle:
     )
     links = gitlink_manifest(repo, commit_raw, refs[0] if len(refs) == 2 else "absent",
                              refs[-1], "parent -> commit")
-    blocked_paths = tracked_sensitive_paths(commit_paths)
-    commit_patch = validate_review_patch(commit_paths, commit_patch)
+    blocked_paths = tracked_sensitive_paths(commit_paths, commit_raw)
+    commit_patch = validate_review_patch(commit_paths, commit_patch, commit_raw)
     commit_summary = REVIEW_SECURITY_OMISSION
     if not blocked_paths:
         commit_summary = git(repo, "log", "-1", "--no-patch", "--format=fuller", refs[-1])
