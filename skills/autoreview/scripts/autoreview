@@ -74,18 +74,6 @@ TRACKED_SENSITIVE_PATH_PARTS = SENSITIVE_PATH_PARTS - {
 # original path to its Git blob ID and SHA-256 of the inspected bytes.
 # Never populate this from the reviewed checkout, environment, or CLI.
 REVIEWED_CONTEXT_BLOBS: dict[str, tuple[str, str]] = {
-    "apps/controller/src/composition/repository-credentials/contracts.ts": (
-        "0d915b6a9f4960d8a4ede5199fda04467a5d7ac0",
-        "a15dc6ebae0873aeed98516f2939a2884445578cb9a981e3badfbadb9ae61024",
-    ),
-    "apps/controller/src/composition/repository-credentials/custody-selection.ts": (
-        "7e9bd1a47168af78f0380cb7ff56c2fb7d20e89f",
-        "a5786ace7a533fea5a0d26eea2f7409a34cff3829fbb1d29bab7294cef3461ad",
-    ),
-    "apps/controller/src/composition/repository-credentials/transport.ts": (
-        "04383146313df3fd3774baae6e5b87bd06df7b17",
-        "70f11d8205bce38a312468ec572ef89ef7265870d3d80601ce6474ed18cbe71b",
-    ),
     "apps/controller/src/drivers/secret/kubernetes/index.ts": (
         "4602602bcaea36a319cca892603692386f125137",
         "334fddd768cc1c0c1380ba8b0abcc678c7257d71ab43ab7446d8ce3a2fd4be90",
@@ -97,14 +85,6 @@ REVIEWED_CONTEXT_BLOBS: dict[str, tuple[str, str]] = {
     "deploy/helm/openclaw-enterprise/templates/repository-credentials-service.yaml": (
         "125fa5338910d6c2baf1fbe83a4302320921d84b",
         "917ebbd773f01b6c4dafca6c641ca653a12ffdac6d414f3f2ace395a48030c36",
-    ),
-    "packages/contracts/src/drivers/credential-proxy/index.ts": (
-        "34f457ec40d77d278ca5a6ff9e1b6120d57e58a9",
-        "dc8daed8e8b12e0a2d0f59f66f9afc761c400d0e377e672ad745cdb76f5f866e",
-    ),
-    "tests/fixtures/repository-credentials/session-state.mjs": (
-        "6ed57fbe3c5d24e8cffd57db78e1766aa680c2e5",
-        "a3a04c494e79cd260125f02487750f3518c3c27b204e48061e8b2eaff81b81cc",
     ),
 }
 TRACKED_CREDENTIAL_DIR_PATTERN = re.compile(
@@ -3793,17 +3773,18 @@ def capture_source_context(repo: Path, raw_path: str, commit: str) -> SourceCont
         raise SystemExit("--source-context must be a repo-relative path")
     rel = original.as_posix()
     risk = tracked_sensitive_repo_path_risk(rel)
-    credential_parents = [match for part in original.parts[:-1]
-                          if (match := TRACKED_CREDENTIAL_DIR_PATTERN.fullmatch(part))]
+    literal_credential_parent = any(
+        (match := TRACKED_CREDENTIAL_DIR_PATTERN.fullmatch(part)) and match[0] == match[1]
+        for part in original.parts[:-1]
+    )
     pin = None
-    if (path_has_sensitive_part(rel) or risk
-            or (credential_parents and not credential_flow_document_path(original))):
+    if path_has_sensitive_part(rel) or risk or literal_credential_parent:
         # A reviewed pin may resolve source naming ambiguity only. Private roots,
         # stores, dotfiles, keys, and general YAML inputs remain ineligible.
         chart_template = ("templates" in original.parts[:-1] and original.suffix in {".yaml", ".yml"})
         source_name = original.suffix in {".js", ".mjs", ".ts"}
         if (not path_has_sensitive_part(rel) and risk != "sensitive path"
-                and (not any(match[0] == match[1] for match in credential_parents)
+                and (not literal_credential_parent
                      or rel == "apps/controller/src/drivers/secret/kubernetes/index.ts")
                 and not any(part.startswith(".") for part in original.parts)
                 and (chart_template or source_name)):

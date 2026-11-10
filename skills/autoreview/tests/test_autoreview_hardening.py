@@ -1682,6 +1682,22 @@ class AutoreviewHardeningTests(unittest.TestCase):
                 self.assertIn(f"commit={commit} blob={oid} mode=100644; context only", sends[0])
                 self.assertNotIn("Dirty document", sends[0])
 
+    def test_source_context_compound_directories_use_tracked_source_rules(self):
+        for path in (
+            "packages/contracts/src/drivers/credential-proxy/index.ts",
+            "drivers/repository-credentials/store.go",
+            ".agents/skills/credential-proxy/SKILL.md",
+        ):
+            for content in (b"// first source revision\n", b"// revised source\n"):
+                with self.subTest(path=path, content=content), self.committed_context_fixture(
+                    path=path, content=content,
+                ) as (_repo, sends, *_):
+                    # Normal source capture is independent of the reviewed-pin table.
+                    main = self.helper["main_impl"]
+                    with mock.patch.dict(main.__globals__, {"REVIEWED_CONTEXT_BLOBS": {}}):
+                        self.assertEqual(main(), 0)
+                    self.assertIn(content.decode(), sends[0])
+
     def test_source_context_duplicates_keep_full_source_in_one_planned_pass(self):
         content = b"# context\n" * 30_000
         for role in ("--source-context", "--source-context-file"):
@@ -1811,7 +1827,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ("apps/controller/src/drivers/secret/kubernetes/index.ts", True, False),
             ("apps/controller/src/drivers/secret/kubernetes/other.ts", False, False),
             ("apps/controller/src/drivers/secrets/kubernetes/index.ts", False, False),
-            ("src/credential-proxy/index.ts", True, False),
+            ("src/credential-proxy/index.ts", True, True),
             (".ssh/credential-proxy/index.ts", False, False),
             ("credentials/session.json", False, False),
             ("credentials/prod.ts", False, False),
@@ -1878,6 +1894,12 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "docs/flows/credentials/model-requests.md",
             "private/docs/flows/credential-source-egress/model-requests.md",
             "docs/Flows/credential-source-egress/model-requests.md",
+            "drivers/repository-credentials/session.json",
+            "drivers/repository-credentials/.env",
+            "drivers/repository-credentials/signing.pem",
+            ".ssh/credential-proxy/index.ts",
+            "private/credential-proxy/index.ts",
+            ".aws/skills/credential-proxy/SKILL.md",
         )
         cases = [("--source-context", path) for path in paths]
         cases.append(("--source-context-file", "credentials/prod.py"))
