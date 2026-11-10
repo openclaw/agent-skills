@@ -2808,7 +2808,8 @@ def capture_added_branch_images(
             )
         if binary and not image_path:
             raise SystemExit(
-                f"refusing unsupported or malformed image in branch diff:\n- {display_escape(path, 500)}"
+                "refusing unsupported binary in branch diff "
+                f"(only added PNG/JPEG/WebP images are supported):\n- {display_escape(path, 500)}"
             )
         if change == "A" and new_mode in {"100644", "100755"} and image_path:
             encoded_size = int(git(repo, "cat-file", "-s", new_oid).strip())
@@ -2836,10 +2837,15 @@ def capture_added_branch_images(
                 "refusing binary changes in branch diff "
                 f"(only added images are supported):\n- {display_escape(path, 500)}"
             )
+        if not image_path:
+            raise SystemExit(
+                "refusing unsupported binary in branch diff "
+                f"(only added PNG/JPEG/WebP images are supported):\n- {display_escape(path, 500)}"
+            )
         media_type = image_media_type(path, content)
         if media_type is None:
             raise SystemExit(
-                f"refusing unsupported or malformed image in branch diff:\n- {display_escape(path, 500)}"
+                f"refusing malformed image in branch diff:\n- {display_escape(path, 500)}"
             )
         image_bytes += len(content)
         images.append(ImageEvidence(path, media_type, hashlib.sha256(content).hexdigest(), content))

@@ -463,20 +463,33 @@ class AutoreviewImageGitTests(unittest.TestCase):
                 AUTOREVIEW.branch_bundle(self.repo, self.base)
         self.assertEqual(len(reads), 1)
 
-    def test_unsupported_binary_and_spoofed_extension_are_rejected(self):
-        for name, data in [("payload.bin", b"\x00opaque"),
-                           ("fake.png", b"\x89PNG\r\n\x1a\n\x00truncated")]:
+    def test_unsupported_binary_and_malformed_image_have_distinct_diagnostics(self):
+        glb_json = b'{"asset":{"version":"2.0"}}'
+        glb_json += b" " * (-len(glb_json) % 4)
+        glb = (
+            b"glTF" + (2).to_bytes(4, "little") + (20 + len(glb_json)).to_bytes(4, "little")
+            + len(glb_json).to_bytes(4, "little") + b"JSON" + glb_json
+        )
+        for name, data, diagnostic in [
+            ("model.glb", glb, "unsupported binary"),
+            ("payload.bin", b"\x00opaque", "unsupported binary"),
+            ("fake.png", b"\x89PNG\r\n\x1a\n\x00truncated", "malformed image"),
+        ]:
             with self.subTest(name=name):
                 self.git("reset", "--hard", self.base)
                 self.commit(name, data)
-                with self.assertRaisesRegex(SystemExit, "unsupported or malformed"):
+                with self.assertRaisesRegex(SystemExit, diagnostic) as caught:
                     AUTOREVIEW.branch_bundle(self.repo, self.base)
+                self.assertIn(name, str(caught.exception))
+                if diagnostic == "unsupported binary":
+                    self.assertNotIn("malformed image", str(caught.exception))
 
     def test_attributes_cannot_hide_opaque_blobs_or_image_attachments(self):
         self.commit(".gitattributes", "* diff\n".encode())
         self.commit("hidden.bin", b"opaque\0payload")
-        with self.assertRaisesRegex(SystemExit, "unsupported or malformed"):
+        with self.assertRaisesRegex(SystemExit, "unsupported binary") as caught:
             AUTOREVIEW.branch_bundle(self.repo, self.base)
+        self.assertIn("hidden.bin", str(caught.exception))
         self.git("rm", "hidden.bin")
         self.git("commit", "-qm", "remove opaque")
         self.commit("portrait.png", AutoreviewImageEvidenceTests.PNG)
