@@ -3319,7 +3319,7 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
     unstaged_patch, unstaged_raw, unstaged_numstat, unstaged_paths = local_diff_capture(repo)
     require_no_binary_diff("local staged diff", staged_numstat, staged_raw)
     require_no_binary_diff("local unstaged diff", unstaged_numstat, unstaged_raw)
-    unstaged_link_paths = {record[0] for record in gitlink_records(unstaged_raw)}
+    unstaged_link_paths = {record[0] for record in gitlink_records(unstaged_raw) if record[2] == "160000"}
     if unstaged_link_paths and any(
         re.search(r"^\+Subproject commit [0-9a-f]+-dirty$", patch, re.MULTILINE)
         for path, patch in local_patch_ownership(unstaged_patch, unstaged_paths, raw_diff=unstaged_raw)
