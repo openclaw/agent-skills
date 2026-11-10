@@ -2643,6 +2643,7 @@ def omit_tracked_sensitive_diff_units(
     patch: str,
     paths: list[str],
     blocked_paths: set[str],
+    raw_diff: str = "",
 ) -> str:
     if not blocked_paths:
         return patch
@@ -2650,9 +2651,23 @@ def omit_tracked_sensitive_diff_units(
     diff_indexes = [
         index for index, unit in enumerate(units) if unit.startswith("diff --git ")
     ]
-    if len(diff_indexes) != len(paths):
-        return REVIEW_SECURITY_OMISSION + "\n"
-    path_by_unit = dict(zip(diff_indexes, paths))
+    section_paths = paths
+    if raw_diff:
+        records = raw_diff.split("\0")
+        raw_paths = records[1::2]
+        if raw_paths != paths:
+            raise SystemExit("cannot establish sensitive patch ownership")
+        # With renames disabled, a raw type change has a deletion and addition
+        # section at the same position. Bind both to the raw path, not headings.
+        section_paths = []
+        for index, path in enumerate(raw_paths):
+            fields = records[index * 2].split()
+            if len(fields) != 5:
+                raise SystemExit("cannot establish sensitive patch ownership")
+            section_paths.extend([path] * (2 if fields[-1] == "T" else 1))
+    if len(diff_indexes) != len(section_paths):
+        raise SystemExit("cannot establish sensitive patch ownership")
+    path_by_unit = dict(zip(diff_indexes, section_paths))
     retained = [
         unit
         for index, unit in enumerate(units)
@@ -2668,7 +2683,7 @@ def validate_review_patch(
     raw_diff: str = "",
 ) -> str:
     blocked_paths = tracked_sensitive_paths(paths, raw_diff)
-    return omit_tracked_sensitive_diff_units(patch, paths, blocked_paths)
+    return omit_tracked_sensitive_diff_units(patch, paths, blocked_paths, raw_diff)
 
 
 def binary_diff_paths(numstat: str) -> list[str]:
@@ -2755,6 +2770,7 @@ def capture_added_branch_images(
     repo: Path,
     raw_diff: str,
     numstat: str,
+    blocked_paths: set[str],
 ) -> tuple[ImageEvidence, ...]:
     images: list[ImageEvidence] = []
     binary_paths = set(binary_diff_paths(numstat))
@@ -2769,7 +2785,7 @@ def capture_added_branch_images(
         if path in binary_deletions:
             continue
         binary = path in binary_paths
-        if tracked_sensitive_paths([path], raw_diff):
+        if path in blocked_paths:
             if binary:
                 raise SystemExit("refusing sensitive binary image path")
             continue
@@ -3592,17 +3608,15 @@ def branch_bundle(repo: Path, base_ref: str) -> CapturedBundle:
         repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--raw", "--no-abbrev", "-z",
         "--end-of-options", merge_base, head_ref,
     )
+    omitted_paths = tracked_sensitive_paths(branch_paths, branch_raw)
     links = gitlink_manifest(repo, branch_raw, merge_base, head_ref, "merge-base -> HEAD")
-    images = capture_added_branch_images(repo, branch_raw, branch_numstat)
+    images = capture_added_branch_images(repo, branch_raw, branch_numstat, omitted_paths)
     branch_patch = git(
         repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--patch", "--end-of-options", merge_base, head_ref,
     )
-    omitted_paths = tracked_sensitive_paths(branch_paths, branch_raw)
     original_patch = branch_patch
-    branch_patch = validate_review_patch(
-        branch_paths,
-        branch_patch,
-        branch_raw,
+    branch_patch = omit_tracked_sensitive_diff_units(
+        branch_patch, branch_paths, omitted_paths, branch_raw,
     )
     header = "\n\n".join(
         [

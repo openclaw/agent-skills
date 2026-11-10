@@ -5096,25 +5096,17 @@ time.sleep(60)
                     expected = expected[:9]
                 self.assertEqual(events, expected)
 
-    def test_review_patch_does_not_disclose_controls_in_omitted_paths(self) -> None:
+    def test_review_patch_does_not_disclose_controls_in_refused_paths(self) -> None:
         path = ".env.\x1b]52;c;VEVTVA==\x07\udc9b"
+        with self.assertRaises(SystemExit) as refusal:
+            self.helper["validate_review_patch"]([path], "")
+        message = str(refusal.exception)
+        self.assertEqual(message, "cannot establish sensitive patch ownership")
+        self.assertNotIn("\x1b", message)
+        self.assertNotIn("\x07", message)
+        self.assertNotIn("\udc9b", message)
 
-        redacted = self.helper["validate_review_patch"](
-            [path],
-            "",
-        )
-
-        self.assertEqual(
-            redacted,
-            self.helper["REVIEW_SECURITY_OMISSION"] + "\n",
-        )
-        self.assertNotIn("\x1b", redacted)
-        self.assertNotIn("\x07", redacted)
-        self.assertNotIn("\udc9b", redacted)
-
-    def test_review_patch_omits_everything_when_sensitive_paths_cannot_be_mapped(
-        self,
-    ) -> None:
+    def test_review_patch_refuses_unmapped_sensitive_paths(self) -> None:
         patch = (
             "commit metadata that must not survive a mapping failure\n"
             "diff --cc .env\n"
@@ -5122,17 +5114,8 @@ time.sleep(60)
             "++placeholder=true\n"
         )
 
-        redacted = self.helper["validate_review_patch"](
-            [".env"],
-            patch,
-        )
-
-        self.assertEqual(
-            redacted,
-            self.helper["REVIEW_SECURITY_OMISSION"] + "\n",
-        )
-        self.assertNotIn("placeholder", redacted)
-        self.assertNotIn("commit metadata", redacted)
+        with self.assertRaisesRegex(SystemExit, "cannot establish sensitive patch ownership"):
+            self.helper["validate_review_patch"]([".env"], patch)
 
     def test_review_patch_preserves_combined_and_headerless_hunk_content(self) -> None:
         credential_shaped_code = '+token = "ordinary-hardcoded-value-12345"\n'
@@ -5252,10 +5235,15 @@ time.sleep(60)
                 git(repo, "commit", "-qm", "baseline mapping")
                 base = git(repo, "rev-parse", "HEAD").strip()
                 select(new_mode, second, "updated-flow-marker\n")
+                (repo / "base.txt").write_text("base\npermitted-sibling-edit\n")
+                git(repo, "add", "base.txt")
                 local = self.helper["local_bundle"](repo)
                 git(repo, "commit", "-qm", "change flow object")
                 for bundle in (local, self.helper["branch_bundle"](repo, base),
                                self.helper["commit_bundle"](repo, "HEAD")):
+                    # Filtering either section of a type change must retain its sibling.
+                    self.assertIn("base.txt", bundle.paths)
+                    self.assertIn("+permitted-sibling-edit", bundle.text)
                     # An unchanged mapping must never be disclosed by a rejected gitlink.
                     self.assertNotIn(url, bundle.text)
                     self.assertEqual(path in bundle.paths, allowed)
