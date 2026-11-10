@@ -108,7 +108,7 @@ class GitlinkBundleTests(unittest.TestCase):
                     # source content, even when they look like a dirty pin.
                     target.rmdir()
                 text = 'Subproject commit ' + old + '-dirty\n'
-                target.write_text(text)
+                target.write_bytes(text.encode())
                 captured = self.helper['local_bundle'](repo)
                 self.assertIn('+' + text, captured.text)
                 self.assertIn(relative, captured.paths)
