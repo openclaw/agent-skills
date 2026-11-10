@@ -146,6 +146,12 @@ that refusal.
 - Explicit provider / non-auth failure: no automatic auth fallback.
 - Force configured route: `--codex-config 'model_provider="review_api"'`;
   `review_api` must match operator `CODEX_HOME/config.toml`.
+- Opt in by API endpoint hostname: `--codex-route api.example.com` selects the
+  unique matching provider in trusted user-owned external Codex configuration.
+  This is the API host, never the review machine's hostname. POSIX only; accepts
+  command auth or a configured bearer token with `requires_openai_auth=false`.
+  Cannot combine with a `model_provider` override. Explicit failure never changes
+  provider, endpoint or credential. Read [route constraints](references/engines.md#api-hostname-selection).
 
 ### Copilot subagent review
 

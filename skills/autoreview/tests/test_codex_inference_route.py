@@ -88,7 +88,10 @@ class CodexInferenceRouteTests(unittest.TestCase):
 
         text = table(self.config)
         text += "\n[model_providers.review_api]\n" + table(self.provider)
-        text += "\n[model_providers.review_api.auth]\n" + table(self.auth)
+        if self.auth is not None:
+            text += "\n[model_providers.review_api.auth]\n" + table(self.auth)
+        for identifier, provider in getattr(self, "extra_providers", {}).items():
+            text += f"\n[model_providers.{identifier}]\n" + table(provider)
         # These unrelated operator capabilities must never enter the review runtime.
         text += '\n[mcp_servers.unrelated]\ncommand = "must-not-execute"\n'
         (self.home / "config.toml").write_text(text, encoding="utf-8")
@@ -108,7 +111,11 @@ class CodexInferenceRouteTests(unittest.TestCase):
             if auth_command:
                 launcher = Path(tomllib.loads(f"value = {auth_command}")["value"])
                 observed["auth_command"] = launcher
-                observed["auth_launcher_text"] = launcher.read_text(encoding="utf-8")
+                auth_args = observed["flags"].get("model_providers.review_api.auth.args")
+                if auth_args:
+                    observed["auth_args"] = tomllib.loads("value=" + auth_args)["value"]
+                else:
+                    observed["auth_launcher_text"] = launcher.read_text(encoding="utf-8")
             catalogue = observed["flags"].get("model_catalog_json")
             if catalogue:
                 file = Path(json.loads(catalogue))
@@ -744,6 +751,329 @@ class CodexInferenceRouteTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             self.run_review(during_run=respond)
         self.assertIn(marker, str(caught.exception))
+
+
+@unittest.skipIf(os.name == "nt", "hostname route requires POSIX ownership checks")
+class CodexHostnameRouteTests(unittest.TestCase):
+    setUp = CodexInferenceRouteTests.setUp
+    write_config = CodexInferenceRouteTests.write_config
+    run_review = CodexInferenceRouteTests.run_review
+    available = CodexInferenceRouteTests.available
+    assert_route_refused = CodexInferenceRouteTests.assert_route_refused
+    use_default_models = CodexInferenceRouteTests.use_default_models
+
+    def configure(self):
+        self.args.codex_config = []
+        self.args.codex_route = ["gateway.example.invalid"]
+        self.auth = None
+        self.token = "synthetic-host-route-credential/+=="
+        self.provider.update({
+            "base_url": "https://Gateway.Example.Invalid.:8443/inference/v1/%23responses/",
+            "experimental_bearer_token": self.token,
+            "supports_websockets": True,
+            "supports_standalone_web_search": False,
+            "request_max_retries": 2, "stream_max_retries": 3, "stream_idle_timeout_ms": 120000,
+        })
+        self.write_config()
+
+    def test_hostname_binds_full_endpoint_and_token_without_other_credentials_or_capabilities(self):
+        self.configure()
+        source_auth = self.home / "auth.json"
+        source_auth.write_text('{"OPENAI_API_KEY":"synthetic-other-login"}')
+        before = {path: path.read_bytes() for path in (source_auth, self.home / "config.toml", self.catalogue)}
+        self.args.stream_engine_output = True
+        token_path = None
+
+        def inspect(observed):
+            nonlocal token_path
+            flags = observed["flags"]
+            self.assertEqual(json.loads(flags["model_providers.review_api.base_url"]), self.provider["base_url"])
+            for key in ("supports_websockets", "supports_standalone_web_search", "request_max_retries",
+                        "stream_max_retries", "stream_idle_timeout_ms"):
+                self.assertEqual(tomllib.loads("value=" + flags[f"model_providers.review_api.{key}"])["value"], self.provider[key])
+            args = observed["auth_args"]
+            self.assertEqual(args[:2], ["-I", "-S"])
+            helper = Path(args[2])
+            token_path = helper.with_name("route-token")
+            self.assertEqual(stat.S_IMODE(token_path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(token_path.parent.stat().st_mode), 0o700)
+            self.assertFalse(helper.is_relative_to(observed["cwd"]))
+            result = subprocess.run([str(observed["auth_command"]), *args], env=observed["env"],
+                                    cwd=helper.parent, capture_output=True, check=True)
+            self.assertEqual(result.stdout.decode(), self.token)
+            self.assertEqual(result.stderr, b"")
+            self.assertNotIn(self.token, repr(observed["command"]))
+            self.assertNotIn(self.token, repr(observed["env"]))
+            self.assertNotIn(self.token, helper.read_text())
+            for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL", "AZURE_OPENAI_API_KEY",
+                        "AZURE_OPENAI_ENDPOINT", "OPENAI_PROJECT", "OPENAI_ORGANIZATION"):
+                self.assertNotIn(key, observed["env"])
+            self.assertEqual(observed["workspace"], [])
+            self.assertFalse((Path(observed["env"]["CODEX_HOME"]) / "auth.json").exists())
+            self.assertEqual(flags["cli_auth_credentials_store"], '"file"')
+            self.assertNotIn("forced_login_method", flags)
+            self.assertIn("--ignore-user-config", observed["command"])
+            self.assertEqual(flags["features.hooks"], "false")
+            self.assertEqual(flags["features.plugins"], "false")
+            self.assertEqual(flags["default_permissions"], '"autoreview"')
+            self.assertEqual(observed["catalogue"], self.catalogue_bytes)
+            self.assertFalse(any(key.startswith("mcp_servers") for key in flags))
+
+        self.config["forced_login_method"] = "chatgpt"
+        self.write_config()
+        before[self.home / "config.toml"] = (self.home / "config.toml").read_bytes()
+        env = {key: "synthetic-unrelated" for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL",
+               "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "OPENAI_PROJECT", "OPENAI_ORGANIZATION")}
+        with mock.patch.dict(os.environ, env), mock.patch.dict(self.helper["run_codex"].__globals__, {
+            "load_codex_auth_fallback_route": mock.Mock(side_effect=AssertionError("no provider fallback")),
+        }):
+            observed = self.run_review(prepare_auth=mock.Mock(side_effect=AssertionError("no auth.json")), during_run=inspect)
+        self.assertFalse(token_path.exists())
+        self.assertFalse(observed["cwd"].exists())
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assertEqual(self.available(), (True, None))
+
+    def test_exact_normalized_hostname_not_active_provider_or_machine_hostname(self):
+        self.configure()
+        self.config["model_provider"] = "another_provider"
+        self.extra_providers = {"another_provider": {"base_url": "https://other.example.invalid/v1"}}
+        for selector, endpoint in (
+            ("GATEWAY.EXAMPLE.INVALID.", self.provider["base_url"]),
+            ("xn--bcher-kva.example", "https://BÜCHER.example/v1"),
+            ("bücher.example.", "https://xn--bcher-kva.example/v1"),
+            ("gateway.example.invalid", "https://%67ateway.example.invalid/v1"),
+            ("::1", "https://[0:0:0:0:0:0:0:1]:8443/v1"),
+            ("127.0.0.1", "https://127.0.0.1:8443/v1"),
+        ):
+            with self.subTest(selector=selector):
+                self.args.codex_route = [selector]
+                self.provider["base_url"] = endpoint
+                self.write_config()
+                observed = self.run_review()
+                self.assertEqual(json.loads(observed["flags"]["model_providers.review_api.base_url"]), endpoint)
+                self.assertEqual(observed["flags"]["model_provider"], '"review_api"')
+
+    def test_malformed_missing_and_ambiguous_hosts_fail_without_auth_or_fallback(self):
+        self.configure()
+        for selector in ("", " gateway.example.invalid", "gateway.example.invalid\n", "https://gateway.example.invalid",
+                         "gateway.example.invalid:443", "user@gateway.example.invalid", "gateway.example.invalid/path",
+                         "*.example.invalid", ".example.invalid", "gateway..invalid", "bad_host", "-bad.invalid",
+                         "bad-.invalid", "a" * 64 + ".invalid", "gateway.example.invalid?", "gateway.example.invalid#",
+                         "gate%77ay.example.invalid", "[::1]", "gateway.example.invalid..", "bad\x00host"):
+            with self.subTest(selector=selector):
+                self.args.codex_route = [selector]
+                self.assert_route_refused()
+        # IDNA2003-only mappings must not conflate the client's distinct hosts.
+        self.args.codex_route = ["faß.example"]
+        self.assert_route_refused()
+        self.provider["base_url"] = "https://faß.example/v1"
+        self.args.codex_route = ["fass.example"]
+        self.write_config()
+        self.assert_route_refused()
+        self.provider["base_url"] = "https://gateway.example.invalid/v1"
+        for selector in ("example.invalid", "gateway.example.invalid.evil", "other.gateway.example.invalid"):
+            with self.subTest(missing=selector):
+                self.args.codex_route = [selector]
+                self.assert_route_refused()
+        self.args.codex_route = ["gateway.example.invalid"]
+        self.extra_providers = {"duplicate": {"base_url": "https://gateway.example.invalid/different-path"}}
+        self.write_config()
+        self.assert_route_refused()
+
+    def test_conflicts_include_repeat_selectors_environment_provider_and_split_context(self):
+        self.configure()
+        self.args.codex_route *= 2
+        self.assert_route_refused()
+        self.args.codex_route = ["gateway.example.invalid"]
+        for overrides in (["model_provider=review_api"], ["model_provider=other"], ["model_context_window=123"]):
+            with self.subTest(overrides=overrides):
+                self.args.codex_config = overrides
+                self.assert_route_refused()
+        self.args.codex_config = []
+        with mock.patch.dict(os.environ, {"AUTOREVIEW_CODEX_CONFIG": "model_provider=review_api"}):
+            self.assert_route_refused()
+        self.args.codex_config = ["model_verbosity='low'"]
+        self.assertEqual(self.available(), (True, None))
+
+    def test_unsupported_authentication_and_connection_shapes_never_degrade_to_other_auth(self):
+        self.configure()
+        original = copy.deepcopy(self.provider)
+        for extra in (
+            {"experimental_bearer_token": ""}, {"experimental_bearer_token": None},
+            {"experimental_bearer_token": 42}, {"experimental_bearer_token": "bad\ntoken"},
+            {"experimental_bearer_token": "bad token"}, {"requires_openai_auth": True},
+            {"env_key": "OPENAI_API_KEY"}, {"http_headers": {"Authorization": "synthetic"}},
+            {"env_http_headers": {"Authorization": "SYNTHETIC"}}, {"auth": {"command": str(self.runtime_helper)}},
+            {"wire_api": "chat"}, {"supports_websockets": "true"}, {"supports_standalone_web_search": 1},
+            {"request_max_retries": -1}, {"stream_idle_timeout_ms": True}, {"query_params": {"key": "value"}},
+        ):
+            with self.subTest(fields=list(extra)):
+                self.provider = {**original, **extra}
+                # JSON null is not TOML; write a literal wrong type instead.
+                if self.provider.get("experimental_bearer_token", 0) is None:
+                    self.provider["experimental_bearer_token"] = []
+                self.write_config()
+                self.assert_route_refused()
+        self.provider = original
+        self.provider.pop("experimental_bearer_token")
+        self.write_config()
+        self.assert_route_refused()
+
+    def test_regression_legacy_projection_cannot_use_configured_bearer_provider(self):
+        self.configure()
+        self.args.codex_route = None
+        self.args.codex_config = ['model_provider="review_api"']
+        self.assert_route_refused()
+        self.args.codex_config = []
+        observed = self.run_review()
+        self.assertNotIn("model_provider", observed["flags"])
+        self.args.codex_route = ["gateway.example.invalid"]
+        self.assertEqual(self.available(), (True, None))
+
+    def test_matched_endpoint_safety_and_unsupported_types_fail_without_public_values(self):
+        self.configure()
+        original = self.provider["base_url"]
+        for endpoint in (
+            "http://gateway.example.invalid/v1", "https://user@gateway.example.invalid/v1",
+            "https://gateway.example.invalid:invalid/v1", "https://gateway.example.invalid:0/v1",
+            "https://gateway.example.invalid/v1?", "https://gateway.example.invalid/v1#",
+            "https://gateway.example.invalid/v1/%invalid", "https://gateway.example.invalid/v1\n",
+        ):
+            with self.subTest(endpoint=endpoint):
+                self.provider["base_url"] = endpoint
+                self.write_config()
+                self.assert_route_refused()
+        self.provider["base_url"] = original
+        self.config["model_context_window"] = {"malformed": self.token}
+        self.write_config()
+        with self.assertRaises(SystemExit) as caught:
+            self.run_review()
+        self.assertNotIn(self.token, str(caught.exception))
+
+    def test_model_retry_keeps_one_frozen_endpoint_token_and_catalogue_and_records_usage(self):
+        self.configure()
+        self.use_default_models()
+        original_endpoint, original_token, original_catalogue = self.provider["base_url"], self.token, self.catalogue_bytes
+        attempts = []
+        self.args.review_usage = []
+        def respond(observed):
+            attempts.append(observed["command"])
+            flags = observed["flags"]
+            self.assertEqual(json.loads(flags["model_providers.review_api.base_url"]), original_endpoint)
+            self.assertEqual(Path(observed["auth_args"][2]).with_name("route-token").read_text(), original_token)
+            self.assertEqual(observed["catalogue"], original_catalogue)
+            self.provider.update(base_url="https://gateway.example.invalid/changed", experimental_bearer_token="synthetic-replacement")
+            self.catalogue.write_text('{"models":[]}')
+            self.write_config()
+            usage = json.dumps({"type": "turn.completed", "usage": {
+                "input_tokens": 5, "cached_input_tokens": 1, "output_tokens": 2, "reasoning_output_tokens": 1,
+            }})
+            if len(attempts) == 1:
+                return subprocess.CompletedProcess(observed["command"], 1, usage,
+                    f"The model {self.args.model} does not exist or you do not have access to it.")
+            Path(observed["command"][observed["command"].index("--output-last-message") + 1]).write_text('{"findings": []}')
+            return subprocess.CompletedProcess(observed["command"], 0, usage, "")
+        self.run_review(during_run=respond)
+        summary = self.helper["review_usage_summary"](self.args)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(summary["attempts"], 2)
+        self.assertEqual(summary["reported_attempts"], 2)
+        self.assertEqual(summary["partial_attempts"], 1)
+        self.assertEqual(summary["tokens"]["input_tokens"], 10)
+
+    def test_hostname_selection_also_accepts_existing_command_auth_and_no_fallback_model(self):
+        self.configure()
+        self.provider.pop("experimental_bearer_token")
+        self.auth = {"command": str(self.runtime_helper)}
+        self.write_config()
+        observed = self.run_review()
+        self.assertNotIn("auth_args", observed)
+        self.assertIn("exec ", observed["auth_launcher_text"])
+        self.provider["experimental_bearer_token"] = self.token
+        self.auth = None
+        self.write_config()
+        self.args.codex_no_fallback = True
+        self.args.fallback_model = "gpt-6-luna"
+        attempts = []
+        def failure(observed):
+            attempts.append(observed["command"])
+            return subprocess.CompletedProcess(observed["command"], 1, "",
+                f"The model {self.args.model} does not exist or you do not have access to it.")
+        with self.assertRaises(SystemExit):
+            self.run_review(during_run=failure)
+        self.assertEqual(len(attempts), 1)
+
+    def test_config_ownership_writable_paths_repository_provenance_and_parse_errors_fail(self):
+        self.configure()
+        config = self.home / "config.toml"
+        for path in (config, self.home):
+            mode = stat.S_IMODE(path.stat().st_mode)
+            path.chmod(mode | 0o020)
+            self.assert_route_refused()
+            path.chmod(mode)
+        original_stat = Path.lstat
+        def foreign_owner(path, *args, **kwargs):
+            info = original_stat(path, *args, **kwargs)
+            if path == config:
+                values = list(info)
+                values[4] = os.getuid() + 1
+                return os.stat_result(values)
+            return info
+        with mock.patch.object(Path, "lstat", foreign_owner):
+            self.assert_route_refused()
+        before = config.read_bytes()
+        for contents in (b"model_provider = [", b"\xff"):
+            config.write_bytes(contents)
+            self.assert_route_refused()
+        config.write_bytes(before)
+        with mock.patch.dict(sys.modules, {"tomllib": None, "tomli": None}):
+            self.assert_route_refused()
+        repo_config = self.repo / "operator.toml"
+        repo_config.write_bytes(before)
+        config.unlink()
+        config.symlink_to(repo_config)
+        self.assert_route_refused()
+        config.unlink()
+        config.write_bytes(before)
+        repo_link = self.repo / "external"
+        repo_link.symlink_to(self.home, target_is_directory=True)
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(repo_link)}):
+            self.assert_route_refused()
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.repo)}):
+            self.assert_route_refused()
+
+    def test_secret_redaction_usage_and_cleanup_on_failures_and_interruption(self):
+        self.configure()
+        self.args.stream_engine_output = True
+        runtimes = []
+        for outcome in ("success", "failure", "missing", "interrupt"):
+            with self.subTest(outcome=outcome):
+                def respond(observed):
+                    runtime = Path(observed["auth_args"][2]).parent
+                    runtimes.append(runtime)
+                    display = observed["stream_display"]
+                    for stream in ("stdout", "stderr"):
+                        self.assertNotIn(self.token, display(stream, self.token) or "")
+                    agent = display("stdout", json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": self.token}}))
+                    self.assertIn("[REDACTED]", agent)
+                    self.assertNotIn(self.token, agent)
+                    usage = display("stdout", '{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":2}}')
+                    self.assertIn("input_tokens=5", usage)
+                    if outcome == "interrupt":
+                        raise KeyboardInterrupt
+                    command = observed["command"]
+                    Path(command[command.index("--output-last-message") + 1]).write_text(
+                        json.dumps({"findings": [], "explanation": self.token}) if outcome == "success" else "")
+                    return subprocess.CompletedProcess(command, 1 if outcome == "failure" else 0, self.token, "HTTP 401 " + self.token)
+                if outcome == "success":
+                    self.assertNotIn(self.token, self.run_review(during_run=respond)["report"])
+                else:
+                    with self.assertRaises(KeyboardInterrupt if outcome == "interrupt" else SystemExit) as caught:
+                        self.run_review(during_run=respond)
+                    self.assertNotIn(self.token, str(caught.exception))
+                self.assertFalse(runtimes[-1].exists())
+        route = self.helper["load_codex_inference_route"](self.repo, [], "gateway.example.invalid")
+        self.assertNotIn(self.token, repr(route))
 
 
 if __name__ == "__main__":

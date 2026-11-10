@@ -11,6 +11,7 @@ import copy
 import functools
 import hashlib
 import io
+import ipaddress
 import json
 import math
 import os
@@ -5189,9 +5190,88 @@ def codex_auth_helper_home(repo: Path) -> Path:
         ) from None
 
 
+class CodexInferenceRoute(NamedTuple):
+    flags: list[str]
+    catalogue: bytes | None
+    bearer_token: str | None = None
+
+    def __repr__(self) -> str:
+        return "CodexInferenceRoute(<private route snapshot>)"
+
+
+def normalize_codex_route_hostname(value: str) -> str:
+    """A host only: case/IDNA/root-dot normalization, never URL/suffix matching."""
+    try:
+        if not value or any(char.isspace() for char in value) or any(char in value for char in "/\\@?#%[]"):
+            raise ValueError
+        try:
+            return ipaddress.ip_address(value).compressed
+        except ValueError:
+            pass
+        source = unicodedata.normalize("NFC", value.removesuffix(".")).lower()
+        host = source.encode("idna").decode("ascii").lower()
+        # The stdlib uses IDNA2003. Refuse its lossy mappings (e.g. ß -> ss)
+        # rather than equating different hosts under the client's URL parser.
+        if not source.isascii() and host.encode("ascii").decode("idna") != source:
+            raise ValueError
+        if len(host) > 253 or not all(
+            re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+            for label in host.split(".")
+        ):
+            raise ValueError
+        return host
+    except (ValueError, UnicodeError):
+        raise SystemExit("Codex inference configuration refused: --codex-route requires one valid API hostname, without scheme, port or path") from None
+
+
+def codex_route_selector(args: argparse.Namespace) -> str | None:
+    selectors = getattr(args, "codex_route", None)
+    if selectors is None:
+        return None
+    if len(selectors) != 1:
+        raise SystemExit("Codex inference configuration refused: select exactly one --codex-route")
+    return normalize_codex_route_hostname(selectors[0])
+
+
+def validate_codex_route_config(repo: Path, source_home: Path) -> None:
+    # Fail closed where POSIX ownership cannot attest the operator input. This
+    # opt-in boundary does not change existing auth-only or named-route behavior.
+    if os.name == "nt":
+        raise SystemExit("Codex inference configuration refused: --codex-route requires POSIX configuration ownership checks")
+    try:
+        raw_home = os.environ.get("CODEX_HOME", "").strip()
+        home = Path(raw_home).expanduser() if raw_home else Path.home() / ".codex"
+        if not home.is_absolute():
+            raise ValueError
+        pending = [home / "config.toml", *home.parents, home]
+        seen: set[Path] = set()
+        while pending:
+            path = pending.pop()
+            if path in seen:
+                continue
+            seen.add(path)
+            if not external_env_path(repo, str(path)) or is_within(path.absolute(), repo.absolute()):
+                raise ValueError
+            info = path.lstat()
+            if info.st_uid not in {0, os.getuid()}:
+                raise ValueError
+            if (not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022
+                    and not (info.st_uid == 0 and stat.S_ISDIR(info.st_mode) and info.st_mode & stat.S_ISVTX)):
+                raise ValueError
+            if stat.S_ISLNK(info.st_mode):
+                target = path.parent / os.readlink(path)
+                pending.extend((target, *target.parents))
+        info = (source_home / "config.toml").stat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_nlink != 1 or source_home.stat().st_uid != os.getuid()):
+            raise ValueError
+    except (OSError, RuntimeError, ValueError):
+        raise SystemExit("Codex inference configuration refused: hostname selection requires trusted user-owned external configuration without writable ancestry or repository provenance") from None
+
+
 def load_codex_inference_route(
-    repo: Path, overrides: Sequence[str] = (),
-) -> tuple[list[str], bytes | None]:
+    repo: Path, overrides: Sequence[str] = (), hostname: str | None = None,
+) -> CodexInferenceRoute:
     """Read the trusted client route without loading operator tool capabilities."""
     def refuse(detail: str) -> None:
         raise SystemExit(f"Codex inference configuration refused: {detail}")
@@ -5201,16 +5281,21 @@ def load_codex_inference_route(
         for key, _, value in (item.partition("=") for item in overrides)
         if key.strip() == "model_provider"
     ]
-    if not selectors:
+    if hostname is not None:
+        hostname = normalize_codex_route_hostname(hostname)
+        if selectors:
+            refuse("--codex-route cannot combine with model_provider overrides (including AUTOREVIEW_CODEX_CONFIG)")
+    elif not selectors:
         # Unselected provider/profile/tuning settings keep their historical
         # auth-only behavior, including on hosts without a TOML parser.
-        return codex_auth_config_flags(repo), None
-    if len(selectors) != 1:
+        return CodexInferenceRoute(codex_auth_config_flags(repo), None)
+    if hostname is None and len(selectors) != 1:
         refuse("select exactly one model_provider")
-    match = re.fullmatch(r'''(["']?)([A-Za-z0-9_-]+)\1''', selectors[0])
-    if match is None:
-        refuse("model_provider must be a bare or quoted provider identifier")
-    provider_id = match[2]
+    if hostname is None:
+        match = re.fullmatch(r'''(["']?)([A-Za-z0-9_-]+)\1''', selectors[0])
+        if match is None:
+            refuse("model_provider must be a bare or quoted provider identifier")
+        provider_id = match[2]
 
     def external_path(
         value: Any, label: str, *, directory: bool = False, absolute: bool = False,
@@ -5234,23 +5319,45 @@ def load_codex_inference_route(
     config_path = source_home / "config.toml"
     if not external_env_path(repo, str(config_path)):
         refuse("operator config must be outside the reviewed repository")
+    if hostname is not None:
+        validate_codex_route_config(repo, source_home)
     config = load_codex_auth_config(config_path, strict=True)
-    flags = codex_auth_config_flags(repo, config=config)
+    # Explicit hostname auth cannot inherit subscription/keyring policy.
+    flags = [] if hostname is not None else codex_auth_config_flags(repo, config=config)
     context_keys = (
         "model_context_window", "model_auto_compact_token_limit",
         "model_auto_compact_token_limit_scope",
     )
-    if config.get("model_provider") != provider_id:
+    providers = config.get("model_providers", {})
+    if hostname is not None:
+        matches = []
+        for identifier, definition in (providers.items() if isinstance(providers, dict) else ()):
+            try:
+                host = urllib.parse.urlsplit(definition["base_url"]).hostname
+                host = urllib.parse.unquote(host, errors="strict") if host else host
+                if host and normalize_codex_route_hostname(host) == hostname:
+                    matches.append(identifier)
+            except (KeyError, TypeError, AttributeError, ValueError, SystemExit):
+                continue
+        if len(matches) != 1:
+            refuse("API hostname must match exactly one configured provider; missing or ambiguous match")
+        provider_id = matches[0]
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", provider_id):
+            refuse("selected provider must have a simple provider identifier")
+    elif config.get("model_provider") != provider_id:
         refuse("selected model_provider must match the operator config")
     if any(key in config for key in ("profile", "openai_base_url")):
         refuse("profile or base URL overrides cannot be projected as one inference route")
     if provider_id in {"openai", "ollama", "lmstudio", "amazon-bedrock", "amazon-bedrock-runtime"}:
         refuse("command authentication requires a distinct named provider")
-    providers = config.get("model_providers", {})
     provider = providers.get(provider_id) if isinstance(providers, dict) else None
-    if not isinstance(provider, dict) or set(provider) - {
+    extra_fields = {
+        "experimental_bearer_token", "supports_standalone_web_search",
+        "request_max_retries", "stream_max_retries", "stream_idle_timeout_ms",
+    } if hostname is not None else set()
+    if not isinstance(provider, dict) or set(provider) - ({
         "name", "base_url", "wire_api", "requires_openai_auth", "supports_websockets", "auth",
-    }:
+    } | extra_fields):
         refuse("unsupported provider fields")
     base_url = provider.get("base_url")
     try:
@@ -5262,12 +5369,12 @@ def load_codex_inference_route(
                 or re.search(r"%(?![0-9a-fA-F]{2})", base_url)):
             raise ValueError
         parsed = urllib.parse.urlsplit(base_url)
-        hostname = urllib.parse.unquote(parsed.hostname or "")
-        if (parsed.scheme != "https" or not hostname
+        endpoint_host = urllib.parse.unquote(parsed.hostname or "")
+        if (parsed.scheme != "https" or not endpoint_host
                 or parsed.username is not None or parsed.password is not None
                 or parsed.port == 0 or parsed.netloc.endswith(":")
                 or any(char.isspace() or ord(char) < 32 or ord(char) == 127
-                       or char in "/\\@?#" for char in hostname)):
+                       or char in "/\\@?#" for char in endpoint_host)):
             raise ValueError
     except ValueError:
         refuse("provider base_url must be an absolute https URL with a host and no userinfo, query, or fragment")
@@ -5278,20 +5385,40 @@ def load_codex_inference_route(
         or not isinstance(provider.get("name", ""), str)
     ):
         refuse("only command-auth Responses routes are supported")
+    if hostname is not None:
+        for key in ("supports_standalone_web_search",):
+            if key in provider and type(provider[key]) is not bool:
+                refuse("unsupported provider connection settings")
+        for key in ("request_max_retries", "stream_max_retries", "stream_idle_timeout_ms"):
+            if key in provider and (type(provider[key]) is not int or not 0 <= provider[key] <= (1 << 64) - 1):
+                refuse("unsupported provider connection settings")
+    bearer = provider.get("experimental_bearer_token")
+    if "experimental_bearer_token" in provider:
+        if ("auth" in provider or not isinstance(bearer, str)
+                or re.fullmatch(r"[A-Za-z0-9._~+/\-]+=*", bearer) is None):
+            refuse("hostname route requires one nonempty bearer token or command authentication, never a combination")
+        if not external_env_path(repo, sys.executable):
+            refuse("bearer authentication requires a trusted external Python interpreter")
     auth = provider.get("auth")
-    if not isinstance(auth, dict) or set(auth) - {
+    if bearer is None and (not isinstance(auth, dict) or set(auth) - {
         "command", "args", "cwd", "timeout_ms", "refresh_interval_ms",
-    } or auth.get("args", []) != []:
+    } or auth.get("args", []) != []):
         refuse("unsupported provider authentication fields")
-    command = external_path(auth.get("command"), "authentication executable", absolute=True)
-    if not os.access(command, os.X_OK):
-        refuse("authentication executable is not executable")
-    if os.name != "nt":
-        codex_auth_helper_home(repo)
-    auth_cwd = external_path(auth.get("cwd", str(source_home)), "authentication cwd", directory=True)
-    for key, minimum in (("timeout_ms", 1), ("refresh_interval_ms", 0)):
-        if key in auth and (type(auth[key]) is not int or not minimum <= auth[key] <= (1 << 64) - 1):
-            refuse(f"invalid authentication {key}")
+    auth_settings = {}
+    if bearer is None:
+        command = external_path(auth.get("command"), "authentication executable", absolute=True)
+        if not os.access(command, os.X_OK):
+            refuse("authentication executable is not executable")
+        if os.name != "nt":
+            codex_auth_helper_home(repo)
+        auth_cwd = external_path(auth.get("cwd", str(source_home)), "authentication cwd", directory=True)
+        for key, minimum in (("timeout_ms", 1), ("refresh_interval_ms", 0)):
+            if key in auth and (type(auth[key]) is not int or not minimum <= auth[key] <= (1 << 64) - 1):
+                refuse(f"invalid authentication {key}")
+        auth_settings = {
+            "auth.command": str(command), "auth.cwd": str(auth_cwd),
+            **{f"auth.{key}": auth[key] for key in ("timeout_ms", "refresh_interval_ms") if key in auth},
+        }
     if any(override.partition("=")[0].strip() in context_keys for override in overrides):
         refuse("context overrides would split the operator inference route")
 
@@ -5307,19 +5434,46 @@ def load_codex_inference_route(
     settings = {
         "model_provider": provider_id,
         **{key: config[key] for key in context_keys if key in config},
-        **{f"model_providers.{provider_id}.{key}": value for key, value in provider.items() if key != "auth"},
-        f"model_providers.{provider_id}.auth.command": str(command),
-        f"model_providers.{provider_id}.auth.cwd": str(auth_cwd),
-        **{f"model_providers.{provider_id}.auth.{key}": auth[key]
-           for key in ("timeout_ms", "refresh_interval_ms") if key in auth},
+        **{f"model_providers.{provider_id}.{key}": value for key, value in provider.items()
+           if key not in {"auth", "experimental_bearer_token"}},
+        **{f"model_providers.{provider_id}.{key}": value for key, value in auth_settings.items()},
     }
-    return flags + [part for key, value in settings.items() for part in ("-c", f"{key}={toml_value(value)}")], catalogue_bytes
+    try:
+        flags += [part for key, value in settings.items() for part in ("-c", f"{key}={toml_value(value)}")]
+    except SystemExit:
+        if hostname is not None:
+            refuse("unsupported inference setting types")
+        raise
+    if bearer is not None and any(bearer in flag for flag in flags):
+        refuse("bearer credential overlaps public route settings")
+    return CodexInferenceRoute(flags, catalogue_bytes, bearer)
 
 
 def prepare_codex_inference_config(
-    route: tuple[list[str], bytes | None], runtime_root: Path,
+    route: CodexInferenceRoute | tuple[list[str], bytes | None], runtime_root: Path,
 ) -> list[str]:
-    flags, catalogue_bytes = route
+    flags, catalogue_bytes = route[:2]
+    flags = list(flags)
+    bearer = getattr(route, "bearer_token", None)
+    if bearer is not None:
+        # Native command auth runs outside the reviewer tool sandbox. The token
+        # never enters argv, environment, config flags or the readable workspace.
+        provider = json.loads(next(flag.partition("=")[2] for flag in flags if flag.startswith("model_provider=")))
+        token_path = runtime_root / "route-token"
+        with open(token_path, "x", encoding="ascii", opener=lambda path, mode: os.open(path, mode, 0o600)) as output:
+            output.write(bearer)
+        helper = runtime_root / "route-auth.py"
+        helper.write_text(
+            "import pathlib, sys\n"
+            "sys.stdout.buffer.write(pathlib.Path(__file__).with_name('route-token').read_bytes())\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o600)
+        for key, value in {
+            "command": str(Path(sys.executable).resolve()), "args": ["-I", "-S", str(helper.resolve())],
+            "cwd": str(runtime_root.resolve()),
+        }.items():
+            flags += ["-c", f"model_providers.{provider}.auth.{key}={toml_value(value)}"]
     if catalogue_bytes is None:
         return flags
     # Client metadata stays outside the model's readable workspace and remains
@@ -5338,6 +5492,10 @@ def stage_codex_auth_helper(repo: Path, runtime_root: Path, flags: list[str]) ->
     for index, flag in enumerate(flags):
         key, separator, value = flag.partition("=")
         if not separator or not re.fullmatch(r"model_providers\.[A-Za-z0-9_-]+\.auth\.command", key):
+            continue
+        if any(item.startswith(key.removesuffix("command") + "args=") for item in flags):
+            # Only our private token reader has arguments; operator auth args
+            # are refused at route validation. It needs no caller HOME access.
             continue
         # Route validation owns the absolute executable. Native command auth
         # runs outside the tool sandbox; only its launcher restores caller HOME.
@@ -5408,6 +5566,7 @@ def codex_runtime_env(
     *,
     file_auth_linked: bool,
     command_auth: bool = False,
+    hostname_route: bool = False,
 ) -> dict[str, str]:
     runtime_home = runtime_root / "home"
     runtime_config = runtime_home / ".config"
@@ -5431,7 +5590,7 @@ def codex_runtime_env(
         if command_auth or file_auth_linked or source_codex_home is None
         else source_codex_home
     )
-    return safe_engine_env(
+    env = safe_engine_env(
         repo,
         [Path(codex_bin).parent],
         engine="codex",
@@ -5448,6 +5607,11 @@ def codex_runtime_env(
             "CODEX_HOME": str(active_codex_home),
         },
     )
+    if hostname_route:
+        for key in ("AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "CODEX_API_KEY",
+                    "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_ORGANIZATION", "OPENAI_PROJECT"):
+            env.pop(key, None)
+    return env
 
 
 def ensure_codex_isolation_supported(
@@ -5464,11 +5628,14 @@ def ensure_codex_isolation_supported(
         prefix="autoreview-codex-probe-runtime.",
         dir=temp_root,
     ) as runtime_dir:
+        hostname_route = codex_route_selector(args) is not None
         probe_env = codex_runtime_env(
             repo,
             Path(runtime_dir),
             codex_bin,
-            file_auth_linked=codex_file_auth_source(repo) is not None,
+            file_auth_linked=not hostname_route and codex_file_auth_source(repo) is not None,
+            command_auth=hostname_route,
+            hostname_route=hostname_route,
         )
         result = run(
             [codex_bin, "--version"],
@@ -5946,7 +6113,7 @@ def codex_command(
     cmd.extend(codex_config_isolation_flags(review_root, runtime_root))
     if auth_config is None:
         auth_config = prepare_codex_inference_config(
-            load_codex_inference_route(source_repo, overrides), runtime_root,
+            load_codex_inference_route(source_repo, overrides, codex_route_selector(args)), runtime_root,
         )
         auth_config = stage_codex_auth_helper(source_repo, runtime_root, auth_config)
     cmd.extend(auth_config)
@@ -5992,6 +6159,9 @@ def stage_review_images(review_root: Path, images: Sequence[ImageEvidence]) -> l
 def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     if not args.tools:
         raise SystemExit("--no-tools is not supported by the Codex engine; use --engine claude --no-tools for a no-tools run")
+    hostname = codex_route_selector(args)
+    overrides = codex_config_overrides(args)
+    route = load_codex_inference_route(repo, overrides, hostname)
     ensure_codex_isolation_supported(args, repo)
     temp_root = safe_temp_root(repo, engine="codex")
     schema_path = write_json_temp(PROVIDER_SCHEMA, temp_root)
@@ -6027,12 +6197,10 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
             )
             runtime_root = Path(runtime_dir)
             runtime_codex_home = runtime_root / "codex-home"
-            overrides = codex_config_overrides(args)
-            route = load_codex_inference_route(repo, overrides)
             command_auth = any(flag.startswith("model_provider=") for flag in route[0])
             auth_fallback = (
                 load_codex_auth_fallback_route(repo, overrides, command_auth=command_auth)
-                if allow_fallback else None
+                if allow_fallback and not command_auth else None
             )
             if auth_fallback is not None and codex_subscription_login_missing(
                 resolve_command(args.codex_bin, repo), temp_root,
@@ -6081,7 +6249,10 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                         label="codex",
                         max_runtime_seconds=getattr(args, "engine_timeout_seconds", None),
                         stream_output=args.stream_engine_output,
-                        stream_display=CodexStreamDisplay(suppress_diagnostics=command_auth, engine_stage=engine_stage) if args.stream_engine_output else None,
+                        stream_display=CodexStreamDisplay(
+                            suppress_diagnostics=command_auth, engine_stage=engine_stage,
+                            secret=getattr(route, "bearer_token", None),
+                        ) if args.stream_engine_output else None,
                         engine_stage=engine_stage,
                         stop_on_output=CodexAuthFailureStopper(),
                         env=codex_runtime_env(
@@ -6090,6 +6261,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                             cmd[0],
                             file_auth_linked=file_auth_linked,
                             command_auth=command_auth,
+                            hostname_route=hostname is not None,
                         ),
                     )
                 except EngineInterrupted as exc:
@@ -6099,7 +6271,9 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                     record_codex_usage(args, result.stdout if result is not None else interrupted_stdout,
                                        completed=result is not None and result.returncode == 0)
                 try:
-                    output = output_path.read_text(encoding="utf-8")
+                    output = redact_codex_route_secret(
+                        output_path.read_text(encoding="utf-8"), getattr(route, "bearer_token", None),
+                    )
                 except UnicodeDecodeError:
                     raise ReviewerUnavailable("codex engine returned non-UTF-8 report",
                                               reason="invalid_report", result=result) from None
@@ -6111,7 +6285,7 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                 auth_fallback = (
                     load_codex_auth_fallback_route(
                         repo, overrides, result, command_auth=command_auth,
-                    ) if allow_fallback else None
+                    ) if allow_fallback and not command_auth else None
                 )
                 if auth_fallback is not None:
                     provider, route = auth_fallback
@@ -6812,13 +6986,20 @@ def run_pi(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     return result.stdout
 
 
+def redact_codex_route_secret(text: str, secret: str | None) -> str:
+    if secret is not None:
+        text = text.replace(secret, "[REDACTED]").replace(secret.replace("/", "\\/"), "[REDACTED]")
+    return text
+
+
 class CodexStreamDisplay:
-    def __init__(self, *, activity_seconds: int = 20, suppress_diagnostics: bool = False, engine_stage: EngineStage | None = None) -> None:
+    def __init__(self, *, activity_seconds: int = 20, suppress_diagnostics: bool = False, engine_stage: EngineStage | None = None, secret: str | None = None) -> None:
         self.engine_stage = engine_stage
         self.stage_generated = False
         self.stage_stream = "stdout"
         self.activity_seconds = activity_seconds
         self.suppress_diagnostics = suppress_diagnostics
+        self.secret = secret
         self.hidden_events = 0
         self.last_visible = time.monotonic()
 
@@ -6907,7 +7088,7 @@ class CodexStreamDisplay:
 
     def visible(self, text: str) -> str:
         self.last_visible = time.monotonic()
-        return stream_display_escape(text)
+        return stream_display_escape(redact_codex_route_secret(text, self.secret))
 
 
 class ClaudeStreamDisplay:
@@ -7612,6 +7793,12 @@ def parse_args() -> argparse.Namespace:
         help="Keep the selected Codex model and authentication route; do not substitute another model or configured provider.",
     )
     parser.add_argument(
+        "--codex-route",
+        action="append",
+        metavar="API_HOSTNAME",
+        help="Opt in to the unique provider with this API endpoint hostname in trusted user-owned external Codex config. No URL/port/path, provider override, or authentication fallback. POSIX only.",
+    )
+    parser.add_argument(
         "--codex-config",
         action="append",
         help='Codex "-c key=value" tuning override (TOML value). Select model_provider=<id> to project the matching trusted external route. Repeatable; one provider selector. Command-, path-, and provider-definition keys are refused. Env default: AUTOREVIEW_CODEX_CONFIG (semicolon-separated).',
@@ -7934,6 +8121,9 @@ def parse_keyed_options(values: list[str] | None, option: str) -> tuple[str | No
 
 
 def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
+    if getattr(args, "codex_route", None) is not None and args.engine != "codex":
+        raise SystemExit("--codex-route is only supported for codex; no codex reviewer selected")
+    codex_route_selector(args)
     if getattr(args, "codex_no_fallback", False) and args.engine != "codex":
         raise SystemExit("--codex-no-fallback is only supported for codex; no codex reviewer selected")
     if args.engine == "kimi":
@@ -8107,7 +8297,7 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
         try:
             codex_config_keys(reviewer)
             codex_speed_override(reviewer)
-            load_codex_inference_route(repo, codex_config_overrides(reviewer))
+            load_codex_inference_route(repo, codex_config_overrides(reviewer), codex_route_selector(reviewer))
         except SystemExit as exc:
             return False, str(exc.code)
     if engine == "claude" and getattr(reviewer, "tools", True):
