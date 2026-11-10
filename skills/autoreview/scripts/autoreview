@@ -2592,11 +2592,13 @@ def skill_instruction_path(path: Path) -> bool:
 
 
 def credential_document_path(path: Path) -> bool:
-    # These named documentation directories describe behavior, not credential stores.
+    # These named directories hold behavior docs or proposals, not credential stores.
     return (
         path.parts[:3] in {
             ("docs", "flows", "credential-source-egress"),
             ("docs", "reference", "repository-credentials"),
+            ("docs", "reference", "credential-sources"),
+            ("specs", "rfcs", "0023-egress-proxy-credential-lifecycle"),
         }
         and len(path.parts) == 4
         and path.suffix == ".md"
