@@ -1784,6 +1784,10 @@ class AutoreviewHardeningTests(unittest.TestCase):
         for path, executable, allowed in (
             ("src/credential-proxy/index.ts", False, True),
             ("fixtures/repository-credentials/state.mjs", False, True),
+            ("apps/controller/src/drivers/secret/kubernetes/index.ts", False, True),
+            ("apps/controller/src/drivers/secret/kubernetes/index.ts", True, False),
+            ("apps/controller/src/drivers/secret/kubernetes/other.ts", False, False),
+            ("apps/controller/src/drivers/secrets/kubernetes/index.ts", False, False),
             ("src/credential-proxy/index.ts", True, False),
             (".ssh/credential-proxy/index.ts", False, False),
             ("credentials/session.json", False, False),
@@ -1807,6 +1811,34 @@ class AutoreviewHardeningTests(unittest.TestCase):
                         with self.assertRaisesRegex(SystemExit, "sensitive --source-context"):
                             main()
                         self.assertFalse(sends)
+
+    def test_source_context_literal_pin_keeps_content_and_topology_checks(self):
+        path = "apps/controller/src/drivers/secret/kubernetes/index.ts"
+        sample = b"export const synthetic = true;\n"
+        oid = hashlib.sha1(b"blob " + str(len(sample)).encode() + b"\0" + sample).hexdigest()
+        pin = (oid, hashlib.sha256(sample).hexdigest())
+        for role in ("--source-context", "--source-context-file"):
+            for kind in ("exact", "edited", "missing pin", "symlink"):
+                content = sample + b"// changed\n" if kind == "edited" else sample
+                with self.subTest(role=role, kind=kind), self.committed_context_fixture(
+                    path=path, role=role, content=content,
+                ) as (repo, sends, *_):
+                    if kind == "symlink":
+                        if os.name == "nt":
+                            self.skipTest("symlink topology check requires POSIX")
+                        (repo / path).unlink()
+                        (repo / path).symlink_to(repo / "source.md")
+                    pins = {} if kind == "missing pin" else {path: pin}
+                    main = self.helper["main_impl"]
+                    with mock.patch.dict(main.__globals__, {"REVIEWED_CONTEXT_BLOBS": pins}):
+                        if kind == "exact":
+                            self.assertEqual(main(), 0)
+                            self.assertIn(sample.decode(), sends[0])
+                            self.assertIn(f"blob={oid} mode=100644", sends[0])
+                        else:
+                            with self.assertRaises(SystemExit):
+                                main()
+                            self.assertFalse(sends)
 
     def test_source_context_retains_strict_directories_stores_and_keyfiles(self):
         paths = (

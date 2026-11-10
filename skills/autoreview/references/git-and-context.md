@@ -84,7 +84,10 @@ authentication, sandbox and mutation checks remain enabled.
   repository-relative path, Git blob ID, Git mode `100644`, and content SHA-256.
   Pins can cover ambiguous compound names such as `credential-proxy`. Private
   roots, literal credential directories such as `credentials/` and `secrets/`,
-  and credential stores remain restricted.
+  and credential stores remain restricted. The sole literal-directory exception is
+  the inspected `apps/controller/src/drivers/secret/kubernetes/index.ts` source,
+  which must also match its installed blob, mode and SHA-256 pin. Neighboring files
+  and other versions remain refused.
   Both source-context flags and batch-manifest contexts use this check. Only the
   installed policy can supply pins. A pin stops matching after a move, edit, or
   mode change. Pins authorize context delivery only. Changed-file, prompt-file,
