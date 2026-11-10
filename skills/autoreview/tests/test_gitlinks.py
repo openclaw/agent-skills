@@ -99,10 +99,19 @@ class GitlinkBundleTests(unittest.TestCase):
                 self.helper['local_bundle'](repo)
 
     def test_subproject_looking_regular_text_is_not_a_dirty_submodule(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            repo, old, base = self.fixture(Path(tmp))
-            (repo / 'source').write_text('Subproject commit ' + old + '-dirty\n')
-            self.assertIn('-dirty', self.helper['local_bundle'](repo).text)
+        for relative in ('source', 'vendor/dependency'):
+            with self.subTest(path=relative), tempfile.TemporaryDirectory() as tmp:
+                repo, old, base = self.fixture(Path(tmp))
+                target = repo / relative
+                if target.is_dir():
+                    # Replacing a gitlink with a file makes these bytes ordinary
+                    # source content, even when they look like a dirty pin.
+                    target.rmdir()
+                text = 'Subproject commit ' + old + '-dirty\n'
+                target.write_bytes(text.encode())
+                captured = self.helper['local_bundle'](repo)
+                self.assertIn('+' + text, captured.text)
+                self.assertIn(relative, captured.paths)
 
     def test_ambiguous_mapping_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:

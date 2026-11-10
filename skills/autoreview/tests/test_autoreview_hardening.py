@@ -302,6 +302,73 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
                 expected = record.staged if span.target == "index" else record.unstaged
                 self.assertEqual(captured.text.encode()[span.start:span.end], expected.encode())
 
+    def test_partial_document_staging_survives_an_omitted_sibling_type_change(self):
+        for staged, reverse, sibling_name in itertools.product(
+            (False, True), (False, True), ("a-sibling.md", "z-sibling.md"),
+        ):
+            if os.name == "nt" and not staged:
+                continue  # Working-tree type changes require native symlinks.
+            with self.subTest(staged=staged, reverse=reverse, sibling=sibling_name), \
+                    tempfile.TemporaryDirectory() as tempdir:
+                repo = init_repo(Path(tempdir))
+                git(repo, "config", "core.autocrlf", "false")
+                if os.name == "nt":
+                    git(repo, "config", "core.symlinks", "false")
+                directory = "docs/flows/credential-source-egress"
+                doc_path = f"{directory}/guide.md"
+                sibling_path = f"{directory}/{sibling_name}"
+                doc = repo / doc_path
+                doc.parent.mkdir(parents=True)
+                doc.write_bytes(b"base document\n")
+                (repo / "allowed.py").write_bytes(b"base source\n")
+                (repo / ".env").write_bytes(b"PRIVATE_BASE_SENTINEL\n")
+                git(repo, "add", ".")
+
+                def select_sibling(link):
+                    # Real index modes work on Windows without symlink privilege.
+                    payload = repo.parent / "payload"
+                    payload.write_bytes(b"PRIVATE_LINK_SENTINEL" if link else b"OMITTED_TEXT_SENTINEL\n")
+                    oid = git(repo, "hash-object", "-w", str(payload)).strip()
+                    mode = "120000" if link else "100644"
+                    git(repo, "update-index", "--add", "--cacheinfo", f"{mode},{oid},{sibling_path}")
+                    git(repo, "checkout-index", "--force", "--", sibling_path)
+
+                select_sibling(reverse)
+                git(repo, "commit", "-qm", "baseline")
+                if staged:
+                    select_sibling(not reverse)
+                else:
+                    sibling = repo / sibling_path
+                    sibling.unlink()
+                    if reverse:
+                        sibling.write_bytes(b"OMITTED_TEXT_SENTINEL\n")
+                    else:
+                        sibling.symlink_to("PRIVATE_LINK_SENTINEL")
+                # Both versions of the document must retain exact source attribution,
+                # even when the omitted transition occupies two adjacent patch sections.
+                doc.write_bytes("staged document 界\n".encode())
+                (repo / "allowed.py").write_bytes(b"review this source\n")
+                (repo / ".env").write_bytes(b"PRIVATE_NEW_SENTINEL\n")
+                git(repo, "add", doc_path, "allowed.py", ".env")
+                doc.write_bytes("working document 界\n".encode())
+
+                captured = self.helper["local_bundle"](repo)
+                self.assertEqual(captured.paths, {doc_path, "allowed.py"})
+                self.assertIn("+review this source", captured.text)
+                for omitted in (sibling_name, "PRIVATE_LINK_SENTINEL", "OMITTED_TEXT_SENTINEL",
+                                "PRIVATE_BASE_SENTINEL", "PRIVATE_NEW_SENTINEL"):
+                    self.assertNotIn(omitted, captured.text)
+                record, = captured.mixed
+                self.assertEqual(record.path, doc_path)
+                self.assertEqual(record.index.content, "staged document 界\n")
+                self.assertEqual(record.working_tree.content, "working document 界\n")
+                self.assertEqual({span.target for span in captured.spans}, {"index", "working_tree"})
+                for span in captured.spans:
+                    self.assertEqual(span.path, doc_path)
+                    expected = record.staged if span.target == "index" else record.unstaged
+                    self.assertEqual(captured.text.encode()[span.start:span.end], expected.encode())
+                self.helper["verify_mixed_sources"](repo, captured.mixed)
+
     def test_mixed_full_dataset_preference_rebatches_before_tiny_change_splits(self):
         budget, minimum = 512_000, 32_000
         render = self.helper["render_review_prompt"]
