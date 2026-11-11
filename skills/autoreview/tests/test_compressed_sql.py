@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import os
 import runpy
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -241,3 +243,63 @@ class CompressedSqlTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, 'outside the reviewed repository'):
                     self.helper['branch_bundle'](repo, base)
             self.assertFalse(list(repo.glob('autoreview-sql-*')))
+
+    def test_user_attributes_cannot_normalize_decoded_line_endings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _ = self.fixture(Path(tmp))
+            home = Path(tmp) / 'home'
+            attributes = home / '.config' / 'git' / 'attributes'
+            attributes.parent.mkdir(parents=True)
+            attributes.write_text('* text=auto\n')
+            with mock.patch.dict(os.environ, {'HOME': str(home)}):
+                patch = self.helper['compressed_sql_diff'](repo, b'SELECT 1;\n', b'SELECT 1;\r\n')
+            self.assertIn('+SELECT 1;\r\n', patch)
+
+    def test_enclosing_worktree_attributes_cannot_hide_decoded_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _ = self.fixture(Path(tmp))
+            outer = Path(tmp) / 'outer'
+            outer.mkdir()
+            git(outer, 'init', '-q')
+            (outer / '.gitattributes').write_text('* text ident\n')
+            scratch = outer / 'scratch'
+            scratch.mkdir()
+            namespace = self.helper['compressed_sql_diff'].__globals__
+            with mock.patch.object(namespace['tempfile'], 'gettempdir', return_value=str(scratch)):
+                patch = self.helper['compressed_sql_diff'](
+                    repo, b"SELECT '$Id: before $';\n", b"SELECT '$Id: after $';\r\n",
+                )
+            self.assertIn("+SELECT '$Id: after $';\r\n", patch)
+
+    def test_enclosing_worktree_filter_cannot_execute_or_rewrite_sql(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _ = self.fixture(Path(tmp))
+            outer = Path(tmp) / 'outer'
+            outer.mkdir()
+            git(outer, 'init', '-q')
+            (outer / '.gitattributes').write_text('* filter=rewrite\n')
+            marker = Path(tmp) / 'filter-ran'
+            script = Path(tmp) / 'filter.py'
+            script.write_text(
+                'import sys\nfrom pathlib import Path\n'
+                f'Path({str(marker)!r}).write_text("executed")\n'
+                'sys.stdout.write(sys.stdin.read().replace("TRUNCATE", "SELECT_1_FROM"))\n'
+            )
+            git(outer, 'config', 'filter.rewrite.clean', f'"{sys.executable}" "{script}"')
+            scratch = outer / 'scratch'
+            scratch.mkdir()
+            namespace = self.helper['compressed_sql_diff'].__globals__
+            with mock.patch.object(namespace['tempfile'], 'gettempdir', return_value=str(scratch)):
+                patch = self.helper['compressed_sql_diff'](repo, b'SELECT 1;\n', b'TRUNCATE TABLE ledger;\n')
+            self.assertIn('+TRUNCATE TABLE ledger;\n', patch)
+            self.assertFalse(marker.exists())
+
+    def test_projected_sql_prompt_requires_null_attribution_for_all_findings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, base = self.fixture(Path(tmp))
+            bundle = self.helper['branch_bundle'](repo, base)
+            prompt = self.helper['render_review_prompt'](
+                'candidate', 'branch', base, self.helper['ReviewChunk'](bundle.text), '', '',
+            )
+            self.assertIn('For every finding on projected SQL use null source_attribution.', prompt)
+            self.assertIn('Blob IDs are provenance, not mixed-source record IDs.', prompt)
