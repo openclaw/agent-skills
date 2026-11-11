@@ -22,8 +22,9 @@ Limits apply before reading the compressed blob and while decoding:
 - 30 seconds per decoded text diff. A timeout fails preparation.
 
 The textual projection uses the original `.sql.gz` path. Finding lines refer to
-its decoded SQL, with line 1 for a compression-only finding. Every projection
-records both sides' full Git object IDs, modes, encoded and decoded byte counts,
+its decoded SQL, with line 1 for a compression-only finding. Use null
+`source_attribution` for every finding on projected SQL. Blob IDs bind evidence;
+they are not mixed-source attribution records. Every projection records both sides' full Git object IDs, modes, encoded and decoded byte counts,
 and SHA-256 hashes. That provenance repeats in continuation context when a diff
 is partitioned. Recompression with identical decoded text still produces review
 input. It is never silently classified as clean.
