@@ -2814,7 +2814,7 @@ def compressed_sql_diff(repo: Path, before: bytes, after: bytes) -> str:
         (root / "before").write_bytes(before)
         (root / "after").write_bytes(after)
         env = safe_git_env(repo)
-        env.update({"GIT_CEILING_DIRECTORIES": str(root.parent), "GIT_ATTR_NOSYSTEM": "1"})
+        env.update({"GIT_DIR": str(root / "no-repository"), "GIT_ATTR_NOSYSTEM": "1"})
         try:
             result = subprocess.run(
                 [resolve_git(repo), *SAFE_GIT_CONFIG_ARGS, "-c", "core.autocrlf=false",
