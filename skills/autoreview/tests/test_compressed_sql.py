@@ -167,14 +167,12 @@ class CompressedSqlTests(unittest.TestCase):
                     self.helper['decode_compressed_sql'](repo, oid, 100, 100)
 
     def test_symlink_type_change_refused(self):
-        if not hasattr(__import__('os'), 'symlink'):
-            self.skipTest('symlinks unavailable')
         with tempfile.TemporaryDirectory() as tmp:
             repo, base = self.fixture(Path(tmp))
             target = repo / 'baseline.sql.gz'
-            target.unlink()
-            target.symlink_to('source')
-            git(repo, 'add', '.')
+            target.write_text('source')
+            oid = git(repo, 'hash-object', '-w', str(target)).strip()
+            git(repo, 'update-index', '--cacheinfo', f'120000,{oid},baseline.sql.gz')
             git(repo, 'commit', '-qm', 'type change')
             with self.assertRaises(SystemExit):
                 self.helper['branch_bundle'](repo, base)
@@ -206,8 +204,10 @@ class CompressedSqlTests(unittest.TestCase):
             git(repo, 'add', '.')
             git(repo, 'commit', '-qm', 'base')
             base = git(repo, 'rev-parse', 'HEAD').strip()
-            (repo / 'link.sql.gz').symlink_to('source')
-            git(repo, 'add', '.')
+            target = repo / 'link.sql.gz'
+            target.write_text('source')
+            oid = git(repo, 'hash-object', '-w', str(target)).strip()
+            git(repo, 'update-index', '--add', '--cacheinfo', f'120000,{oid},link.sql.gz')
             git(repo, 'commit', '-qm', 'link')
             bundle = self.helper['branch_bundle'](repo, base)
             self.assertIn('new file mode 120000', bundle.text)
@@ -224,9 +224,9 @@ class CompressedSqlTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo, base = self.fixture(Path(tmp))
             source = repo / 'source'
-            source.unlink()
-            source.symlink_to('baseline.sql.gz')
-            git(repo, 'add', '.')
+            source.write_text('baseline.sql.gz')
+            oid = git(repo, 'hash-object', '-w', str(source)).strip()
+            git(repo, 'update-index', '--cacheinfo', f'120000,{oid},source')
             git(repo, 'commit', '-qm', 'type change')
             bundle = self.helper['branch_bundle'](repo, base)
             self.assertIn('+SELECT 2;', bundle.text)
