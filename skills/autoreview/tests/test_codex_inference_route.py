@@ -252,16 +252,16 @@ class CodexInferenceRouteTests(unittest.TestCase):
         prepare_auth.assert_not_called()
         self.assertEqual(self.available(), (False, str(caught.exception.code)))
 
-    def use_default_models(self):
+    def select_explicit_primary_model(self):
         args = copy.copy(self.args)
-        args.model, args.thinking, args.fallback_model = [], [], []
+        args.model, args.thinking, args.fallback_model = ["gpt-6.1-sol"], [], []
         with mock.patch.dict(self.helper["reviewer_args"].__globals__, {
             "env_defaults_for": lambda _: (None, {}),
         }):
             self.args = self.helper["reviewer_args"](args)[0]
 
-    def test_primary_only_catalogue_keeps_normal_fallback_and_frozen_route(self):
-        self.use_default_models()
+    def test_primary_only_catalogue_does_not_retry_model_access_failure(self):
+        self.select_explicit_primary_model()
         self.write_config()
         original = self.catalogue_bytes
         events = []
@@ -276,19 +276,20 @@ class CodexInferenceRouteTests(unittest.TestCase):
             self.assert_auth_command(observed, self.runtime_helper)
             launchers.append(observed["auth_command"])
             if selected == "gpt-6.1-sol":
-                # A retry keeps the prepared route even if operator files change.
+                # Changing operator files must not trigger another model attempt.
                 self.catalogue.write_bytes(b"changed after primary send")
                 (self.home / "config.toml").write_text('model_provider = "another-route"')
                 return subprocess.CompletedProcess(
                     command, 1, "", "The model gpt-6.1-sol does not exist or you do not have access to it.",
                 )
 
-        self.run_review(during_run=respond)
-        self.assertEqual(events, ["gpt-6.1-sol", "gpt-6-sol"])
-        self.assertEqual(launchers[0], launchers[1])
+        with self.assertRaises(SystemExit):
+            self.run_review(during_run=respond)
+        self.assertEqual(events, ["gpt-6.1-sol"])
+        self.assertEqual(len(launchers), 1)
 
     def test_primary_only_catalogue_does_not_block_successful_primary(self):
-        self.use_default_models()
+        self.select_explicit_primary_model()
         self.write_config()
         attempts = []
         self.run_review(during_run=lambda observed: attempts.append(observed["command"]))
@@ -703,7 +704,7 @@ class CodexInferenceRouteTests(unittest.TestCase):
 
         self.assertEqual(self.run_review(during_run=stream)["report"], '{"findings": []}')
 
-    def test_command_auth_missing_report_and_failed_retry_do_not_return_diagnostics(self):
+    def test_command_auth_missing_report_and_model_failure_do_not_return_diagnostics(self):
         self.write_config()
         marker = "synthetic-private-diagnostic"
         for stream_output in (False, True):
@@ -719,7 +720,7 @@ class CodexInferenceRouteTests(unittest.TestCase):
                         self.run_review(during_run=no_report)
                     self.assertEqual(str(caught.exception), "codex engine failed: missing-report; provider diagnostics suppressed")
 
-        self.use_default_models()
+        self.select_explicit_primary_model()
         attempts = []
         def fail_retry(observed):
             attempts.append(observed["command"])
@@ -730,9 +731,9 @@ class CodexInferenceRouteTests(unittest.TestCase):
         console = io.StringIO()
         with contextlib.redirect_stderr(console), self.assertRaises(SystemExit) as caught:
             self.run_review(during_run=fail_retry)
-        self.assertEqual(len(attempts), 2)
+        self.assertEqual(len(attempts), 1)
         self.assertNotIn(marker, console.getvalue())
-        self.assertEqual(str(caught.exception), "codex engine failed: provider-auth-helper; provider diagnostics suppressed")
+        self.assertEqual(str(caught.exception), "codex engine failed: provider-access; provider diagnostics suppressed")
 
     def test_default_route_keeps_diagnostic_streaming_and_stdout_fallback(self):
         self.args.codex_config = []
@@ -760,7 +761,7 @@ class CodexHostnameRouteTests(unittest.TestCase):
     run_review = CodexInferenceRouteTests.run_review
     available = CodexInferenceRouteTests.available
     assert_route_refused = CodexInferenceRouteTests.assert_route_refused
-    use_default_models = CodexInferenceRouteTests.use_default_models
+    select_explicit_primary_model = CodexInferenceRouteTests.select_explicit_primary_model
 
     def configure(self):
         self.args.codex_config = []
@@ -950,9 +951,9 @@ class CodexHostnameRouteTests(unittest.TestCase):
             self.run_review()
         self.assertNotIn(self.token, str(caught.exception))
 
-    def test_model_retry_keeps_one_frozen_endpoint_token_and_catalogue_and_records_usage(self):
+    def test_model_access_failure_records_one_attempt_without_changing_routes(self):
         self.configure()
-        self.use_default_models()
+        self.select_explicit_primary_model()
         original_endpoint, original_token, original_catalogue = self.provider["base_url"], self.token, self.catalogue_bytes
         attempts = []
         self.args.review_usage = []
@@ -973,13 +974,14 @@ class CodexHostnameRouteTests(unittest.TestCase):
                     f"The model {self.args.model} does not exist or you do not have access to it.")
             Path(observed["command"][observed["command"].index("--output-last-message") + 1]).write_text('{"findings": []}')
             return subprocess.CompletedProcess(observed["command"], 0, usage, "")
-        self.run_review(during_run=respond)
+        with self.assertRaises(SystemExit):
+            self.run_review(during_run=respond)
         summary = self.helper["review_usage_summary"](self.args)
-        self.assertEqual(len(attempts), 2)
-        self.assertEqual(summary["attempts"], 2)
-        self.assertEqual(summary["reported_attempts"], 2)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(summary["attempts"], 1)
+        self.assertEqual(summary["reported_attempts"], 1)
         self.assertEqual(summary["partial_attempts"], 1)
-        self.assertEqual(summary["tokens"]["input_tokens"], 10)
+        self.assertEqual(summary["tokens"]["input_tokens"], 5)
 
     def test_hostname_selection_also_accepts_existing_command_auth_and_no_fallback_model(self):
         self.configure()

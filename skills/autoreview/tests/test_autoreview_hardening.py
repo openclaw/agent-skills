@@ -4060,7 +4060,7 @@ time.sleep(60)
                         stream.close()
 
     @unittest.skipIf(os.name == "nt", "the executable fixture is POSIX-only")
-    def test_cli_codex_model_fallback_opt_out_preserves_failed_terminal(self) -> None:
+    def test_cli_codex_model_failure_never_retries_a_different_model(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             repo = init_repo(root)
@@ -4070,7 +4070,7 @@ time.sleep(60)
                    if not key.startswith("AUTOREVIEW_") or key == "AUTOREVIEW_GIT"}
             env.update({"HOME": str(root), "USERPROFILE": str(root), "CODEX_HOME": str(root),
                         "AUTOREVIEW_FAKE_RECORD": str(root / "record.json")})
-            for primary, fallback in (("gpt-6.1-sol", "gpt-6-sol"), ("gpt-6-sol", "gpt-6-luna"), ("gpt-5.6-sol", "gpt-5.6-terra")):
+            for primary in ("gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol"):
                 # Even a schema-valid output file cannot override the failing child exit.
                 failure = (
                     'model = args[args.index("--model") + 1]\n'
@@ -4098,28 +4098,24 @@ time.sleep(60)
                         self.assertEqual(planned.returncode, 0, planned.stdout + planned.stderr)
                         policy = "codex_fallback: disabled (model and authentication route)"
                         self.assertEqual(policy in planned.stdout, disabled)
-                        self.assertEqual(f"fallback_model: {fallback}" in planned.stdout, not disabled)
+                        self.assertNotIn("fallback_model:", planned.stdout)
                         self.assertFalse(report.exists())
                         result = subprocess.run(argv, cwd=repo, env=env, text=True, capture_output=True, timeout=30)
-                        self.assertEqual(result.returncode, 1 if disabled else 0, result.stdout + result.stderr)
+                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                         self.assertEqual(policy in result.stdout, disabled)
-                        self.assertEqual(f"fallback_model: {fallback}" in result.stdout, not disabled)
+                        self.assertNotIn("fallback_model:", result.stdout)
                         attempts = [json.loads(line)["argv"] for line in invocations.read_text().splitlines()]
                         models = [args[args.index("--model") + 1] for args in attempts if "exec" in args]
-                        self.assertEqual(models, [primary] if disabled else [primary, fallback])
+                        self.assertEqual(models, [primary])
                         outcome = json.loads(sidecar.read_text())
-                        self.assertEqual(outcome["status"], "reviewer_unavailable" if disabled else "scoped-clean")
-                        self.assertEqual(outcome["report_produced"], not disabled)
-                        if disabled:
-                            self.assertEqual(outcome["reason"], "engine_failed")
-                            self.assertEqual(outcome["reviewer_exit_code"], 17)
-                            self.assertFalse(outcome["timed_out"])
-                            self.assertFalse(report.exists())
-                            self.assertNotIn("scoped-clean:", result.stdout)
-                            self.assertNotIn("retrying with", result.stderr)
-                        else:
-                            self.assertEqual(json.loads(report.read_text())["findings"], [])
-                            self.assertIn(f"retrying with {fallback}", result.stderr)
+                        self.assertEqual(outcome["status"], "reviewer_unavailable")
+                        self.assertFalse(outcome["report_produced"])
+                        self.assertEqual(outcome["reason"], "engine_failed")
+                        self.assertEqual(outcome["reviewer_exit_code"], 17)
+                        self.assertFalse(outcome["timed_out"])
+                        self.assertFalse(report.exists())
+                        self.assertNotIn("scoped-clean:", result.stdout)
+                        self.assertNotIn("retrying with", result.stderr)
 
     def test_tracked_binary_changes_are_blocked_in_all_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

@@ -10,17 +10,15 @@ it is not `--engine copilot`, does not inherit Codex CLI flags/defaults, and
 produces no helper-validated machine status or helper isolation guarantees.
 
 - Defaults + engine-selection policy: [SKILL.md](../SKILL.md#engines).
-- Explicit `gpt-6.1-sol`: same access-only `gpt-6-sol` retry.
-  Explicit `gpt-6-sol`: access-only `gpt-6-luna` retry.
-- Other explicit models, including Luna/Astra: no model fallback.
-- Explicit `gpt-5.6-sol`: access-only `gpt-5.6-terra` retry.
+- Codex follows the trusted user configuration model; no model retries.
+- No configured model: omit `--model` and use the Codex recommended default.
 - GPT-6.1 Sol rejects `none`/`minimal` effort before review preparation;
   GPT-6 Sol/Luna reject `minimal`. Effort-only override keeps default model.
 - Honor explicit user engine/model choices. No automatic fallback between engines.
 
 - Override defaults: `--engine`, `--model`, `--thinking`.
-- Codex tier: Ultrafast when active model catalog lists it; otherwise Codex silently
-  sends standard tier. Raw `--codex-config service_tier=...` keeps its value.
+- Codex tier: standard (`default`). Explicit `--codex-speed` or raw
+  `--codex-config service_tier=...` overrides remain supported.
 - `--codex-speed fast`: priority service. `--codex-speed default`: standard tier.
 - `--codex-no-fallback`: keep the selected Codex model and initial authentication
   route. Disables all helper model retries and configured-provider rerouting,
@@ -48,7 +46,7 @@ Require GPT-6 Astra without model fallback: select explicitly:
 - GPT-6.1 Sol + GPT-6 Astra: `low`, `medium`, `high`, `xhigh`, `max`;
   neither supports `none`/`minimal`.
 - GPT-6 Sol + Luna: additionally support `none`, never `minimal`.
-- AutoReview default: `medium`; no fallback from explicit Luna/Astra selection.
+- AutoReview default: `high`; no fallback from explicit Luna/Astra selection.
 - Codex `ultra`: automatic delegation; outside helper's supported effort levels.
   Deepest supported review: `max`.
 - EU data residency: `--codex-speed default`; GPT-6 fast mode unavailable there.
@@ -151,8 +149,7 @@ Profile settings remain ignored. Force configured route before subscription atte
   imported. Provider diagnostics stay suppressed; known bearer values are also
   redacted from displayed assistant output and final report text.
 - Selection is explicit: failed validation/auth/transport never switches provider,
-  endpoint or credential. Existing model-access retries stay on the same frozen
-  route/token/catalogue snapshot; add `--codex-no-fallback` to disable those too.
+  endpoint, credential or model. The route/token/catalogue snapshot remains frozen.
   Dry-run performs selection and ownership checks without staging or executing
   authentication. Omitting the new option preserves existing behavior.
 

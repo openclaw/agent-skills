@@ -119,11 +119,18 @@ verified parent-relative patch; otherwise attribution stays unknown.
 Never switch review hosts after launch or to bypass missing context, isolation failures,
 slowness or rate limits. If no route is eligible, report unavailable.
 
-The helper's Codex engine defaults to **GPT-6.1 Sol (`gpt-6.1-sol`), medium reasoning, Ultrafast**.
-It retries GPT-6 Sol once only for account-access failure, without chaining to Luna.
-Network, rate-limit, capacity, and unsupported-effort errors do not trigger fallback.
+The helper's Codex engine follows the operator's top-level `model` in
+`$CODEX_HOME/config.toml` (default `~/.codex/config.toml`), with **high reasoning, standard service tier**.
+Explicit CLI/environment model overrides win. With no configured model, Codex
+chooses its recommended default. Only the model identifier is inherited; project
+config, profiles, reasoning, hooks and permissions are not imported. Repository-owned
+config is excluded. Invalid operator TOML fails clearly; Python 3.10 requires `tomli`.
+The isolated reviewer still ignores user configuration. No automatic model fallback
+is used: access, network, rate-limit, capacity and effort errors keep the selected model.
+Changing your Codex model changes future reviews without editing this skill; this
+does not automatically upgrade an explicitly pinned user model.
 Use `--codex-no-fallback` when only the selected Codex model and authentication
-route are authorized. It disables helper model retries and configured-provider
+route are authorized. It disables configured-provider
 selection before launch or after authentication failure. Explicit initial provider
 selection and native recovery within the same route remain unchanged; failure
 stays `reviewer_unavailable`. Defaults remain unchanged when the flag is absent.
