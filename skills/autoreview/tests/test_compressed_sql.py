@@ -294,6 +294,45 @@ class CompressedSqlTests(unittest.TestCase):
             self.assertIn('+TRUNCATE TABLE ledger;\n', patch)
             self.assertFalse(marker.exists())
 
+    def test_separator_in_temp_path_cannot_restore_enclosing_attributes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _ = self.fixture(Path(tmp))
+            outer = Path(tmp) / ('outer' + os.pathsep + 'path')
+            outer.mkdir()
+            git(outer, 'init', '-q')
+            (outer / '.gitattributes').write_text('* text ident\n')
+            scratch = outer / 'scratch'
+            scratch.mkdir()
+            namespace = self.helper['compressed_sql_diff'].__globals__
+            with mock.patch.object(namespace['tempfile'], 'gettempdir', return_value=str(scratch)):
+                patch = self.helper['compressed_sql_diff'](
+                    repo, b"SELECT '$Id: before $';\n", b"SELECT '$Id: after $';\r\n",
+                )
+            self.assertIn("+SELECT '$Id: after $';\r\n", patch)
+
+    def test_separator_in_temp_path_cannot_restore_enclosing_filters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, _ = self.fixture(Path(tmp))
+            outer = Path(tmp) / ('outer' + os.pathsep + 'path')
+            outer.mkdir()
+            git(outer, 'init', '-q')
+            (outer / '.gitattributes').write_text('* filter=rewrite\n')
+            marker = Path(tmp) / 'filter-ran'
+            script = Path(tmp) / 'filter.py'
+            script.write_text(
+                'import sys\nfrom pathlib import Path\n'
+                f'Path({str(marker)!r}).write_text("executed")\n'
+                'sys.stdout.write(sys.stdin.read().replace("TRUNCATE", "SELECT_1_FROM"))\n'
+            )
+            git(outer, 'config', 'filter.rewrite.clean', f'"{sys.executable}" "{script}"')
+            scratch = outer / 'scratch'
+            scratch.mkdir()
+            namespace = self.helper['compressed_sql_diff'].__globals__
+            with mock.patch.object(namespace['tempfile'], 'gettempdir', return_value=str(scratch)):
+                patch = self.helper['compressed_sql_diff'](repo, b'SELECT 1;\n', b'TRUNCATE TABLE ledger;\n')
+            self.assertIn('+TRUNCATE TABLE ledger;\n', patch)
+            self.assertFalse(marker.exists())
+
     def test_projected_sql_prompt_requires_null_attribution_for_all_findings(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo, base = self.fixture(Path(tmp))
