@@ -2813,12 +2813,15 @@ def compressed_sql_diff(repo: Path, before: bytes, after: bytes) -> str:
         root = Path(directory)
         (root / "before").write_bytes(before)
         (root / "after").write_bytes(after)
+        env = safe_git_env(repo)
+        env.update({"GIT_CEILING_DIRECTORIES": str(root.parent), "GIT_ATTR_NOSYSTEM": "1"})
         try:
             result = subprocess.run(
                 [resolve_git(repo), *SAFE_GIT_CONFIG_ARGS, "-c", "core.autocrlf=false",
+                 "-c", f"core.attributesFile={os.devnull}",
                  "diff", "--no-index", *SAFE_DIFF_FLAGS, "--text", "--diff-algorithm=myers",
                  "-U3", "--inter-hunk-context=0", "--no-indent-heuristic", "--", "before", "after"],
-                cwd=root, env=safe_git_env(repo), stdout=subprocess.PIPE,
+                cwd=root, env=env, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, timeout=30,
             )
         except subprocess.TimeoutExpired:
@@ -4484,7 +4487,8 @@ def render_review_prompt(
           A clean pin review does not certify upstream dependency code. Use line 1.
         - Compressed SQL projections bind exact committed gzip blobs to decoded text diffs.
           Lines refer to decoded SQL at the original .sql.gz path. For compression-only
-          findings use line 1 and null source_attribution. This is text review, not SQL
+          findings use line 1. For every finding on projected SQL use null source_attribution.
+          Blob IDs are provenance, not mixed-source record IDs. This is text review, not SQL
           execution, schema validation or proof that an artifact matches its generator.
         - Binary deletions include Git metadata only, not the former binary contents.
           Review the removal's impact without claiming to have inspected those contents.
