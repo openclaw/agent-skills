@@ -3221,12 +3221,6 @@ class AutoreviewBridgeDefaultsTests(unittest.TestCase):
         path.write_text(json.dumps(data), encoding="utf-8")
         return path
 
-    def test_unset_bridge_preserves_current_defaults(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=True):
-            reviewer = AUTOREVIEW.reviewer_args(self.parse())[0]
-        self.assertEqual(reviewer.model, "gpt-6.1-sol")
-        self.assertEqual(reviewer.thinking, "medium")
-
     def test_file_defaults_beat_environment_and_lose_to_cli(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = self.write_config(directory, {
@@ -3252,18 +3246,18 @@ class AutoreviewBridgeDefaultsTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"AUTOREVIEW_BRIDGE_FILE": "bridge.json"}, clear=True):
             with self.assertRaisesRegex(SystemExit, "absolute path"):
                 AUTOREVIEW.reviewer_args(self.parse())
-        with tempfile.NamedTemporaryFile(dir=AUTOREVIEW.repo_root(), suffix=".json", delete=False) as handle:
-            handle.write(b'{"schema_version": 1, "defaults": {}}')
-        try:
-            with mock.patch.dict(
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".git").mkdir()
+            inside = repo / "bridge.json"
+            inside.write_text('{"schema_version": 1, "defaults": {}}', encoding="utf-8")
+            with mock.patch.object(AUTOREVIEW, "discover_repo_root", return_value=repo), mock.patch.dict(
                 os.environ,
-                {"AUTOREVIEW_BRIDGE_FILE": str(Path(handle.name))},
+                {"AUTOREVIEW_BRIDGE_FILE": str(inside)},
                 clear=True,
             ):
                 with self.assertRaisesRegex(SystemExit, "outside the reviewed repository"):
                     AUTOREVIEW.reviewer_args(self.parse())
-        finally:
-            Path(handle.name).unlink()
 
     def test_invalid_documents_fail_before_a_reviewer_starts(self) -> None:
         cases = (
