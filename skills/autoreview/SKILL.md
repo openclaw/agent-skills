@@ -197,6 +197,17 @@ fail closed. Binary deletions are reviewed as deletion metadata in every mode,
 without Pillow. Materialize partial-clone objects before review; isolated Git
 intentionally disables lazy network fetching.
 
+## Compressed SQL review
+
+Branch mode supports added or modified regular `.sql.gz` files through bounded,
+strict gzip decoding. Both committed sides become a text diff at the original
+path, with blob IDs, encoded/decoded hashes and sizes. No SQL executes. This
+reviews text changes and compression provenance, not generator reproducibility
+or database equivalence. It never grants a review exemption or an automatic
+clean verdict. Read [compressed SQL limits](references/compressed-sql.md).
+Other binary formats, local/commit compressed changes and explicit review batches
+retain their refusals.
+
 ## Runtime boundaries
 
 Keep helper-owned isolation, sanitized authentication, process cleanup, Git scope,
