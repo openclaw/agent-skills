@@ -3211,5 +3211,83 @@ class AutoreviewPreflightTests(unittest.TestCase):
                 self.assertEqual(diagnostic.read_text(), "diagnostic sentinel")
 
 
+class AutoreviewBridgeDefaultsTests(unittest.TestCase):
+    def parse(self, *options: str) -> argparse.Namespace:
+        with mock.patch.object(sys, "argv", ["autoreview", "--engine", "codex", "--dry-run", *options]):
+            return AUTOREVIEW.parse_args()
+
+    def write_config(self, directory: str, data: object) -> Path:
+        path = Path(directory) / "bridge.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def test_unset_bridge_preserves_current_defaults(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            reviewer = AUTOREVIEW.reviewer_args(self.parse())[0]
+        self.assertEqual(reviewer.model, "gpt-6.1-sol")
+        self.assertEqual(reviewer.thinking, "medium")
+
+    def test_file_defaults_beat_environment_and_lose_to_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_config(directory, {
+                "schema_version": 1,
+                "defaults": {"codex": {"model": "config-model", "thinking": "high"}},
+            })
+            env = {
+                "AUTOREVIEW_BRIDGE_FILE": str(path),
+                "AUTOREVIEW_MODEL": "environment-model",
+                "AUTOREVIEW_THINKING": "low",
+            }
+            with mock.patch.dict(os.environ, env, clear=True):
+                reviewer = AUTOREVIEW.reviewer_args(self.parse())[0]
+                self.assertEqual(reviewer.model, "config-model")
+                self.assertEqual(reviewer.thinking, "high")
+                reviewer = AUTOREVIEW.reviewer_args(
+                    self.parse("--model", "cli-model", "--thinking", "medium")
+                )[0]
+                self.assertEqual(reviewer.model, "cli-model")
+                self.assertEqual(reviewer.thinking, "medium")
+
+    def test_file_must_be_absolute_and_outside_the_reviewed_repository(self) -> None:
+        with mock.patch.dict(os.environ, {"AUTOREVIEW_BRIDGE_FILE": "bridge.json"}, clear=True):
+            with self.assertRaisesRegex(SystemExit, "absolute path"):
+                AUTOREVIEW.reviewer_args(self.parse())
+        with tempfile.NamedTemporaryFile(dir=AUTOREVIEW.repo_root(), suffix=".json", delete=False) as handle:
+            handle.write(b'{"schema_version": 1, "defaults": {}}')
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {"AUTOREVIEW_BRIDGE_FILE": str(Path(handle.name))},
+                clear=True,
+            ):
+                with self.assertRaisesRegex(SystemExit, "outside the reviewed repository"):
+                    AUTOREVIEW.reviewer_args(self.parse())
+        finally:
+            Path(handle.name).unlink()
+
+    def test_invalid_documents_fail_before_a_reviewer_starts(self) -> None:
+        cases = (
+            ({"schema_version": 2, "defaults": {}}, "schema_version must be 1"),
+            ({"schema_version": 1, "defaults": {"synthetic": {}}}, "unknown engine: synthetic"),
+            ({"schema_version": 1, "defaults": {"codex": {"thinking": "invalid"}}}, "invalid thinking for codex"),
+            ({"schema_version": 1, "defaults": {"codex": {"model": ""}}}, "must be a non-empty string"),
+            ({"schema_version": 1, "defaults": {}, "routes": []}, "unsupported keys: routes"),
+        )
+        for document, diagnostic in cases:
+            with self.subTest(document=document), tempfile.TemporaryDirectory() as directory:
+                path = self.write_config(directory, document)
+                with mock.patch.dict(os.environ, {"AUTOREVIEW_BRIDGE_FILE": str(path)}, clear=True):
+                    with self.assertRaisesRegex(SystemExit, diagnostic):
+                        AUTOREVIEW.reviewer_args(self.parse())
+
+    def test_malformed_json_fails_before_a_reviewer_starts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bridge.json"
+            path.write_text("{", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"AUTOREVIEW_BRIDGE_FILE": str(path)}, clear=True):
+                with self.assertRaisesRegex(SystemExit, "not valid JSON"):
+                    AUTOREVIEW.reviewer_args(self.parse())
+
+
 if __name__ == "__main__":
     unittest.main()

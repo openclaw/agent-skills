@@ -7838,6 +7838,63 @@ def run_engine(args: argparse.Namespace, repo: Path, prompt: str) -> str:
     raise SystemExit(f"unsupported engine: {args.engine}")
 
 
+def bridge_defaults() -> dict[str, dict[str, str]]:
+    raw = os.environ.get("AUTOREVIEW_BRIDGE_FILE")
+    if raw is None:
+        return {}
+    raw = raw.strip()
+    if not raw:
+        raise SystemExit("AUTOREVIEW_BRIDGE_FILE cannot be empty")
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise SystemExit(f"AUTOREVIEW_BRIDGE_FILE must be an absolute path: {raw}")
+    resolved = path.resolve()
+    if not resolved.is_file():
+        raise SystemExit(f"AUTOREVIEW_BRIDGE_FILE is not a file: {raw}")
+    repo = discover_repo_root(Path.cwd().resolve())
+    if repo is not None and resolved.is_relative_to(repo.resolve()):
+        raise SystemExit(f"AUTOREVIEW_BRIDGE_FILE must be outside the reviewed repository: {raw}")
+    try:
+        data = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"AUTOREVIEW_BRIDGE_FILE is not valid JSON: {raw}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit("AUTOREVIEW_BRIDGE_FILE must contain a JSON object")
+    unknown = set(data) - {"schema_version", "defaults"}
+    if unknown:
+        raise SystemExit(f"AUTOREVIEW_BRIDGE_FILE has unsupported keys: {', '.join(sorted(unknown))}")
+    if data.get("schema_version") != 1:
+        raise SystemExit("AUTOREVIEW_BRIDGE_FILE schema_version must be 1")
+    defaults = data.get("defaults")
+    if not isinstance(defaults, dict):
+        raise SystemExit("AUTOREVIEW_BRIDGE_FILE defaults must be an object")
+    validated: dict[str, dict[str, str]] = {}
+    for engine, values in defaults.items():
+        if engine not in ENGINES:
+            raise SystemExit(f"AUTOREVIEW_BRIDGE_FILE has unknown engine: {engine}")
+        if not isinstance(values, dict):
+            raise SystemExit(f"AUTOREVIEW_BRIDGE_FILE defaults for {engine} must be an object")
+        unknown = set(values) - {"model", "thinking"}
+        if unknown:
+            raise SystemExit(
+                f"AUTOREVIEW_BRIDGE_FILE has unsupported defaults for {engine}: "
+                f"{', '.join(sorted(unknown))}"
+            )
+        clean = {}
+        for key, value in values.items():
+            if not isinstance(value, str) or not value.strip():
+                raise SystemExit(f"AUTOREVIEW_BRIDGE_FILE default {engine}.{key} must be a non-empty string")
+            clean[key] = value.strip()
+        if "thinking" in clean and clean["thinking"] not in THINKING_LEVELS_BY_ENGINE[engine]:
+            valid = ", ".join(sorted(THINKING_LEVELS_BY_ENGINE[engine])) or "none"
+            raise SystemExit(
+                f"AUTOREVIEW_BRIDGE_FILE has invalid thinking for {engine}: "
+                f"{clean['thinking']} (valid: {valid})"
+            )
+        validated[engine] = clean
+    return validated
+
+
 def env_defaults_for(env_suffix: str) -> tuple[str | None, dict[str, str]]:
     env_key = env_suffix.replace("-", "_").upper()
     global_value = os.environ.get(f"AUTOREVIEW_{env_key}")
@@ -7907,9 +7964,11 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
         raise SystemExit("--codex-config is only supported for codex; no codex reviewer selected")
     if getattr(args, "codex_speed", None) and engine != "codex":
         raise SystemExit("--codex-speed is only supported for codex; no codex reviewer selected")
+    bridge_engine_defaults = bridge_defaults().get(engine, {})
     model_override = (
         model_by_engine.get(engine)
         or global_model
+        or bridge_engine_defaults.get("model")
         or env_model_by_engine.get(engine)
         or env_global_model
     )
@@ -7917,6 +7976,7 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
     thinking = (
         thinking_by_engine.get(engine)
         or global_thinking
+        or bridge_engine_defaults.get("thinking")
         or env_thinking_by_engine.get(engine)
         or env_global_thinking
         or DEFAULT_THINKING_BY_ENGINE.get(engine)
