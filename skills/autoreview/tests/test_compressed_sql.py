@@ -219,3 +219,25 @@ class CompressedSqlTests(unittest.TestCase):
             bundle = self.helper['branch_bundle'](repo, base)
             self.assertIn('Added empty decoded SQL', bundle.text)
             self.assertNotIn('Decoded SQL unchanged', bundle.text)
+
+    def test_projection_preserves_unrelated_type_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, base = self.fixture(Path(tmp))
+            source = repo / 'source'
+            source.unlink()
+            source.symlink_to('baseline.sql.gz')
+            git(repo, 'add', '.')
+            git(repo, 'commit', '-qm', 'type change')
+            bundle = self.helper['branch_bundle'](repo, base)
+            self.assertIn('+SELECT 2;', bundle.text)
+            self.assertIn('new file mode 120000', bundle.text)
+            self.assertIn('deleted file mode 100644', bundle.text)
+
+    def test_decoded_temp_files_cannot_be_written_inside_repository(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, base = self.fixture(Path(tmp))
+            namespace = self.helper['compressed_sql_diff'].__globals__
+            with mock.patch.object(namespace['tempfile'], 'gettempdir', return_value=str(repo)):
+                with self.assertRaisesRegex(SystemExit, 'outside the reviewed repository'):
+                    self.helper['branch_bundle'](repo, base)
+            self.assertFalse(list(repo.glob('autoreview-sql-*')))
