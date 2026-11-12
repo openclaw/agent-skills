@@ -76,6 +76,20 @@ class ReviewBatchTests(unittest.TestCase):
     def write_manifest(self, repo, manifest):
         (repo / ".review/batches.json").write_bytes(json.dumps(manifest).encode("utf-8"))
 
+    def manifest_v2(self, repo, bodies=None):
+        manifest = self.manifest(repo)
+        manifest["version"] = 2
+        bodies = bodies or {"first-peer.md": "FIRST PEER WHOLE\r\n", "second-peer.md": "SECOND PEER WHOLE\r\n"}
+        manifest["evidence_files"] = []
+        for name, text in bodies.items():
+            path = ".review/" + name
+            raw = text.encode("utf-8")
+            (repo / path).write_bytes(raw)
+            manifest["evidence_files"].append({"path": path, "sha256": hashlib.sha256(raw).hexdigest()})
+        for batch, item in zip(manifest["batches"], manifest["evidence_files"]):
+            batch["evidence_files"] = [item["path"]]
+        return manifest
+
     def invoke(self, repo, *options, engine=None):
         argv = [str(SCRIPT), "--mode", "branch", "--base", "HEAD^", "--engine", "codex",
                 "--max-priority", "P2", "--review-batches", ".review/batches.json",
@@ -136,6 +150,132 @@ class ReviewBatchTests(unittest.TestCase):
                 self.assertEqual(prompt.count((repo / "contract.py").read_bytes().decode()), 1)
                 self.assertEqual(prompt.count("GLOBAL WHOLE OWNER"), 1)
                 self.assertIn("blob=" + self.git(repo, "rev-parse", "HEAD:contract.py"), prompt)
+
+    def test_v2_selects_complete_frozen_peer_files_within_the_transport_budget(self):
+        with self.fixture() as repo:
+            bodies = {name: ("# " + name + " peer contract\r\n") * 20_000 + "fox 🦊\r\n"
+                      for name in ("first-peer.md", "second-peer.md")}
+            manifest = self.manifest_v2(repo, bodies)
+            self.write_manifest(repo, manifest)
+            dry, dry_sends, dry_output = self.invoke(repo, "--max-prompt-bytes", "950000", "--dry-run")
+            self.assertEqual(dry, 0, dry_output)
+            self.assertFalse(dry_sends)
+            status, sends, output = self.invoke(repo, "--max-prompt-bytes", "950000")
+            self.assertEqual(status, 0, output)
+            plan = lambda text: next(line for line in text.splitlines() if line.startswith("review plan:"))
+            self.assertEqual(plan(dry_output), plan(output))
+            self.assertEqual(len(sends), 2)
+            for prompt, (own, body) in zip(sends, bodies.items()):
+                self.assertIn(body, prompt)
+                self.assertLessEqual(len(prompt.encode("utf-8")), 950_000)
+                self.assertLess(len(prompt), 1_048_576)
+                self.assertEqual(prompt.count("GLOBAL WHOLE OWNER"), 1)
+                for other, text in bodies.items():
+                    if other != own:
+                        self.assertNotIn(text, prompt)
+                        self.assertGreater(len((prompt + text).encode("utf-8")), 950_000)
+            report = json.loads((repo.parent / "result.json").read_bytes())
+            allocation = report["review_allocation"]
+            self.assertEqual(allocation["version"], 2)
+            self.assertEqual(allocation["evidence_files"], [
+                {**row, "bytes": len(bodies[Path(row["path"]).name].encode("utf-8"))}
+                for row in manifest["evidence_files"]
+            ])
+            self.assertEqual([row["evidence_files"] for row in allocation["batches"]],
+                             [batch["evidence_files"] for batch in manifest["batches"]])
+
+    def test_v2_declared_evidence_must_be_unique_bound_and_completely_allocated(self):
+        mutations = {
+            "wrong sha": lambda m: m["evidence_files"][0].update(sha256="0" * 64),
+            "malformed sha": lambda m: m["evidence_files"][0].update(sha256="A" * 64),
+            "extra field": lambda m: m["evidence_files"][0].update(command="ignored"),
+            "duplicate path": lambda m: m["evidence_files"].append(m["evidence_files"][0]),
+            "non-array": lambda m: m.update(evidence_files={}),
+            "unknown reference": lambda m: m["batches"][0]["evidence_files"].append(".review/unknown.md"),
+            "duplicate reference": lambda m: m["batches"][0]["evidence_files"].append(m["evidence_files"][0]["path"]),
+            "unused evidence": lambda m: m["batches"][1].update(evidence_files=[]),
+            "missing references": lambda m: m["batches"][0].pop("evidence_files"),
+            "missing universe": lambda m: m.pop("evidence_files"),
+            "v1 fields unchanged": lambda m: m.update(version=1),
+        }
+        with self.fixture() as repo:
+            for label, mutate in mutations.items():
+                with self.subTest(label=label):
+                    manifest = self.manifest_v2(repo)
+                    mutate(manifest)
+                    self.write_manifest(repo, manifest)
+                    status, sends, _ = self.invoke(repo)
+                    self.assertNotEqual(status, 0)
+                    self.assertFalse(sends)
+
+    def test_v2_unsafe_evidence_refuses_before_any_send(self):
+        for kind in ("sensitive", "outside", "alias", "symlink", "parent symlink", "binary", "non-UTF-8", "directory"):
+            with self.subTest(kind=kind), self.fixture() as repo:
+                manifest = self.manifest_v2(repo)
+                old = repo / manifest["evidence_files"][0]["path"]
+                path = ".review/first-peer.md"
+                if kind == "sensitive":
+                    path = ".env"
+                    (repo / path).write_bytes(old.read_bytes())
+                elif kind == "outside":
+                    path = "../outside.md"
+                    (repo.parent / "outside.md").write_bytes(old.read_bytes())
+                elif kind == "alias":
+                    path = ".review/./first-peer.md"
+                elif kind == "symlink":
+                    target = repo / ".review/original.md"
+                    old.rename(target)
+                    old.symlink_to(target)
+                elif kind == "parent symlink":
+                    (repo / ".review").rename(repo / ".old-review")
+                    (repo / ".review").symlink_to(repo / ".old-review", target_is_directory=True)
+                elif kind in {"binary", "non-UTF-8"}:
+                    old.write_bytes(b"\0not text" if kind == "binary" else b"\xffnot UTF-8")
+                else:
+                    old.unlink()
+                    old.mkdir()
+                manifest["evidence_files"][0]["path"] = path
+                manifest["batches"][0]["evidence_files"] = [path]
+                if kind in {"binary", "non-UTF-8"}:
+                    manifest["evidence_files"][0]["sha256"] = hashlib.sha256(old.read_bytes()).hexdigest()
+                self.write_manifest(repo, manifest)
+                status, sends, _ = self.invoke(repo)
+                self.assertNotEqual(status, 0)
+                self.assertFalse(sends)
+
+    def test_v2_evidence_mutation_blocks_later_sends_and_final_publication(self):
+        for when, mutation in ((1, "bytes"), (1, "topology"), (2, "bytes")):
+            with self.subTest(when=when, mutation=mutation), self.fixture() as repo:
+                self.write_manifest(repo, self.manifest_v2(repo))
+
+                def engine(index, report):
+                    if index == when:
+                        path = repo / ".review/second-peer.md"
+                        if mutation == "bytes":
+                            path.write_bytes(b"changed peer\n")
+                        else:
+                            raw = path.read_bytes()
+                            path.unlink()
+                            path.symlink_to(repo / ".review/replacement.md")
+                            (repo / ".review/replacement.md").write_bytes(raw)
+                    return report
+
+                status, sends, output = self.invoke(repo, engine=engine)
+                self.assertNotEqual(status, 0)
+                self.assertEqual(len(sends), when)
+                self.assertNotIn("scoped-clean", output)
+                self.assertFalse((repo.parent / "result.json").exists())
+
+    def test_v2_all_selected_evidence_capacity_is_checked_before_the_first_send(self):
+        with self.fixture() as repo:
+            manifest = self.manifest_v2(repo, {
+                "first-peer.md": "small\n", "second-peer.md": "x" * 1_000_000,
+            })
+            self.write_manifest(repo, manifest)
+            for options in ((), ("--dry-run",)):
+                status, sends, _ = self.invoke(repo, "--max-prompt-bytes", "950000", *options)
+                self.assertNotEqual(status, 0)
+                self.assertFalse(sends)
 
     def test_invalid_or_stale_manifest_has_zero_launches(self):
         mutations = {

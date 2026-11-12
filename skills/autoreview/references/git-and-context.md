@@ -187,6 +187,59 @@ and path identity before every send and before publishing the aggregate.
 }
 ```
 
+Version 2 preserves the same frozen range and source-context contract and adds
+independently captured, per-assignment evidence files. Use it when different
+assignments need different complete peer contracts and their global union does
+not fit the review route. Global `--prompt-file` and `--source-context-file`
+inputs still appear whole in every pass.
+
+Add the required top-level `evidence_files` array, containing exact canonical
+repository-relative paths and lowercase SHA-256 values of their complete UTF-8
+bytes. Add the required `evidence_files` array to every assignment, selecting
+paths from that declared list; it may be empty. For example:
+
+```json
+{
+  "version": 2,
+  "base": "<full resolved merge-base OID>",
+  "head": "<full reviewed HEAD OID>",
+  "bundle_sha256": "<dry-run bundle SHA-256>",
+  "contexts": [],
+  "evidence_files": [
+    {"path": ".review/peer-contract.md", "sha256": "<complete file SHA-256>"}
+  ],
+  "batches": [
+    {
+      "name": "owner-and-peer",
+      "kind": "integration",
+      "changes": ["src/owner.py"],
+      "contexts": [],
+      "evidence_files": [".review/peer-contract.md"],
+      "obligations": ["Check the owner against the complete peer contract."]
+    }
+  ]
+}
+```
+
+Every declared evidence file must occur in an assignment. Unknown, duplicate or
+unused references, stale content hashes and unsafe files refuse preparation.
+Files use the existing prompt-file path, sensitivity, regular-file and topology
+checks. The helper freezes all declared files, revalidates them before each send
+and before publishing the aggregate, and renders only the selected whole files
+as context evidence in each assignment. No excerpt, truncation or independent
+finding scope is introduced. Record peer repository/commit/blob/mode provenance
+inside a peer contract when that source is outside the reviewed repository;
+the operator owns that provenance and its semantic sufficiency. The helper binds
+the supplied file bytes, not an external repository or a claimed source origin.
+
+Allocation metadata records each file's path, byte count and SHA-256, plus every
+assignment's references. Complete change-unit and source-context coverage,
+integration requirements, isolation and capacity checks apply to both versions.
+Set `--max-prompt-bytes` below the actual route's input limit; for a route limited
+to 1,048,576 input characters, a 950,000 UTF-8 byte budget leaves framing room.
+An estimated token or model context capacity does not widen a transport limit.
+An oversized assignment refuses the entire plan before any reviewer starts.
+
 - Exact fields and canonical paths only; no globs, commands, duplicate keys or
   relevance inference. Every changed path in the original range and every declared
   context must occur in an assignment. Repeating a changed unit or context across
