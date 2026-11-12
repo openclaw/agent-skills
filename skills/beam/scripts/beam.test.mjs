@@ -33,7 +33,8 @@ function run(args, options = {}) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [script, ...args], {
       cwd: path.resolve("."),
-      env: { ...process.env, BEAM_ACCESS_TOKEN: "", BEAM_AUTH_TOKEN: "", ...options.env },
+      // Handoff is the publish default; never let a test retire a real source.
+      env: { ...process.env, BEAM_ACCESS_TOKEN: "", BEAM_AUTH_TOKEN: "", BEAM_STATE: path.join(tempDir(), "handoffs.sqlite"), ...options.env },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -524,6 +525,7 @@ test("publish dry-run emits a sanitized versioned payload", async () => {
   const session = claudeSession();
   const result = await run([
     "publish",
+    "--snapshot",
     "--endpoint",
     "http://127.0.0.1:9/api/v1/beam/sessions",
     "--session",
@@ -554,6 +556,7 @@ test("publish bounds transcript item count for the receiver schema", async () =>
   );
   const result = await run([
     "publish",
+    "--snapshot",
     "--endpoint",
     "http://127.0.0.1:9/api/v1/beam/sessions",
     "--session",
@@ -577,6 +580,7 @@ test("publish honors the total max-chars disclosure limit", async () => {
   ]);
   const result = await run([
     "publish",
+    "--snapshot",
     "--endpoint",
     "http://127.0.0.1:9/api/v1/beam/sessions",
     "--session",
@@ -604,6 +608,7 @@ test("publish keeps multibyte transcript items within receiver limits", async ()
   ]);
   const result = await run([
     "publish",
+    "--snapshot",
     "--endpoint",
     "http://127.0.0.1:9/api/v1/beam/sessions",
     "--session",
@@ -625,6 +630,7 @@ test("publish keeps multibyte transcript items within receiver limits", async ()
 test("publish rejects an entry limit above the receiver maximum", async () => {
   const result = await run([
     "publish",
+    "--snapshot",
     "--endpoint",
     "http://127.0.0.1:9/api/v1/beam/sessions",
     "--session",
@@ -644,6 +650,7 @@ test("publish accepts IPv6 loopback development endpoints", async () => {
   const session = claudeSession();
   const result = await run([
     "publish",
+    "--snapshot",
     "--endpoint",
     "http://[::1]:9/api/v1/beam/sessions",
     "--session",
@@ -668,6 +675,7 @@ test("publish fails closed when an explicit session id has no exact transcript",
   const result = await run(
     [
       "publish",
+      "--snapshot",
       "--endpoint",
       "http://127.0.0.1:9/api/v1/beam/sessions",
       "--session-id",
@@ -697,6 +705,7 @@ test("publish keeps display titles out of exact session discovery", async () => 
   const result = await run(
     [
       "publish",
+      "--snapshot",
       "--endpoint",
       "http://127.0.0.1:9/api/v1/beam/sessions",
       "--session-id",
@@ -730,6 +739,7 @@ test("publish refuses fuzzy newest-session fallback when no identity is availabl
   const result = await run(
     [
       "publish",
+      "--snapshot",
       "--endpoint",
       "http://127.0.0.1:9/api/v1/beam/sessions",
       "--cwd",
@@ -754,6 +764,7 @@ test("publish refuses fuzzy newest-session fallback when no identity is availabl
 test("publish rejects a missing explicit session path instead of discovering another session", async () => {
   const result = await run([
     "publish",
+    "--snapshot",
     "--endpoint",
     "http://127.0.0.1:9/api/v1/beam/sessions",
     "--session",
@@ -1015,6 +1026,7 @@ test(
     const result = await run(
       [
         "publish",
+        "--snapshot",
         "--endpoint",
         "https://beam.invalid/api/v1/beam/sessions",
         "--session",
@@ -1090,7 +1102,7 @@ test("publish sends Cloudflare Access auth and normalized session JSON", async (
   const endpoint = `http://127.0.0.1:${address.port}/api/v1/beam/sessions`;
 
   const result = await run(
-    ["publish", "--endpoint", endpoint, "--session", session],
+    ["publish", "--snapshot", "--endpoint", endpoint, "--session", session],
     { env: { BEAM_ACCESS_TOKEN: "test-access-token" } },
   );
 
@@ -1121,7 +1133,7 @@ test("publish distinguishes upload-only receipts while preserving older and staf
   for (const canView of [undefined, true, false]) {
     if (canView === undefined) delete receipt.canView;
     else receipt.canView = canView;
-    const result = await run(["publish", "--endpoint", endpoint, "--session", session], {
+    const result = await run(["publish", "--snapshot", "--endpoint", endpoint, "--session", session], {
       env: { BEAM_ACCESS_TOKEN: "synthetic-personal-access" },
     });
     assert.equal(result.code, 0, result.stderr);
@@ -1129,8 +1141,8 @@ test("publish distinguishes upload-only receipts while preserving older and staf
     const target = endpoint.replace(/\/api\/v1\/beam\/sessions$/,
       `/beam/upload-flow-${requests.at(-1).beamId.slice(0, 12)}`);
     assert.equal(result.stdout, canView === false
-      ? `Beam upload succeeded: ${target}\nThis link is for authorized Team operators; upload-only access does not let you open it.\nSnapshot is read-only. To continue in Team, its authenticated original publisher must run beam handoff with the same endpoint and source transcript selector.\n`
-      : `Beamed session: ${target}\nSnapshot is read-only. To continue in Team, its authenticated original publisher must run beam handoff with the same endpoint and source transcript selector.\n`);
+      ? `Beam upload succeeded: ${target}\nThis link is for authorized Team operators; upload-only access does not let you open it.\nSnapshot is read-only. To continue in Team, rerun beam publish without --snapshot (or beam handoff) with the same endpoint and source selector.\n`
+      : `Beamed session: ${target}\nSnapshot is read-only. To continue in Team, rerun beam publish without --snapshot (or beam handoff) with the same endpoint and source selector.\n`);
     assert.equal(requests.at(-1).version, 1);
     assert.equal(Object.hasOwn(requests.at(-1), "canView"), false);
     assert.doesNotMatch(JSON.stringify(requests.at(-1)), /abcdefghijklmnopqrstuvwxyz123456|hidden compact summary|synthetic-personal-access/);
@@ -1148,7 +1160,7 @@ test("upload-only success stays quiet for publish and lifecycle hooks", async (t
   }, "", { canView: false });
 
   for (const command of ["publish", "hook"]) {
-    const result = await run([command, "--endpoint", endpoint, "--quiet",
+    const result = await run([command, ...(command === "publish" ? ["--snapshot"] : []), "--endpoint", endpoint, "--quiet",
       ...(command === "publish" ? ["--session", session] : [])], {
       stdin: command === "hook"
         ? JSON.stringify({ transcript_path: session, hook_event_name: "Stop" })
@@ -1171,7 +1183,7 @@ test("publish rejects malformed provided canView without retry or success output
   const malformed = [null, "false", "true", 0, 1, {}, [], [false]];
   for (const canView of malformed) {
     receipt.canView = canView;
-    const result = await run(["publish", "--endpoint", endpoint, "--session", session]);
+    const result = await run(["publish", "--snapshot", "--endpoint", endpoint, "--session", session]);
     assert.equal(result.code, 1, JSON.stringify(canView));
     assert.equal(result.stdout, "");
     assert.match(result.stderr, /invalid canView receipt field/);
@@ -1197,7 +1209,7 @@ test("upload-only receipts still require safe origin, base path, and exact sessi
   ];
   for (const [accepted, urlForPayload] of cases) {
     makeUrl = urlForPayload;
-    const result = await run(["publish", "--endpoint", endpoint, "--session", session]);
+    const result = await run(["publish", "--snapshot", "--endpoint", endpoint, "--session", session]);
     assert.equal(result.code, accepted ? 0 : 1, result.stderr);
     if (accepted) assert.match(result.stdout, /authorized Team operators/);
     else {
@@ -1233,6 +1245,7 @@ test("publish refuses redirects without forwarding the Access token or payload",
   const result = await run(
     [
       "publish",
+      "--snapshot",
       "--endpoint",
       `http://127.0.0.1:${sourceAddress.port}/api/v1/beam/sessions`,
       "--session",
@@ -1264,6 +1277,7 @@ test("publish ignores unvalidated legacy sessionUrl response fields", async (t) 
 
   const result = await run([
     "publish",
+    "--snapshot",
     "--endpoint",
     `http://127.0.0.1:${address.port}/api/v1/beam/sessions`,
     "--session",
@@ -1288,7 +1302,7 @@ test("publish rejects receiver URLs containing reflected credentials", async (t)
   const address = server.address();
 
   const result = await run(
-    ["publish", "--endpoint", `http://127.0.0.1:${address.port}/api/v1/beam/sessions`, "--session", session],
+    ["publish", "--snapshot", "--endpoint", `http://127.0.0.1:${address.port}/api/v1/beam/sessions`, "--session", session],
     { env: { BEAM_ACCESS_TOKEN: "test-access-token" } },
   );
 
@@ -1319,6 +1333,7 @@ test("publish accepts bare and named Beam URLs below the endpoint-derived base p
     makePath = pathFactory;
     const result = await run([
       "publish",
+      "--snapshot",
       "--endpoint",
       endpoint,
       "--session",
@@ -1341,6 +1356,7 @@ test("publish accepts the current canonical catalog URL during rollout", async (
   );
   const result = await run([
     "publish",
+    "--snapshot",
     "--endpoint",
     endpoint,
     "--session",
@@ -1406,6 +1422,7 @@ test("publish rejects malformed pretty Beam URLs", async (t) => {
     makeUrl = urlFactory;
     const result = await run([
       "publish",
+      "--snapshot",
       "--endpoint",
       endpoint,
       "--session",
@@ -1459,6 +1476,7 @@ test("publish rejects malformed rollout catalog URLs", async (t) => {
     makeUrl = urlFactory;
     const result = await run([
       "publish",
+      "--snapshot",
       "--endpoint",
       endpoint,
       "--session",
@@ -1490,7 +1508,7 @@ test("publish never prints access tokens on receiver errors", async (t) => {
 
   for (status of [401, 403]) {
     const result = await run(
-      ["publish", "--endpoint", `http://127.0.0.1:${address.port}/api/v1/beam/sessions`, "--session", session],
+      ["publish", "--snapshot", "--endpoint", `http://127.0.0.1:${address.port}/api/v1/beam/sessions`, "--session", session],
       { env: { BEAM_ACCESS_TOKEN: "super-secret-access-token" } },
     );
 
@@ -1539,4 +1557,66 @@ test("source model metadata follows the native conversation without exporting ac
     { type: "assistant", sessionId: "model-session", message: { role: "assistant", model: "claude-opus-4-6", content: "Result" } },
   ]);
   assert.deepEqual(renderSession(file, { source: "claude" }).sourceModel, { provider: "anthropic", model: "claude-opus-4-6" });
+});
+
+test("publish hands off by default and retires the source in local state", async (t) => {
+  const session = claudeSession();
+  const state = path.join(tempDir(), "handoffs.sqlite");
+  const generation = "b".repeat(32);
+  const endpoint = await beamReceiverEndpoint(t, (payload) => `/beam/${payload.beamId.slice(0, 12)}`, "", {
+    handoff: { id: generation, owner: "gateway", access: "owned" },
+  });
+  const result = await run(["publish", "--endpoint", endpoint, "--session", session], { env: { BEAM_STATE: state } });
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /^Conversation handed to Team: /m);
+  assert.doesNotMatch(result.stdout, /Snapshot is read-only/);
+  const again = await run(["publish", "--endpoint", endpoint, "--session", session], { env: { BEAM_STATE: state } });
+  assert.equal(again.code, 0, again.stderr);
+  assert.match(again.stdout, /^Conversation handed to Team: /m);
+});
+
+test("publish --complete requires --snapshot", async () => {
+  const result = await run(["publish", "--endpoint", "https://beam.invalid/api/v1/beam/sessions", "--session", claudeSession(), "--complete"]);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /--complete applies to --snapshot publishing/);
+});
+
+test("sanitizer keeps calendar dates but still redacts phone numbers", () => {
+  assert.equal(sanitizeVisibleText("ClawCon 2026.12.06, Claw Cafe 2026-12-04 and 06/12/2026"), "ClawCon 2026.12.06, Claw Cafe 2026-12-04 and 06/12/2026");
+  assert.equal(sanitizeVisibleText("call +1 415 555 0134 or 0412 345 678"), "call +[REDACTED_PHONE] or [REDACTED_PHONE]");
+});
+
+test("images and delivered files become visible asset placeholders without bytes or paths", () => {
+  const dir = tempDir();
+  const video = path.join(dir, "launch-reel.mp4");
+  fs.writeFileSync(video, Buffer.alloc(3 * 1024 * 1024));
+  const session = path.join(dir, "22222222-2222-4333-8444-555555555555.jsonl");
+  const pixels = Buffer.alloc(30 * 1024).toString("base64");
+  writeJsonl(session, [
+    { type: "user", sessionId: "22222222-2222-4333-8444-555555555555", message: { role: "user", content: [
+      { type: "image", source: { type: "base64", media_type: "image/webp", data: pixels } },
+      { type: "text", text: "[Image: source: /private/tmp/session/images/1.webp]\nmake it loop" },
+    ] } },
+    { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "SendUserFile", input: { files: [video] } }] } },
+    { type: "assistant", message: { role: "assistant", content: "Done." } },
+  ]);
+  const rendered = renderSession(session, { source: "claude" });
+  const text = rendered.items.map((item) => item.text).join("\n");
+  assert.match(text, /\[Beam asset omitted: image \(image\/webp, 30 KB\)\]/);
+  assert.match(text, /\[Beam asset omitted: image\]\nmake it loop/);
+  assert.match(text, /\[Beam asset omitted: file launch-reel\.mp4 \(3\.0 MB\)\]/);
+  assert.doesNotMatch(text, new RegExp(dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.ok(!text.includes(pixels.slice(0, 64)));
+});
+
+test("default publish falls back to a snapshot on receivers without handoff support", async (t) => {
+  const session = claudeSession();
+  const state = path.join(tempDir(), "handoffs.sqlite");
+  const endpoint = await beamReceiverEndpoint(t, (payload) => `/beam/${payload.beamId.slice(0, 12)}`);
+  const result = await run(["publish", "--endpoint", endpoint, "--session", session], { env: { BEAM_STATE: state } });
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /^Beamed session: /m);
+  assert.match(result.stderr, /does not support handoff/);
+  const again = await run(["publish", "--snapshot", "--endpoint", endpoint, "--session", session], { env: { BEAM_STATE: state } });
+  assert.equal(again.code, 0, again.stderr);
 });

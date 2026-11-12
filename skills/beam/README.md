@@ -18,12 +18,15 @@ The `beam` helper is self-contained. It does not require `agent-transcript`,
    - explicit use: `--session <file>`
 2. It reads a bounded transcript window and recognizes visible Claude Code and
    Codex messages, including modern Codex `item_completed` records.
-3. It drops system/developer setup, reasoning, raw tool inputs/outputs, images,
-   browser state, and unknown records. Tool activity becomes aggregate family
+3. It drops system/developer setup, reasoning, raw tool inputs/outputs,
+   browser state, and unknown records. Images, pasted screenshots and files
+   delivered with `SendUserFile` become `[Beam asset omitted: …]` placeholders
+   (type and size only; no bytes, paths or URLs), so Team readers know an asset
+   existed. Tool activity becomes aggregate family
    counts such as `2 read, 1 execute`.
 4. It strips internal hook wrappers and redacts credentials, auth headers,
-   private keys, email addresses, phone numbers, secret query parameters, and
-   broad local paths.
+   private keys, email addresses, phone numbers (calendar dates such as
+   `2026.12.06` stay readable), secret query parameters, and broad local paths.
 5. It uploads a closed, size-bounded JSON payload. The receiver exposes a passive
    transcript projection, not remote access to the local coding session.
 
@@ -48,7 +51,12 @@ A copied installation is also standalone:
 scripts/install-skills --mode copy --target ~/.agents/skills beam
 ```
 
-## Publish a snapshot
+## Publish (hands off by default)
+
+`beam publish` hands the conversation to Team by default. Add `--snapshot` for a
+read-only share. Receivers without handoff support return a snapshot; the helper
+says so on stderr and keeps the source active. Lifecycle hooks always publish
+snapshots.
 
 Set the installed skill directory and receiver endpoint:
 
@@ -186,7 +194,7 @@ Templates:
 
 `Stop` refreshes the snapshot after a completed root turn. Claude Code
 `SessionEnd` marks it complete. Codex users can publish a final snapshot with
-`publish --complete`; the public Codex template intentionally does not claim an
+`publish --snapshot --complete`; the public Codex template intentionally does not claim an
 automatic completion hook. Hook failures exit nonzero but do not emit a blocking
 hook decision.
 
@@ -216,8 +224,8 @@ before upload.
 
 ## Live logical conversation handoff
 
-A snapshot is read-only until its original verified publisher explicitly releases
-it with `beam handoff`. The helper freezes sanitized source history and durably
+A snapshot is read-only until its original verified publisher releases it with
+`beam publish` (the default) or `beam handoff`. The helper freezes sanitized source history and durably
 retires that Beam identity before network dispatch. It records the receiver-issued
 publication generation, then sends an existing-only release. A retry cannot
 create another incarnation after snapshot expiry. An uncertain release keeps the
@@ -246,7 +254,7 @@ rejected without changing history or refreshing retention.
 
 Requires Node 22.13+ for handoff state. The local SQLite store defaults to
 `.local/state/openclaw-beam/handoffs.sqlite` under the user's home; `--state FILE`
-selects an explicit store. It holds sanitized pending history until acknowledgment,
+or `BEAM_STATE` selects an explicit store. It holds sanitized pending history until acknowledgment,
 then only ownership and destination metadata. Do not delete pending or acknowledged
 retirement state to recover a source. Receiver ownership metadata survives snapshot
 expiry and archive without retaining transcript items. Ownerless/shared-token

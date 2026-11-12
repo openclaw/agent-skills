@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 // Source retirement survives CLI restarts and ambiguous network outcomes. Only
 // the sanitized, bounded pending payload is retained; credentials never are.
 export async function openHandoffs(options, create = true) {
-  const file = options.state || path.join(os.homedir(), ".local", "state", "openclaw-beam", "handoffs.sqlite");
+  const file = options.state || process.env.BEAM_STATE || path.join(os.homedir(), ".local", "state", "openclaw-beam", "handoffs.sqlite");
   if (!create && !fs.existsSync(file)) return undefined;
   const { DatabaseSync } = await import("node:sqlite");
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -43,6 +43,9 @@ export async function openHandoffs(options, create = true) {
       db.prepare("UPDATE handoffs SET session_key=?,receipt=? WHERE endpoint=? AND beam_id=?")
         .run(sessionKey, JSON.stringify({ ...receipt, sessionId }), endpoint, beamId);
     },
+    forgetUnpublished(endpoint, beamId) {
+      db.prepare("DELETE FROM handoffs WHERE endpoint=? AND beam_id=? AND receipt IS NULL AND publication_id IS NULL").run(endpoint, beamId);
+    },
     close() { db.close(); },
   };
 }
@@ -53,7 +56,7 @@ export function transferredReceipt(result) {
     ["owned", "shared"].includes(result.handoff.access);
 }
 
-export async function releaseSource(state, endpoint, payload, upload) {
+export async function releaseSource(state, endpoint, payload, upload, { snapshotFallback = false } = {}) {
   let row = state.get(endpoint, payload.beamId);
   if (!row && !payload.items) throw new Error("No pending handoff exists for this Beam ID; select its exact source transcript for the initial handoff");
   row ??= state.begin(endpoint, payload);
@@ -66,6 +69,12 @@ export async function releaseSource(state, endpoint, payload, upload) {
       return published;
     }
     if (!/^[a-f0-9]{32}$/.test(published.publicationId)) {
+      // A definite snapshot-only receipt means nothing was transferred, so an
+      // implicit (default) handoff may restore the source instead of stranding it.
+      if (snapshotFallback && published?.ok !== false && !Object.hasOwn(published, "publicationId")) {
+        state.forgetUnpublished(endpoint, payload.beamId);
+        return { ...published, snapshotFallback: true };
+      }
       throw new Error("Receiver does not support live handoff; update it before retrying handoff. Source remains retired pending reconciliation.");
     }
     state.publication(endpoint, payload.beamId, published.publicationId);

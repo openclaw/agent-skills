@@ -18,9 +18,9 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 
 function usage() {
   console.log(`Usage:
-  beam publish --endpoint URL [--session FILE | --session-id ID | --thread-id ID] [--title TEXT] [--complete] [--dry-run]
+  beam publish --endpoint URL [--session FILE | --session-id ID | --thread-id ID] [--title TEXT] [--snapshot [--complete]] [--dry-run]
   beam hook --endpoint URL [--quiet] [--dry-run]
-  beam handoff --endpoint URL [--session FILE | --session-id ID | --thread-id ID]
+  beam handoff --endpoint URL [--session FILE | --session-id ID | --thread-id ID | --beam-id ID]
   beam read --endpoint URL --beam-id ID --profile-dir DIR
   beam continue --endpoint URL --beam-id ID --profile-dir DIR --message TEXT [--request-id ID]
 
@@ -28,6 +28,11 @@ Environment:
   BEAM_ENDPOINT       Default receiver URL
   BEAM_ACCESS_TOKEN   Cloudflare Access application token (sent as cf-access-token)
   BEAM_AUTH_TOKEN     Gateway bearer token fallback (sent as Authorization: Bearer)
+  BEAM_STATE          Local handoff state file (default: ~/.local/state/openclaw-beam/handoffs.sqlite)
+
+publish hands the conversation to Team by default (same as handoff). Pass --snapshot
+for a read-only share. Hooks always publish read-only snapshots.
+Images and files are never uploaded; Beam leaves an "asset omitted" placeholder.
 
 Guests use their own Cloudflare Access sign-in or BEAM_ACCESS_TOKEN, never a shared Gateway token.
 The hook command reads Claude Code or Codex hook JSON from stdin. Raw transcripts never leave the machine.`);
@@ -461,8 +466,13 @@ async function main() {
     await publish(payload, options);
     return;
   }
+  // publish is a handoff unless the user asks for a read-only snapshot. Hooks
+  // fire every turn, so they stay snapshots and never retire the source.
+  const snapshotOnly = command === "hook" || (command === "publish" && Boolean(options.snapshot));
+  const mode = command === "publish" && !snapshotOnly ? "handoff" : command;
+  if (command === "publish" && options.complete && !snapshotOnly) throw new Error("--complete applies to --snapshot publishing; a handoff already finalizes the source");
   const endpoint = endpointUrl(options).href;
-  let state = await openHandoffs(options, !["publish", "hook"].includes(command));
+  let state = await openHandoffs(options, !["publish", "hook"].includes(command) || mode === "handoff");
   let result;
   try {
     if (command === "read" || command === "continue") {
@@ -476,8 +486,9 @@ async function main() {
       console.log(JSON.stringify(result));
       return;
     }
-    if (command === "handoff") {
-      result = await releaseSource(state, endpoint, payload, (frozen) => publish(frozen, options));
+    if (mode === "handoff") {
+      result = await releaseSource(state, endpoint, payload, (frozen) => publish(frozen, options), { snapshotFallback: command === "publish" });
+      if (result.snapshotFallback) console.error("Receiver does not support handoff; published a read-only snapshot instead and kept the source active.");
     } else {
       const retired = state?.get(endpoint, payload.beamId);
       if (retired) {
@@ -510,7 +521,7 @@ async function main() {
       console.log(`Beamed session: ${target}`);
     }
     if (!transferredReceipt(result)) {
-      console.log("Snapshot is read-only. To continue in Team, its authenticated original publisher must run beam handoff with the same endpoint and source transcript selector.");
+      console.log("Snapshot is read-only. To continue in Team, rerun beam publish without --snapshot (or beam handoff) with the same endpoint and source selector.");
     }
   }
 }
