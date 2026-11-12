@@ -31,6 +31,7 @@ import time
 import unicodedata
 import urllib.parse
 import warnings
+import zlib
 from collections.abc import Callable, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, NamedTuple
@@ -167,6 +168,10 @@ TRACKED_TOKEN_CREDENTIAL_EXTENSIONS = {
     ".yml",
 }
 MAX_REVIEW_PROMPT_BYTES = 512_000
+MAX_REVIEW_SQL_COMPRESSED_BYTES = 20 * 1024 * 1024
+MAX_REVIEW_SQL_BYTES = 32 * 1024 * 1024
+MAX_REVIEW_SQL_TOTAL_BYTES = 100 * 1024 * 1024
+MAX_REVIEW_SQL_TOTAL_COMPRESSED_BYTES = 100 * 1024 * 1024
 MAX_REVIEW_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_REVIEW_IMAGE_TOTAL_BYTES = 100 * 1024 * 1024
 # Rebatch evidence before eager planning repeats nearly full context for tiny
@@ -2777,6 +2782,109 @@ def image_media_type(path: str, content: bytes) -> str | None:
     return match[0]
 
 
+def decode_compressed_sql(
+    repo: Path, oid: str, remaining: int, encoded_remaining: int,
+) -> tuple[bytes, bytes]:
+    encoded_size = int(git(repo, "cat-file", "-s", oid).strip())
+    if encoded_size > min(MAX_REVIEW_SQL_COMPRESSED_BYTES, encoded_remaining):
+        raise SystemExit("compressed SQL exceeds the 20 MiB encoded or 100 MiB aggregate encoded limit")
+    encoded = git_bytes(repo, "cat-file", "blob", oid).stdout
+    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    limit = min(MAX_REVIEW_SQL_BYTES, remaining)
+    try:
+        decoded = decoder.decompress(encoded, limit + 1)
+    except zlib.error:
+        raise SystemExit("compressed SQL has invalid gzip data or checksum") from None
+    if len(decoded) > limit or decoder.unconsumed_tail:
+        raise SystemExit("compressed SQL exceeds the 32 MiB decoded or 100 MiB aggregate limit")
+    if not decoder.eof or decoder.unused_data:
+        raise SystemExit("compressed SQL requires one complete gzip member without trailing data")
+    try:
+        decoded.decode("utf-8")
+    except UnicodeDecodeError:
+        raise SystemExit("compressed SQL must decode to strict UTF-8 text") from None
+    if b"\0" in decoded:
+        raise SystemExit("compressed SQL must not contain NUL bytes")
+    return encoded, decoded
+
+
+def compressed_sql_diff(repo: Path, before: bytes, after: bytes) -> str:
+    with tempfile.TemporaryDirectory(prefix="autoreview-sql-", dir=safe_temp_root(repo)) as directory:
+        root = Path(directory)
+        (root / "before").write_bytes(before)
+        (root / "after").write_bytes(after)
+        env = safe_git_env(repo)
+        env.update({"GIT_DIR": str(root / "no-repository"), "GIT_ATTR_NOSYSTEM": "1"})
+        try:
+            result = subprocess.run(
+                [resolve_git(repo), *SAFE_GIT_CONFIG_ARGS, "-c", "core.autocrlf=false",
+                 "-c", f"core.attributesFile={os.devnull}",
+                 "diff", "--no-index", *SAFE_DIFF_FLAGS, "--text", "--diff-algorithm=myers",
+                 "-U3", "--inter-hunk-context=0", "--no-indent-heuristic", "--", "before", "after"],
+                cwd=root, env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            raise SystemExit("compressed SQL diff exceeded its 30 second preparation limit") from None
+    if result.returncode not in {0, 1}:
+        raise SystemExit("cannot construct compressed SQL text diff")
+    text = result.stdout.decode("utf-8")
+    hunk = re.search(r"^@@ ", text, re.MULTILINE)
+    return text[hunk.start():] if hunk else "Decoded SQL unchanged; review compression provenance.\n"
+
+
+def capture_compressed_sql(
+    repo: Path, raw_diff: str, numstat: str, blocked_paths: set[str],
+) -> dict[str, str]:
+    projections: dict[str, str] = {}
+    binary_paths = set(binary_diff_paths(numstat))
+    total = 0
+    encoded_total = 0
+    records = raw_diff.split("\0")
+    for index in range(0, len(records) - 1, 2):
+        metadata, path = records[index:index + 2]
+        if not path.endswith(".sql.gz") or path in blocked_paths or path not in binary_paths:
+            continue
+        old_mode, new_mode, old_oid, new_oid, change = metadata.lstrip(":").split()
+        if change == "D":
+            continue
+        if (change not in {"A", "M"} or new_mode not in {"100644", "100755"}
+                or old_mode not in {"000000", "100644", "100755"}):
+            continue
+        provenance = []
+        contents = []
+        for side, mode, oid in (("before", old_mode, old_oid), ("after", new_mode, new_oid)):
+            if mode == "000000":
+                contents.append(b"")
+                provenance.append(f"compressed-sql {side}: absent\n")
+                continue
+            encoded, decoded = decode_compressed_sql(
+                repo, oid, MAX_REVIEW_SQL_TOTAL_BYTES - total,
+                MAX_REVIEW_SQL_TOTAL_COMPRESSED_BYTES - encoded_total,
+            )
+            encoded_total += len(encoded)
+            total += len(decoded)
+            contents.append(decoded)
+            provenance.append(
+                f"compressed-sql {side}: oid={oid} mode={mode} "
+                f"encoded_bytes={len(encoded)} decoded_bytes={len(decoded)} "
+                f"encoded_sha256={hashlib.sha256(encoded).hexdigest()} "
+                f"decoded_sha256={hashlib.sha256(decoded).hexdigest()}\n"
+            )
+        old_path = json.dumps("a/" + path, ensure_ascii=True) if old_mode != "000000" else "/dev/null"
+        new_path = json.dumps("b/" + path, ensure_ascii=True)
+        decoded_patch = compressed_sql_diff(repo, *contents)
+        if old_mode == "000000" and not contents[1]:
+            decoded_patch = "Added empty decoded SQL; review compression provenance.\n"
+        projections[path] = (
+            f"diff --git {json.dumps('a/' + path)} {new_path}\n"
+            + "".join(provenance)
+            + f"--- {old_path}\n+++ {new_path}\n"
+            + decoded_patch
+        )
+    return projections
+
+
 def capture_added_branch_images(
     repo: Path,
     raw_diff: str,
@@ -3627,11 +3735,28 @@ def branch_bundle(repo: Path, base_ref: str) -> CapturedBundle:
     )
     omitted_paths = tracked_sensitive_paths(branch_paths, branch_raw)
     links = gitlink_manifest(repo, branch_raw, merge_base, head_ref, "merge-base -> HEAD")
-    images = capture_added_branch_images(repo, branch_raw, branch_numstat, omitted_paths)
+    sql = capture_compressed_sql(repo, branch_raw, branch_numstat, omitted_paths)
+    records = branch_raw.split("\0")
+    image_raw = "".join(
+        records[index] + "\0" + records[index + 1] + "\0"
+        for index in range(0, len(records) - 1, 2) if records[index + 1] not in sql
+    )
+    image_numstat = "\0".join(
+        record for record in branch_numstat.split("\0")
+        if record.split("\t", 2)[-1] not in sql
+    )
+    images = capture_added_branch_images(repo, image_raw, image_numstat, omitted_paths)
     branch_patch = git(
         repo, "diff-tree", *COMMIT_DIFF_FLAGS, "--patch", "--end-of-options", merge_base, head_ref,
     )
     original_patch = branch_patch
+    if sql:
+        branch_patch = "".join(
+            sql.get(path, patch)
+            for path, patch in local_patch_ownership(
+                branch_patch, branch_paths, "compressed SQL", raw_diff=branch_raw,
+            )
+        )
     branch_patch = omit_tracked_sensitive_diff_units(
         branch_patch, branch_paths, omitted_paths, branch_raw,
     )
@@ -4053,6 +4178,9 @@ def update_review_chunk_context(
         if match:
             return int(match.group(1)) + 1, None, False
         return next_new_line, None, False
+    if not in_hunk and line.startswith("compressed-sql "):
+        context.append(line)
+        return next_new_line, next_old_line, False
     if not in_hunk and line.startswith(("--- ", "+++ ")):
         header_prefix = line[:4]
         context[:] = [entry for entry in context if not entry.startswith(header_prefix)]
@@ -4086,6 +4214,7 @@ def compact_review_chunk_context(context: list[str]) -> list[str]:
     hunk_header = next((entry for entry in context if entry.startswith("@@ ")), None)
     path_header = new_header if new_header and new_header != "+++ /dev/null\n" else old_header
     compact = [path_header or context[0]]
+    compact.extend(entry for entry in context if entry.startswith("compressed-sql "))
     if hunk_header:
         compact.append(hunk_header)
     return compact
@@ -4356,6 +4485,11 @@ def render_review_prompt(
         - Gitlinks (mode 160000) are superproject dependency pins. Review their exact
           old/new IDs, .gitmodules URLs and integration, not omitted upstream contents.
           A clean pin review does not certify upstream dependency code. Use line 1.
+        - Compressed SQL projections bind exact committed gzip blobs to decoded text diffs.
+          Lines refer to decoded SQL at the original .sql.gz path. For compression-only
+          findings use line 1. For every finding on projected SQL use null source_attribution.
+          Blob IDs are provenance, not mixed-source record IDs. This is text review, not SQL
+          execution, schema validation or proof that an artifact matches its generator.
         - Binary deletions include Git metadata only, not the former binary contents.
           Review the removal's impact without claiming to have inspected those contents.
         - Read-only tools and web search may verify external dependency contracts.
