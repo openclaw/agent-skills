@@ -9,16 +9,17 @@ Use when the user explicitly asks to beam, publish, or share the current local c
 
 ## Contract
 
-- Treat invoking this skill as approval for one snapshot upload to the named destination.
+- Treat invoking this skill as approval to hand the current conversation to the named destination. `publish` hands off by default; pass `--snapshot` only when the user asks for a read-only share (or for `--complete` snapshots).
 - Never upload raw JSONL, reasoning, system/developer prompts, tool output, environment values, credentials, browser state, cookies, or local paths.
 - The helper is self-contained: it resolves and parses exact Claude Code or Codex transcripts, then uploads only locally redacted user/assistant messages and compact tool counts.
-- Ordinary publishing shares a read-only snapshot. A separately requested `handoff` releases the source Beam identity and moves its logical conversation to Team. After handoff, use Beam's authenticated `read` and `continue` commands for subsequent work; do not resume independent source work or publish another transcript copy.
+- A handoff releases the source Beam identity and moves its logical conversation to Team; receivers without handoff support get a read-only snapshot and the source stays active. After handoff, use Beam's authenticated `read` and `continue` commands for subsequent work; do not resume independent source work or publish another transcript copy.
 - Team owns one durable conversation after release. The source history imports once; reads, reconnects and continuations resolve that same conversation. Native provider runtime IDs need not survive. Do not connect a node, expose a terminal, transfer credentials or grant filesystem/tool access.
 - Require HTTPS except for loopback development endpoints.
 - Guests use their existing personal Cloudflare Access sign-in or `BEAM_ACCESS_TOKEN`; never request, share, or copy a Gateway token for guest uploads. `BEAM_AUTH_TOKEN` remains the ordinary operator Gateway-auth fallback, not a guest credential. Never print token values.
+- Beam carries text only. Images, pasted screenshots and delivered files (`SendUserFile`) become `[Beam asset omitted: …]` placeholders with type and size, never bytes, paths or URLs. The receiver caps a request at about 56 KB and 6,000 characters per item. When the conversation's point is a large asset (video, deck, build output), tell the user it will be omitted and offer to share it separately, or ask first if the beam is useless without it.
 - Live synchronization is opt-in persistent behavior. Do not install hooks unless the user explicitly asks for live Beam updates.
 
-## Snapshot
+## Publish (handoff by default)
 
 Set or obtain the destination receiver URL first:
 
@@ -57,13 +58,14 @@ Useful options:
 node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --session /path/to/session.jsonl
 node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --thread-id "$CODEX_THREAD_ID"
 node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --title "Fix upload flow"
-node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --complete
+node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --snapshot
+node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --snapshot --complete
 node "$BEAM_SKILL_DIR/scripts/beam" publish --endpoint "$BEAM_ENDPOINT" --dry-run
 ```
 
-`--dry-run` prints the sanitized payload locally and performs no network request.
+`--dry-run` prints the sanitized payload locally, performs no network request and changes no ownership. `BEAM_STATE` (or `--state FILE`) selects the local handoff store; tests and sandboxes must point it at a temporary file.
 
-On success, return only the Beam URL and a short disclosure summary: source harness, shared message count, whether older entries were truncated, and whether the beam is complete. The URL uses the endpoint-derived Control UI base path followed by `/beam/<title-slug>-<id-prefix>`, for example `https://gateway.example.com/beam/fix-upload-flow-0123456789ab`. The title comes from `--title` or the first shared user message. The stable ID suffix identifies the session; links with an earlier title remain valid.
+On success, return only the Beam URL and a short disclosure summary: source harness, shared message count, whether older entries were truncated, whether it was handed off or shared as a snapshot, and which assets were omitted. The URL uses the endpoint-derived Control UI base path followed by `/beam/<title-slug>-<id-prefix>`, for example `https://gateway.example.com/beam/fix-upload-flow-0123456789ab`. The title comes from `--title` or the first shared user message. The stable ID suffix identifies the session; links with an earlier title remain valid.
 
 If the receipt includes `canView: false`, say that the upload succeeded and the link is for authorized Team operators; upload-only access does not let the guest open it. Do not present it as a guest-viewable link. Staff and older receipts may omit `canView`; omission is not a new access grant.
 
@@ -75,7 +77,7 @@ Revoked access needs an authorized operator to restore it. Never blindly retry a
 
 ## Live logical handoff
 
-Only perform this when the user asks to move or continue the conversation in Team; permission to share a snapshot alone is insufficient. Requires Node 22.13+ and an updated receiver.
+`publish` performs this by default; `handoff` is the explicit form and the recovery entry point (`--beam-id`). Requires Node 22.13+ and an updated receiver; older receivers fall back to a snapshot without retiring the source.
 
 ```sh
 node "$BEAM_SKILL_DIR/scripts/beam" handoff --endpoint "$BEAM_ENDPOINT" --thread-id "$CODEX_THREAD_ID"
@@ -101,7 +103,7 @@ The helper accepts the snake_case JSON emitted by both Claude Code and Codex lif
 node "$BEAM_SKILL_DIR/scripts/beam" hook --endpoint "$BEAM_ENDPOINT" --quiet
 ```
 
-Configure root `Stop` hooks for turn-by-turn updates. Claude Code can also use `SessionEnd` for finalization; Codex finalization uses an explicit `publish --complete`. See:
+Configure root `Stop` hooks for turn-by-turn updates. Claude Code can also use `SessionEnd` for finalization; Codex finalization uses an explicit `publish --snapshot --complete`. See:
 
 - `references/claude-code-hooks.json`
 - `references/codex-hooks.toml`

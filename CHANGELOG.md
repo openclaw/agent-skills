@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Make `beam publish` hand the conversation to Team by default, with `--snapshot` for read-only shares and a clean snapshot fallback (source kept active) on receivers without handoff support. Hooks still publish snapshots only.
+- Show `[Beam asset omitted: …]` placeholders for images, pasted screenshots and delivered files instead of dropping them silently; no asset bytes, paths or URLs are uploaded.
+- Stop redacting calendar dates such as `2026.12.06` as phone numbers.
+- Add `BEAM_STATE` to select the local handoff store, and isolate Beam tests from the real store.
+
 - Preserve local Autoreview source attribution for partially staged files beside Git type changes, while continuing to omit sensitive symlink content.
 
 - Pin the shared source-release workflow to a reviewed commit with complete release listing and exact-byte draft retry checks.

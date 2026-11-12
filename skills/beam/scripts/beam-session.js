@@ -192,11 +192,40 @@ function parseRows(file) {
   return { rows, truncated: bounded.truncated };
 }
 
+// Beam carries text only (the receiver caps each request), so assets never
+// travel. A visible placeholder tells Team readers something was there.
+const ASSET_BLOCK_TYPES = ["image", "image_url", "input_image", "local_image", "document", "input_file", "file"];
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "";
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+function safeMediaType(value) {
+  return typeof value === "string" && /^[a-z]+\/[a-z0-9.+-]{1,64}$/i.test(value) ? value.toLowerCase() : "";
+}
+
+export function assetPlaceholder(kind, details = {}) {
+  const name = typeof details.name === "string" && /^[^\\/\s][^\\/]{0,119}$/.test(details.name) ? details.name : "";
+  const meta = [safeMediaType(details.mediaType), formatBytes(details.bytes)].filter(Boolean).join(", ");
+  return `[Beam asset omitted: ${kind}${name ? ` ${name}` : ""}${meta ? ` (${meta})` : ""}]`;
+}
+
+function assetBlockPlaceholder(block, type) {
+  const source = isRecord(block.source) ? block.source : {};
+  const data = typeof source.data === "string" ? source.data : typeof block.data === "string" ? block.data : "";
+  const bytes = data ? Math.floor((data.length * 3) / 4) : undefined;
+  const kind = type === "document" || type.includes("file") ? "file" : "image";
+  return assetPlaceholder(kind, { mediaType: source.media_type || block.media_type || block.mime_type, bytes });
+}
+
 function textBlock(block) {
   if (typeof block === "string") return block;
   if (!isRecord(block)) return "";
   const type = String(block.type || "").toLowerCase();
-  if (["thinking", "reasoning", "tool_use", "tool_result", "image", "image_url"].includes(type)) {
+  if (ASSET_BLOCK_TYPES.includes(type)) return assetBlockPlaceholder(block, type);
+  if (["thinking", "reasoning", "tool_use", "tool_result"].includes(type)) {
     return "";
   }
   if (["text", "input_text", "output_text"].includes(type) && typeof block.text === "string") {
@@ -220,6 +249,7 @@ function visibleText(content) {
 
 function stripInternalWrappers(input) {
   return String(input || "")
+    .replace(/\[Image(?: #\d+)?: source: [^\]\r\n]+\]/gi, () => assetPlaceholder("image"))
     .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "")
     .replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>/gi, "")
     .replace(/<command-name>[\s\S]*?<\/command-name>/gi, "")
@@ -489,6 +519,16 @@ function redactSecretBearingLines(text, stats) {
   return output.join("\n");
 }
 
+// Calendar dates (2026.12.06, 2026-12-04, 06/12/2026) share the phone rule's
+// shape but are not contact data; keep them readable.
+function isDateLike(value) {
+  const trimmed = value.trim();
+  const ymd = /^(\d{4})([./-])(\d{1,2})\2(\d{1,2})$/.exec(trimmed);
+  if (ymd) return Number(ymd[3]) >= 1 && Number(ymd[3]) <= 12 && Number(ymd[4]) >= 1 && Number(ymd[4]) <= 31;
+  const dmy = /^(\d{1,2})([./-])(\d{1,2})\2(\d{4})$/.exec(trimmed);
+  return Boolean(dmy) && Number(dmy[1]) >= 1 && Number(dmy[1]) <= 31 && Number(dmy[3]) >= 1 && Number(dmy[3]) <= 31;
+}
+
 function redact(input, stats) {
   let text = redactYamlSecretBlocks(stripInternalWrappers(input), stats);
   const fixedRules = [
@@ -506,7 +546,7 @@ function redact(input, stats) {
     [/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/gi, "[REDACTED_AUTH_HEADER]"],
     [/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, "$1[REDACTED]@"],
     [/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[REDACTED_EMAIL]"],
-    [/\b(?:\+?\d[\d .()-]{7,}\d)\b/g, "[REDACTED_PHONE]"],
+    [/\b(?:\+?\d[\d .()-]{7,}\d)\b/g, (match) => (isDateLike(match) ? match : "[REDACTED_PHONE]")],
     [/([?&#](?:token|key|secret|signature|sig|access_token|auth|password|passwd|api_key|client_secret)=)[^\s`"'>&#]+/gi, "$1[REDACTED]"],
   ];
   for (const [pattern, replacement] of fixedRules) {
@@ -677,6 +717,21 @@ function activeClaudeRows(rows) {
   return primary.filter((row) => typeof row.uuid === "string" && chain.has(row.uuid));
 }
 
+const FILE_DELIVERY_TOOLS = new Set(["SendUserFile"]);
+
+function deliveredFilePlaceholders(block) {
+  if (!FILE_DELIVERY_TOOLS.has(block.name) || !isRecord(block.input) || !Array.isArray(block.input.files)) return [];
+  return block.input.files.slice(0, 20).filter((file) => typeof file === "string" && file.trim()).map((file) => {
+    let bytes;
+    try {
+      bytes = fs.statSync(file).size;
+    } catch {
+      // Relative or since-removed files still get a name-only placeholder.
+    }
+    return assetPlaceholder("file", { name: path.basename(file), bytes });
+  });
+}
+
 function parseClaude(rows, options) {
   const items = [];
   const stats = { redactions: 0, toolCalls: 0, toolOutputsDropped: 0, toolFamilies: {} };
@@ -697,7 +752,10 @@ function parseClaude(rows, options) {
     if (Array.isArray(content)) {
       for (const block of content) {
         if (!isRecord(block)) continue;
-        if (block.type === "tool_use") addTool(stats, block.name || "tool_use");
+        if (block.type === "tool_use") {
+          addTool(stats, block.name || "tool_use");
+          if (role === "assistant") for (const text of deliveredFilePlaceholders(block)) items.push({ type: "agentMessage", text });
+        }
         if (block.type === "tool_result") stats.toolOutputsDropped++;
       }
     }
