@@ -7576,7 +7576,11 @@ def _validate_report(
         if rel in records:
             reason = mixed_attribution_error(finding, records[rel], available or set())
         elif finding.get("source_attribution") is not None:
-            reason = "source attribution has no owner-built mixed record for this path"
+            # The schema requires the key, but attribution is meaningful only
+            # for paths with an owner-built mixed record. Engines can still
+            # emit a non-null attribution for ordinary paths; drop it rather
+            # than rejecting an otherwise valid finding.
+            finding["source_attribution"] = None
         if reason:
             rejected = copy.deepcopy(finding)
             rejected["attribution_rejection_reason"] = reason

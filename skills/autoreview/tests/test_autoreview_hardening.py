@@ -7581,6 +7581,37 @@ else:
                 with self.assertRaisesRegex(SystemExit, "invalid file path"):
                     self.helper["validate_report"](outside, repo, {"escape/outside.ts"}, [])
 
+    def test_nonmixed_attribution_is_dropped_instead_of_rejecting_the_finding(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = Path(tempdir)
+            report = {
+                "findings": [{
+                    "title": "Synthetic claim",
+                    "body": "A concrete defect.",
+                    "priority": "P2",
+                    "confidence": 0.8,
+                    "category": "bug",
+                    "code_location": {"file_path": "calc.py", "line": 2},
+                    "source_attribution": {
+                        "target": "working_tree",
+                        "record_id": "not-a-mixed-record",
+                        "source_id": "not-mixed-either",
+                        "side": "present",
+                        "column": 1,
+                        "excerpt": "return a - b",
+                    },
+                }],
+                "overall_correctness": "patch is incorrect",
+                "overall_explanation": "The synthetic defect is real.",
+                "overall_confidence": 0.8,
+            }
+
+            self.helper["validate_report"](report, repo, {"calc.py"}, [], ())
+
+            self.assertEqual(len(report["findings"]), 1)
+            self.assertIsNone(report["findings"][0]["source_attribution"])
+            self.assertNotIn("attribution_rejected_findings", report)
+
     def test_validate_report_normalizes_relative_finding_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
