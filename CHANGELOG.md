@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Update validation and source-release tests to Node.js 26.13.1 and native sandbox checks to Codex CLI 0.169.0 while retaining the Python 3.10 installed-helper contract.
+
 - Recognize named companions of numbered RFCs as regular tracked source while preserving credential-storage, symlink and gitlink refusals. Thanks @russellb. (#367)
 
 - Distinguish unsupported binary assets from malformed supported images in Autoreview diagnostics without changing refusal behavior. Thanks @saariuslystoned. (#386)
