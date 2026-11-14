@@ -6,7 +6,7 @@
   scope; presence/edits do not make parent dirty. Ordinary adjacent files stay included.
 - Revalidate worktree boundaries without changing Git ignore rules.
 
-- Tracked RFC source companions may use a credential-named RFC directory:
+- Regular tracked RFC source companions may use a credential-named RFC directory:
   `specs/rfcs/NNNN-lowercase-slug/` or `docs/rfcs/NNNN-lowercase-slug/`, with
   immediate `README.md`, `index.md`, `contracts.md`, `design.md`, or `security.md`.
   This is a path convention, not content scanning. Other sensitive title words,
