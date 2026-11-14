@@ -137,6 +137,62 @@ class ReviewBatchTests(unittest.TestCase):
                 self.assertEqual(prompt.count("GLOBAL WHOLE OWNER"), 1)
                 self.assertIn("blob=" + self.git(repo, "rev-parse", "HEAD:contract.py"), prompt)
 
+    def test_rfc_contract_change_reaches_allocated_review_whole(self):
+        for root in ("specs/rfcs", "docs/rfcs"):
+            with self.subTest(root=root), self.fixture() as repo:
+                rel = f"{root}/0042-credential-lifecycle/contracts.md"
+                path = repo / rel
+                path.parent.mkdir(parents=True)
+                body = "# Service admission\n\nOnly the selected service may request this operation.\n"
+                path.write_bytes(body.encode("utf-8"))
+                self.git(repo, "add", rel)
+                self.git(repo, "commit", "--amend", "--no-edit", "-q")
+                manifest = self.manifest(repo)
+                blob = self.git(repo, "rev-parse", "HEAD:" + rel)
+                manifest["contexts"].append({"path": rel, "blob": blob, "mode": "100644"})
+                for batch in manifest["batches"]:
+                    batch["changes"].append(rel)
+                    batch["contexts"].append(rel)
+                self.write_manifest(repo, manifest)
+                status, sends, output = self.invoke(repo)
+                self.assertEqual(status, 0, output)
+                self.assertEqual(len(sends), 2)
+                for prompt in sends:
+                    self.assertIn(rel, prompt)
+                    self.assertEqual(prompt.count(body), 1)
+                    self.assertIn("blob=" + blob, prompt)
+                    for line in body.splitlines():
+                        self.assertIn("+" + line + "\n", prompt)
+                allocation = json.loads((repo.parent / "result.json").read_bytes())["review_allocation"]
+                self.assertEqual(allocation["omitted_paths"], [])
+                self.assertIn(rel, [unit["path"] for unit in allocation["units"]])
+                context = next(item for item in allocation["contexts"] if item["path"] == rel)
+                self.assertEqual(context["blob"], blob)
+                self.assertEqual(context["sha256"], hashlib.sha256(body.encode()).hexdigest())
+
+    def test_rfc_credential_storage_omissions_block_batch_dispatch(self):
+        for suffix in ("notes.md", "token.md", "secret.md", "config.json",
+                       "private.pem", ".env", "credentials/contracts.md", ".ssh/index.md"):
+            with self.subTest(suffix=suffix), self.fixture() as repo:
+                rel = "specs/rfcs/0042-credential-lifecycle/" + suffix
+                path = repo / rel
+                path.parent.mkdir(parents=True)
+                marker = "SYNTHETIC STORAGE MUST NOT REACH REVIEW\n"
+                path.write_text(marker, encoding="utf-8")
+                self.git(repo, "add", rel)
+                self.git(repo, "commit", "--amend", "--no-edit", "-q")
+                capture = self.helper["branch_bundle"](repo, "HEAD^")
+                self.assertNotIn(marker.strip(), capture.text)
+                manifest = self.manifest(repo)
+                with self.assertRaisesRegex(SystemExit, "refusing sensitive --source-context"):
+                    self.helper["capture_source_context"](repo, rel, manifest["head"])
+                manifest["batches"][0]["changes"].append(rel)
+                self.write_manifest(repo, manifest)
+                status, sends, output = self.invoke(repo)
+                self.assertNotEqual(status, 0)
+                self.assertFalse(sends)
+                self.assertIn("cannot certify a range with omitted sensitive inputs", str(status) + output)
+
     def test_invalid_or_stale_manifest_has_zero_launches(self):
         mutations = {
             "base": lambda m: m.update(base="0" * 40),

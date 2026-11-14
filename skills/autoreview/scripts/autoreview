@@ -2579,7 +2579,26 @@ def credential_store_path(normalized: str) -> bool:
         ".tsx",
         ".vue",
     }
-    return credential_directory and credential_data_file and not skill_instruction_path(path)
+    return (
+        credential_directory
+        and credential_data_file
+        and not skill_instruction_path(path)
+    )
+
+
+def rfc_source_path(path: Path) -> bool:
+    # Only immediate, named companions of numbered public RFCs are source.
+    # Never exempt nested stores, arbitrary Markdown, or other sensitive titles.
+    parts = path.parts
+    if (
+        len(parts) != 4
+        or parts[:2] not in {("specs", "rfcs"), ("docs", "rfcs")}
+        or re.fullmatch(r"[0-9]{4}-[a-z0-9]+(?:-[a-z0-9]+)*", parts[2]) is None
+        or parts[3] not in {"README.md", "index.md", "contracts.md", "design.md", "security.md"}
+    ):
+        return False
+    title = re.sub(r"(?<=-)credentials?(?=-|$)", "source", parts[2])
+    return not any(pattern.search(title) for pattern in SENSITIVE_NAME_PATTERNS)
 
 
 def skill_instruction_path(path: Path) -> bool:
@@ -2615,7 +2634,7 @@ def tracked_sensitive_repo_path_risk(rel: str, *, regular_file: bool = True) -> 
         or f"/{normalized.lower()}".endswith("/.docker/config.json")
         or parts & TRACKED_SENSITIVE_PATH_PARTS
         or (credential_store_path(normalized)
-            and not (regular_file and credential_document_path(path)))
+            and not (regular_file and (credential_document_path(path) or rfc_source_path(path))))
         or token_credential_store_path(normalized)
     ):
         return "sensitive path"
