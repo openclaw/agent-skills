@@ -1504,7 +1504,7 @@ class AutoreviewBinaryDeletionTests(unittest.TestCase):
                         self.helper["local_bundle"](repo, ref)
                 git(repo, "commit", "-qm", "binary content change")
                 for target in ("branch", "commit"):
-                    with self.assertRaisesRegex(SystemExit, "refusing (binary changes|unsupported or malformed image)"):
+                    with self.assertRaisesRegex(SystemExit, "refusing (binary changes|unsupported binary)"):
                         self.helper["build_bundle"](repo, target, base, "HEAD")
 
     def test_worktree_deletion_cannot_hide_staged_binary_change(self):
