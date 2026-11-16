@@ -2,27 +2,14 @@
 
 ## Unreleased
 
-- Update validation and source-release tests to Node.js 26.13.1 and native sandbox checks to Codex CLI 0.169.0 while retaining the Python 3.10 installed-helper contract.
+## 0.7.0 - 2026-11-15
 
-- Recognize named companions of numbered RFCs as regular tracked source while preserving credential-storage, symlink and gitlink refusals. Thanks @russellb. (#367)
-
-- Distinguish unsupported binary assets from malformed supported images in Autoreview diagnostics without changing refusal behavior. Thanks @saariuslystoned. (#386)
+**Highlights:** Hand off conversations with Beam by default, control Autoreview authentication fallback and prompt budgets, and harden the Codex login probe against inherited startup hooks.
 
 - Make `beam publish` hand the conversation to Team by default, with `--snapshot` for read-only shares and a clean snapshot fallback (source kept active) on receivers without handoff support. Hooks still publish snapshots only.
 - Show `[Beam asset omitted: …]` placeholders for images, pasted screenshots and delivered files instead of dropping them silently; no asset bytes, paths or URLs are uploaded.
 - Stop redacting calendar dates such as `2026.12.06` as phone numbers.
 - Add `BEAM_STATE` to select the local handoff store, and isolate Beam tests from the real store.
-
-- Preserve local Autoreview source attribution for partially staged files beside Git type changes, while continuing to omit sensitive symlink content.
-
-- Pin the shared source-release workflow to a reviewed commit with complete release listing and exact-byte draft retry checks.
-- Run Autoreview's Codex `login status` probe with the reviewer's filtered environment, keeping the operator's login and Codex home while dropping `NODE_OPTIONS`, other startup hooks and `PATH` entries inside the reviewed checkout. Thanks @karstenevers. (#368)
-
-- Update the development Node.js types to 26.6.6 while retaining Node.js 26 and the Python 3.10 installed-helper contract.
-
-- Retain the platform timeout for CodeQL instead of imposing a shorter scan budget.
-
-- Scan main daily with CodeQL while preserving pull request and manual scans and the existing skill validation and release gates.
 
 - Resolve Agent Transcript and Team Handoff commands from their installed skill directories. Keep Crabbox E2E guidance conditional on the requested or consumer-required proof scope.
 - Avoid installing or caching the development typechecker in Python-only CI validation groups; retain typechecking in the full and core groups.
@@ -30,6 +17,23 @@
 - Add `autoreview --codex-no-fallback` to keep reviews on the selected Codex model and authentication route, refusing model or configured-provider substitution while preserving native recovery within that route.
 - Recognize current Codex terminal refresh-token messages, preserving configured-provider recovery by default and sanitized refusal when fallback is disabled.
 - Add an explicit Autoreview `--max-prompt-bytes` planning budget for complete required context, keeping the 512,000-byte default, intact inputs, pass limits, and reviewer isolation unchanged. Native handoffs check all encoded requests against their existing transport limit before publishing any pass.
+
+- Pin the shared source-release workflow to a reviewed commit with complete release listing and exact-byte draft retry checks.
+- Run Autoreview's Codex `login status` probe with the reviewer's filtered environment, keeping the operator's login and Codex home while dropping `NODE_OPTIONS`, other startup hooks and `PATH` entries inside the reviewed checkout. Thanks @karstenevers. (#368)
+
+- Update validation and source-release tests to Node.js 26.13.1 and native sandbox checks to Codex CLI 0.169.0 while retaining the Python 3.10 installed-helper contract.
+
+- Recognize named companions of numbered RFCs as regular tracked source while preserving credential-storage, symlink and gitlink refusals. Thanks @russellb. (#367)
+
+- Distinguish unsupported binary assets from malformed supported images in Autoreview diagnostics without changing refusal behavior. Thanks @saariuslystoned. (#386)
+
+- Preserve local Autoreview source attribution for partially staged files beside Git type changes, while continuing to omit sensitive symlink content.
+
+- Update the development Node.js types to 26.6.6 while retaining Node.js 26 and the Python 3.10 installed-helper contract.
+
+- Retain the platform timeout for CodeQL instead of imposing a shorter scan budget.
+
+- Scan main daily with CodeQL while preserving pull request and manual scans and the existing skill validation and release gates.
 
 - Pin the Linux installed-source helper check to Python 3.11.18 for its patched certificate trust, while retaining the existing compatibility matrix. Thanks @joshavant. (#341)
 
