@@ -114,11 +114,9 @@ class NativeHandoffTests(ReviewFixture):
         return json.dumps({"ok": True, "status": "ok", "final": json.dumps(report),
                            "model": model_id or model, "provider": provider})
 
-    def consumer(self, request, report=CLEAN, *, failure=False, delay=0):
+    def consumer(self, request, report=CLEAN, *, failure=False):
         # Simulate only the remote execution boundary; invoke the real submit
         # command and preserve its complete bytes and one-shot commit custody.
-        if delay:
-            time.sleep(delay / 1000)
         response = {"run_id": request["run_id"], "pass": request["pass"],
                     "prompt_sha256": request["prompt_sha256"],
                     "status": "failed" if failure else "done",
@@ -302,16 +300,47 @@ class NativeHandoffTests(ReviewFixture):
                 self.assertEqual(state["status"], "incomplete" if code == 2 else "reviewer_unavailable")
                 self.assertEqual(self.report.exists(), code == 2)
 
-    def test_uncommitted_response_and_missing_response_timeout(self):
+    def test_host_delivery_can_outlive_the_reviewer_budget(self):
+        helper = runpy.run_path(str(SCRIPT))
+        args = argparse.Namespace(native_handoff=str(self.handoff), engine_timeout_seconds=.1)
+        reviewer = argparse.Namespace(model="fixture/reviewer", thinking=None, openclaw_models=[])
+        handoff = helper["NativeHandoff"](args, reviewer, ["review prompt"])
+        elapsed = 0.0
+
+        def deliver_after_budget(_seconds):
+            nonlocal elapsed
+            if elapsed == 0:
+                elapsed = 1.0
+                return
+            request = json.loads((self.handoff / "1.request.json").read_text())
+            spool = self.root / f"handoff.{request['run_id']}.1.response.json"
+            spool.write_text(json.dumps({"run_id": request["run_id"], "pass": 1,
+                "prompt_sha256": request["prompt_sha256"], "status": "done",
+                "output": self.completion(request, CLEAN)}))
+            helper["submit_native_response"](self.handoff, spool)
+
+        try:
+            with mock.patch.object(helper["time"], "monotonic", side_effect=lambda: elapsed), \
+                    mock.patch.object(helper["time"], "sleep", side_effect=deliver_after_budget):
+                self.assertEqual(json.loads(handoff.run("review prompt")), CLEAN)
+        finally:
+            handoff.close()
+        self.assertFalse(self.handoff.exists())
+        self.assertEqual(list(self.root.glob("*.response.json")), [])
+
+    def test_uncommitted_and_missing_responses_wait_for_host_cancellation(self):
         for response in (False, True):
             with self.subTest(uncommitted=response):
                 self.start(timeout=".3")
                 req = self.request()
                 if response:
                     self.deliver(req, commit=False)
-                self.finish(1)
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    self.process.communicate(timeout=.5)
+                self.process.send_signal(signal.SIGTERM)
+                self.finish(143)
                 state = json.loads(self.status.read_text())
-                self.assertTrue(state["timed_out"])
+                self.assertEqual(state["status"], "interrupted")
                 self.assertFalse(state["report_produced"])
                 self.assertFalse(self.report.exists())
 
@@ -323,10 +352,12 @@ class NativeHandoffTests(ReviewFixture):
 
     def test_late_collector_cannot_recreate_retired_exchange(self):
         self.start(timeout=".3")
-        result = self.consumer(self.request(), delay=800)
+        request = self.request()
+        self.process.send_signal(signal.SIGTERM)
+        self.finish(143)
+        result = self.consumer(request)
         self.assertEqual(result.returncode, 1)
-        self.finish(1)
-        self.assertTrue(json.loads(self.status.read_text())["timed_out"])
+        self.assertEqual(json.loads(self.status.read_text())["status"], "interrupted")
         self.assertFalse(self.report.exists())
         self.assertEqual(list(self.root.glob("*.response.json")), [])
 
@@ -370,8 +401,7 @@ module["submit_native_response"](Path(job["root"]), Path(job["source"]))
             str(job), str(ready), str(marker), str(release)], env=self.env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            # Import before the helper's short deadline starts, then hold its
-            # active writer until timeout cleanup is actually waiting on it.
+            # Hold the active writer until host cancellation reaches cleanup.
             deadline = time.monotonic() + 6
             while not ready.exists() and sender.poll() is None and time.monotonic() < deadline:
                 time.sleep(.01)
@@ -388,18 +418,19 @@ module["submit_native_response"](Path(job["root"]), Path(job["source"]))
             while not marker.exists() and sender.poll() is None and time.monotonic() < deadline:
                 time.sleep(.01)
             self.assertTrue(marker.exists(), "submission did not reach the locked write")
+            self.process.send_signal(signal.SIGTERM)
             deadline = time.monotonic() + 3
             while not self.status.exists() and self.process.poll() is None and time.monotonic() < deadline:
                 time.sleep(.01)
-            self.assertTrue(self.status.exists(), "helper did not reach timeout cleanup")
+            self.assertTrue(self.status.exists(), "helper did not reach cancellation cleanup")
             self.assertIsNone(self.process.poll(), "helper exited before its active writer")
             if interrupt:
                 self.process.send_signal(signal.SIGTERM)
             release.touch()
             out, err = sender.communicate(timeout=5)
             self.assertEqual(sender.returncode, 0, out + err)
-            self.finish(143 if interrupt else 1)
-            self.assertTrue(json.loads(self.status.read_text())["timed_out"])
+            self.finish(143)
+            self.assertEqual(json.loads(self.status.read_text())["status"], "interrupted")
             self.assertFalse(spool.exists())
             self.assertFalse(self.report.exists())
         finally:

@@ -8843,6 +8843,7 @@ class NativeHandoff:
             "prompt": prompt, "prompt_bytes": utf8_size(prompt), "prompt_sha256": digest,
             "model": self.model, "thinking": self.thinking,
             "engine_timeout_seconds": self.timeout,
+            "timeout_owner": "host",
             "max_result_bytes": self.MAX_RESULT_BYTES,
         }
         encoded = json.dumps(request)
@@ -8859,15 +8860,11 @@ class NativeHandoff:
         encoded, digest = self.encode_request(number, prompt)
         atomic_write_text(self.root / f"{number}.request.json", encoded)
         print(f"native pass ready: {number}/{self.pass_count}", flush=True)
-        deadline = time.monotonic() + self.timeout if self.timeout is not None else None
         ready_path = self.root / f"{number}.ready"
         try:
             while not ready_path.exists():
-                if deadline is not None and time.monotonic() >= deadline:
-                    failure = ReviewerUnavailable("OpenClaw execution result timed out", reason="timeout")
-                    failure.timed_out = True
-                    raise failure
-                time.sleep(0.1 if deadline is None else min(0.1, max(0, deadline - time.monotonic())))
+                # The host owns the reviewer deadline; delivery uses the parent lifetime.
+                time.sleep(0.1)
             ready = json.loads(self.read_file(ready_path, 1024))
             raw = self.read_file(self.root / f"{number}.result.json", self.MAX_RESULT_BYTES)
             if (not isinstance(ready, dict) or set(ready) != {"run_id", "pass", "bytes"}

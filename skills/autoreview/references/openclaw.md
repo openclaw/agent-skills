@@ -100,8 +100,18 @@ plugin metadata. Bind the native run to the actual caller's owner and permitted
 model before execution, deny tools and discovery, suppress workspace context and
 skills, and clear model fallbacks and remembered native-runtime consent for that
 run. Bind the first request's invocation and plan, and check subsequent requests
-consistently. An omitted helper timeout adds no wrapper deadline; caller
-cancellation and native process lifetime still apply.
+consistently. A request with `timeout_owner: "host"` delegates the optional
+reviewer-process limit to the integration, starting when it launches that process.
+The helper does not count down while waiting for launch or result delivery. Keep
+that wait under the parent lifetime and cancellation; a disconnected integration
+must stop and join its helper. With an explicit limit, use one process watchdog
+and disable the competing native attempt timer (`agent exec --timeout 0`). An
+omitted helper timeout adds no wrapper deadline and retains native defaults.
+
+Older helpers omit `timeout_owner` and retain their existing handoff deadline.
+Integrations must keep that legacy path usable, including finite limits, rather
+than requiring an update before review. Updating the helper removes the premature
+handoff deadline; older integrations already enforce the reviewer-process limit.
 
 Before creating the exchange, the helper checks every encoded request against the
 4,000,000-byte transport limit, including JSON escaping and envelope overhead.
@@ -116,7 +126,8 @@ budget if a request is too large. At `native pass ready: N/T`, read the complete
 | `run_id`, `pass`, `passes` | Invocation identity and sequential pass/count |
 | `prompt`, `prompt_bytes`, `prompt_sha256` | Complete UTF-8 prompt, length and digest |
 | `model`, `thinking` | Canonical-resolved selection, or null for native defaults |
-| `engine_timeout_seconds` | Optional canonical deadline per pass, or null; no integration default |
+| `engine_timeout_seconds` | Optional reviewer-process limit per pass, or null; no integration default |
+| `timeout_owner` | `host`: the integration enforces the process limit; no helper handoff timer |
 | `max_result_bytes` | 2,000,000 UTF-8 bytes for the complete encoded response |
 
 The prompt already contains the canonical report schema. Send its bytes intact
