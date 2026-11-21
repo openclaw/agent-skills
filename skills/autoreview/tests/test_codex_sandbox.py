@@ -8,9 +8,46 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 HELPER = Path(__file__).resolve().parents[1] / "scripts" / "autoreview"
+
+
+class CodexSandboxPreflightTests(unittest.TestCase):
+    def test_linux_checks_selected_installation_inside_tool_sandbox(self):
+        helper = runpy.run_path(str(HELPER), run_name="autoreview_under_test")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = str(root / "installed-codex")
+            args = type("Args", (), {"codex_bin": binary, "codex_route": None})()
+            for sandbox_exit in (0, 1):
+                runner = mock.Mock(side_effect=[
+                    subprocess.CompletedProcess([], 0, "codex test", ""),
+                    subprocess.CompletedProcess([], sandbox_exit, "", "sandbox denied"),
+                ])
+                with self.subTest(sandbox_exit=sandbox_exit), \
+                        mock.patch.object(sys, "platform", "linux"), \
+                        mock.patch.dict(helper["ensure_codex_isolation_supported"].__globals__, {
+                            "resolve_command": mock.Mock(return_value=binary),
+                            "safe_temp_root": mock.Mock(return_value=root),
+                            "codex_route_selector": mock.Mock(return_value=None),
+                            "codex_runtime_env": mock.Mock(return_value={"SYNTHETIC": "isolated"}),
+                            "codex_file_auth_source": mock.Mock(return_value=None),
+                            "run": runner,
+                        }):
+                    if sandbox_exit:
+                        with self.assertRaisesRegex(SystemExit, "Codex tool sandbox preflight failed"):
+                            helper["ensure_codex_isolation_supported"](args, root)
+                    else:
+                        self.assertEqual(helper["ensure_codex_isolation_supported"](args, root), binary)
+                    calls = runner.call_args_list
+                    self.assertEqual(len(calls), 2)
+                    command = calls[1].args[0]
+                    self.assertEqual(command[:2], [binary, "sandbox"])
+                    self.assertEqual(command[-3:], ["--", binary, "--version"])
+                    self.assertIn('permissions.autoreview.filesystem={":minimal"="read",":workspace_roots"="read"}', command)
+                    self.assertEqual(calls[1].kwargs["env"], {"SYNTHETIC": "isolated"})
 
 
 @unittest.skipUnless(sys.platform == "darwin" and shutil.which("codex"), "requires macOS and Codex")

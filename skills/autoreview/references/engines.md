@@ -14,9 +14,12 @@ produces no helper-validated machine status or helper isolation guarantees.
   Explicit `gpt-6-sol`: access-only `gpt-6-luna` retry.
 - Other explicit models, including Luna/Astra: no model fallback.
 - Explicit `gpt-5.6-sol`: access-only `gpt-5.6-terra` retry.
-- GPT-6.1 Sol rejects `none`/`minimal` effort before review preparation;
+- GPT-6.1 Sol and GPT-6.2 Sol/Astra reject `none`/`minimal` effort before review preparation;
   GPT-6 Sol/Luna reject `minimal`. Effort-only override keeps default model.
 - Honor explicit user engine/model choices. No automatic fallback between engines.
+- On Linux, preflight also runs the selected Codex installation inside its tool
+  sandbox. An inaccessible home-directory install is unavailable; use a system-wide
+  install instead of widening the review filesystem profile.
 
 - Override defaults: `--engine`, `--model`, `--thinking`.
 - Codex tier: Ultrafast when active model catalog lists it; otherwise Codex silently
@@ -45,7 +48,7 @@ Require GPT-6 Astra without model fallback: select explicitly:
 "$AUTOREVIEW" --mode local --model gpt-6-astra --thinking high
 ```
 
-- GPT-6.1 Sol + GPT-6 Astra: `low`, `medium`, `high`, `xhigh`, `max`;
+- GPT-6.1 Sol, GPT-6 Astra, and GPT-6.2 Sol/Astra: `low`, `medium`, `high`, `xhigh`, `max`;
   neither supports `none`/`minimal`.
 - GPT-6 Sol + Luna: additionally support `none`, never `minimal`.
 - AutoReview default: `medium`; no fallback from explicit Luna/Astra selection.
@@ -54,6 +57,8 @@ Require GPT-6 Astra without model fallback: select explicitly:
 - EU data residency: `--codex-speed default`; GPT-6 fast mode unavailable there.
 
 See [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol),
+[GPT-6.2 Sol](https://developers.openai.com/api/docs/models/gpt-6.2-sol),
+[GPT-6.2 Astra](https://developers.openai.com/api/docs/models/gpt-6.2-astra),
 [GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol), and
 [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) model docs
 and [Codex reasoning modes](https://learn.chatgpt.com/docs/models#know-when-to-use-max-or-ultra).
