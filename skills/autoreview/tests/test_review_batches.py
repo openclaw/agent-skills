@@ -517,7 +517,9 @@ class ReviewBatchTests(unittest.TestCase):
                 for prompt in sends:
                     self.assertIn(rel, prompt)
                     self.assertEqual(prompt.count(body), 1)
-                    self.assertIn("blob=" + blob, prompt)
+                    self.assertIn("# Source context: " + json.dumps(
+                        [rel, blob, len(body.encode("utf-8"))], separators=(",", ":"),
+                    ), prompt)
                     for line in body.splitlines():
                         self.assertIn("+" + line + "\n", prompt)
                 allocation = json.loads((repo.parent / "result.json").read_bytes())["review_allocation"]
