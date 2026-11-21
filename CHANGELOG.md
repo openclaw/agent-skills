@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Fail Linux Codex preflight when the selected installation cannot re-execute inside the read-only tool sandbox, preventing a review with broken tool access without broadening filesystem permissions. Thanks @vrknetha. (#395)
+
+- Update the development YAML parser to PyYAML 6.0.4 while preserving the Python 3.10 installed-helper floor.
+
+- Reject unsupported `none` and `minimal` reasoning efforts for explicitly selected GPT-6.2 Sol/Astra before preparing review evidence; keep the default model and access-only retry policy unchanged. Thanks @coygeek. (#396)
+- Accept ordinary-path findings with shape-valid extra source attribution by clearing that attribution, while retaining strict mixed-source provenance validation and the raw provider report. Thanks @kesslerio. (#377, #387)
+
 ## 0.7.0 - 2026-11-15
 
 **Highlights:** Hand off conversations with Beam by default, control Autoreview authentication fallback and prompt budgets, and harden the Codex login probe against inherited startup hooks.

@@ -31,6 +31,7 @@ class CodexInferenceRouteTests(unittest.TestCase):
         self.repo = init_repo(self.root)
         self.home = self.root / "operator-home"
         self.home.mkdir()
+        self.home.chmod(0o700)
         self.runtime_helper = write_executable(
             self.home / "credential-helper", "#!/bin/sh\nexit 99\n"
         )
@@ -95,6 +96,7 @@ class CodexInferenceRouteTests(unittest.TestCase):
         # These unrelated operator capabilities must never enter the review runtime.
         text += '\n[mcp_servers.unrelated]\ncommand = "must-not-execute"\n'
         (self.home / "config.toml").write_text(text, encoding="utf-8")
+        (self.home / "config.toml").chmod(0o600)
 
     def run_review(self, *, prepare_auth=None, during_run=None):
         observed = {}
