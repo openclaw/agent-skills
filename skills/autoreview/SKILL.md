@@ -129,6 +129,10 @@ selection and native recovery within the same route remain unchanged; failure
 stays `reviewer_unavailable`. Defaults remain unchanged when the flag is absent.
 An effort-only override keeps the model. `--engine`, `--model`, and `--thinking`
 override defaults; per-engine environment overrides use `AUTOREVIEW_<ENGINE>_*`.
+For shared defaults, set `AUTOREVIEW_BRIDGE_FILE` to an absolute JSON file outside
+the reviewed checkout. Its `schema_version: 1` document may set per-engine
+`model` and `thinking` defaults. A file default beats an environment default,
+and a CLI option beats both; an unset variable leaves behavior unchanged.
 Ultrafast requires model-catalog support, otherwise Codex sends the standard tier.
 `--codex-speed fast` selects priority; `default` selects standard. A raw
 `--codex-config service_tier=...` retains its value.
