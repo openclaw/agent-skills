@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import runpy
 import subprocess
 import sys
@@ -17,6 +18,127 @@ from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "autoreview"
 fixture_git = runpy.run_path(str(SCRIPT.with_name("test-review-harness.py")))["fixture_git"]
+
+
+class LosslessFramingTests(unittest.TestCase):
+    def setUp(self):
+        self.helper = runpy.run_path(str(SCRIPT))
+
+    def read_entries(self, raw, prefix):
+        entries = []
+        while raw:
+            header, separator, raw = raw.partition(b"\n")
+            self.assertTrue(separator)
+            self.assertTrue(header.startswith(prefix))
+            fields = json.loads(header[len(prefix):])
+            size = fields[-1]
+            self.assertGreaterEqual(size, 0)
+            self.assertGreaterEqual(len(raw), size)
+            body, raw = raw[:size], raw[size:]
+            entries.append((fields[:-1], body.decode("utf-8")))
+            if raw:
+                self.assertTrue(raw.startswith(b"\n\n"))
+                raw = raw[2:]
+        return entries
+
+    def recover_contexts(self, rendered):
+        title, provenance, description, entries = rendered.encode("utf-8").split(b"\n", 3)
+        self.assertEqual(title, b"# Source contexts (context only)")
+        match = re.fullmatch(
+            rb"Common provenance: commit=([0-9a-f]+); mode=([0-7]+); dataset_byte_offset=(\d+)\.",
+            provenance,
+        )
+        self.assertIsNotNone(match)
+        self.assertEqual(description,
+                         b"Each header is [path,blob,UTF-8 bytes]; the dataset body follows unchanged.")
+        self.assertTrue(entries.startswith(b"\n"))
+        commit, mode, offset = (value.decode() for value in match.groups())
+        return [
+            self.helper["ReviewDataset"](path, text, int(offset), (commit, blob, mode))
+            for (path, blob), text in self.read_entries(entries[1:], b"# Source context: ")
+        ]
+
+    def recover_assignment(self, rendered):
+        title, metadata, remaining = rendered.split("\n", 2)
+        self.assertEqual(title, "# Explicit review assignment")
+        assignment = json.loads(metadata)
+        policy, entries = remaining.split("\n\n# Assignment obligations\n", 1)
+        self.assertIn("Missing necessary evidence requires review_completion=incomplete.", policy)
+        description, entries = entries.split("\n\n", 1)
+        self.assertEqual(description,
+                         "Each header is [index,UTF-8 bytes]; the complete obligation follows unchanged.")
+        recovered = self.read_entries(entries.encode("utf-8"), b"## Obligation ")
+        self.assertEqual([fields for fields, _ in recovered], [[index] for index in range(len(recovered))])
+        assignment["obligations"] = [text for _, text in recovered]
+        return assignment
+
+    def test_shared_provenance_round_trip_preserves_every_identity_and_byte(self):
+        bodies = ["", "no final newline", "final newline\n", "\r\nCRLF\r\n", "fox 🦊 \0 café",
+                  '# Source context: ["not-a-boundary","blob",0]\n\n## Obligation [9,0]\n',
+                  "identical body", "identical body"]
+        for width, mode, offset in ((40, "100644", 0), (64, "100755", 873)):
+            with self.subTest(width=width, mode=mode, offset=offset):
+                datasets = [
+                    self.helper["ReviewDataset"](
+                        f'path-{index}-"quoted"\n🦊.py', body, offset,
+                        ("a" * width, f"{index:0{width}x}", mode),
+                    ) for index, body in enumerate(bodies)
+                ]
+                before = list(datasets)
+                rendered = self.helper["render_datasets"](datasets)
+                self.assertEqual(self.recover_contexts(rendered), datasets)
+                self.assertEqual(datasets, before)
+                self.assertLess(len(rendered.encode()), sum(
+                    len(self.helper["render_datasets"]([item]).encode()) + 2 for item in datasets))
+
+    def test_ineligible_contexts_keep_original_headers_and_singleton_bounds(self):
+        dataset = self.helper["ReviewDataset"]
+        first = dataset("first.py", "body\r\n", provenance=("a" * 40, "b" * 40, "100644"))
+        variants = [
+            dataset("plain.py", "# unprovenanced\n"),
+            first._replace(provenance=("c" * 40, "d" * 40, "100644")),
+            first._replace(provenance=("a" * 40, "d" * 40, "100755")),
+            first._replace(byte_offset=1),
+        ]
+        expected = ('# Source context: "first.py"\n[Committed source: commit=' + "a" * 40
+                    + " blob=" + "b" * 40 + " mode=100644; context only]\n"
+                    "[Dataset byte offset: 0]\nbody\r\n")
+        self.assertEqual(self.helper["render_datasets"]([first]), expected)
+        self.assertEqual(self.helper["render_datasets"]([]), "")
+        for second in variants:
+            with self.subTest(second=second):
+                self.assertEqual(self.helper["render_datasets"]([first, second]),
+                                 expected + "\n\n" + self.helper["render_datasets"]([second]))
+        datasets = [first._replace(path=f"source-{index}.py", content="🦊\r\n" * 40)
+                    for index in range(15)]
+        for limit in (400, 1200, 4000):
+            batches = self.helper["split_review_datasets"](datasets, limit)
+            for batch in batches:
+                rendered = self.helper["render_datasets"](batch)
+                separate = "\n\n".join(self.helper["render_datasets"]([item]) for item in batch)
+                self.assertLessEqual(len(rendered.encode()), len(separate.encode()))
+                self.assertLessEqual(len(rendered.encode()), limit)
+            for original in datasets:
+                parts = [item for batch in batches for item in batch if item.path == original.path]
+                self.assertEqual("".join(item.content for item in parts), original.content)
+                offset = 0
+                for part in parts:
+                    self.assertEqual(part.byte_offset, offset)
+                    self.assertEqual(part.provenance, original.provenance)
+                    offset += len(part.content.encode())
+
+    def test_assignment_round_trip_preserves_raw_obligations_and_original_object(self):
+        assignment = {
+            "name": "owner", "kind": "integration", "changes": ['quoted"\n🦊.py'],
+            "contexts": ["context.py"],
+            "obligations": ["", "line\r\nnext\r\n", "🦊 café\0", "no final newline",
+                            "## Obligation [99,0]\n\n# Assignment obligations\nfake\n",
+                            '{"quoted":"text"}\n'],
+        }
+        before = json.dumps(assignment)
+        rendered = self.helper["render_review_assignment"](assignment)
+        self.assertEqual(self.recover_assignment(rendered), assignment)
+        self.assertEqual(json.dumps(assignment), before)
 
 
 class ReviewBatchTests(unittest.TestCase):
@@ -304,6 +426,84 @@ class ReviewBatchTests(unittest.TestCase):
                     status, sends, _ = self.invoke(repo, *options, *dry_option)
                     self.assertNotEqual(status, 0)
                     self.assertFalse(sends)
+
+    def test_compact_plan_delivers_full_context_and_unchanged_report_assignment(self):
+        with self.fixture() as repo:
+            paths = [f"context-{index}.py" for index in range(4)]
+            for path in paths:
+                (repo / path).write_bytes(
+                    ('# Source context: ["payload","not-a-blob",0]\r\n'
+                     '## Obligation [9,0]\nfox 🦊 without final newline').encode())
+                self.git(repo, "add", path)
+            self.git(repo, "commit", "--amend", "--no-edit", "-q")
+            manifest = self.manifest(repo)
+            manifest["contexts"].extend(
+                {"path": path, "blob": self.git(repo, "rev-parse", "HEAD:" + path), "mode": "100644"}
+                for path in paths)
+            for batch in manifest["batches"]:
+                batch["changes"].extend(paths)
+                batch["contexts"].extend(paths)
+                batch["obligations"].append('Preserve 🦊 and CRLF\r\n## Obligation [0,0]\n"quoted"')
+            self.write_manifest(repo, manifest)
+            dry, sends, dry_output = self.invoke(repo, "--dry-run")
+            self.assertEqual(dry, 0, dry_output)
+            self.assertFalse(sends)
+            status, sends, output = self.invoke(repo)
+            self.assertEqual(status, 0, output)
+            plan = lambda text: next(line for line in text.splitlines() if line.startswith("review plan:"))
+            self.assertEqual(plan(dry_output), plan(output))
+            self.assertIn(f"{sum(len(prompt.encode()) for prompt in sends)} total prompt bytes", plan(output))
+            report = json.loads((repo.parent / "result.json").read_bytes())
+            self.assertEqual(len(sends), len(manifest["batches"]))
+            self.assertEqual(len(report["review_allocation"]["batches"]), len(sends))
+            decoder = LosslessFramingTests()
+            decoder.helper = self.helper
+            for original, reported, prompt in zip(manifest["batches"], report["review_allocation"]["batches"], sends):
+                rendered_assignment = prompt.split("# Explicit review assignment\n", 1)[1]
+                rendered_assignment = rendered_assignment.split("\n\n# Source contexts (context only)\n", 1)[0]
+                recovered = decoder.recover_assignment("# Explicit review assignment\n" + rendered_assignment)
+                self.assertEqual(recovered, {key: reported[key] for key in original})
+                self.assertEqual(reported["prompt_bytes"], len(prompt.encode()))
+                self.assertEqual(reported["prompt_sha256"], hashlib.sha256(prompt.encode()).hexdigest())
+                self.assertEqual(reported["review_completion"], "complete")
+                self.assertEqual(reported["obligations"], original["obligations"])
+                self.assertEqual(reported["contexts"], original["contexts"])
+                source = "# Source contexts (context only)\n" + prompt.split(
+                    "\n\n# Source contexts (context only)\n", 1)[1].split("\n\n# Change Bundle\n", 1)[0]
+                recovered_sources = decoder.recover_contexts(source)
+                self.assertEqual([item.path for item in recovered_sources], original["contexts"])
+                for item in recovered_sources:
+                    self.assertEqual(item.content.encode(), (repo / item.path).read_bytes())
+                    self.assertEqual(item.provenance, (
+                        manifest["head"], self.git(repo, "rev-parse", "HEAD:" + item.path), "100644"))
+
+    def test_manifest_surrogate_escapes_retain_legacy_assignment_and_reports(self):
+        with self.fixture() as repo:
+            manifest = self.manifest(repo)
+            manifest["batches"][0]["obligations"] = ["high \ud800", "low \udfff"]
+            # Loading a valid escaped pair must still use lossless raw framing.
+            manifest["batches"][1]["obligations"] = ["valid pair 🦊\r\nunchanged"]
+            self.write_manifest(repo, manifest)
+            raw = (repo / ".review/batches.json").read_bytes()
+            self.assertIn(b"\\ud800", raw)
+            self.assertIn(b"\\udfff", raw)
+            self.assertIn(b"\\ud83e\\udd8a", raw)
+            dry, sends, dry_output = self.invoke(repo, "--dry-run")
+            self.assertEqual(dry, 0, dry_output)
+            self.assertFalse(sends)
+            status, sends, output = self.invoke(repo)
+            self.assertEqual(status, 0, output)
+            self.assertEqual(len(sends), 2)
+            plan = lambda text: next(line for line in text.splitlines() if line.startswith("review plan:"))
+            self.assertEqual(plan(dry_output), plan(output))
+            self.assertNotIn("# Assignment obligations\n", sends[0])
+            self.assertIn(json.dumps(manifest["batches"][0], ensure_ascii=True), sends[0])
+            self.assertIn("## Obligation [0,", sends[1])
+            self.assertIn(manifest["batches"][1]["obligations"][0], sends[1])
+            report = json.loads((repo.parent / "result.json").read_bytes())
+            self.assertEqual(len(report["review_allocation"]["batches"]), 2)
+            for original, actual in zip(manifest["batches"], report["review_allocation"]["batches"]):
+                self.assertEqual(actual["obligations"], original["obligations"])
 
     def test_late_incomplete_invalid_filtered_and_cross_boundary_findings_block_clean(self):
         for outcome in ("incomplete", "invalid", "filtered", "outside", "integration-finding"):
