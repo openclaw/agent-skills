@@ -412,11 +412,12 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
 
                     optimize = self.helper["optimize_evidence_plan"]
 
-                    def probe_full_batch(baseline, available, change_bytes, evidence, build):
+                    def probe_full_batch(baseline, available, change_bytes, evidence, build, max_review_passes=None):
                         # Exercise the optimizer's one-batch retry, including a
                         # continuation correction that reduces change capacity.
+                        self.assertIsNone(max_review_passes)
                         self.assertIsNone(build(len(complete.encode()) + 128, len(baseline)))
-                        return optimize(baseline, available, change_bytes, evidence, build)
+                        return optimize(baseline, available, change_bytes, evidence, build, max_review_passes)
 
                     with mock.patch.dict(self.helper["build_review_prompts"].__globals__, {
                         "render_review_prompt": observe_render, "split_review_bundle": bounded_split,
@@ -4928,11 +4929,12 @@ time.sleep(60)
 
                     optimize = self.helper["optimize_evidence_plan"]
 
-                    def probe_full_batch(baseline, available, change_bytes, evidence, build):
+                    def probe_full_batch(baseline, available, change_bytes, evidence, build, max_review_passes=None):
                         # Exercise the optimizer's one-batch retry, including a
                         # continuation correction that reduces change capacity.
+                        self.assertIsNone(max_review_passes)
                         self.assertIsNone(build(len(complete.encode()) + 128, len(baseline)))
-                        return optimize(baseline, available, change_bytes, evidence, build)
+                        return optimize(baseline, available, change_bytes, evidence, build, max_review_passes)
 
                     with mock.patch.dict(self.helper["build_review_prompts"].__globals__, {
                         "render_review_prompt": observe_render, "split_review_bundle": bounded_split,
