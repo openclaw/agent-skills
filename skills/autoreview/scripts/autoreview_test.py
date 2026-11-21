@@ -1169,7 +1169,8 @@ class AutoreviewAmpTests(unittest.TestCase):
             stream_engine_output=False,
             thinking="high",
         )
-        secret_prompt = "review diff PRIVATE_REVIEW_MARKER_8f3c\nCRLF\r\nbare\r🦊\nno final newline"
+        private_marker = "PRIVATE_REVIEW_MARKER_8f3c"
+        secret_prompt = f"review diff {private_marker}\nCRLF\r\nbare\r🦊\nno final newline"
         observed: dict[str, object] = {}
 
         def fake_preflight(
@@ -1264,8 +1265,8 @@ class AutoreviewAmpTests(unittest.TestCase):
         self.assertIn("--settings-file", command)
         self.assertNotIn("--orb-execute", command)
         self.assertEqual(command[command.index("--mode") + 1], "autoreview")
-        self.assertNotIn(secret_prompt, " ".join(command))
-        self.assertNotIn(secret_prompt, str(observed["input"]))
+        self.assertNotIn(private_marker, " ".join(command))
+        self.assertNotIn(private_marker, str(observed["input"]))
         self.assertEqual(observed["prompt"], secret_prompt.encode("utf-8"))
         self.assertEqual(observed["workspace"], [])
         settings = observed["settings"]
@@ -1295,7 +1296,7 @@ class AutoreviewAmpTests(unittest.TestCase):
         })
         self.assertIn('tools: ["autoreview_generate"]', plugin)
         self.assertIn("readFileSync", plugin)
-        self.assertNotIn(secret_prompt, plugin)
+        self.assertNotIn(private_marker, plugin)
         env = observed["env"]
         self.assertIsInstance(env, dict)
         assert isinstance(env, dict)

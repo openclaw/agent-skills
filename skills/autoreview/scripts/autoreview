@@ -3957,6 +3957,15 @@ def verify_evidence(repo: Path, files: list[EvidenceFile | SourceContext]) -> No
             raise SystemExit("evidence changed; rerun autoreview against the updated inputs")
 
 
+def choose_prompt_rendering(legacy: str, compact: str) -> str:
+    # Native handoff JSON-encodes the prompt. Framing must not grow either
+    # the prompt budget or the independently bounded transport request.
+    if (utf8_size(compact) <= utf8_size(legacy)
+            and len(json.dumps(compact)) <= len(json.dumps(legacy))):
+        return compact
+    return legacy
+
+
 def render_datasets(datasets: list[ReviewDataset]) -> str:
     parts = []
     for dataset in datasets:
@@ -3988,8 +3997,7 @@ def render_datasets(datasets: list[ReviewDataset]) -> str:
             ]
             compact = prefix + "\n\n".join(entries)
             # Singleton sizing in the partitioner remains a conservative bound.
-            if utf8_size(compact) <= utf8_size(rendered):
-                return compact
+            return choose_prompt_rendering(rendered, compact)
     return rendered
 
 
@@ -4586,6 +4594,7 @@ def build_mixed_change_passes(
 def build_mixed_review_passes(
     repo: Path, target: str, target_ref: str | None, captured: CapturedBundle,
     extra_prompt: str, datasets: list[ReviewDataset], max_prompt_bytes: int,
+    max_review_passes: int | None = None,
 ) -> list[ReviewPass]:
     branch = current_branch(repo)
     full = mixed_bundle_chunk(captured)
@@ -4657,7 +4666,7 @@ def build_mixed_review_passes(
         baseline = build_batch_plan(evidence_limit)
         evidence_limit //= 2
     return optimize_evidence_plan(
-        baseline, max_prompt_bytes, utf8_size(captured.text), datasets, build_batch_plan,
+        baseline, max_prompt_bytes, utf8_size(captured.text), datasets, build_batch_plan, max_review_passes,
     )
 
 
@@ -4740,7 +4749,9 @@ def build_review_prompts(
 ) -> list[str] | list[ReviewPass]:
     if isinstance(bundle, CapturedBundle):
         if bundle.mixed:
-            return build_mixed_review_passes(repo, target, target_ref, bundle, extra_prompt, datasets, max_prompt_bytes)
+            return build_mixed_review_passes(
+                repo, target, target_ref, bundle, extra_prompt, datasets, max_prompt_bytes, max_review_passes,
+            )
         bundle = bundle.text
     branch = current_branch(repo)
     rendered_datasets = render_datasets(datasets)
@@ -4820,7 +4831,7 @@ def build_review_prompts(
         baseline = build_batch_plan(evidence_limit)
         if baseline is not None:
             return optimize_evidence_plan(
-                baseline, available, utf8_size(bundle), datasets, build_batch_plan,
+                baseline, available, utf8_size(bundle), datasets, build_batch_plan, max_review_passes,
             )
         # Actual continuation headers may need more room than the initial
         # evidence allocation leaves. Rebatch before sending any partial pass.
@@ -4853,6 +4864,7 @@ def optimize_evidence_plan(
     baseline: list[str] | list[ReviewPass], available: int, change_bytes: int,
     datasets: list[ReviewDataset],
     build_batch_plan: Callable[[int, int], list[str] | list[ReviewPass] | None],
+    max_review_passes: int | None = None,
 ) -> list[str] | list[ReviewPass]:
     if not datasets or len(baseline) == 1:
         return baseline
@@ -4866,16 +4878,22 @@ def optimize_evidence_plan(
     limits = {evidence_bytes}
     for chunks in range(first_chunks, first_chunks + 4):
         limits.add(available - (change_bytes + chunks - 1) // chunks)
-    best, best_bytes = baseline, review_plan_bytes(baseline)
+    def score(plan: list[str] | list[ReviewPass]) -> tuple[bool, int, int]:
+        # A feasible complete plan wins before byte savings; the final guard
+        # still refuses when none of these candidates fits the requested count.
+        return (max_review_passes is not None and len(plan) > max_review_passes,
+                review_plan_bytes(plan), len(plan))
+
+    best, best_score = baseline, score(baseline)
     for limit in sorted(limits):
         if not minimum <= limit < available:
             continue
         candidate = build_batch_plan(limit, len(baseline))
         if candidate is None or len(candidate) > len(baseline):
             continue
-        candidate_bytes = review_plan_bytes(candidate)
-        if candidate_bytes <= best_bytes and (candidate_bytes, len(candidate)) < (best_bytes, len(best)):
-            best, best_bytes = candidate, candidate_bytes
+        candidate_score = score(candidate)
+        if candidate_score < best_score:
+            best, best_score = candidate, candidate_score
     return best
 
 
@@ -4976,7 +4994,7 @@ def render_review_assignment(assignment: dict[str, Any]) -> str:
         "Each header is [index,UTF-8 bytes]; the complete obligation follows unchanged.\n\n"
         + "\n\n".join(obligations)
     )
-    return compact if utf8_size(compact) <= utf8_size(legacy) else legacy
+    return choose_prompt_rendering(legacy, compact)
 
 
 def prepare_batch_review(

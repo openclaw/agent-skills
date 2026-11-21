@@ -90,8 +90,9 @@ class LosslessFramingTests(unittest.TestCase):
                 rendered = self.helper["render_datasets"](datasets)
                 self.assertEqual(self.recover_contexts(rendered), datasets)
                 self.assertEqual(datasets, before)
-                self.assertLess(len(rendered.encode()), sum(
-                    len(self.helper["render_datasets"]([item]).encode()) + 2 for item in datasets))
+                legacy = "\n\n".join(self.helper["render_datasets"]([item]) for item in datasets)
+                self.assertLess(len(rendered.encode()), len(legacy.encode()))
+                self.assertLessEqual(len(json.dumps(rendered)), len(json.dumps(legacy)))
 
     def test_ineligible_contexts_keep_original_headers_and_singleton_bounds(self):
         dataset = self.helper["ReviewDataset"]
@@ -193,6 +194,93 @@ class LosslessFramingTests(unittest.TestCase):
                          datasets[0].content)
         for item in datasets[1:]:
             self.assertEqual(sum(prompt.count(json.dumps(item.path)) for prompt in prompts), 1)
+
+    def test_assignment_keeps_a_fitting_native_request_with_escaped_unicode(self):
+        assignment = {"name": "owner", "kind": "owner", "changes": ["a.py"],
+                      "contexts": [], "obligations": ["雪" * 40]}
+        render = self.helper["render_review_assignment"]
+        title, _metadata, rest = render(assignment).split("\n", 2)
+        policy = rest.split("\n\n# Assignment obligations\n", 1)[0]
+
+        def legacy():
+            return title + "\n" + json.dumps(assignment, ensure_ascii=True) + "\n" + policy
+
+        def prompt(text):
+            return self.helper["render_review_prompt"](
+                "fixture", "branch", "base", self.helper["ReviewChunk"]("+x\n"), text, "",
+            )
+
+        # Exercise the unchanged wire encoder at its actual limit, without
+        # creating a handoff directory or launching a reviewer.
+        handoff = object.__new__(self.helper["NativeHandoff"])
+        handoff.run_id, handoff.pass_count = "0" * 32, 1
+        handoff.model, handoff.thinking, handoff.timeout = "fixture/reviewer", "high", None
+        initial = prompt(legacy())
+        encoded, _ = handoff.encode_request(1, initial)
+        padding = handoff.MAX_REQUEST_BYTES - len(encoded.encode())
+        padding -= len(str(len(initial.encode()) + padding)) - len(str(len(initial.encode())))
+        assignment["obligations"][0] = "x" * padding + assignment["obligations"][0]
+        expected = prompt(legacy())
+        actual = prompt(render(assignment))
+        encoded, _ = handoff.encode_request(1, expected)
+        self.assertEqual(len(encoded.encode()), handoff.MAX_REQUEST_BYTES)
+        self.assertTrue(actual == expected, "the fitting native request must retain legacy framing")
+        self.assertEqual(self.recover_assignment(render(assignment)), assignment)
+        handoff.encode_request(1, actual)
+        with self.assertRaisesRegex(SystemExit, "exceeds 4000000 bytes"):
+            handoff.encode_request(1, actual + "x")
+
+    def test_fallback_prefers_a_complete_plan_within_the_requested_pass_count(self):
+        datasets = []
+        for index, size in enumerate((39_000, 16_000, 22_000)):
+            item = self.helper["ReviewDataset"](f"evidence-{index}", "")
+            overhead = len(self.helper["render_datasets"]([item]).encode())
+            datasets.append(item._replace(content=chr(65 + index) * (size - overhead)))
+        empty = self.helper["render_review_prompt"](
+            "fixture", "branch", "base", self.helper["ReviewChunk"](""), "", "",
+            (999_999, 999_999),
+        )
+        cap = 100_000 + len(empty.encode()) + 4_096
+        bundle = "+x\n" * (309_400 // 3) + "x" * (309_400 % 3)
+        with mock.patch.dict(self.helper["build_review_prompts"].__globals__, {
+            "current_branch": lambda _repo: "fixture",
+        }):
+            unlimited = self.helper["build_review_prompts"](
+                Path.cwd(), "branch", "base", bundle, "", datasets, cap,
+            )
+            limited = self.helper["build_review_prompts"](
+                Path.cwd(), "branch", "base", bundle, "", datasets, cap, 11,
+            )
+            impossible = self.helper["build_review_prompts"](
+                Path.cwd(), "branch", "base", bundle, "", datasets, cap, 1,
+            )
+        self.assertEqual(len(unlimited), 14)
+        self.assertEqual(len(limited), 11)
+        self.helper["check_review_pass_budget"](11, len(limited))
+        with self.assertRaisesRegex(SystemExit, "--max-review-passes allows 1"):
+            self.helper["check_review_pass_budget"](1, len(impossible))
+        batches, fragments = {}, {item.path: {} for item in datasets}
+        for prompt in limited:
+            self.assertLessEqual(len(prompt.encode()), cap)
+            context, change = prompt.rsplit("\n\n# Change Bundle\n", 1)
+            batch = re.search(r"Evidence batch: (\d+)/(\d+)", context).group(1)
+            batches.setdefault(batch, []).append(change)
+            for path, offset, text in re.findall(
+                r"# Dataset: (evidence-\d+)\n\[Dataset byte offset: (\d+)\]\n([ABC]+)",
+                context,
+            ):
+                prior = fragments[path].setdefault(int(offset), text)
+                self.assertEqual(prior, text)
+        self.assertTrue(batches)
+        for changes in batches.values():
+            self.assertEqual("".join(changes), bundle)
+        for item in datasets:
+            offset = 0
+            for start, text in sorted(fragments[item.path].items()):
+                self.assertEqual(start, offset)
+                offset += len(text.encode())
+            self.assertEqual("".join(text for _, text in sorted(fragments[item.path].items())),
+                             item.content)
 
     def test_prompt_pipes_deliver_exact_bytes_without_changing_output_decoding(self):
         prompt = 'first\nCRLF\r\nbare\rfox 🦊\n## Obligation [0,0]\nno final newline'

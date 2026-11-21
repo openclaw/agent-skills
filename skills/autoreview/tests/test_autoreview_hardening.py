@@ -731,6 +731,17 @@ class AutoreviewMixedTargetTests(unittest.TestCase):
             planned = self.helper["build_review_prompts"](repo, "local", None, captured, "", datasets, 30_000)
             self.assertLessEqual(len(planned), len(legacy))
             self.assertLessEqual(self.helper["review_plan_bytes"](planned), self.helper["review_plan_bytes"](legacy))
+            optimizer = mock.Mock(wraps=self.helper["optimize_evidence_plan"])
+            with mock.patch.dict(self.helper["build_review_prompts"].__globals__, {
+                "optimize_evidence_plan": optimizer,
+            }):
+                bounded = self.helper["build_review_prompts"](
+                    repo, "local", None, captured, "", datasets, 30_000, len(planned),
+                )
+            optimizer.assert_called_once()
+            self.assertEqual(optimizer.call_args.args[-1], len(planned))
+            self.assertLessEqual(len(bounded), len(planned))
+            self.assertEqual(bounded, planned)
 
     def test_file_hunk_long_line_boundaries_and_evidence_batches_keep_authority(self):
         # Force each partition dimension independently of prompt overhead. All
