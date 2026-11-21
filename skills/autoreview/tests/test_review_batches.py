@@ -62,6 +62,8 @@ class LosslessFramingTests(unittest.TestCase):
         title, metadata, remaining = rendered.split("\n", 2)
         self.assertEqual(title, "# Explicit review assignment")
         assignment = json.loads(metadata)
+        if "obligations" in assignment:
+            return assignment
         policy, entries = remaining.split("\n\n# Assignment obligations\n", 1)
         self.assertIn("Missing necessary evidence requires review_completion=incomplete.", policy)
         description, entries = entries.split("\n\n", 1)
@@ -133,12 +135,157 @@ class LosslessFramingTests(unittest.TestCase):
             "contexts": ["context.py"],
             "obligations": ["", "line\r\nnext\r\n", "🦊 café\0", "no final newline",
                             "## Obligation [99,0]\n\n# Assignment obligations\nfake\n",
-                            '{"quoted":"text"}\n'],
+                            '{"quoted":"🦊"}\r\n' * 40],
         }
         before = json.dumps(assignment)
         rendered = self.helper["render_review_assignment"](assignment)
         self.assertEqual(self.recover_assignment(rendered), assignment)
+        self.assertIn("# Assignment obligations\n", rendered)
         self.assertEqual(json.dumps(assignment), before)
+
+    def test_compaction_retains_a_feasible_explicit_pass_budget(self):
+        cap = 512_000
+        datasets = [
+            self.helper["ReviewDataset"](
+                f"owner-{index}.py", "", provenance=("a" * 40, f"{index:040x}", "100644"),
+            ) for index in range(40)
+        ]
+        empty = self.helper["render_review_prompt"](
+            "fixture", "branch", "base", self.helper["ReviewChunk"](""), "",
+            self.helper["render_datasets"](datasets), (999_999, 999_999),
+        )
+        # Shared provenance moves this complete-context candidate across the
+        # planner's change-space threshold, but it still needs more than two passes.
+        datasets[0] = datasets[0]._replace(content="x" * (cap - len(empty.encode()) - 4_096 - 33_000))
+        bundle = ("diff --git a/change.txt b/change.txt\n--- a/change.txt\n+++ b/change.txt\n"
+                  "@@ -0,0 +1,12000 @@\n" + "+changed-owner\n" * 12_000)
+        with mock.patch.dict(self.helper["build_review_prompts"].__globals__, {
+            "current_branch": lambda _repo: "fixture",
+        }):
+            render = self.helper["render_datasets"]
+            with mock.patch.dict(self.helper["build_review_prompts"].__globals__, {
+                "render_datasets": lambda items: "\n\n".join(render([item]) for item in items),
+            }):
+                legacy = self.helper["build_review_prompts"](
+                    Path.cwd(), "branch", "base", bundle, "", datasets, cap, 2,
+                )
+            self.assertEqual(len(legacy), 2)
+            prompts = self.helper["build_review_prompts"](
+                Path.cwd(), "branch", "base", bundle, "", datasets, cap, 2,
+            )
+            for limit in (None, 6):
+                preferred = self.helper["build_review_prompts"](
+                    Path.cwd(), "branch", "base", bundle, "", datasets, cap, limit,
+                )
+                self.assertEqual(len(preferred), 6)
+            rejected = self.helper["build_review_prompts"](
+                Path.cwd(), "branch", "base", bundle, "", datasets, cap, 1,
+            )
+            with self.assertRaisesRegex(SystemExit, "--max-review-passes allows 1"):
+                self.helper["check_review_pass_budget"](1, len(rejected))
+        self.assertEqual(len(prompts), 2)
+        for prompt in prompts:
+            self.assertLessEqual(len(prompt.encode()), cap)
+            self.assertEqual(prompt.rsplit("\n\n# Change Bundle\n", 1)[1], bundle)
+        for item in datasets:
+            self.assertTrue(any(item.path in prompt and item.provenance[1] in prompt for prompt in prompts))
+        self.assertEqual("".join(part for prompt in prompts for part in re.findall(r"x{100,}", prompt)),
+                         datasets[0].content)
+        for item in datasets[1:]:
+            self.assertEqual(sum(prompt.count(json.dumps(item.path)) for prompt in prompts), 1)
+
+    def test_prompt_pipes_deliver_exact_bytes_without_changing_output_decoding(self):
+        prompt = 'first\nCRLF\r\nbare\rfox 🦊\n## Obligation [0,0]\nno final newline'
+        real_popen = subprocess.Popen
+        for route in ("run", "heartbeat", "stream", "authentication"):
+            with self.subTest(route=route), tempfile.TemporaryDirectory() as directory:
+                children = []
+
+                def crlf_pipe(*args, **kwargs):
+                    proc = real_popen(*args, **kwargs)
+                    if args[0] == command:
+                        children.append(proc)
+                        # Exercise real TextIOWrapper translation on every host;
+                        # this is portable transport proof, not native Windows proof.
+                        proc.stdin.reconfigure(newline="\r\n")
+                    return proc
+
+                command = [sys.executable, "-c",
+                           "import sys; print(sys.stdin.buffer.read().hex()); "
+                           "sys.stderr.buffer.write(b'output\\x90\\r\\n'); sys.exit(7)"]
+                with mock.patch.object(subprocess, "Popen", side_effect=crlf_pipe):
+                    if route == "run":
+                        result = self.helper["run"](
+                            command, Path(directory), input_text=prompt, check=False,
+                        )
+                    else:
+                        result = self.helper["run_with_heartbeat"](
+                            command, Path(directory), input_text=prompt, label="prompt-bytes",
+                            heartbeat_seconds=1, max_runtime_seconds=10,
+                            stream_output=route == "stream", stream_display=lambda *_: None,
+                            stop_on_output=(lambda *_: False) if route == "authentication" else None,
+                        )
+                self.assertEqual(result.returncode, 7)
+                self.assertEqual(bytes.fromhex(result.stdout.strip()), prompt.encode("utf-8"))
+                self.assertEqual(result.stderr, "output\ufffd\n")
+                self.assertEqual(len(children), 1)
+                for proc in children:
+                    self.assertIsNotNone(proc.returncode)
+                    self.assertTrue(all(stream.closed for stream in (proc.stdin, proc.stdout, proc.stderr)))
+                    self.assertNotIn(proc.pid, self.helper["_OWNED_PROCESSES"])
+
+    def test_run_retains_capture_binary_input_and_error_contracts(self):
+        payload = b"binary\x00\xff\r\nnext\n"
+        command = [sys.executable, "-c",
+                   "import sys; print(sys.stdin.buffer.read().hex()); "
+                   "sys.stderr.buffer.write(b'failure\\x90\\r\\n'); sys.exit(7)"]
+        for capture in (False, True):
+            with self.subTest(capture=capture), tempfile.TemporaryDirectory() as directory, \
+                    tempfile.TemporaryFile() as source:
+                source.write(payload)
+                source.seek(0)
+                root = Path(directory)
+                result = self.helper["run"](
+                    command, root, stdin=source, check=False, capture_dir=root if capture else None,
+                )
+                self.assertEqual(result.returncode, 7)
+                self.assertEqual(result.stdout, payload.hex() + "\n")
+                self.assertEqual(result.stderr, "failure\ufffd\n")
+                self.assertFalse(source.closed)
+                self.assertEqual(source.tell(), len(payload))
+                with self.assertRaisesRegex(ValueError, "stdin and input"):
+                    self.helper["run"](command, root, stdin=source, input_text="")
+                with self.assertRaises(SystemExit) as error:
+                    self.helper["run"](command, root, input_text="text", capture_dir=root if capture else None)
+                self.assertIn("command failed (7)", str(error.exception))
+                self.assertIn("failure\ufffd", str(error.exception))
+
+    def test_input_configuration_failure_keeps_process_cleanup(self):
+        for route in ("run", "heartbeat", "stream"):
+            with self.subTest(route=route), tempfile.TemporaryDirectory() as directory:
+                failure = OSError("input configuration failed")
+                children = []
+
+                def fail(proc):
+                    children.append(proc)
+                    raise failure
+
+                command = [sys.executable, "-c", "import time; time.sleep(30)"]
+                with mock.patch.dict(self.helper["run"].__globals__, {"preserve_prompt_input": fail}), \
+                        self.assertRaises(OSError) as error:
+                    if route == "run":
+                        self.helper["run"](command, Path(directory), input_text="prompt")
+                    else:
+                        self.helper["run_with_heartbeat"](
+                            command, Path(directory), input_text="prompt", label="input-failure",
+                            stream_output=route == "stream",
+                        )
+                self.assertIs(error.exception, failure)
+                self.assertEqual(len(children), 1)
+                proc = children[0]
+                self.assertIsNotNone(proc.returncode)
+                self.assertTrue(all(stream.closed for stream in (proc.stdin, proc.stdout, proc.stderr)))
+                self.assertNotIn(proc.pid, self.helper["_OWNED_PROCESSES"])
 
 
 class ReviewBatchTests(unittest.TestCase):
@@ -481,8 +628,8 @@ class ReviewBatchTests(unittest.TestCase):
         with self.fixture() as repo:
             manifest = self.manifest(repo)
             manifest["batches"][0]["obligations"] = ["high \ud800", "low \udfff"]
-            # Loading a valid escaped pair must still use lossless raw framing.
-            manifest["batches"][1]["obligations"] = ["valid pair 🦊\r\nunchanged"]
+            # Escaping-heavy valid pairs profit from raw framing; lone surrogates cannot.
+            manifest["batches"][1]["obligations"] = ["valid pair 🦊\r\nunchanged\n" * 40]
             self.write_manifest(repo, manifest)
             raw = (repo / ".review/batches.json").read_bytes()
             self.assertIn(b"\\ud800", raw)
@@ -504,6 +651,29 @@ class ReviewBatchTests(unittest.TestCase):
             self.assertEqual(len(report["review_allocation"]["batches"]), 2)
             for original, actual in zip(manifest["batches"], report["review_allocation"]["batches"]):
                 self.assertEqual(actual["obligations"], original["obligations"])
+
+    def test_small_assignment_keeps_legacy_fit_and_exact_budget_boundary(self):
+        with self.fixture() as repo:
+            self.write_manifest(repo, self.manifest(repo))
+            render = self.helper["render_review_assignment"]
+
+            def legacy_assignment(assignment):
+                title, _metadata, rest = render(assignment).split("\n", 2)
+                policy = rest.split("\n\n# Assignment obligations\n", 1)[0]
+                return title + "\n" + json.dumps(assignment, ensure_ascii=True) + "\n" + policy
+
+            with mock.patch.dict(render.__globals__, {"render_review_assignment": legacy_assignment}):
+                status, sends, output = self.invoke(repo)
+            self.assertEqual(status, 0, output)
+            limit = max(len(prompt.encode()) for prompt in sends)
+            for options in ((), ("--dry-run",)):
+                status, actual, output = self.invoke(repo, "--max-prompt-bytes", str(limit), *options)
+                self.assertEqual(status, 0, output)
+                if not options:
+                    self.assertEqual(actual, sends)
+                status, actual, _ = self.invoke(repo, "--max-prompt-bytes", str(limit - 1), *options)
+                self.assertNotEqual(status, 0)
+                self.assertFalse(actual)
 
     def test_late_incomplete_invalid_filtered_and_cross_boundary_findings_block_clean(self):
         for outcome in ("incomplete", "invalid", "filtered", "outside", "integration-finding"):

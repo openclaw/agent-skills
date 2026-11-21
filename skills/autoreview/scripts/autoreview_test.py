@@ -1169,7 +1169,7 @@ class AutoreviewAmpTests(unittest.TestCase):
             stream_engine_output=False,
             thinking="high",
         )
-        secret_prompt = "review diff PRIVATE_REVIEW_MARKER_8f3c"
+        secret_prompt = "review diff PRIVATE_REVIEW_MARKER_8f3c\nCRLF\r\nbare\r🦊\nno final newline"
         observed: dict[str, object] = {}
 
         def fake_preflight(
@@ -1215,7 +1215,7 @@ class AutoreviewAmpTests(unittest.TestCase):
             settings_path = runtime_root / "settings.json"
             plugin_root = Path(str(env["XDG_CONFIG_HOME"])) / "amp" / "plugins"
             plugin_path = next(plugin_root.glob("autoreview-*.ts"))
-            observed["prompt"] = prompt_path.read_text(encoding="utf-8")
+            observed["prompt"] = prompt_path.read_bytes()
             observed["settings"] = json.loads(settings_path.read_text(encoding="utf-8"))
             observed["plugin"] = plugin_path.read_text(encoding="utf-8")
             observed["plugin_path"] = plugin_path
@@ -1266,7 +1266,7 @@ class AutoreviewAmpTests(unittest.TestCase):
         self.assertEqual(command[command.index("--mode") + 1], "autoreview")
         self.assertNotIn(secret_prompt, " ".join(command))
         self.assertNotIn(secret_prompt, str(observed["input"]))
-        self.assertEqual(observed["prompt"], secret_prompt)
+        self.assertEqual(observed["prompt"], secret_prompt.encode("utf-8"))
         self.assertEqual(observed["workspace"], [])
         settings = observed["settings"]
         self.assertIsInstance(settings, dict)

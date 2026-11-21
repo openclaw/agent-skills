@@ -548,6 +548,13 @@ PROVIDER_SCHEMA = {
 }
 
 
+def preserve_prompt_input(proc: subprocess.Popen[str]) -> None:
+    if proc.stdin is not None:
+        # Length-framed evidence and prompt hashes describe these exact bytes.
+        # Keep output decoding unchanged; only input must avoid Windows LF expansion.
+        proc.stdin.reconfigure(newline="")
+
+
 def run(
     args: list[str],
     cwd: Path,
@@ -559,6 +566,8 @@ def run(
     text_errors: str = SUBPROCESS_TEXT_ERRORS,
     capture_dir: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if input_text is not None and stdin is not None:
+        raise ValueError("stdin and input arguments may not both be used.")
     with contextlib.ExitStack() as stack:
         captures = [
             stack.enter_context(tempfile.TemporaryFile(
@@ -567,18 +576,24 @@ def run(
             ))
             for _ in range(2)
         ] if capture_dir is not None else []
-        result = subprocess.run(
+        with subprocess.Popen(
             args,
             cwd=cwd,
-            input=input_text,
-            stdin=stdin,
+            stdin=subprocess.PIPE if input_text is not None else stdin,
             text=True,
             encoding=SUBPROCESS_TEXT_ENCODING,
             errors=text_errors,
             stdout=captures[0] if captures else subprocess.PIPE,
             stderr=captures[1] if captures else subprocess.PIPE,
             env=env,
-        )
+        ) as proc:
+            try:
+                preserve_prompt_input(proc)
+                stdout, stderr = proc.communicate(input_text)
+            except BaseException:
+                proc.kill()
+                raise
+            result = subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
         if captures:
             for capture in captures:
                 capture.seek(0)
@@ -1747,6 +1762,7 @@ def run_with_heartbeat(
         )
         register_owned_process(proc)
     try:
+        preserve_prompt_input(proc)
         first_communicate = True
         while True:
             try:
@@ -1820,6 +1836,7 @@ def run_with_stream(
             register_owned_process(proc)
         collection_entered = False
         try:
+            preserve_prompt_input(proc)
             if engine_stage is not None:
                 try:
                     engine_stage.seen("launch_returned")
@@ -4730,7 +4747,7 @@ def build_review_prompts(
     minimum_change = max(4, max_prompt_bytes // FULL_DATASET_CHANGE_DIVISOR) if datasets else 4
     change_prompts = build_change_review_prompts(
         branch, target, target_ref, bundle, extra_prompt, rendered_datasets, max_prompt_bytes,
-        min_change_bytes=minimum_change,
+        max_passes=max_review_passes, min_change_bytes=minimum_change,
     )
     if change_prompts is not None:
         return change_prompts
@@ -4935,6 +4952,14 @@ def branch_batch_units(captured: CapturedBundle) -> list[dict[str, Any]]:
 
 
 def render_review_assignment(assignment: dict[str, Any]) -> str:
+    policy = (
+        "\nReview every assigned change and obligation, including the stated cross-owner contracts. "
+        "The header describes the frozen full range; only the assigned change units are finding targets here. "
+        "Do not rely on another assignment to supply a missing caller, callee or integration contract. "
+        "Missing necessary evidence requires review_completion=incomplete. Other assignments cannot waive that result."
+    )
+    prefix = "# Explicit review assignment\n"
+    legacy = prefix + json.dumps(assignment, ensure_ascii=True) + policy
     try:
         obligations = [
             "## Obligation " + json.dumps([index, utf8_size(text)], separators=(",", ":")) + "\n" + text
@@ -4943,27 +4968,15 @@ def render_review_assignment(assignment: dict[str, Any]) -> str:
     except UnicodeEncodeError:
         # JSON permits lone surrogate escapes; retain their original escaped
         # representation instead of narrowing accepted manifest strings.
-        obligations = None
-        serialized = json.dumps(assignment, ensure_ascii=True)
-    else:
-        metadata = {key: value for key, value in assignment.items() if key != "obligations"}
-        serialized = json.dumps(metadata, ensure_ascii=True, separators=(",", ":"))
-    instructions = (
-        "# Explicit review assignment\n"
-        + serialized + "\n"
-        "Review every assigned change and obligation, including the stated cross-owner contracts. "
-        "The header describes the frozen full range; only the assigned change units are finding targets here. "
-        "Do not rely on another assignment to supply a missing caller, callee or integration contract. "
-        "Missing necessary evidence requires review_completion=incomplete. Other assignments cannot waive that result."
-    )
-    if obligations is None:
-        return instructions
-    return (
-        instructions
+        return legacy
+    metadata = {key: value for key, value in assignment.items() if key != "obligations"}
+    compact = (
+        prefix + json.dumps(metadata, ensure_ascii=True, separators=(",", ":")) + policy
         + "\n\n# Assignment obligations\n"
         "Each header is [index,UTF-8 bytes]; the complete obligation follows unchanged.\n\n"
         + "\n\n".join(obligations)
     )
+    return compact if utf8_size(compact) <= utf8_size(legacy) else legacy
 
 
 def prepare_batch_review(
@@ -6994,7 +7007,7 @@ def run_amp(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         # plugin inventory has proved that Amp loaded only the generated adapter.
         # Users with personal or workspace plugins must use a dedicated Amp API
         # key/account without plugins for autoreview.
-        prompt_path.write_text(prompt, encoding="utf-8")
+        prompt_path.write_bytes(prompt.encode("utf-8"))
         prompt_path.chmod(0o600)
 
         cmd = [

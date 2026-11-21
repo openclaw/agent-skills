@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Reduce Autoreview prompt framing overhead without dropping evidence or changing review limits. Preserve exact prompt bytes across text input and Amp files, and retain existing assignment and pass-budget behavior when compact framing would not fit better.
+
 - Fail Linux Codex preflight when the selected installation cannot re-execute inside the read-only tool sandbox, preventing a review with broken tool access without broadening filesystem permissions. Thanks @vrknetha. (#395)
 
 - Update the development YAML parser to PyYAML 6.0.4 while preserving the Python 3.10 installed-helper floor.
