@@ -548,6 +548,13 @@ PROVIDER_SCHEMA = {
 }
 
 
+def preserve_prompt_input(proc: subprocess.Popen[str]) -> None:
+    if proc.stdin is not None:
+        # Length-framed evidence and prompt hashes describe these exact bytes.
+        # Keep output decoding unchanged; only input must avoid Windows LF expansion.
+        proc.stdin.reconfigure(newline="")
+
+
 def run(
     args: list[str],
     cwd: Path,
@@ -559,6 +566,8 @@ def run(
     text_errors: str = SUBPROCESS_TEXT_ERRORS,
     capture_dir: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if input_text is not None and stdin is not None:
+        raise ValueError("stdin and input arguments may not both be used.")
     with contextlib.ExitStack() as stack:
         captures = [
             stack.enter_context(tempfile.TemporaryFile(
@@ -567,18 +576,24 @@ def run(
             ))
             for _ in range(2)
         ] if capture_dir is not None else []
-        result = subprocess.run(
+        with subprocess.Popen(
             args,
             cwd=cwd,
-            input=input_text,
-            stdin=stdin,
+            stdin=subprocess.PIPE if input_text is not None else stdin,
             text=True,
             encoding=SUBPROCESS_TEXT_ENCODING,
             errors=text_errors,
             stdout=captures[0] if captures else subprocess.PIPE,
             stderr=captures[1] if captures else subprocess.PIPE,
             env=env,
-        )
+        ) as proc:
+            try:
+                preserve_prompt_input(proc)
+                stdout, stderr = proc.communicate(input_text)
+            except BaseException:
+                proc.kill()
+                raise
+            result = subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
         if captures:
             for capture in captures:
                 capture.seek(0)
@@ -1747,6 +1762,7 @@ def run_with_heartbeat(
         )
         register_owned_process(proc)
     try:
+        preserve_prompt_input(proc)
         first_communicate = True
         while True:
             try:
@@ -1820,6 +1836,7 @@ def run_with_stream(
             register_owned_process(proc)
         collection_entered = False
         try:
+            preserve_prompt_input(proc)
             if engine_stage is not None:
                 try:
                     engine_stage.seen("launch_returned")
@@ -3940,6 +3957,15 @@ def verify_evidence(repo: Path, files: list[EvidenceFile | SourceContext]) -> No
             raise SystemExit("evidence changed; rerun autoreview against the updated inputs")
 
 
+def choose_prompt_rendering(legacy: str, compact: str) -> str:
+    # Native handoff JSON-encodes the prompt. Framing must not grow either
+    # the prompt budget or the independently bounded transport request.
+    if (utf8_size(compact) <= utf8_size(legacy)
+            and len(json.dumps(compact)) <= len(json.dumps(legacy))):
+        return compact
+    return legacy
+
+
 def render_datasets(datasets: list[ReviewDataset]) -> str:
     parts = []
     for dataset in datasets:
@@ -3950,7 +3976,29 @@ def render_datasets(datasets: list[ReviewDataset]) -> str:
         else:
             header = f"# Dataset: {dataset.path}\n"
         parts.append(header + f"[Dataset byte offset: {dataset.byte_offset}]\n{dataset.content}")
-    return "\n\n".join(parts)
+    rendered = "\n\n".join(parts)
+    if len(datasets) > 1 and all(dataset.provenance for dataset in datasets):
+        first = datasets[0]
+        commit, _, mode = first.provenance
+        if all((dataset.provenance[0], dataset.provenance[2], dataset.byte_offset)
+               == (commit, mode, first.byte_offset) for dataset in datasets):
+            # Share only identical provenance; byte lengths keep source text from
+            # masquerading as framing, including headers inside complete bodies.
+            prefix = (
+                "# Source contexts (context only)\n"
+                f"Common provenance: commit={commit}; mode={mode}; dataset_byte_offset={first.byte_offset}.\n"
+                "Each header is [path,blob,UTF-8 bytes]; the dataset body follows unchanged.\n\n"
+            )
+            entries = [
+                "# Source context: " + json.dumps(
+                    [dataset.path, dataset.provenance[1], utf8_size(dataset.content)],
+                    ensure_ascii=True, separators=(",", ":"),
+                ) + "\n" + dataset.content for dataset in datasets
+            ]
+            compact = prefix + "\n\n".join(entries)
+            # Singleton sizing in the partitioner remains a conservative bound.
+            return choose_prompt_rendering(rendered, compact)
+    return rendered
 
 
 def split_review_datasets(
@@ -4546,6 +4594,7 @@ def build_mixed_change_passes(
 def build_mixed_review_passes(
     repo: Path, target: str, target_ref: str | None, captured: CapturedBundle,
     extra_prompt: str, datasets: list[ReviewDataset], max_prompt_bytes: int,
+    max_review_passes: int | None = None,
 ) -> list[ReviewPass]:
     branch = current_branch(repo)
     full = mixed_bundle_chunk(captured)
@@ -4617,7 +4666,7 @@ def build_mixed_review_passes(
         baseline = build_batch_plan(evidence_limit)
         evidence_limit //= 2
     return optimize_evidence_plan(
-        baseline, max_prompt_bytes, utf8_size(captured.text), datasets, build_batch_plan,
+        baseline, max_prompt_bytes, utf8_size(captured.text), datasets, build_batch_plan, max_review_passes,
     )
 
 
@@ -4700,14 +4749,16 @@ def build_review_prompts(
 ) -> list[str] | list[ReviewPass]:
     if isinstance(bundle, CapturedBundle):
         if bundle.mixed:
-            return build_mixed_review_passes(repo, target, target_ref, bundle, extra_prompt, datasets, max_prompt_bytes)
+            return build_mixed_review_passes(
+                repo, target, target_ref, bundle, extra_prompt, datasets, max_prompt_bytes, max_review_passes,
+            )
         bundle = bundle.text
     branch = current_branch(repo)
     rendered_datasets = render_datasets(datasets)
     minimum_change = max(4, max_prompt_bytes // FULL_DATASET_CHANGE_DIVISOR) if datasets else 4
     change_prompts = build_change_review_prompts(
         branch, target, target_ref, bundle, extra_prompt, rendered_datasets, max_prompt_bytes,
-        min_change_bytes=minimum_change,
+        max_passes=max_review_passes, min_change_bytes=minimum_change,
     )
     if change_prompts is not None:
         return change_prompts
@@ -4780,7 +4831,7 @@ def build_review_prompts(
         baseline = build_batch_plan(evidence_limit)
         if baseline is not None:
             return optimize_evidence_plan(
-                baseline, available, utf8_size(bundle), datasets, build_batch_plan,
+                baseline, available, utf8_size(bundle), datasets, build_batch_plan, max_review_passes,
             )
         # Actual continuation headers may need more room than the initial
         # evidence allocation leaves. Rebatch before sending any partial pass.
@@ -4813,6 +4864,7 @@ def optimize_evidence_plan(
     baseline: list[str] | list[ReviewPass], available: int, change_bytes: int,
     datasets: list[ReviewDataset],
     build_batch_plan: Callable[[int, int], list[str] | list[ReviewPass] | None],
+    max_review_passes: int | None = None,
 ) -> list[str] | list[ReviewPass]:
     if not datasets or len(baseline) == 1:
         return baseline
@@ -4826,16 +4878,22 @@ def optimize_evidence_plan(
     limits = {evidence_bytes}
     for chunks in range(first_chunks, first_chunks + 4):
         limits.add(available - (change_bytes + chunks - 1) // chunks)
-    best, best_bytes = baseline, review_plan_bytes(baseline)
+    def score(plan: list[str] | list[ReviewPass]) -> tuple[bool, int, int]:
+        # A feasible complete plan wins before byte savings; the final guard
+        # still refuses when none of these candidates fits the requested count.
+        return (max_review_passes is not None and len(plan) > max_review_passes,
+                review_plan_bytes(plan), len(plan))
+
+    best, best_score = baseline, score(baseline)
     for limit in sorted(limits):
         if not minimum <= limit < available:
             continue
         candidate = build_batch_plan(limit, len(baseline))
         if candidate is None or len(candidate) > len(baseline):
             continue
-        candidate_bytes = review_plan_bytes(candidate)
-        if candidate_bytes <= best_bytes and (candidate_bytes, len(candidate)) < (best_bytes, len(best)):
-            best, best_bytes = candidate, candidate_bytes
+        candidate_score = score(candidate)
+        if candidate_score < best_score:
+            best, best_score = candidate, candidate_score
     return best
 
 
@@ -4909,6 +4967,34 @@ def branch_batch_units(captured: CapturedBundle) -> list[dict[str, Any]]:
         })
         offset += utf8_size(patch)
     return units
+
+
+def render_review_assignment(assignment: dict[str, Any]) -> str:
+    policy = (
+        "\nReview every assigned change and obligation, including the stated cross-owner contracts. "
+        "The header describes the frozen full range; only the assigned change units are finding targets here. "
+        "Do not rely on another assignment to supply a missing caller, callee or integration contract. "
+        "Missing necessary evidence requires review_completion=incomplete. Other assignments cannot waive that result."
+    )
+    prefix = "# Explicit review assignment\n"
+    legacy = prefix + json.dumps(assignment, ensure_ascii=True) + policy
+    try:
+        obligations = [
+            "## Obligation " + json.dumps([index, utf8_size(text)], separators=(",", ":")) + "\n" + text
+            for index, text in enumerate(assignment["obligations"])
+        ]
+    except UnicodeEncodeError:
+        # JSON permits lone surrogate escapes; retain their original escaped
+        # representation instead of narrowing accepted manifest strings.
+        return legacy
+    metadata = {key: value for key, value in assignment.items() if key != "obligations"}
+    compact = (
+        prefix + json.dumps(metadata, ensure_ascii=True, separators=(",", ":")) + policy
+        + "\n\n# Assignment obligations\n"
+        "Each header is [index,UTF-8 bytes]; the complete obligation follows unchanged.\n\n"
+        + "\n\n".join(obligations)
+    )
+    return choose_prompt_rendering(legacy, compact)
 
 
 def prepare_batch_review(
@@ -4993,13 +5079,7 @@ def prepare_batch_review(
             "name": name, "kind": batch["kind"], "changes": [unit["path"] for unit in selected_units],
             "contexts": selected_contexts, "obligations": obligations,
         }
-        instructions = (
-            "# Explicit review assignment\n" + json.dumps(assignment, ensure_ascii=True) + "\n"
-            "Review every assigned change and obligation, including the stated cross-owner contracts. "
-            "The header describes the frozen full range; only the assigned change units are finding targets here. "
-            "Do not rely on another assignment to supply a missing caller, callee or integration contract. "
-            "Missing necessary evidence requires review_completion=incomplete. Other assignments cannot waive that result."
-        )
+        instructions = render_review_assignment(assignment)
         datasets = tuple(sources[path] for path in selected_contexts)
         prompt = render_review_prompt(
             current_branch(repo), target, target_ref, chunk,
@@ -6945,7 +7025,7 @@ def run_amp(args: argparse.Namespace, repo: Path, prompt: str) -> str:
         # plugin inventory has proved that Amp loaded only the generated adapter.
         # Users with personal or workspace plugins must use a dedicated Amp API
         # key/account without plugins for autoreview.
-        prompt_path.write_text(prompt, encoding="utf-8")
+        prompt_path.write_bytes(prompt.encode("utf-8"))
         prompt_path.chmod(0o600)
 
         cmd = [
