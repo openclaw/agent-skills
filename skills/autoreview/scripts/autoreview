@@ -31,6 +31,7 @@ import time
 import unicodedata
 import urllib.parse
 import warnings
+from collections import Counter
 from collections.abc import Callable, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, NamedTuple
@@ -3917,6 +3918,7 @@ def capture_source_context_inputs(
              ("--source-context-file", getattr(args, "source_context_file", None)))
     datasets, files = list(evidence.datasets), list(evidence.files)
     chunks = [evidence.prompt] if evidence.prompt else []
+    intact = []
     sources: dict[tuple[str, str], SourceContext] = {}
     for role, paths in roles:
         if paths and captured.commit is None:
@@ -3939,9 +3941,11 @@ def capture_source_context_inputs(
             if role == "--source-context-file":
                 # Prompt evidence stays intact in every pass, with source provenance
                 # and the same revalidation fences as partitionable source context.
-                chunks.append(render_datasets([dataset]))
+                intact.append(dataset)
             else:
                 datasets.append(dataset)
+    if intact:
+        chunks.append(render_datasets(intact))
     return EvidenceInputs("\n\n".join(chunks), datasets, files)
 
 
@@ -3979,19 +3983,24 @@ def render_datasets(datasets: list[ReviewDataset]) -> str:
     rendered = "\n\n".join(parts)
     if len(datasets) > 1 and all(dataset.provenance for dataset in datasets):
         first = datasets[0]
-        commit, _, mode = first.provenance
-        if all((dataset.provenance[0], dataset.provenance[2], dataset.byte_offset)
-               == (commit, mode, first.byte_offset) for dataset in datasets):
-            # Share only identical provenance; byte lengths keep source text from
-            # masquerading as framing, including headers inside complete bodies.
+        commit = first.provenance[0]
+        if all((dataset.provenance[0], dataset.byte_offset)
+               == (commit, first.byte_offset) for dataset in datasets):
+            # Share equal commit/offset and a default mode; byte lengths keep
+            # headers inside complete source bodies from masquerading as framing.
+            modes = Counter(dataset.provenance[2] for dataset in datasets)
+            mode = min(modes, key=lambda value: (-modes[value], value))
             prefix = (
                 "# Source contexts (context only)\n"
-                f"Common provenance: commit={commit}; mode={mode}; dataset_byte_offset={first.byte_offset}.\n"
-                "Each header is [path,blob,UTF-8 bytes]; the dataset body follows unchanged.\n\n"
+                + json.dumps([commit, mode, first.byte_offset], separators=(",", ":")) + "\n"
+                "Common [commit,mode,byte offset]; headers [path,blob,mode?,UTF-8 bytes]. "
+                "Omitted mode is common.\n\n"
             )
             entries = [
-                "# Source context: " + json.dumps(
-                    [dataset.path, dataset.provenance[1], utf8_size(dataset.content)],
+                json.dumps(
+                    [dataset.path, dataset.provenance[1],
+                     *([] if dataset.provenance[2] == mode else [dataset.provenance[2]]),
+                     utf8_size(dataset.content)],
                     ensure_ascii=True, separators=(",", ":"),
                 ) + "\n" + dataset.content for dataset in datasets
             ]
@@ -4997,6 +5006,22 @@ def render_review_assignment(assignment: dict[str, Any]) -> str:
     return choose_prompt_rendering(legacy, compact)
 
 
+def render_assignment_context(assignment: dict[str, Any], datasets: list[ReviewDataset]) -> str:
+    if [dataset.path for dataset in datasets] != assignment["contexts"]:
+        raise ValueError("assignment contexts do not match the ordered source records")
+    sources = render_datasets(datasets)
+    legacy = render_review_assignment(assignment) + "\n\n" + sources
+    if not datasets:
+        return legacy
+    # This reference binds only this assignment's records, never the invariant
+    # contexts in extra_prompt. Choose the whole pair so fallback cannot orphan it.
+    referenced = {key: value for key, value in assignment.items() if key != "contexts"}
+    referenced["contexts_from"] = "# Assigned source contexts"
+    compact = (render_review_assignment(referenced)
+               + "\n\n# Assigned source contexts\n" + sources)
+    return choose_prompt_rendering(legacy, compact)
+
+
 def prepare_batch_review(
     args: argparse.Namespace, repo: Path, target: str, target_ref: str | None,
     captured: CapturedBundle, evidence: EvidenceInputs,
@@ -5079,12 +5104,11 @@ def prepare_batch_review(
             "name": name, "kind": batch["kind"], "changes": [unit["path"] for unit in selected_units],
             "contexts": selected_contexts, "obligations": obligations,
         }
-        instructions = render_review_assignment(assignment)
         datasets = tuple(sources[path] for path in selected_contexts)
         prompt = render_review_prompt(
             current_branch(repo), target, target_ref, chunk,
-            apply_finding_threshold_prompt(args, evidence.prompt) + "\n\n" + instructions,
-            render_datasets(list(datasets)),
+            apply_finding_threshold_prompt(args, evidence.prompt),
+            render_assignment_context(assignment, list(datasets)),
         )
         plans.append(ReviewPass(prompt, chunk, datasets, len(plans) + 1, name,
                                 frozenset(changes), {**metadata, "assignment": assignment}))

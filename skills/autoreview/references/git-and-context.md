@@ -115,6 +115,9 @@ authentication, sandbox and mutation checks remain enabled.
   mode change. Pins authorize context delivery only. Changed-file, prompt-file,
   and dataset rules still apply.
 - Every source block: path, commit, blob, mode provenance.
+- Compact framing shares equal commit/offset values and a default Git mode;
+  exceptions retain their exact mode. Ordered, byte-sized records preserve every
+  path, full blob ID and complete body, including literal newlines.
 - `--source-context` bytes: partition with change when needed.
 - `--source-context-file` blocks: complete every pass; must fit with instructions
   + change framing. Over-capacity plan: refuse, never drop required evidence.
@@ -208,6 +211,11 @@ and path identity before every send and before publishing the aggregate.
   modes/OIDs. The helper checks exact reconstruction and records byte offsets,
   digests, manifest identity, assigned contexts and rendered prompt identities.
   Whole source blobs retain commit/blob/mode provenance and existing source checks.
+- Prompt metadata may reference its dedicated assigned-source block instead of
+  repeating that block's ordered path list. Common intact context stays separate;
+  its whole records can share provenance within their own block. Reports retain
+  the original contexts array. Compact framing never increases
+  either UTF-8 prompt bytes or JSON-encoded transport size.
 - Each assignment is one intact pass. All assignments must fit the existing
   `--max-prompt-bytes` and `--max-review-passes` limits before any reviewer starts.
   The helper does not split required contracts or automatically raise a limit.

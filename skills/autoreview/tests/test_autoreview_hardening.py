@@ -1838,12 +1838,18 @@ class AutoreviewHardeningTests(unittest.TestCase):
             "--source-context-file", "src/owner.py", "--source-context-file", "./src/owner.py",
             "--source-context-file", "src/copy.py",
             path="src/owner.py", content=content, setup=copy_source,
-        ) as (_repo, sends, *_):
+        ) as (repo, sends, *_):
             self.assertEqual(self.helper["main_impl"](), 0)
             self.assertEqual(len(sends), 1)
             self.assertEqual(sends[0].count(content.decode()), 6)
+            for path in ("src/owner.py", "src/copy.py"):
+                oid = git(repo, "rev-parse", "HEAD:" + path).strip()
+                headers = (
+                    "# Source context: " + json.dumps(path),
+                    json.dumps([path, oid, len(content)], separators=(",", ":")),
+                )
+                self.assertEqual(sum(sends[0].count(header) for header in headers), 2)
             for header, count in (
-                ('# Source context: "src/owner.py"', 2), ('# Source context: "src/copy.py"', 2),
                 (f"# Dataset: {Path('src/owner.py')}", 1), (f"# Prompt file: {Path('src/owner.py')}", 1),
             ):
                 self.assertEqual(sends[0].count(header), count)
