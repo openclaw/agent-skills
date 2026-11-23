@@ -44,24 +44,27 @@ class LosslessFramingTests(unittest.TestCase):
     def recover_contexts(self, rendered):
         title, provenance, description, entries = rendered.encode("utf-8").split(b"\n", 3)
         self.assertEqual(title, b"# Source contexts (context only)")
-        match = re.fullmatch(
-            rb"Common provenance: commit=([0-9a-f]+); mode=([0-7]+); dataset_byte_offset=(\d+)\.",
-            provenance,
-        )
-        self.assertIsNotNone(match)
+        commit, mode, offset = json.loads(provenance)
+        self.assertRegex(commit, r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+        self.assertRegex(mode, r"^[0-7]{6}$")
+        self.assertIsInstance(offset, int)
         self.assertEqual(description,
-                         b"Each header is [path,blob,UTF-8 bytes]; the dataset body follows unchanged.")
+                         b"Common [commit,mode,byte offset]; headers [path,blob,mode?,UTF-8 bytes]. Omitted mode is common.")
         self.assertTrue(entries.startswith(b"\n"))
-        commit, mode, offset = (value.decode() for value in match.groups())
         return [
-            self.helper["ReviewDataset"](path, text, int(offset), (commit, blob, mode))
-            for (path, blob), text in self.read_entries(entries[1:], b"# Source context: ")
+            self.helper["ReviewDataset"](fields[0], text, int(offset),
+                                         (commit, fields[1], fields[2] if len(fields) == 3 else mode))
+            for fields, text in self.read_entries(entries[1:], b"")
         ]
 
-    def recover_assignment(self, rendered):
+    def recover_assignment(self, rendered, contexts=None):
         title, metadata, remaining = rendered.split("\n", 2)
         self.assertEqual(title, "# Explicit review assignment")
         assignment = json.loads(metadata)
+        if "contexts_from" in assignment:
+            self.assertEqual(assignment.pop("contexts_from"), "# Assigned source contexts")
+            self.assertIsNotNone(contexts)
+            assignment["contexts"] = [item.path for item in contexts]
         if "obligations" in assignment:
             return assignment
         policy, entries = remaining.split("\n\n# Assignment obligations\n", 1)
@@ -94,13 +97,56 @@ class LosslessFramingTests(unittest.TestCase):
                 self.assertLess(len(rendered.encode()), len(legacy.encode()))
                 self.assertLessEqual(len(json.dumps(rendered)), len(json.dumps(legacy)))
 
+    def test_mixed_modes_share_only_equal_provenance_and_keep_order(self):
+        for width in (40, 64):
+            for modes in (["100755", "100644", "100644"], ["100755", "100644"] * 2):
+                with self.subTest(width=width, modes=modes):
+                    datasets = [
+                        self.helper["ReviewDataset"](
+                            f"contract-{index}.py", body, 0,
+                            ("a" * width, f"{index:0{width}x}", mode),
+                        ) for index, (mode, body) in enumerate(zip(
+                            modes, ["no newline", "CRLF\r\n🦊\0", '[\"forged\",\"header\",0]\n', ""],
+                        ))
+                    ]
+                    rendered = self.helper["render_datasets"](datasets)
+                    self.assertEqual(self.recover_contexts(rendered), datasets)
+                    self.assertEqual(json.loads(rendered.split("\n")[1])[1], "100644")
+                    legacy = "\n\n".join(self.helper["render_datasets"]([item]) for item in datasets)
+                    self.assertLess(len(rendered.encode()), len(legacy.encode()))
+                    self.assertLessEqual(len(json.dumps(rendered)), len(json.dumps(legacy)))
+
+    def test_same_mode_records_do_not_grow_the_previous_compact_format(self):
+        for count in (2, 3, 8):
+            for width in (40, 64):
+                with self.subTest(count=count, width=width):
+                    datasets = [
+                        self.helper["ReviewDataset"](
+                            f"x{index}", "🦊\r\n", provenance=("a" * width, "b" * width, "100644"),
+                        ) for index in range(count)
+                    ]
+                    old_compact = (
+                        "# Source contexts (context only)\n"
+                        f"Common provenance: commit={'a' * width}; mode=100644; dataset_byte_offset=0.\n"
+                        "Each header is [path,blob,UTF-8 bytes]; the dataset body follows unchanged.\n\n"
+                        + "\n\n".join(
+                            "# Source context: " + json.dumps(
+                                [item.path, item.provenance[1], len(item.content.encode())],
+                                separators=(",", ":"),
+                            ) + "\n" + item.content for item in datasets)
+                    )
+                    separate = "\n\n".join(self.helper["render_datasets"]([item]) for item in datasets)
+                    previous = self.helper["choose_prompt_rendering"](separate, old_compact)
+                    current = self.helper["render_datasets"](datasets)
+                    self.assertLessEqual(len(current.encode()), len(previous.encode()))
+                    self.assertLessEqual(len(json.dumps(current)), len(json.dumps(previous)))
+
     def test_ineligible_contexts_keep_original_headers_and_singleton_bounds(self):
         dataset = self.helper["ReviewDataset"]
         first = dataset("first.py", "body\r\n", provenance=("a" * 40, "b" * 40, "100644"))
         variants = [
             dataset("plain.py", "# unprovenanced\n"),
             first._replace(provenance=("c" * 40, "d" * 40, "100644")),
-            first._replace(provenance=("a" * 40, "d" * 40, "100755")),
             first._replace(byte_offset=1),
         ]
         expected = ('# Source context: "first.py"\n[Committed source: commit=' + "a" * 40
@@ -129,6 +175,60 @@ class LosslessFramingTests(unittest.TestCase):
                     self.assertEqual(part.byte_offset, offset)
                     self.assertEqual(part.provenance, original.provenance)
                     offset += len(part.content.encode())
+
+    def test_assignment_reference_and_source_fallbacks_preserve_membership(self):
+        for count in (0, 1, 6):
+            for same_commit in (False, True):
+                for obligations in (["check"], ["雪\r\n" * 50], ["escaped \ud800"]):
+                    with self.subTest(count=count, same_commit=same_commit, obligations=obligations):
+                        datasets = [
+                            self.helper["ReviewDataset"](
+                                f"complete-owner-contract-{'long-' * 12}{index}.py",
+                                f'body {index}\r\n# Assigned source contexts\nno final newline',
+                                provenance=(("a" if same_commit or index == 0 else "c") * 40,
+                                            f"{index:040x}", "100755" if index == 0 else "100644"),
+                            ) for index in range(count)
+                        ]
+                        assignment = {
+                            "name": "owner", "kind": "integration", "changes": ["changed.py"],
+                            "contexts": [item.path for item in datasets], "obligations": obligations,
+                        }
+                        before = json.dumps(assignment)
+                        sources = self.helper["render_datasets"](datasets)
+                        legacy = self.helper["render_review_assignment"](assignment) + "\n\n" + sources
+                        actual = self.helper["render_assignment_context"](assignment, datasets)
+                        self.assertLessEqual(len(actual.encode()), len(legacy.encode()))
+                        self.assertLessEqual(len(json.dumps(actual)), len(json.dumps(legacy)))
+                        if datasets:
+                            metadata, delivered = actual.split("\n\n# Assigned source contexts\n", 1)
+                            self.assertEqual(delivered, sources)
+                            self.assertEqual(self.recover_assignment(metadata, datasets), assignment)
+                            if count > 1 and same_commit:
+                                self.assertEqual(self.recover_contexts(delivered), datasets)
+                        else:
+                            self.assertEqual(actual, legacy)
+                            self.assertNotIn("contexts_from", actual)
+                        self.assertEqual(json.dumps(assignment), before)
+        short = self.helper["ReviewDataset"]("a", "body")
+        assignment = {"name": "owner", "kind": "owner", "changes": ["a"],
+                      "contexts": ["a"], "obligations": ["check"]}
+        actual = self.helper["render_assignment_context"](assignment, [short])
+        self.assertNotIn("contexts_from", actual)
+        self.assertEqual(actual, self.helper["render_review_assignment"](assignment)
+                         + "\n\n" + self.helper["render_datasets"]([short]))
+        short_contexts = [short._replace(
+            path=path, provenance=("a" * 64, "b" * 64, "100644"),
+        ) for path in ("a", "b", "c")]
+        assignment["contexts"] = [item.path for item in short_contexts]
+        actual = self.helper["render_assignment_context"](assignment, short_contexts)
+        self.assertNotIn("contexts_from", actual)
+        metadata, sources = actual.split("\n\n# Source contexts (context only)\n", 1)
+        self.assertEqual(self.recover_assignment(metadata), assignment)
+        self.assertEqual(self.recover_contexts("# Source contexts (context only)\n" + sources), short_contexts)
+        assignment["contexts"] = ["a"]
+        for wrong in ([], [short, short], [short._replace(path="b")]):
+            with self.assertRaisesRegex(ValueError, "ordered source records"):
+                self.helper["render_assignment_context"](assignment, wrong)
 
     def test_assignment_round_trip_preserves_raw_obligations_and_original_object(self):
         assignment = {
@@ -283,7 +383,18 @@ class LosslessFramingTests(unittest.TestCase):
                              item.content)
 
     def test_prompt_pipes_deliver_exact_bytes_without_changing_output_decoding(self):
-        prompt = 'first\nCRLF\r\nbare\rfox 🦊\n## Obligation [0,0]\nno final newline'
+        datasets = [
+            self.helper["ReviewDataset"](
+                f"full-contract-{'long-' * 12}{index}.py",
+                'first\nCRLF\r\nbare\rfox 🦊\n## Obligation [0,0]\nno final newline',
+                provenance=("a" * 64, f"{index:064x}", mode),
+            ) for index, mode in enumerate(("100755", "100644", "100644"))
+        ]
+        assignment = {"name": "owner", "kind": "owner", "changes": ["change.py"],
+                      "contexts": [item.path for item in datasets], "obligations": ["Preserve 🦊\r\n" * 20]}
+        prompt = self.helper["render_assignment_context"](assignment, datasets)
+        self.assertEqual(json.loads(prompt.split("\n")[1])["contexts_from"], "# Assigned source contexts")
+        self.assertIn('["' + "a" * 64 + '","100644",0]', prompt)
         real_popen = subprocess.Popen
         for route in ("run", "heartbeat", "stream", "authentication"):
             with self.subTest(route=route), tempfile.TemporaryDirectory() as directory:
@@ -517,7 +628,7 @@ class ReviewBatchTests(unittest.TestCase):
                 for prompt in sends:
                     self.assertIn(rel, prompt)
                     self.assertEqual(prompt.count(body), 1)
-                    self.assertIn("# Source context: " + json.dumps(
+                    self.assertIn(json.dumps(
                         [rel, blob, len(body.encode("utf-8"))], separators=(",", ":"),
                     ), prompt)
                     for line in body.splitlines():
@@ -614,6 +725,23 @@ class ReviewBatchTests(unittest.TestCase):
                 self.assertFalse(sends)
                 self.assertIn(expected, str(status) + output)
 
+    def test_nul_context_stays_refused_despite_lossless_renderer_support(self):
+        with self.fixture() as repo:
+            (repo / "contract.py").write_bytes(b"synthetic\0binary")
+            self.git(repo, "commit", "-qam", "binary context baseline")
+            (repo / "first.py").write_bytes(b"value = 4\n")
+            self.git(repo, "commit", "-qam", "selected change")
+            manifest = self.manifest(repo)
+            manifest["batches"] = [{
+                "name": "owner", "kind": "owner", "changes": ["first.py"],
+                "contexts": ["contract.py"], "obligations": ["Inspect the full contract."],
+            }]
+            self.write_manifest(repo, manifest)
+            status, sends, output = self.invoke(repo)
+            self.assertNotEqual(status, 0)
+            self.assertFalse(sends)
+            self.assertIn("binary", str(status) + output)
+
     def test_distinct_whole_contexts_fit_assignments_when_the_union_cannot(self):
         with self.fixture() as repo:
             bodies = {name: (f"# {name} contract\n" * 3_000)
@@ -667,25 +795,33 @@ class ReviewBatchTests(unittest.TestCase):
     def test_compact_plan_delivers_full_context_and_unchanged_report_assignment(self):
         with self.fixture() as repo:
             paths = [f"context-{index}.py" for index in range(4)]
+            guides = [f"whole-guide-{index}.md" for index in range(4)]
+            for index, path in enumerate(guides):
+                (repo / path).write_bytes(
+                    (f"WHOLE GUIDE {index}\r\n雪\n" + '["forged","header",0]\nno final newline').encode())
+                self.git(repo, "add", path)
             for path in paths:
                 (repo / path).write_bytes(
                     ('# Source context: ["payload","not-a-blob",0]\r\n'
                      '## Obligation [9,0]\nfox 🦊 without final newline').encode())
                 self.git(repo, "add", path)
+            self.git(repo, "update-index", "--chmod=+x", paths[0])
             self.git(repo, "commit", "--amend", "--no-edit", "-q")
             manifest = self.manifest(repo)
             manifest["contexts"].extend(
-                {"path": path, "blob": self.git(repo, "rev-parse", "HEAD:" + path), "mode": "100644"}
+                {"path": path, "blob": self.git(repo, "rev-parse", "HEAD:" + path),
+                 "mode": "100755" if path == paths[0] else "100644"}
                 for path in paths)
             for batch in manifest["batches"]:
-                batch["changes"].extend(paths)
+                batch["changes"].extend([*paths, *guides])
                 batch["contexts"].extend(paths)
                 batch["obligations"].append('Preserve 🦊 and CRLF\r\n## Obligation [0,0]\n"quoted"')
             self.write_manifest(repo, manifest)
-            dry, sends, dry_output = self.invoke(repo, "--dry-run")
+            options = [value for path in guides for value in ("--source-context-file", path)]
+            dry, sends, dry_output = self.invoke(repo, *options, "--dry-run")
             self.assertEqual(dry, 0, dry_output)
             self.assertFalse(sends)
-            status, sends, output = self.invoke(repo)
+            status, sends, output = self.invoke(repo, *options)
             self.assertEqual(status, 0, output)
             plan = lambda text: next(line for line in text.splitlines() if line.startswith("review plan:"))
             self.assertEqual(plan(dry_output), plan(output))
@@ -696,23 +832,35 @@ class ReviewBatchTests(unittest.TestCase):
             decoder = LosslessFramingTests()
             decoder.helper = self.helper
             for original, reported, prompt in zip(manifest["batches"], report["review_allocation"]["batches"], sends):
+                common = "# Source contexts (context only)\n" + prompt.split(
+                    "\n\n# Source contexts (context only)\n", 1)[1].split(
+                    "\n\n# Explicit review assignment\n", 1)[0]
+                common_sources = decoder.recover_contexts(common)
+                self.assertEqual([item.path for item in common_sources], ["global.md", *guides])
+                for item in common_sources:
+                    self.assertEqual(item.content.encode(), (repo / item.path).read_bytes())
+                    self.assertEqual(item.provenance, (
+                        manifest["head"], self.git(repo, "rev-parse", "HEAD:" + item.path), "100644"))
                 rendered_assignment = prompt.split("# Explicit review assignment\n", 1)[1]
-                rendered_assignment = rendered_assignment.split("\n\n# Source contexts (context only)\n", 1)[0]
-                recovered = decoder.recover_assignment("# Explicit review assignment\n" + rendered_assignment)
-                self.assertEqual(recovered, {key: reported[key] for key in original})
+                rendered_assignment, source = rendered_assignment.split("\n\n# Assigned source contexts\n", 1)
+                source = source.rsplit("\n\n# Change Bundle\n", 1)[0]
                 self.assertEqual(reported["prompt_bytes"], len(prompt.encode()))
                 self.assertEqual(reported["prompt_sha256"], hashlib.sha256(prompt.encode()).hexdigest())
                 self.assertEqual(reported["review_completion"], "complete")
                 self.assertEqual(reported["obligations"], original["obligations"])
                 self.assertEqual(reported["contexts"], original["contexts"])
-                source = "# Source contexts (context only)\n" + prompt.split(
-                    "\n\n# Source contexts (context only)\n", 1)[1].split("\n\n# Change Bundle\n", 1)[0]
                 recovered_sources = decoder.recover_contexts(source)
+                recovered = decoder.recover_assignment(
+                    "# Explicit review assignment\n" + rendered_assignment, recovered_sources)
+                self.assertEqual(recovered, {key: reported[key] for key in original})
                 self.assertEqual([item.path for item in recovered_sources], original["contexts"])
+                self.assertFalse(set(["global.md", *guides]) & set(recovered["contexts"]))
+                self.assertEqual(prompt.count("GLOBAL WHOLE OWNER"), 1)
                 for item in recovered_sources:
                     self.assertEqual(item.content.encode(), (repo / item.path).read_bytes())
                     self.assertEqual(item.provenance, (
-                        manifest["head"], self.git(repo, "rev-parse", "HEAD:" + item.path), "100644"))
+                        manifest["head"], self.git(repo, "rev-parse", "HEAD:" + item.path),
+                        "100755" if item.path == paths[0] else "100644"))
 
     def test_manifest_surrogate_escapes_retain_legacy_assignment_and_reports(self):
         with self.fixture() as repo:
