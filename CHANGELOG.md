@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Default Autoreview's Codex reviewer to GPT-6.2 Sol with a one-time GPT-6.1 Sol access retry; explicit GPT-6.1 Sol keeps its GPT-6 Sol retry. When the ChatGPT route refuses the model for this sign-in (as Codex 0.164.0 does for GPT-6.2 Sol), the pass retries the same model once on the operator's validated configured provider, and `--codex-route api.openai.com` selects the API directly when the root provider is the subscription.
+
 - Reduce Autoreview prompt framing overhead without dropping evidence or changing review limits. Preserve exact prompt bytes across text input and Amp files, avoid growth in raw or JSON-encoded requests, and prefer complete plans within the requested pass count.
 
 - Fail Linux Codex preflight when the selected installation cannot re-execute inside the read-only tool sandbox, preventing a review with broken tool access without broadening filesystem permissions. Thanks @vrknetha. (#395)

@@ -119,8 +119,13 @@ verified parent-relative patch; otherwise attribution stays unknown.
 Never switch review hosts after launch or to bypass missing context, isolation failures,
 slowness or rate limits. If no route is eligible, report unavailable.
 
-The helper's Codex engine defaults to **GPT-6.1 Sol (`gpt-6.1-sol`), medium reasoning, Ultrafast**.
-It retries GPT-6 Sol once only for account-access failure, without chaining to Luna.
+The helper's Codex engine defaults to **GPT-6.2 Sol (`gpt-6.2-sol`), medium reasoning**, requesting Ultrafast.
+Codex 0.164.0 advertises no tier for 6.2 and sends Standard; a client and route that
+advertise Ultrafast for 6.2 use it, at Ultrafast usage rates.
+Codex 0.164.0 with a ChatGPT sign-in refuses 6.2 as `not supported when using Codex with
+a ChatGPT account`; that refusal also marks other models an account cannot use there.
+It retries GPT-6.1 Sol once only for account-access failure, including that refusal when
+no configured provider serves it, without chaining to GPT-6 Sol.
 Network, rate-limit, capacity, and unsupported-effort errors do not trigger fallback.
 Use `--codex-no-fallback` when only the selected Codex model and authentication
 route are authorized. It disables helper model retries and configured-provider
@@ -142,8 +147,10 @@ that refusal.
 - Valid configured provider + `codex login status` reports no login (~10s timeout): skip subscription; probe error/timeout → subscription first; explicit provider → no probe.
 - Live auth failure → stop attempt fast. Retry pass once on operator's configured,
   validated named command-auth provider; print selected provider. No valid route → fail.
+- Subscription refuses the model for ChatGPT sign-in → same one-time retry, same model,
+  on that provider. No valid route → model access retry on the subscription.
 - Live stop: definite credential failure immediately; generic auth failure ≥3 lines / 60s.
-- Explicit provider / non-auth failure: no automatic auth fallback.
+- Explicit provider / other failures: no automatic route fallback.
 - Force configured route: `--codex-config 'model_provider="review_api"'`;
   `review_api` must match operator `CODEX_HOME/config.toml`.
 - Opt in by API endpoint hostname: `--codex-route api.example.com` selects the
@@ -152,6 +159,8 @@ that refusal.
   command auth or a configured bearer token with `requires_openai_auth=false`.
   Cannot combine with a `model_provider` override. Explicit failure never changes
   provider, endpoint or credential. Read [route constraints](references/engines.md#api-hostname-selection).
+  When the root `model_provider` is the subscription, `--codex-route api.openai.com`
+  runs GPT-6.2 Sol directly on a named API provider.
 
 ### Copilot subagent review
 
