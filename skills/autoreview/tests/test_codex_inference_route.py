@@ -754,6 +754,24 @@ class CodexInferenceRouteTests(unittest.TestCase):
             self.run_review(during_run=respond)
         self.assertIn(marker, str(caught.exception))
 
+    def test_default_route_surfaces_stdout_json_error_when_stderr_has_warning(self):
+        self.args.codex_config = []
+        self.write_config()
+        stderr_warning = 'WARNING: proceeding, even though we could not create PATH aliases under "/tmp"\n'
+        stdout_jsonl = "\n".join([
+            json.dumps({"type": "thread.started", "thread_id": "t-1"}),
+            json.dumps({"type": "turn.failed", "error": {"message": "stream disconnected: upstream 502"}}),
+        ])
+
+        def fail_with_warning(observed):
+            return subprocess.CompletedProcess(observed["command"], 1, stdout_jsonl, stderr_warning)
+
+        with self.assertRaises(SystemExit) as caught:
+            self.run_review(during_run=fail_with_warning)
+        msg = str(caught.exception)
+        self.assertIn("WARNING: proceeding", msg)
+        self.assertIn("stream disconnected: upstream 502", msg)
+
 
 @unittest.skipIf(os.name == "nt", "hostname route requires POSIX ownership checks")
 class CodexHostnameRouteTests(unittest.TestCase):

@@ -6213,6 +6213,51 @@ def codex_subscription_login_missing(repo: Path, codex_bin: str, cwd: Path) -> b
     return "not logged in" in output or (result.returncode == 1 and not output)
 
 
+def codex_stdout_error_summary(stdout: str, *, max_chars: int = 2000) -> str:
+    text = (stdout or "").strip()
+    if not text:
+        return ""
+    extracted: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        etype = event.get("type")
+        if etype == "error":
+            msg = event.get("message")
+            if isinstance(msg, str) and msg.strip():
+                extracted.append(msg.strip())
+        elif etype == "turn.failed":
+            err = event.get("error")
+            msg = err.get("message") if isinstance(err, dict) else event.get("message")
+            if isinstance(msg, str) and msg.strip():
+                extracted.append(msg.strip())
+    if extracted:
+        summary = "\n".join(dict.fromkeys(extracted))
+        return summary[-max_chars:] if len(summary) > max_chars else summary
+    return text[-max_chars:] if len(text) > max_chars else text
+
+
+def codex_failure_detail(
+    result: subprocess.CompletedProcess[str],
+    secret: str | None = None,
+) -> str:
+    stderr = (result.stderr or "").strip()
+    stdout_summary = codex_stdout_error_summary(result.stdout or "")
+    parts: list[str] = []
+    if stderr:
+        parts.append(stderr)
+    if stdout_summary and stdout_summary not in stderr:
+        parts.append(f"stdout: {stdout_summary}" if stderr else stdout_summary)
+    return redact_codex_route_secret("\n".join(parts), secret)
+
+
 def codex_failure_category(result: subprocess.CompletedProcess[str]) -> str:
     # Classify only; captured auth-helper diagnostics must never escape.
     text = (result.stderr + "\n" + result.stdout).lower()
@@ -6480,9 +6525,10 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                         f"codex engine failed: {codex_failure_category(result)}; provider diagnostics suppressed",
                         result=result,
                     )
-                detail = result.stderr or result.stdout
+                secret = getattr(route, "bearer_token", None)
+                detail = codex_failure_detail(result, secret)
                 if primary_failure is not None:
-                    primary_detail = primary_failure.stderr or primary_failure.stdout
+                    primary_detail = codex_failure_detail(primary_failure, secret)
                     raise ReviewerUnavailable(
                         f"codex engine failed with primary model ({primary_failure.returncode})\n{primary_detail}\n"
                         f"codex fallback model failed ({result.returncode})\n{detail}", result=result,
