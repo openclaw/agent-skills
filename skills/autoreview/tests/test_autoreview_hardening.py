@@ -4082,7 +4082,8 @@ time.sleep(60)
                    if not key.startswith("AUTOREVIEW_") or key == "AUTOREVIEW_GIT"}
             env.update({"HOME": str(root), "USERPROFILE": str(root), "CODEX_HOME": str(root),
                         "AUTOREVIEW_FAKE_RECORD": str(root / "record.json")})
-            for primary, fallback in (("gpt-6.1-sol", "gpt-6-sol"), ("gpt-6-sol", "gpt-6-luna"), ("gpt-5.6-sol", "gpt-5.6-terra")):
+            for primary, fallback in (("gpt-6.2-sol", "gpt-6.1-sol"), ("gpt-6.1-sol", "gpt-6-sol"),
+                                      ("gpt-6-sol", "gpt-6-luna"), ("gpt-5.6-sol", "gpt-5.6-terra")):
                 # Even a schema-valid output file cannot override the failing child exit.
                 failure = (
                     'model = args[args.index("--model") + 1]\n'

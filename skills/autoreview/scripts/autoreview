@@ -438,10 +438,10 @@ PROVIDER_CREDENTIAL_PATH_ENV_KEYS = {
 }
 DEFAULT_MODEL_BY_ENGINE = {
     "amp": "openai/gpt-5.6-sol",
-    "codex": "gpt-6.1-sol",
+    "codex": "gpt-6.2-sol",
     "claude": "claude-fable-5",
 }
-DEFAULT_CODEX_ACCESS_FALLBACK_MODEL = "gpt-6-sol"
+DEFAULT_CODEX_ACCESS_FALLBACK_MODEL = "gpt-6.1-sol"
 AMP_THINKING_VALUES = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
 DEFAULT_THINKING_BY_ENGINE = {
     "amp": "high",
@@ -6172,13 +6172,24 @@ class CodexAuthFailureStopper:
         return False
 
 
+def codex_subscription_unsupported_model(result: subprocess.CompletedProcess[str]) -> bool:
+    # The ChatGPT route refuses models this sign-in cannot use there (GPT-6.2 Sol on
+    # Codex 0.164.0) before inference; the operator's root-selected command-auth
+    # provider may serve the same request, as it does for authentication failures.
+    return not isinstance(result, TimedOutEngineProcess) and any(
+        "not supported when using codex with a chatgpt account" in message.lower()
+        for message in codex_error_messages(result)
+    )
+
+
 def load_codex_auth_fallback_route(
     repo: Path, overrides: Sequence[str], result: subprocess.CompletedProcess[str] | None = None,
     *, command_auth: bool,
 ) -> tuple[str, tuple[list[str], bytes | None]] | None:
     if (command_auth
             or any(item.partition("=")[0].strip() == "model_provider" for item in overrides)
-            or (result is not None and (result.returncode == 0 or not codex_authentication_failure(result)))):
+            or (result is not None and (result.returncode == 0 or not (
+                codex_authentication_failure(result) or codex_subscription_unsupported_model(result))))):
         return None
     source_home = codex_source_home(repo)
     if source_home is None:
@@ -6451,8 +6462,9 @@ def run_codex(args: argparse.Namespace, repo: Path, prompt: str) -> str:
                     )
                     command_auth = True
                     primary_failure = None
+                    reason = "authentication" if codex_authentication_failure(result) else "model unsupported"
                     print(
-                        "codex auth: subscription route failed (authentication); "
+                        f"codex auth: subscription route failed ({reason}); "
                         f"retrying on configured provider {provider}",
                         file=sys.stderr, flush=True,
                     )
@@ -7919,7 +7931,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         action="append",
-        help="Model override or engine=model. Repeatable. Defaults: codex=gpt-6.1-sol with an access-only gpt-6-sol retry, claude=claude-fable-5, amp=openai/gpt-5.6-sol.",
+        help="Model override or engine=model. Repeatable. Defaults: codex=gpt-6.2-sol with an access-only gpt-6.1-sol retry, claude=claude-fable-5, amp=openai/gpt-5.6-sol.",
     )
     parser.add_argument("--thinking", action="append", help="Thinking/effort override or engine=level. Repeatable. Codex: none, minimal, low, medium, high, xhigh, max; gpt-6-sol and gpt-6-luna exclude minimal; gpt-6.1-sol, gpt-6-astra, gpt-6.2-sol, and gpt-6.2-astra require low through max. Claude: low, medium, high, xhigh, max. Amp: none, low, medium, high, xhigh, max. Pi: off, minimal, low, medium, high, xhigh.")
     parser.add_argument(
@@ -8336,6 +8348,9 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
         fallback_model = None
     elif engine == "codex" and model == DEFAULT_MODEL_BY_ENGINE["codex"]:
         fallback_model = DEFAULT_CODEX_ACCESS_FALLBACK_MODEL
+    elif engine == "codex" and model == "gpt-6.1-sol":
+        # Keep the shipped retry contract for explicitly selected GPT-6.1 Sol.
+        fallback_model = "gpt-6-sol"
     elif engine == "codex" and model == "gpt-6-sol":
         # Keep the shipped retry contract for explicitly selected GPT-6 Sol.
         fallback_model = "gpt-6-luna"

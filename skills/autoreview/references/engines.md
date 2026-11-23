@@ -10,7 +10,8 @@ it is not `--engine copilot`, does not inherit Codex CLI flags/defaults, and
 produces no helper-validated machine status or helper isolation guarantees.
 
 - Defaults + engine-selection policy: [SKILL.md](../SKILL.md#engines).
-- Explicit `gpt-6.1-sol`: same access-only `gpt-6-sol` retry.
+- Explicit `gpt-6.2-sol`: same access-only `gpt-6.1-sol` retry.
+  Explicit `gpt-6.1-sol`: access-only `gpt-6-sol` retry.
   Explicit `gpt-6-sol`: access-only `gpt-6-luna` retry.
 - Other explicit models, including Luna/Astra: no model fallback.
 - Explicit `gpt-5.6-sol`: access-only `gpt-5.6-terra` retry.
@@ -66,9 +67,12 @@ and [Codex reasoning modes](https://learn.chatgpt.com/docs/models#know-when-to-u
 Default: ChatGPT subscription; preserve only user authentication settings.
 Live authentication failure → stop attempt fast; retry pass once on operator's
 validated configured named command-auth route, including context + catalogue.
+The subscription refusing a model for ChatGPT sign-in (`not supported when using
+Codex with a ChatGPT account`, as for GPT-6.2 Sol on Codex 0.164.0) takes the same
+one-time retry with the same model; the access retry still applies on that route.
 Definite credential failure → immediate stop; generic auth failure → stop after
 3 lines within 60s. Single 401: allow Codex's reload/refresh recovery.
-Explicit provider / non-auth failure / no valid configured route: no auth fallback.
+Explicit provider / other failures / no valid configured route: no route fallback.
 Profile settings remain ignored. Force configured route before subscription attempt:
 
 ```bash
