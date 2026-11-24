@@ -207,9 +207,8 @@ function safeMediaType(value) {
 }
 
 export function assetPlaceholder(kind, details = {}) {
-  const name = typeof details.name === "string" && /^[^\\/\s][^\\/]{0,119}$/.test(details.name) ? details.name : "";
   const meta = [safeMediaType(details.mediaType), formatBytes(details.bytes)].filter(Boolean).join(", ");
-  return `[Beam asset omitted: ${kind}${name ? ` ${name}` : ""}${meta ? ` (${meta})` : ""}]`;
+  return `[Beam asset omitted: ${kind}${meta ? ` (${meta})` : ""}]`;
 }
 
 function assetBlockPlaceholder(block, type) {
@@ -728,7 +727,7 @@ function deliveredFilePlaceholders(block) {
     } catch {
       // Relative or since-removed files still get a name-only placeholder.
     }
-    return assetPlaceholder("file", { name: path.basename(file), bytes });
+    return assetPlaceholder("file", { bytes });
   });
 }
 

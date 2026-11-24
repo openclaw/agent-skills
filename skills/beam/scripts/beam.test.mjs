@@ -1588,7 +1588,7 @@ test("sanitizer keeps calendar dates but still redacts phone numbers", () => {
 
 test("images and delivered files become visible asset placeholders without bytes or paths", () => {
   const dir = tempDir();
-  const video = path.join(dir, "launch-reel.mp4");
+  const video = path.join(dir, "reviewer@example.test.mp4");
   fs.writeFileSync(video, Buffer.alloc(3 * 1024 * 1024));
   const session = path.join(dir, "22222222-2222-4333-8444-555555555555.jsonl");
   const pixels = Buffer.alloc(30 * 1024).toString("base64");
@@ -1604,8 +1604,9 @@ test("images and delivered files become visible asset placeholders without bytes
   const text = rendered.items.map((item) => item.text).join("\n");
   assert.match(text, /\[Beam asset omitted: image \(image\/webp, 30 KB\)\]/);
   assert.match(text, /\[Beam asset omitted: image\]\nmake it loop/);
-  assert.match(text, /\[Beam asset omitted: file launch-reel\.mp4 \(3\.0 MB\)\]/);
+  assert.match(text, /\[Beam asset omitted: file \(3\.0 MB\)\]/);
   assert.doesNotMatch(text, new RegExp(dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(text, /reviewer@example\.test|\.mp4/i);
   assert.ok(!text.includes(pixels.slice(0, 64)));
 });
 
