@@ -45,6 +45,8 @@ Install only Beam from the canonical skills checkout:
 scripts/install-skills beam
 ```
 
+Put a compatible [Beam executable](https://github.com/openclaw/beam) on your executable search path to use the native transport with Gateway endpoints ending in `/api/v1/beam/sessions`. The skill passes the cleaned snapshot, Beam ID and state path through its v1 hook protocol. Existing hooks keep their arguments. Custom upload URLs and installations without the native protocol use the bundled sender. After a native operation fails, its journal and request ID are the recovery source.
+
 A copied installation is also standalone:
 
 ```sh
@@ -276,6 +278,8 @@ https://docs.openclaw.ai/plugins/beam
 node --check skills/beam/scripts/beam
 node --check skills/beam/scripts/beam-session.js
 node --check skills/beam/scripts/beam-handoff.js
-node --test skills/beam/scripts/beam.test.mjs skills/beam/scripts/beam-handoff.test.mjs
+node --test skills/beam/scripts/beam.test.mjs skills/beam/scripts/beam-handoff.test.mjs skills/beam/scripts/beam-native*.test.mjs
 python scripts/validate-skills
 ```
+
+For the cross-version test, set `BEAM_TEST_NATIVE_CLI` to the compiled executable and `BEAM_TEST_V1_SKILL` to the released v0.7.0 `skills/beam` directory. The test installs the current skill in a temporary directory and recovers a released sender's suspended handoff.

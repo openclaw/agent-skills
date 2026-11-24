@@ -203,6 +203,8 @@ def main(argv: list[str] | None = None) -> int:
         ["node", "--test",
          "skills/agent-transcript/scripts/agent-transcript.test.mjs",
          "skills/beam/scripts/beam.test.mjs",
+         "skills/beam/scripts/beam-native.test.mjs",
+         "skills/beam/scripts/beam-native.e2e.test.mjs",
          "skills/session-viewer/scripts/session-viewer.test.ts"],
     ]
     if args.group not in ("all", "core"):

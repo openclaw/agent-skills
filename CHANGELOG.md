@@ -10,6 +10,8 @@
 
 - Update the development YAML parser to PyYAML 6.0.4 while preserving the Python 3.10 installed-helper floor.
 
+- Run existing Beam publishing commands and hooks through a compatible installed native Beam executable, preserving their source IDs, receipts and journal.
+
 - Reject unsupported `none` and `minimal` reasoning efforts for explicitly selected GPT-6.2 Sol/Astra before preparing review evidence; keep the default model and access-only retry policy unchanged. Thanks @coygeek. (#396)
 - Accept ordinary-path findings with shape-valid extra source attribution by clearing that attribution, while retaining strict mixed-source provenance validation and the raw provider report. Thanks @kesslerio. (#377, #387)
 

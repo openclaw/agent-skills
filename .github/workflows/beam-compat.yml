@@ -1,0 +1,50 @@
+name: Beam compatibility
+on:
+  pull_request:
+    paths:
+      - 'skills/beam/**'
+      - '.github/workflows/beam-compat.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'skills/beam/**'
+      - '.github/workflows/beam-compat.yml'
+permissions:
+  contents: read
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: openclaw/agent-skills
+          ref: a056640843cb9b7701a451c2d43ef554709ab988 # v0.7.0
+          path: released
+          sparse-checkout: skills/beam
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: openclaw/beam
+          ref: 6588f81bb4083f1b2a67f7713135700c9a458f3a
+          path: native
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26.13.1'
+      - name: Check installed skill against the native CLI and released sender
+        run: |
+          mkdir "$RUNNER_TEMP/beam-bin"
+          go -C native build -o "$RUNNER_TEMP/beam-bin/beam" ./cmd/beam
+          export PATH="$RUNNER_TEMP/beam-bin:$PATH"
+          export BEAM_TEST_NATIVE_CLI="$RUNNER_TEMP/beam-bin/beam"
+          export BEAM_TEST_V1_SKILL="$GITHUB_WORKSPACE/released/skills/beam"
+          node --test skills/beam/scripts/beam.test.mjs skills/beam/scripts/beam-handoff.test.mjs skills/beam/scripts/beam-native*.test.mjs
