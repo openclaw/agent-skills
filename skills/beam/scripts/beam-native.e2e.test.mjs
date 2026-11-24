@@ -63,14 +63,14 @@ test(
     );
     const bodies = [];
     const wire = [];
-    let custom = 0;
+    const snapshots = [];
     const server = http.createServer((request, response) => {
       let data = "";
       request.on("data", (chunk) => (data += chunk));
       request.on("end", () => {
         const packet = JSON.parse(data);
-        if (request.url === "/custom-upload") {
-          custom++;
+        if (request.url === "/custom-upload" || request.url === "/review/api/v1/beam/sessions") {
+          snapshots.push(request.url);
           response.setHeader("content-type", "application/json");
           response.end(JSON.stringify({ ok: true }));
           return;
@@ -106,13 +106,16 @@ test(
       BEAM_ACCESS_TOKEN: "",
       BEAM_STATE: db,
     };
-    const customSnapshot = await invoke(
-      current,
-      ["publish", "--snapshot", "--session", transcript, "--endpoint", origin + "/custom-upload"],
-      env,
-    );
-    assert.equal(customSnapshot.code, 0, customSnapshot.err);
-    assert.equal(custom, 1);
+    const routes = ["/custom-upload", "/review/api/v1/beam/sessions"];
+    for (const route of routes) {
+      const snapshot = await invoke(
+        current,
+        ["publish", "--snapshot", "--session", transcript, "--endpoint", origin + route],
+        env,
+      );
+      assert.equal(snapshot.code, 0, snapshot.err);
+    }
+    assert.deepEqual(snapshots, routes);
     assert.equal(fs.existsSync(db), false);
     const first = await invoke(
       old,
