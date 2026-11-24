@@ -199,7 +199,6 @@ def main(argv: list[str] | None = None) -> int:
         ["node", "--check", "skills/agent-transcript/scripts/agent-transcript"],
         ["node", "--check", "skills/beam/scripts/beam"],
         ["node", "--check", "skills/beam/scripts/beam-session.js"],
-        ["node", "--check", "skills/beam/scripts/beam-native.js"],
         ["npm", "run", "typecheck"],
         ["node", "--test",
          "skills/agent-transcript/scripts/agent-transcript.test.mjs",
