@@ -11,7 +11,7 @@ Use when the user explicitly asks to beam, publish, or share the current local c
 
 - Treat invoking this skill as approval to hand the current conversation to the named destination. `publish` hands off by default; pass `--snapshot` only when the user asks for a read-only share (or for `--complete` snapshots).
 - Never upload raw JSONL, reasoning, system/developer prompts, tool output, environment values, credentials, browser state, cookies, or local paths.
-- The helper is self-contained: it resolves and parses exact Claude Code or Codex transcripts, then uploads only locally redacted user/assistant messages and compact tool counts.
+- The installed helper resolves the exact Claude Code or Codex transcript and cleans it locally. A compatible native `beam` on PATH handles transport and handoff recovery. The bundled sender supports installations without that binary.
 - A handoff releases the source Beam identity and moves its logical conversation to Team; receivers without handoff support get a read-only snapshot and the source stays active. After handoff, use Beam's authenticated `read` and `continue` commands for subsequent work; do not resume independent source work or publish another transcript copy.
 - Team owns one durable conversation after release. The source history imports once; reads, reconnects and continuations resolve that same conversation. Native provider runtime IDs need not survive. Do not connect a node, expose a terminal, transfer credentials or grant filesystem/tool access.
 - Require HTTPS except for loopback development endpoints.
@@ -117,8 +117,9 @@ Full installation, authentication, data-boundary, and hook documentation:
 
 ```bash
 node --check skills/beam/scripts/beam
+node --check skills/beam/scripts/beam-native.js
 node --check skills/beam/scripts/beam-session.js
 node --check skills/beam/scripts/beam-handoff.js
-node --test skills/beam/scripts/beam.test.mjs skills/beam/scripts/beam-handoff.test.mjs
+node --test skills/beam/scripts/beam.test.mjs skills/beam/scripts/beam-handoff.test.mjs skills/beam/scripts/beam-native.test.mjs
 scripts/validate-skills
 ```

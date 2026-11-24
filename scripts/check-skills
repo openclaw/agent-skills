@@ -199,10 +199,13 @@ def main(argv: list[str] | None = None) -> int:
         ["node", "--check", "skills/agent-transcript/scripts/agent-transcript"],
         ["node", "--check", "skills/beam/scripts/beam"],
         ["node", "--check", "skills/beam/scripts/beam-session.js"],
+        ["node", "--check", "skills/beam/scripts/beam-native.js"],
         ["npm", "run", "typecheck"],
         ["node", "--test",
          "skills/agent-transcript/scripts/agent-transcript.test.mjs",
          "skills/beam/scripts/beam.test.mjs",
+         "skills/beam/scripts/beam-native.test.mjs",
+         "skills/beam/scripts/beam-native.e2e.test.mjs",
          "skills/session-viewer/scripts/session-viewer.test.ts"],
     ]
     if args.group not in ("all", "core"):
