@@ -2673,6 +2673,22 @@ class AutoreviewAuthFallbackTests(unittest.TestCase):
             self.repo, ["model_provider=review_api"],
         ))
 
+    def test_auth_failure_reports_missing_toml_reader_for_provider_discovery(self) -> None:
+        self.configure_provider()
+        failure = subprocess.CompletedProcess([], 1, "", "401 Unauthorized PRIVATE_SENTINEL")
+        with mock.patch.dict(sys.modules, {"tomllib": None, "tomli": None}):
+            self.assertIsNone(AUTOREVIEW.load_codex_auth_fallback_route(
+                self.repo, [], command_auth=False,
+            ))
+            with self.assertRaisesRegex(
+                AUTOREVIEW.ReviewerUnavailable, r"authentication.*fallback provider.*Python 3\.11.*tomli",
+            ) as caught:
+                AUTOREVIEW.load_codex_auth_fallback_route(
+                    self.repo, [], failure, command_auth=False,
+                )
+        self.assertEqual(caught.exception.returncode, 1)
+        self.assertNotIn("PRIVATE_SENTINEL", str(caught.exception))
+
     def test_fallback_rejects_explicit_provider_command_auth_and_non_auth_failure(self) -> None:
         self.configure_provider()
         for overrides, command_auth, result in (

@@ -5221,6 +5221,10 @@ def parse_codex_auth_config_fallback(text: str) -> dict[str, Any]:
     return config
 
 
+class CodexTomlParserUnavailable(SystemExit):
+    """The legacy auth reader cannot determine the configured inference route."""
+
+
 def load_codex_auth_config(path: Path, *, strict: bool = False) -> dict[str, Any]:
     try:
         text = path.read_text(encoding="utf-8")
@@ -5239,7 +5243,7 @@ def load_codex_auth_config(path: Path, *, strict: bool = False) -> dict[str, Any
             import tomli as tomllib
     except ModuleNotFoundError:
         if strict:
-            raise SystemExit("Codex inference configuration refused: reading an operator route requires Python 3.11 or tomli")
+            raise CodexTomlParserUnavailable("Codex inference configuration refused: reading an operator route requires Python 3.11 or tomli")
         return parse_codex_auth_config_fallback(text)
     try:
         config = tomllib.loads(text)
@@ -6186,11 +6190,19 @@ def load_codex_auth_fallback_route(
     config_path = source_home / "config.toml"
     if not external_env_path(repo, str(config_path)):
         return None
-    provider = load_codex_auth_config(config_path).get("model_provider")
-    if not isinstance(provider, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", provider):
-        return None
     try:
+        provider = load_codex_auth_config(config_path, strict=True).get("model_provider")
+        if not isinstance(provider, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", provider):
+            return None
         route = load_codex_inference_route(repo, [*overrides, f"model_provider={provider}"])
+    except CodexTomlParserUnavailable:
+        if result is None:
+            return None  # The primary login can still succeed.
+        raise ReviewerUnavailable(
+            "codex engine failed: authentication; checking config.toml for a fallback provider "
+            "requires Python 3.11 or the tomli package",
+            result=result,
+        ) from None
     except SystemExit:
         # Invalid/unavailable routes cannot replace the original auth failure.
         return None
