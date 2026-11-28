@@ -81,6 +81,7 @@ Profile settings remain ignored. Force configured route before subscription atte
 - Provider discovery and projection require Python 3.11+ or `tomli`. The legacy
   reader supports subscription login settings. If authentication fails and
   AutoReview cannot read the provider settings, it reports the missing parser.
+  On older Python versions, run `python -m pip install tomli` with AutoReview's interpreter.
 
 - Selected route must use an absolute `https` base URL with a host and no userinfo,
   query, or fragment (including empty `?`/`#`). OpenAI-compatible Responses gateways
