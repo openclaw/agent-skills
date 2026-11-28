@@ -78,8 +78,9 @@ Profile settings remain ignored. Force configured route before subscription atte
 - Selector must match `model_provider` in operator's external `CODEX_HOME/config.toml`.
   Accepts one bare or simply quoted identifier; overrides cannot supply provider
   definitions or other capabilities.
-- Projection requires Python 3.11 or `tomli`; default auth-only operation keeps
-  existing fallback parser.
+- Provider discovery and projection require Python 3.11+ or `tomli`. The legacy
+  reader supports subscription login settings. If authentication fails and
+  AutoReview cannot read the provider settings, it reports the missing parser.
 
 - Selected route must use an absolute `https` base URL with a host and no userinfo,
   query, or fragment (including empty `?`/`#`). OpenAI-compatible Responses gateways
