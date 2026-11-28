@@ -18,10 +18,12 @@ from unittest import mock
 SCRIPT = Path(__file__).with_name("check-skills")
 HELPER = runpy.run_path(str(SCRIPT))
 MAIN = HELPER["main"]
+UNICODE_PROBE_TIMEOUT = 30
 
 
 class CheckSkillsTest(unittest.TestCase):
     fixture_failure = None
+    unicode_proof_modes = ("outer", "narrow")
 
     def test_manifest_covers_checkout_test_files_in_their_groups(self) -> None:
         root = SCRIPT.resolve().parent.parent
@@ -453,19 +455,20 @@ with tempfile.TemporaryDirectory() as temporary:
         case.assertFalse(marker.exists())
         case.assertCountEqual(log.read_text().splitlines(), groups["boundaries"])
 '''
-        for mode in ("outer", "narrow"):
+        for mode in self.unicode_proof_modes:
             with self.subTest(proof=mode):
                 command = [sys.executable, "-X", "utf8=1" if mode == "outer" else "utf8=0",
                            "-S", "-c", code, str(Path(__file__).resolve()), mode,
                            self.fixture_failure or ""]
                 environment = {**os.environ, "PYTHONIOENCODING": "utf-8"}
                 result = subprocess.run(command, env=environment, text=True, encoding="utf-8",
-                                        capture_output=True, timeout=30)
+                                        capture_output=True, timeout=UNICODE_PROBE_TIMEOUT)
                 if mode == "narrow" and result.returncode == 77:
                     # Try the common POSIX UTF-8 locale when the inherited
                     # locale cannot establish the required filesystem support.
                     result = subprocess.run(command, env={**environment, "LC_ALL": "C.UTF-8"},
-                                            text=True, encoding="utf-8", capture_output=True, timeout=30)
+                                            text=True, encoding="utf-8", capture_output=True,
+                                            timeout=UNICODE_PROBE_TIMEOUT)
                 if mode == "narrow" and result.returncode == 77:
                     self.skipTest(result.stderr.strip())
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -475,18 +478,24 @@ with tempfile.TemporaryDirectory() as temporary:
 import runpy, sys, unittest
 case = runpy.run_path(sys.argv[1])["CheckSkillsTest"](
     "test_fixture_source_supports_unicode_paths_under_a_narrow_locale")
-case.fixture_failure = "skills.autoreview.tests.test_native_handoff.Cases.test_0"
+fixture_class = "skills.autoreview.tests.test_native_handoff.Cases"
+case.fixture_failure = fixture_class + ".test_0"
 result = unittest.TextTestRunner().run(unittest.TestSuite([case]))
-sys.exit(0 if result.wasSuccessful() else 1)
+case.assertFalse(result.errors)
+case.assertTrue(result.failures)
+case.assertEqual(len(result.failures) + len(result.skipped), len(case.unicode_proof_modes))
+for _, diagnostic in result.failures:
+    case.assertIn(f"FAIL: test_0 ({fixture_class}", diagnostic)
 '''
+        # Budget for each sequential probe, the optional narrow-locale retry,
+        # and one interval for interpreter startup and reporting.
+        timeout = (len(self.unicode_proof_modes) + 2) * UNICODE_PROBE_TIMEOUT
         result = subprocess.run(
             [sys.executable, "-O", "-S", "-X", "utf8=1", "-c", code, str(Path(__file__).resolve())],
             env={**os.environ, "PYTHONOPTIMIZE": "1", "PYTHONIOENCODING": "utf-8"},
-            text=True, encoding="utf-8", capture_output=True, timeout=30,
+            text=True, encoding="utf-8", capture_output=True, timeout=timeout,
         )
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("FAIL: test_0", result.stderr)
-        self.assertIn("skills.autoreview.tests.test_native_handoff.Cases", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_empty_and_broken_discovery_fail_before_running_tests(self) -> None:
         with self.fixture() as (root, foreign, marker, log, environment, groups):
