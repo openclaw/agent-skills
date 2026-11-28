@@ -25,7 +25,7 @@ env -u CRABBOX_AWS_INSTANCE_PROFILE \
   --provider aws --network public --tailscale=false \
   --tailscale-exit-node= \
   --tailscale-exit-node-allow-lan-access=false \
-  --keep --timing-json
+  --ttl 4h --idle-timeout 90m --keep --timing-json
 
 "$CRABBOX" inspect --provider aws --id <cbx_id> --json | \
   jq -e '.network == "public" and .tailscale == null' >/dev/null
