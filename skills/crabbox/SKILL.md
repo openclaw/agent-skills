@@ -55,14 +55,20 @@ description: "Crabbox/Testbox remote proof: portable provider routing, untrusted
 - Source trust restricts providers; does not select one. Inspect/preserve resolved provider.
 - Normally omit `--provider`; override only when explicitly requested or proof
   requires backend semantics. Never for size, duration, hydration failure, capacity.
-- No speculative warmup or provider escalation.
+- No speculative warmup or provider escalation. Use the smallest proven profile;
+  increase only for recorded memory needs or measured total-cost benefit.
+  Testbox sizing uses `--blacksmith-workflow`, not direct `--class`/`--type`;
+  profile changes require fresh leases. Runner labels request a tier, not
+  guaranteed hardware: measure available CPUs, affinity/quotas, and usable RAM;
+  size workers from those facts and record requested and observed resources.
 
-| Provider | Use |
-| --- | --- |
-| `blacksmith-testbox` | Trusted maintainer source with prepared CI; `tbx_...` |
-| `aws` | Direct brokered execution, fresh PRs, custom sync/env/capture; `cbx_...` |
-| `local-container` | Configured/requested local Docker; not remote proof |
-| `ssh` | Existing operator host for macOS/Windows/WSL2 |
+| Provider                   | Use                                                                      |
+| -------------------------- | ------------------------------------------------------------------------ |
+| `ascii-box` (`boat` alias) | Direct Boat Linux VMs; `cbx_...`                                         |
+| `blacksmith-testbox`       | Trusted maintainer source with prepared CI; `tbx_...`                    |
+| `aws`                      | Direct brokered execution, fresh PRs, custom sync/env/capture; `cbx_...` |
+| `local-container`          | Configured/requested local Docker; not remote proof                      |
+| `ssh`                      | Existing operator host for macOS/Windows/WSL2                            |
 
 ## Preflight
 
@@ -82,6 +88,21 @@ test -n "$CRABBOX"
   path; verify canonical upstream before building in clean task checkout.
 - Never assume sibling checkouts trusted or replace operator's binary with task build.
 - Isolate wrapper failures with installed CLI on same resolved provider.
+- Native Linux/WSL command-lifecycle or cancellation proof needs a complete
+  matching distribution or verified `CRABBOX_RUNTIME_ARTIFACTS` manifest binding
+  the selected controller. Verify common frozen-source provenance separately;
+  a manifest binds bytes, not their build origin. CLI `--version` alone does not establish native
+  supervision; a development CLI without its runtime pack uses legacy SSH.
+  Verify the pack before allocation using upstream
+  [runtime artifact instructions](https://github.com/openclaw/crabbox/blob/main/scripts/runtime-artifacts/README.md).
+
+## Lease Lifetime
+
+Before allocation, reuse, extension, or cleanup, read the complete
+[lease lifetime rules](references/lease-lifetime.md). Provisioned/direct TTL
+includes preparation;
+`--keep` does not prevent expiry. Preserve exact IDs and recovery state until
+blocking stop confirms cleanup. Delegated Testbox keeps its native job limits.
 
 ## Trusted Testbox
 
@@ -100,17 +121,28 @@ Several commands: save id, reuse, stop:
 "$CRABBOX" stop <tbx_id>
 ```
 
+- Verify the physical execution checkout and expected source/patch in the
+  executing shell; HEAD alone cannot prove dirty synchronized inputs. Prefer
+  `bash -c` unless the consumer hydration contract requires another shell.
 - One lease, one active command; no sync/reclaim during run. `--reclaim` only
   for deliberate checkout-path ownership transfer.
 - Native Testbox runs sync even with reused ids. `--no-sync` is unsupported and
   exits with code 2 before provider activity. It cannot preserve a remote baseline.
-- Base/head changed: stop + rewarm; never override stale lease.
+- Follow the consumer's validated allocation-reuse contract. Compatible trusted
+  source revisions may reuse only when that owner explicitly supports it and
+  validates the same task, physical checkout, base, dependencies, preparation,
+  and workflow/job/ref. Missing/incompatible receipts or changed preparation:
+  stop + rewarm. Preserve original allocation provenance; no stale-lease override.
+  Raw native callers gain no source-refresh exception from a wrapper contract.
   Crabbox `warmup --blacksmith-ref` (native `blacksmith testbox warmup --ref`):
   branch/tag only, never raw SHA. Never checkout refs in synced root.
 - Testbox native status/stop: `--id`; status has no `--json`. Use
   `blacksmith testbox list --all` or `blacksmith testbox status --id <tbx_id>`.
 - Delegated Testbox rejects `--fresh-pr`, `--full-resync`, `--script*`, `--env-helper`,
   and capture/download flags. Crabbox `stop` does not accept `--timing-json`.
+
+For recursive artifact download, read the complete
+[directory download recipe](references/blacksmith-downloads.md) before use.
 
 ### Verify Synced Inputs
 

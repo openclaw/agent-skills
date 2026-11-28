@@ -10,8 +10,18 @@ escalation or waiting for capacity.
 "$CRABBOX" run --provider aws --timing-json --shell -- "<check-command>"
 ```
 
+For a longer bounded command, request the required lifetime before preparation:
+
+```sh
+"$CRABBOX" run --provider aws --idle-timeout 90m --ttl 240m \
+  --timing-json --shell -- "<check-command>"
+```
+
 - Stale sync: retry `--full-resync` once. Still bad: fresh lease.
 - One-shot should stop itself; failure/interruption: verify `"$CRABBOX" list --provider aws`.
+  Use `--retained` to find kept terminal resources with unconfirmed cleanup;
+  inspect and stop the exact owned ID. A missing live-list row is not deletion
+  proof. Follow the [lifetime and cleanup rules](lease-lifetime.md).
 
 Broker auth, not cloud keys:
 
@@ -74,7 +84,7 @@ Human desktop: prefer WebVNC when resolved provider supports it.
 Never change providers only to gain desktop support.
 
 ```sh
-"$CRABBOX" warmup --desktop --browser --keep
+"$CRABBOX" warmup --desktop --browser --ttl 2h --idle-timeout 30m --keep
 "$CRABBOX" desktop launch --id <id> \
   --browser --url https://example.com --webvnc --open --take-control
 "$CRABBOX" desktop doctor --id <id>
@@ -91,3 +101,6 @@ Before handoff: prove CLI/app from neutral `~`:
 
 - Visible desktop alone proves nothing. Keep browser windowed unless capture task.
 - Never commit proof assets to product repo.
+
+- Desktop activity does not extend total TTL. Save artifacts before the effective
+  deadline; `--keep` is not persistence. Follow the lifetime rules before handoff.
