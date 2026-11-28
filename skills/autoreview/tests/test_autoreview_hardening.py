@@ -6,6 +6,7 @@ import base64
 import contextlib
 import hashlib
 import copy
+import functools
 import io
 import itertools
 import json
@@ -1672,6 +1673,36 @@ class AutoreviewHardeningTests(unittest.TestCase):
             yield
 
     @contextlib.contextmanager
+    def fixed_review_source(self, repo):
+        # These matrices vary arguments and provider replies against one unchanged
+        # tree. Capture real Git inputs once and check the tree again at the end.
+        snapshot = self.helper["source_tree_snapshot"](repo)
+
+        def fixed_snapshot(source, progress=None):
+            self.assertEqual(source, repo)
+            return snapshot
+
+        with mock.patch.dict(self.helper["main_impl"].__globals__, {
+            "repo_root": lambda: repo,
+            "preflight_git": functools.cache(self.helper["preflight_git"]),
+            "current_branch": functools.cache(self.helper["current_branch"]),
+            "build_bundle": functools.cache(self.helper["build_bundle"]),
+            "source_tree_snapshot": fixed_snapshot,
+        }):
+            yield
+        self.assertEqual(self.helper["source_tree_snapshot"](repo), snapshot)
+
+    @contextlib.contextmanager
+    def local_status_fixture(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            repo = init_repo(root)
+            git(repo, "commit", "-q", "--allow-empty", "-m", "base")
+            (repo / "source.txt").write_text("changed\n")
+            with self.fixed_review_source(repo):
+                yield root
+
+    @contextlib.contextmanager
     def preparation_fixture(self, *options):
         with tempfile.TemporaryDirectory() as tempdir:
             repo = init_repo(Path(tempdir))
@@ -2021,11 +2052,28 @@ class AutoreviewHardeningTests(unittest.TestCase):
         )
         cases = [("--source-context", path) for path in paths]
         cases.append(("--source-context-file", "credentials/prod.py"))
-        for role, path in cases:
-            with self.subTest(role=role, path=path), self.committed_context_fixture(path=path, role=role) as (_repo, sends, *_):
-                with self.assertRaisesRegex(SystemExit, "sensitive --source-context"):
-                    self.helper["main_impl"]()
-                self.assertFalse(sends)
+        with self.preparation_fixture("--mode", "branch", "--base", "HEAD^") as (repo, sends, *_):
+            for path in paths:
+                file = repo / path
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_bytes(b"regular source\n")
+            # Put every exact spelling in the tree, even on case-insensitive hosts.
+            blob = git(repo, "hash-object", "-w", paths[0]).strip()
+            entries = "".join(f"100644 {blob}\t{path}\0" for path in paths).encode("utf-8")
+            fixture_git(repo, "-c", "core.ignorecase=false", "update-index", "-z", "--index-info",
+                        input=entries, check=True)
+            git(repo, "commit", "-qm", "source context")
+            git(repo, "add", "source.md")
+            git(repo, "commit", "-qm", "selected change")
+            tracked = set(git(repo, "ls-tree", "-r", "--name-only", "-z", "HEAD").split("\0"))
+            self.assertLessEqual(set(paths), tracked)
+
+            with self.fixed_review_source(repo):
+                for role, path in cases:
+                    with self.subTest(role=role, path=path), mock.patch.object(sys, "argv", [*sys.argv, role, path]):
+                        with self.assertRaisesRegex(SystemExit, "sensitive --source-context"):
+                            self.helper["main_impl"]()
+                        self.assertFalse(sends)
 
     def test_source_context_rejects_unsafe_or_absent_committed_inputs_before_engine(self):
         for kind, diagnostic in (
@@ -3736,11 +3784,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
                                      {"report.txt", "report.json", "status.json"})
 
     def test_completion_finalizes_status_once_and_preserves_provider_observations(self) -> None:
-        with tempfile.TemporaryDirectory() as tempdir:
-            root = Path(tempdir)
-            repo = init_repo(root)
-            git(repo, "commit", "-q", "--allow-empty", "-m", "base")
-            (repo / "source.txt").write_text("changed\n")
+        with self.local_status_fixture() as root:
             status_fn = self.helper["review_status"]
             for completions in (("complete",), ("incomplete",), ("incomplete", "complete"), ("complete", "incomplete")):
                 for has_finding in (False, True):
@@ -3779,7 +3823,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
                                 finalized = mock.Mock(wraps=status_fn)
                                 text = io.StringIO()
                                 with mock.patch.dict(self.helper["main_impl"].__globals__, {
-                                    "repo_root": lambda: repo,
                                     "build_review_prompts": lambda *_: ["synthetic pack"] * len(completions),
                                     "run_engine": engine, "review_status": finalized,
                                 }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(text), \
@@ -3833,11 +3876,7 @@ class AutoreviewHardeningTests(unittest.TestCase):
             ("isolation", SystemExit("isolation refused"), None),
             ("spawn", OSError("cannot execute reviewer"), None),
         )
-        with tempfile.TemporaryDirectory() as tempdir:
-            root = Path(tempdir)
-            repo = init_repo(root)
-            git(repo, "commit", "-q", "--allow-empty", "-m", "base")
-            (repo / "source.txt").write_text("changed\n")
+        with self.local_status_fixture() as root:
             for count in (1, 2):
                 for label, failure, reason in cases:
                     with self.subTest(count=count, label=label):
@@ -3853,7 +3892,6 @@ class AutoreviewHardeningTests(unittest.TestCase):
                         engine = mock.Mock(side_effect=[clean] * (count - 1) + [failure])
                         stdout = io.StringIO()
                         with mock.patch.dict(self.helper["main_impl"].__globals__, {
-                            "repo_root": lambda: repo,
                             "build_review_prompts": lambda *_args: ["synthetic pack"] * count,
                             "run_engine": engine,
                         }), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
@@ -5320,68 +5358,84 @@ time.sleep(60)
                  "specs/rfcs/0023-egress-proxy-credential-lifecycle/guide.md",
                  "specs/rfcs/0042-credential-lifecycle/contracts.md")
         url = "https://example.invalid/private-flow-repository.git"
-        for path, (old_mode, new_mode, allowed) in itertools.product(paths, (
+        transitions = (
             ("160000", "160000", False), ("120000", "120000", False),
             ("000000", "160000", False), ("000000", "120000", False),
             ("100644", "160000", False), ("160000", "100644", False),
             ("100644", "120000", False), ("120000", "100644", False),
             ("160000", "000000", False), ("120000", "000000", False),
             ("100644", "000000", True), ("100644", "100755", True),
-        )):
-            with self.subTest(path=path, old_mode=old_mode, new_mode=new_mode), tempfile.TemporaryDirectory() as tempdir:
-                repo = init_repo(Path(tempdir))
-                git(repo, "config", "core.filemode", "false")
-                if os.name == "nt":
-                    git(repo, "config", "core.symlinks", "false")
-                (repo / "base.txt").write_text("base\n")
-                git(repo, "add", "base.txt")
-                git(repo, "commit", "-qm", "first pin")
-                first = git(repo, "rev-parse", "HEAD").strip()
-                git(repo, "commit", "--allow-empty", "-qm", "second pin")
-                second = git(repo, "rev-parse", "HEAD").strip()
-                (repo / ".gitmodules").write_text(
-                    f'[submodule "flow"]\npath = {path}\nurl = {url}\n'
-                )
-                git(repo, "add", ".gitmodules")
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo = init_repo(Path(tempdir))
+            git(repo, "config", "core.filemode", "false")
+            if os.name == "nt":
+                git(repo, "config", "core.symlinks", "false")
+            (repo / ".gitmodules").write_text("".join(
+                f'[submodule "flow-{i}"]\npath = {path}\nurl = {url}\n' for i, path in enumerate(paths)
+            ))
+            sibling = repo / "base.txt"
+            sibling.write_text("base\n")
+            git(repo, "add", ".gitmodules", "base.txt")
+            git(repo, "commit", "-qm", "first pin")
+            first = git(repo, "rev-parse", "HEAD").strip()
+            git(repo, "commit", "--allow-empty", "-qm", "second pin")
+            second = git(repo, "rev-parse", "HEAD").strip()
 
-                def select(mode, pin, text):
+            def blobs(label):
+                files = []
+                for i in range(len(paths)):
+                    file = repo.parent / f"{label}-{i}.txt"
+                    file.write_bytes(f"{label}-flow-marker-{i}\n".encode())
+                    files.append(str(file))
+                return git(repo, "hash-object", "-w", *files).splitlines()
+
+            original, updated = blobs("original"), blobs("updated")
+
+            def select(mode, pin, objects):
+                for path in paths:
                     target = repo / path
                     if target.is_symlink() or target.is_file():
                         target.unlink()
                     elif target.is_dir():
                         target.rmdir()
-                    if mode == "000000":
-                        git(repo, "update-index", "--force-remove", path)
-                        return
-                    payload = repo.parent / "payload"
-                    payload.write_text(text)
-                    oid = pin if mode == "160000" else git(repo, "hash-object", "-w", str(payload)).strip()
-                    git(repo, "update-index", "--add", "--cacheinfo", f"{mode},{oid},{path}")
+                if mode == "000000":
+                    git(repo, "update-index", "--force-remove", "--", *paths)
+                    return
+                entries = []
+                for path, oid in zip(paths, objects, strict=True):
                     if mode == "160000":
-                        target.mkdir(parents=True)
-                    else:
-                        git(repo, "checkout-index", "--force", "--", path)
+                        (repo / path).mkdir(parents=True, exist_ok=True)
+                        oid = pin
+                    entries.extend(("--cacheinfo", f"{mode},{oid},{path}"))
+                git(repo, "update-index", "--add", *entries)
+                if mode != "160000":
+                    git(repo, "checkout-index", "--force", "--", *paths)
 
-                select(old_mode, first, "original-flow-marker\n")
-                git(repo, "commit", "-qm", "baseline mapping")
-                base = git(repo, "rev-parse", "HEAD").strip()
-                select(new_mode, second, "updated-flow-marker\n")
-                (repo / "base.txt").write_text("base\npermitted-sibling-edit\n")
-                git(repo, "add", "base.txt")
-                local = self.helper["local_bundle"](repo)
-                git(repo, "commit", "-qm", "change flow object")
-                for bundle in (local, self.helper["branch_bundle"](repo, base),
-                               self.helper["commit_bundle"](repo, "HEAD")):
-                    # Filtering either section of a type change must retain its sibling.
-                    self.assertIn("base.txt", bundle.paths)
-                    self.assertIn("+permitted-sibling-edit", bundle.text)
-                    # An unchanged mapping must never be disclosed by a rejected gitlink.
-                    self.assertNotIn(url, bundle.text)
-                    self.assertEqual(path in bundle.paths, allowed)
-                    self.assertEqual("original-flow-marker" in bundle.text, allowed)
-                    if not allowed:
-                        self.assertNotIn("updated-flow-marker", bundle.text)
-                        self.assertNotIn(path, bundle.text)
+            for old_mode, new_mode, allowed in transitions:
+                with self.subTest(old_mode=old_mode, new_mode=new_mode):
+                    select(old_mode, first, original)
+                    sibling.write_text("base\n")
+                    git(repo, "add", "base.txt")
+                    git(repo, "commit", "--allow-empty", "-qm", "baseline mapping")
+                    select(new_mode, second, updated)
+                    sibling.write_text("base\npermitted-sibling-edit\n")
+                    git(repo, "add", "base.txt")
+                    local = self.helper["local_bundle"](repo)
+                    git(repo, "commit", "-qm", "change flow objects")
+                    for bundle in (local, self.helper["branch_bundle"](repo, "HEAD^"),
+                                   self.helper["commit_bundle"](repo, "HEAD")):
+                        self.assertIn("base.txt", bundle.paths)
+                        self.assertIn("+permitted-sibling-edit", bundle.text)
+                        self.assertNotIn(url, bundle.text)
+                        for i, path in enumerate(paths):
+                            with self.subTest(path=path):
+                                self.assertEqual(path in bundle.paths, allowed)
+                                self.assertEqual(f"original-flow-marker-{i}" in bundle.text, allowed)
+                                self.assertEqual(f"updated-flow-marker-{i}" in bundle.text,
+                                                 allowed and new_mode != "000000")
+                                if not allowed:
+                                    self.assertNotIn(path, bundle.text)
 
     def test_secret_named_workflows_are_reviewable_in_all_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

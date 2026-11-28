@@ -164,6 +164,7 @@ class CheckSkillsTest(unittest.TestCase):
             root = Path(directory) / "repo"
             (root / "scripts").mkdir(parents=True)
             shutil.copy2(SCRIPT, root / "scripts/check-skills")
+            (root / "scripts/windows-hardening-seconds.json").write_text("{}", encoding="utf-8")
             for name in ("windows_test_process.py", "windows-test-process.test.py"):
                 shutil.copy2(SCRIPT.with_name(name), root / "scripts" / name)
             log = Path(directory) / "executed"
@@ -228,9 +229,14 @@ class CheckSkillsTest(unittest.TestCase):
             self.assertTrue(bootstrap["windows_test_process_status"]()["eligible"],
                             "runner fixtures must be created by the admitted test process")
         with self.fixture() as (root, foreign, marker, log, environment, groups):
+            hardening = sorted(groups["hardening"])
+            # The two slowest IDs would land together in an alternating split.
+            # Two live IDs use the default estimate and one profile entry is stale.
+            timings = {hardening[0]: 10, hardening[2]: 9, hardening[4]: 2, "removed.test": 20}
+            (root / "scripts/windows-hardening-seconds.json").write_text(json.dumps(timings), encoding="utf-8")
             expected = {**groups, "all": sum(groups.values(), []),
-                        "hardening-1": sorted(groups["hardening"])[::2],
-                        "hardening-2": sorted(groups["hardening"])[1::2]}
+                        "hardening-1": [hardening[0], hardening[1], hardening[3]],
+                        "hardening-2": [hardening[2], hardening[4]]}
             for group, labels in expected.items():
                 with self.subTest(group=group):
                     log.unlink(missing_ok=True)

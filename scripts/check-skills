@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import importlib
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -123,6 +124,25 @@ def repository_test_modules(root: Path):
         sys.modules.update(previous)
 
 
+def hardening_shard(root: Path, tests: list[unittest.TestCase], group: str) -> list[unittest.TestCase]:
+    # The profile records whole seconds for tests taking at least two seconds
+    # in Windows "test end" output. The short tests average about half a second.
+    timings = json.loads((root / "scripts/windows-hardening-seconds.json").read_text(encoding="utf-8"))
+
+    def seconds(test: unittest.TestCase) -> float:
+        return timings.get(test.id(), 0.5)
+
+    shards = [[] for _ in HARDENING_SHARDS]
+    totals = [0.0] * len(shards)
+    # Place the longest remaining test on the shard with the least assigned time.
+    for test in sorted(tests, key=lambda test: (-seconds(test), test.id())):
+        index = totals.index(min(totals))
+        shards[index].append(test)
+        totals[index] += seconds(test)
+    # Keep unittest class fixtures together in the selected shard.
+    return sorted(shards[HARDENING_SHARDS.index(group)], key=lambda test: test.id())
+
+
 def repository_test_suite(root: Path, group: str) -> unittest.TestSuite:
     if group == "all":
         groups = TEST_MODULES
@@ -156,7 +176,7 @@ def repository_test_suite(root: Path, group: str) -> unittest.TestSuite:
     if not tests or len(tests) != len({test.id() for test in tests}):
         raise ValueError("test discovery returned empty or duplicate test IDs")
     if group in HARDENING_SHARDS:
-        tests = sorted(tests, key=lambda test: test.id())[HARDENING_SHARDS.index(group)::2]
+        tests = hardening_shard(root, tests, group)
         if not tests:
             raise ValueError("hardening shard has no test IDs")
     return unittest.TestSuite(tests)

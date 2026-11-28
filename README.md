@@ -216,6 +216,12 @@ are development-only; installed skills do not need `npm install`. The separate
 macOS CI job uses the `xcode-27` Apple Silicon runner and installs a pinned Codex CLI to exercise native sandbox access
 controls without a reviewer account or provider request.
 
+The two Windows hardening shards assign the longest tests first, using
+`scripts/windows-hardening-seconds.json`. Refresh the estimates from the
+`test end` lines in both completed Windows shards. Record full test IDs
+taking at least two seconds and round their durations to whole seconds.
+Shorter tests and new IDs use a half-second estimate.
+
 Python autoreview suites run through `check-skills` with a fresh temporary
 directory beneath the caller's home and without inherited reviewer settings or
 provider credentials. The caller's home must be writable and have private storage
